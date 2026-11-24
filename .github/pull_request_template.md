@@ -1,6 +1,6 @@
 ## Description
 
-<!-- Describe what problem this PR solves or what feature it adds. -->
+<!-- Describe what problem this Android PR solves or what mobile feature it adds. -->
 
 ## Motivation & Parity Basis
 
@@ -12,19 +12,19 @@ Per AGENTS.md and CONTRIBUTING.md, state what this change is based on:
 - An estimate (documented per docs/MECHANICS.md)
 -->
 
-## Platforms & Devices Tested
+## Android Devices Tested
 
-<!-- List platforms and devices tested (e.g. Linux x86_64 Vulkan, Windows 11, macOS, Android arm64 / Vivo Y27 Mali-G52 MC2). -->
-- [ ] Linux x86_64
-- [ ] Windows x64
-- [ ] macOS
-- [ ] Android arm64-v8a (Device: `...`, GPU: `...`)
+<!-- List Android devices tested (e.g. Vivo Y27 Mali-G52 MC2, Samsung Galaxy S23 Adreno 740, or Android x86_64 Emulator). -->
+- [ ] Android arm64-v8a (Device Model: `...`, GPU / SoC: `...`, Android Version: `...`)
+- [ ] Android x86_64 Emulator
+
+*(Note: If you have changes for the PC/desktop version, please submit them upstream to https://github.com/rippelz/rustudio)*
 
 ## Visual Verification
 
 <!--
 Per AGENTS.md, look at screenshots. A test that passes while the picture is wrong isn't a fix.
-Attach screenshots, FPS comparisons, or screen recordings if UI or rendering is changed.
+Attach mobile screenshots, FPS comparisons, or screen recordings if UI or rendering is changed.
 -->
 
 ## Verification Checklist
@@ -42,7 +42,7 @@ Please verify the following before requesting review:
 - [ ] Ran GPU pipeline build test if modifying shaders (`cargo test -p rustudio-render --lib -- render::gpu_tests::renderer_pipelines_build_on_this_gpu`).
 - [ ] Added or updated unit tests for bug fixes, settings, or protocol changes.
 
-### Android & Mobile Engineering Rules (if applicable)
+### Android & Mobile Engineering Rules
 - [ ] Native Android graphics drivers only (standard Vulkan 1.1+ / OpenGL ES 3.0+; no Turnip/PanVK/adrenotools).
 - [ ] Never silently downgrades user quality settings.
 - [ ] Touch & multi-touch isolation respected (floating panels/joystick do not leak pointer events to 3D camera).

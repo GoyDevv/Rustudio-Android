@@ -1,11 +1,16 @@
 # Credits: original files used
 
+## Project Authors & Upstream
+
+- **[rippelz/rustudio](https://github.com/rippelz/rustudio)**: Creator of the original rustudio project and maintainer of the PC (Linux, Windows, macOS) version.
+- **[TouseefX/rustudio](https://github.com/TouseefX/rustudio)**: Developer and core contributor to rustudio.
+
+---
+
 rustudio is the person's own editor for their Roblox places. Nothing from
 Roblox Studio is copied into this repository or compiled into the program. The
-files below are downloaded from Roblox's own CDN into
-`~/.local/share/rustudio/studio` on first launch and read at run time only,
-through `~/.local/share/rustudio/content` (`RUSTUDIO_CONTENT_DIR` points it
-elsewhere).
+files below are downloaded from Roblox's own CDN into the app data directory on first launch and read at run time only,
+through the content cache (`RUSTUDIO_CONTENT_DIR` points it elsewhere).
 
 | File in the game's folder | Used for |
 |---|---|
@@ -16,17 +21,7 @@ elsewhere).
 | `content/fonts/*.ttf`, `content/fonts/*.otf` (e.g. `Oswald-Regular.ttf`, `Sarpanch-Regular.ttf`, `BuilderExtended-Bold.otf`, `Montserrat-Bold.ttf`) | the text of TextLabels, TextButtons and TextBoxes in GUIs, drawn with the same font files Studio uses |
 | `content/fonts/BuilderSans-Regular.otf`, `SourceSansPro-Regular.ttf`, `NotoSans*UI-Regular.ttf`, `NotoNaskhArabicUI-Regular.ttf` | fallback glyphs for GUI text whose font lacks a character (e.g. "▶" in Sarpanch), after the text's own font |
 
-System fonts, read at run time when installed (not part of Studio or
-rustudio): `NotoSansSymbols2-Regular.ttf`, `NotoSansSymbols-Regular.ttf`
-(Noto, SIL OFL) and `DejaVuSans.ttf` (DejaVu, Bitstream Vera licence) under
-`/usr/share/fonts`, as the last fallbacks for symbols in GUI text and the
-editor's own text.
-
-Read straight from the Studio install at run time (read only, never
-copied; found as `RUSTUDIO_STUDIO_DIR`, else the folder the content link
-points into, else the copy rustudio downloads on first run from Roblox's
-deployment CDN into `~/.local/share/rustudio/studio` (`crates/rustudio-core/src/studio_content.rs`),
-else `~/.local/share/rustudio/studio`):
+Read straight from the Studio install or downloaded on first run from Roblox's deployment CDN:
 
 | File in the game's folder | Used for |
 |---|---|
@@ -43,23 +38,11 @@ else `~/.local/share/rustudio/studio`):
 Studio's rules and default values (camera speed settings, the fly speed-up
 rule, wheel zoom, snap increments) are written into rustudio's own code; no
 Studio code is copied. Values measured from Studio (listed in
-`docs/MECHANICS.md` and `mechanics.json`): camera speed, wheel step, field of view, snap increments, part defaults, theme colours, Studio's settings in an offline Studio's `appdata/Roblox/GlobalSettings_13.xml`, and Output messages seen while playing og.rbxl and Place A in an offline Studio. The fidelity captures in `../checks/compare/*/studio/` (screenshots, Output, structural dumps, physics facts) are Studio's own, taken offline in an offline Studio by `tools/fidelity/fidelity.py`; the R15 hip height, part sizes, resting height, jump apex, fall time and walk speed used in code come from them.
+`docs/MECHANICS.md` and `mechanics.json`): camera speed, wheel step, field of view, snap increments, part defaults, theme colours, Studio's settings in an offline Studio's `appdata/Roblox/GlobalSettings_13.xml`, and Output messages seen while playing og.rbxl and Place A in an offline Studio.
 
-Downloaded at run time from Roblox's public asset delivery (no login; `docs/MATERIALS.md`) and cached in `~/.cache/rustudio/assets`: the material texture packs Studio uses and their images, the default animations Roblox's Animate scripts ask for, the body part meshes and cages the body files above point at, and any other public asset a place uses. The material tables (pack ids, colours), the HACD collision settings and the
-material texture repeat are matched to Studio; the values are written into
-rustudio's own code.
+Downloaded at run time from Roblox's public asset delivery (no login; `docs/MATERIALS.md`) and cached: the material texture packs Studio uses and their images, the default animations Roblox's Animate scripts ask for, the body part meshes and cages the body files above point at, and any other public asset a place uses.
 
-With the person's own Roblox session (`docs/AUTH.md`; signed in only), the same endpoint also gives assets Roblox serves to signed-in accounts: the current dynamic head of the R15 body file (mesh, cage, face), the person's avatar items (clothing, accessories, layered clothing), models a place loads with InsertService, and the person's own places. Those meshes are often Draco-compressed; they are decoded with the `draco-core` crate (Apache-2.0, a Rust reading of Google's Draco format). The self-test's "catalog-assets" step puts on Roblox's catalog item "Hooded Jacket - Gray" (8516620262). The place-upload route `/ide/publish/UploadExistingAsset` is the one Studio uses for publishing (`docs/AUTH.md`).
-
-Other files read at run time, outside the game's folder: an optional local asset
-store (`RUSTUDIO_LOCAL_ASSETS=<folder>` of `<id>[.ext]` files, off by default) and the person's rbxasset
-upload ledger `~/.local/share/rbxasset/ledger.json` with the files it points
-at (FBX model uploads among them, imported in memory). All read only:
-rustudio writes nothing into either.
-
-GUI measurements (top bar inset, text widths) were taken from Studio in
-an offline Studio; Place A' own notes on its uploads (Shared/GunMeshes, GrenadeArt)
-confirmed how Roblox places imported FBX meshes.
+With the person's own Roblox session (`docs/AUTH.md`; signed in only), the same endpoint also gives assets Roblox serves to signed-in accounts: the current dynamic head of the R15 body file (mesh, cage, face), the person's avatar items (clothing, accessories, layered clothing), models a place loads with InsertService, and the person's own places.
 
 ## Bundled third-party art
 
@@ -69,8 +52,7 @@ confirmed how Roblox places imported FBX meshes.
 
 ## Vendored and patched crates
 
-Under `vendor/`, each with its upstream licence file and a note of what
-rustudio changed and why:
+Under `vendor/`, each with its upstream licence file and a note of what rustudio changed and why:
 
 | Crate | Licence | Change |
 |---|---|---|
