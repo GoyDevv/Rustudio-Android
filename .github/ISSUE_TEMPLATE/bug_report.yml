@@ -1,0 +1,86 @@
+name: Bug Report
+description: Report an issue, glitch, crash, or unexpected behavior in rustudio
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue!
+        Please read [CONTRIBUTING.md](https://github.com/GoyDevv/Rustudio-Android/blob/main/CONTRIBUTING.md) and [docs/ANDROID.md](https://github.com/GoyDevv/Rustudio-Android/blob/main/docs/ANDROID.md) before submitting.
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the problem...
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating System / Platform
+      description: Which platform did you encounter this issue on?
+      options:
+        - Android (arm64-v8a)
+        - Android (x86_64 Emulator)
+        - Linux (x86_64 Wayland/X11)
+        - Windows (x64)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware / GPU Details
+      description: Device model and GPU (e.g. Vivo Y27 / Mali-G52 MC2, Adreno 650, NVIDIA RTX 3070, Apple M1)
+      placeholder: Device model, GPU model, driver version
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Step-by-step instructions to reproduce the issue.
+      placeholder: |
+        1. Open place '...'
+        2. Press Play / Open Explorer
+        3. Click on '...'
+        4. Observe crash / rendering glitch
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen based on Roblox Studio behavior?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Output Window Traces
+      description: Copy and paste relevant logs, backtraces, or Output panel messages.
+      render: shell
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or Videos
+      description: Drag and drop screenshots or videos showing the issue.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have verified this is not a duplicate of an existing issue.
+          required: true
+        - label: I am using native graphics drivers without unofficial driver shims (no Turnip, PanVK, or libadrenotools on Android).
+          required: false

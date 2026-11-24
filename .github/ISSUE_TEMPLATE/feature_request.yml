@@ -1,0 +1,46 @@
+name: Feature Request
+description: Suggest an idea or enhancement for rustudio
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve rustudio!
+        Please review [CONTRIBUTING.md](https://github.com/GoyDevv/Rustudio-Android/blob/main/CONTRIBUTING.md) to understand our architecture and design philosophy.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear description of what the problem or limitation is.
+      placeholder: I'm always frustrated when...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution / Feature
+      description: A clear and concise description of what you want to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: studio_parity
+    attributes:
+      label: Roblox Studio Parity Reference
+      description: How does Roblox Studio handle this? Include references, API names, or screenshots where applicable.
+  - type: dropdown
+    id: target_platform
+    attributes:
+      label: Target Platform
+      options:
+        - All Platforms (Desktop & Android)
+        - Android Specific (Touch controls, floating panels, mobile UX)
+        - Desktop Specific (Linux, Windows, macOS)
+        - Renderer / Engine / Core
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Additional Context / Alternatives Considered
+      description: Any other context, workarounds, or alternatives you've considered.
