@@ -111,4 +111,4 @@ If your PR touches Android:
    - Screenshots or FPS measurements if the change affects UI or rendering.
 4. Respond to review feedback and keep your branch up to date with `main`.
 
-Need help or want to discuss a bigger change first? Join the [rustudio Discord](https://discord.gg/pdVZpADpWr) or open an issue!
+Need help or want to discuss a bigger change first? Join the [rustudio Discord](https://discord.gg/8EX6cpgsRx) or open an issue!
