@@ -331,6 +331,11 @@ pub struct SunShadows {
     h_pipe: wgpu::RenderPipeline,
     v_pipe: wgpu::RenderPipeline,
     drawn: [Option<Drawn>; CASCADES],
+    /// Last dynamic-caster generation drawn into each cascade.
+    drawn_dyn: [u64; CASCADES],
+    /// Dynamic-caster generation seen on the previous `plan()` call, to tell
+    /// continuous motion (Playtest / active drag) from a just-settled move.
+    last_dyn_gen: u64,
     frame: u64,
 }
 
@@ -485,7 +490,7 @@ impl SunShadows {
         };
         let h_pipe = pipe("sun shadow blur across", "fs_h", &[Some(&h_layout)]);
         let v_pipe = pipe("sun shadow blur down", "fs_v", &[Some(&pass_layout), Some(&v_layout)]);
-        SunShadows { atlas_view, temp_view, pass_buf, pass_layout, pass_bg, h_bg, v_bg, h_pipe, v_pipe, drawn: [None; CASCADES], frame: 0 }
+        SunShadows { atlas_view, temp_view, pass_buf, pass_layout, pass_bg, h_bg, v_bg, h_pipe, v_pipe, drawn: [None; CASCADES], drawn_dyn: [0; CASCADES], last_dyn_gen: 0, frame: 0 }
     }
 
     /// The cascades to redraw this frame. Cascade 0 follows the camera, so
@@ -493,32 +498,46 @@ impl SunShadows {
     /// counts changes of what stands still). With moving casters
     /// (`moving`) they also come round in turn: one of them a frame,
     /// cascade 1 every 2nd, 2 every 4th, 3 every 8th.
-    pub fn plan(&mut self, cascades: &[Cascade; CASCADES], scene: u64, moving: bool) -> [bool; CASCADES] {
+    pub fn plan(&mut self, cascades: &[Cascade; CASCADES], scene: u64, dyn_gen: u64, moving: bool) -> [bool; CASCADES] {
         self.frame += 1;
         let f = self.frame;
+        let dyn_active = dyn_gen != self.last_dyn_gen;
+        self.last_dyn_gen = dyn_gen;
         std::array::from_fn(|i| {
             let now = Drawn { cascade: cascades[i], scene };
+            let stale_dyn = self.drawn_dyn[i] != dyn_gen;
             let turn = moving && if cfg!(target_os = "android") {
                 [f % 2 == 0, f % 4 == 1, f % 8 == 3, f % 16 == 7][i]
             } else {
                 [true, f % 2 == 0, f % 4 == 1, f % 8 == 3][i]
             };
-            let due = turn || self.drawn[i] != Some(now);
+            // When dynamic casters stop moving (e.g. after a fast 3D editor
+            // drag), immediately flush any cascade that was skipped by the
+            // stagger schedule so shadows never freeze at an old position.
+            let settle_flush = !dyn_active && stale_dyn;
+            let due = turn || settle_flush || self.drawn[i] != Some(now);
             if due {
                 self.drawn[i] = Some(now);
+                self.drawn_dyn[i] = dyn_gen;
             }
             due
         })
     }
 
+    /// Whether any cascade has not yet rendered the latest dynamic-caster state.
+    pub fn has_stale_dyn(&self, dyn_gen: u64) -> bool {
+        self.drawn_dyn.iter().any(|&g| g != dyn_gen)
+    }
+
     /// Nothing drawn is current any more (the depth map was lost / shadows off).
     pub fn forget(&mut self) {
         self.drawn = [None; CASCADES];
+        self.drawn_dyn = [u64::MAX; CASCADES];
     }
 
     /// Uploads the passes' constants; before any of them is encoded.
     pub fn upload(&self, queue: &wgpu::Queue, cascades: &[Cascade; CASCADES]) {
-        let mut data = vec![0u8; (CASCADES as u64 * PASS_STRIDE) as usize];
+        let mut data = [0u8; CASCADES * PASS_STRIDE as usize];
         for (i, c) in cascades.iter().enumerate() {
             let k = (c.level as usize).clamp(1, EVSM_H_WEIGHTS.len()) - 1;
             let mut raw = PassRaw {

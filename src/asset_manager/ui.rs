@@ -1668,11 +1668,14 @@ impl AssetManager {
         let mut start_upload = false;
         let mut local_imports: Vec<(usize, std::path::PathBuf)> = Vec::new();
         let groups = self.groups.as_ref().and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default();
+        let screen = ctx.content_rect();
+        let modal_w = (screen.width() - 24.0).clamp(320.0, 680.0);
+        let modal_h = (screen.height() - 32.0).clamp(280.0, 420.0);
 
         egui::Window::new("Asset Manager — Bulk Import")
             .collapsible(false)
             .resizable(true)
-            .default_size(Vec2::new(540.0, 380.0))
+            .default_size(Vec2::new(modal_w, modal_h))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -1697,46 +1700,79 @@ impl AssetManager {
                 });
                 ui.separator();
 
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height((modal_h - 120.0).max(120.0)).show(ui, |ui| {
                     for (idx, item) in modal.items.iter_mut().enumerate() {
+                        let is_pending = matches!(item.status, ImportStatus::Pending);
+                        let is_local_model = super::api::is_local_model_path(&item.path);
+                        let mut insert_one_local = false;
+                        let mut retry_one = false;
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
                             icon(ui.painter(), ir, item.kind.icon(), kind_color(item.kind));
                             ui.add_enabled(
-                                matches!(item.status, ImportStatus::Pending),
-                                egui::TextEdit::singleline(&mut item.display_name).desired_width(180.0),
+                                is_pending,
+                                egui::TextEdit::singleline(&mut item.display_name).desired_width(160.0),
                             );
-                            ui.label(RichText::new(item.asset_type).size(11.5).color(theme::TEXT_DIM));
+                            ui.add_enabled_ui(is_pending, |ui| {
+                                egui::ComboBox::from_id_salt(("am_imp_type", idx))
+                                    .width(88.0)
+                                    .selected_text(item.asset_type)
+                                    .show_ui(ui, |ui| {
+                                        for &ty in &super::api::IMPORT_ASSET_TYPES {
+                                            if ui.selectable_value(&mut item.asset_type, ty, ty).clicked() {
+                                                item.kind = super::api::kind_for_asset_type(ty, &item.path);
+                                            }
+                                        }
+                                    });
+                            });
                             ui.label(RichText::new(format_bytes(item.size_bytes)).size(11.0).color(theme::TEXT_DIM));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match &item.status {
                                 ImportStatus::Pending => {
-                                    ui.label(RichText::new("Ready").size(11.0).color(theme::TEXT_DIM));
+                                    if is_local_model {
+                                        if ui.small_button("Insert Local").clicked() {
+                                            insert_one_local = true;
+                                        }
+                                    } else {
+                                        ui.label(RichText::new("Ready").size(11.0).color(theme::TEXT_DIM));
+                                    }
                                 }
                                 ImportStatus::Uploading => {
                                     ui.spinner();
                                     ui.label(RichText::new("Uploading...").size(11.0).color(LINK));
                                 }
                                 ImportStatus::Done(id) => {
-                                    ui.label(RichText::new(format!("✔ {id}")).size(11.0).color(GOOD));
+                                    let uri = format!("rbxassetid://{id}");
+                                    if ui.small_button("Copy ID").clicked() {
+                                        self.actions.push(Action::CopyText(uri.clone(), format!("Copied {uri}")));
+                                    }
+                                    ui.label(RichText::new(format!("✔ {uri}")).size(11.0).color(GOOD));
                                 }
                                 ImportStatus::LocalImported => {
                                     ui.label(RichText::new("✔ Inserted locally").size(11.0).color(GOOD));
                                 }
                                 ImportStatus::Failed(e) => {
+                                    if ui.small_button("Retry").clicked() {
+                                        retry_one = true;
+                                    }
                                     ui.label(RichText::new("Failed").size(11.0).color(theme::ERROR)).on_hover_text(e);
                                 }
                             });
                         });
-                        let _ = idx;
+                        if insert_one_local {
+                            item.status = ImportStatus::LocalImported;
+                            local_imports.push((idx, item.path.clone()));
+                        } else if retry_one {
+                            item.status = ImportStatus::Pending;
+                        }
                     }
                 });
 
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let has_pending = modal.items.iter().any(|i| matches!(i.status, ImportStatus::Pending));
                     if self.signed_in {
                         ui.add_enabled_ui(has_pending && !modal.uploading, |ui| {
-                            if primary_btn(ui, "Upload to Roblox").clicked() {
+                            if primary_btn(ui, "Upload All to Roblox").clicked() {
                                 start_upload = true;
                             }
                         });
@@ -1747,14 +1783,11 @@ impl AssetManager {
                         }
                     }
                     let has_local_models = modal.items.iter().any(|i| {
-                        matches!(i.status, ImportStatus::Pending)
-                            && matches!(i.path.extension().and_then(|e| e.to_str()), Some("rbxm" | "rbxmx"))
+                        matches!(i.status, ImportStatus::Pending) && super::api::is_local_model_path(&i.path)
                     });
-                    if has_local_models && ui.button("Insert .rbxm/.rbxmx Locally").clicked() {
+                    if has_local_models && ui.button("Insert Local").clicked() {
                         for (idx, item) in modal.items.iter_mut().enumerate() {
-                            if matches!(item.status, ImportStatus::Pending)
-                                && matches!(item.path.extension().and_then(|e| e.to_str()), Some("rbxm" | "rbxmx"))
-                            {
+                            if matches!(item.status, ImportStatus::Pending) && super::api::is_local_model_path(&item.path) {
                                 item.status = ImportStatus::LocalImported;
                                 local_imports.push((idx, item.path.clone()));
                             }

@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// GitHub's latest release: never a draft or a pre-release, so a stable
 /// build is only ever offered stable releases.
-const FEED: &str = "https://api.github.com/repos/rippelz/rustudio/releases/latest";
+const FEED: &str = "https://api.github.com/repos/GoyDevv/Rustudio-Android/releases/latest";
 const SNOOZE: Duration = Duration::from_secs(12 * 3600);
 
 #[derive(Clone)]
@@ -87,7 +87,7 @@ impl Updater {
         // RUSTUDIO_NO_UPDATE_CHECK / RUSTUDIO_UI_SHOTS, or the rustudio option.
         // An Android APK is installed by the system: nothing here could put
         // a release in place, so the phone never asks.
-        let off = !rustudio_core::rustudio_settings::update_check() || cfg!(target_os = "android");
+        let off = !rustudio_core::rustudio_settings::update_check();
         if off {
             *stage.lock().unwrap() = Stage::Current;
         } else {
@@ -145,7 +145,7 @@ impl Updater {
                         let (title, subtitle) = match &stage {
                             Stage::Available(r) => ("Update available".to_string(), format!("{ours}  →  {}", r.version)),
                             Stage::Downloading(r) => (format!("Downloading {}", r.version), progress_text(&self.progress)),
-                            Stage::Installed(r) => ("Update ready".to_string(), format!("{} starts when rustudio restarts.", r.version)),
+                            Stage::Installed(r) => ("Update downloaded".to_string(), if cfg!(target_os = "android") { format!("v{} saved to Download/Rustudio/. Tap it in Files to install!", r.version) } else { format!("{} starts when rustudio restarts.", r.version) }),
                             Stage::Failed(..) => ("Update failed".to_string(), "Nothing was changed.".to_string()),
                             _ => unreachable!(),
                         };
@@ -209,12 +209,21 @@ impl Updater {
                                             ctx.open_url(egui::OpenUrl::new_tab(&r.page));
                                         }
                                     }
-                                    Stage::Installed(_) => {
-                                        if ui.add(primary("Restart now")).clicked() {
-                                            action = Action::Restart;
-                                        }
-                                        if ui.add(secondary("Later")).clicked() {
-                                            close = true;
+                                    Stage::Installed(r) => {
+                                        if cfg!(target_os = "android") {
+                                            if ui.add(primary("Open Release")).clicked() {
+                                                ctx.open_url(egui::OpenUrl::new_tab(&r.page));
+                                            }
+                                            if ui.add(secondary("Close")).clicked() {
+                                                close = true;
+                                            }
+                                        } else {
+                                            if ui.add(primary("Restart now")).clicked() {
+                                                action = Action::Restart;
+                                            }
+                                            if ui.add(secondary("Later")).clicked() {
+                                                close = true;
+                                            }
                                         }
                                     }
                                     Stage::Failed(r, _) => {
@@ -375,11 +384,19 @@ fn check() -> Result<Option<Release>, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let asset = asset_suffix().and_then(|suf| assets.iter().find(|(n, _)| n.ends_with(suf)).cloned());
+    let asset = if cfg!(target_os = "android") {
+        assets
+            .iter()
+            .find(|(n, _)| n.to_ascii_lowercase().ends_with(".apk"))
+            .or_else(|| assets.iter().find(|(n, _)| n.to_ascii_lowercase().contains("bundle") && n.to_ascii_lowercase().ends_with(".zip")))
+            .cloned()
+    } else {
+        asset_suffix().and_then(|suf| assets.iter().find(|(n, _)| n.ends_with(suf)).cloned())
+    };
     let sums = assets.iter().find(|(n, _)| n == "SHA256SUMS").map(|(_, u)| u.clone());
     Ok(Some(Release {
         version: tag.trim_start_matches('v').to_string(),
-        page: feed["html_url"].as_str().unwrap_or("https://github.com/rippelz/rustudio/releases").to_string(),
+        page: feed["html_url"].as_str().unwrap_or("https://github.com/GoyDevv/Rustudio-Android/releases").to_string(),
         asset,
         sums,
     }))
@@ -387,6 +404,9 @@ fn check() -> Result<Option<Release>, String> {
 
 /// Running out of a cargo `target/{debug,release}` folder: built from source.
 fn source_build() -> bool {
+    if cfg!(target_os = "android") {
+        return false;
+    }
     let Ok(exe) = std::env::current_exe() else { return false };
     let parts: Vec<_> = exe.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
     parts.windows(2).any(|w| w[0] == "target" && (w[1] == "release" || w[1] == "debug"))
@@ -443,6 +463,16 @@ fn remove_leftovers() {
     }
 }
 
+#[cfg(target_os = "android")]
+fn install(r: &Release, progress: &Progress) -> Result<PathBuf, String> {
+    let (name, url) = r.asset.as_ref().ok_or("No Android APK asset found in this release")?;
+    let bytes = download(url, progress)?;
+    let saved = crate::android::crash_export::save_to_downloads_android(name, &bytes)
+        .map_err(|e| format!("Failed to save update to Downloads: {e}"))?;
+    Ok(PathBuf::from(saved))
+}
+
+#[cfg(not(target_os = "android"))]
 fn install(r: &Release, progress: &Progress) -> Result<PathBuf, String> {
     let (name, url) = r.asset.clone().ok_or("no download for this platform")?;
     let root = install_root()?;

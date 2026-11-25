@@ -66,7 +66,7 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     let mut s = egui_dock::Style::from_egui(style);
     s.tab_bar.bg_fill = PANEL_DARK;
     s.tab_bar.hline_color = DIVIDER;
-    s.tab_bar.height = 24.0;
+    s.tab_bar.height = if cfg!(target_os = "android") { 28.0 } else { 24.0 };
     // Studio's panels have a full-width title bar with the name centred.
     s.tab_bar.fill_tab_bar = true;
     s.tab.active.bg_fill = PANEL_DARK;
@@ -78,8 +78,8 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     s.tab.hovered.bg_fill = HOVER_BG;
     s.tab.tab_body.bg_fill = PANEL;
     s.tab.tab_body.inner_margin = egui::Margin::same(4);
-    s.separator.width = if cfg!(target_os = "android") { 3.0 } else { 2.0 };
-    s.separator.extra_interact_width = if cfg!(target_os = "android") { 24.0 } else { 8.0 };
+    s.separator.width = if cfg!(target_os = "android") { 4.0 } else { 2.0 };
+    s.separator.extra_interact_width = if cfg!(target_os = "android") { 56.0 } else { 8.0 };
     s.separator.color_idle = DIVIDER;
     s.separator.color_hovered = ACCENT;
     s.separator.color_dragged = SELECT;

@@ -50,6 +50,8 @@ pub mod bin_dump;
 #[cfg(unix)]
 pub mod control;
 pub mod coverage;
+pub mod crash;
+pub mod crash_dialog;
 pub mod explorer;
 pub mod file_dialog;
 pub mod hypr;
@@ -452,8 +454,165 @@ fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
 /// Snapdragon phone with the Turnip driver swapped in (android::turnip),
 /// the renderer's objects are made on Turnip's loader up front and handed
 /// over as they are; everywhere else wgpu makes them.
-pub(crate) fn wgpu_setup(setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu::WgpuSetup {
-    // Native graphics driver only (Vulkan first with GLES 3 fallback on Android).
+#[cfg(target_os = "android")]
+mod android_gpu_guard {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PROBE_FILE: &str = ".vulkan_boot_probe";
+    const FAILED_FILE: &str = ".vulkan_failed";
+
+    static BOOT_VERIFIED: AtomicBool = AtomicBool::new(false);
+
+    fn getprop(key: &str) -> String {
+        std::process::Command::new("getprop")
+            .arg(key)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn probe_path() -> PathBuf {
+        crate::crash::dir().join(PROBE_FILE)
+    }
+
+    fn failed_path() -> PathBuf {
+        crate::crash::dir().join(FAILED_FILE)
+    }
+
+    /// Detects Android devices whose vendor Vulkan HAL crashes inside vkQueueSubmit
+    /// on the first rendered frame (e.g. MediaTek MT6765 / PowerVR Rogue GE8320
+    /// `vulkan.mt6765.so` null-pointer SIGSEGV) while native OpenGL ES 3 works cleanly.
+    fn known_broken_vulkan_reason() -> Option<String> {
+        const KNOWN_BROKEN_LIBS: &[&str] = &[
+            "/vendor/lib64/hw/vulkan.mt6765.so",
+            "/vendor/lib64/hw/vulkan.mt6762.so",
+            "/vendor/lib64/hw/vulkan.mt6761.so",
+            "/vendor/lib64/hw/vulkan.mt6739.so",
+            "/vendor/lib64/hw/vulkan.mt8766.so",
+            "/vendor/lib64/hw/vulkan.mt8768.so",
+            "/vendor/lib64/hw/vulkan.powervr.so",
+            "/vendor/lib64/egl/libGLES_powervr.so",
+        ];
+        for path in KNOWN_BROKEN_LIBS {
+            if Path::new(path).exists() {
+                return Some(format!("detected {path}"));
+            }
+        }
+
+        const PROPS: &[&str] = &[
+            "ro.board.platform",
+            "ro.hardware.vulkan",
+            "ro.hardware.egl",
+            "ro.hardware",
+            "ro.soc.model",
+        ];
+        const TOKENS: &[&str] = &[
+            "mt6765",
+            "mt6762",
+            "mt6761",
+            "mt6739",
+            "mt8766",
+            "mt8768",
+            "powervr",
+            "rogue",
+            "ge8320",
+            "ge8300",
+            "ge8100",
+            "gm9446",
+            "imagination",
+        ];
+        for prop in PROPS {
+            let val = getprop(prop);
+            let lower = val.to_ascii_lowercase();
+            if lower.is_empty() {
+                continue;
+            }
+            for tok in TOKENS {
+                if lower.contains(tok) {
+                    return Some(format!("{prop}={val}"));
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns true if Android should boot directly on native OpenGL ES 3 instead of Vulkan.
+    pub(crate) fn should_force_gles() -> bool {
+        // Respect explicit developer override (e.g. WGPU_BACKEND=vulkan or gl).
+        if std::env::var_os("WGPU_BACKEND").is_some() {
+            return false;
+        }
+
+        // Layer 1: Known-broken PowerVR / legacy MediaTek Vulkan HALs (zero-crash first boot).
+        if let Some(reason) = known_broken_vulkan_reason() {
+            log::warn!(
+                "rustudio: known-unstable Android Vulkan driver ({reason}); booting on native OpenGL ES 3"
+            );
+            return true;
+        }
+
+        // Layer 2: Self-healing Vulkan boot probe for any other device whose Vulkan driver
+        // crashes before completing initial rendered frames.
+        let dir = crate::crash::dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let failed = failed_path();
+        let probe = probe_path();
+        let fingerprint = getprop("ro.build.fingerprint");
+
+        if let Ok(saved) = std::fs::read_to_string(&failed) {
+            let saved_fp = saved.trim();
+            if saved_fp.is_empty() || fingerprint.is_empty() || saved_fp == fingerprint {
+                log::warn!(
+                    "rustudio: previous Vulkan startup crash recorded; booting on native OpenGL ES 3"
+                );
+                return true;
+            }
+            // OS firmware changed since the crash — clear marker and re-probe Vulkan.
+            let _ = std::fs::remove_file(&failed);
+        }
+
+        if probe.exists() {
+            log::warn!(
+                "rustudio: Vulkan crashed before completing startup frames on the previous launch; switching to native OpenGL ES 3"
+            );
+            let _ = std::fs::write(&failed, &fingerprint);
+            let _ = std::fs::remove_file(&probe);
+            return true;
+        }
+
+        // Arm the boot probe; cleared after the first 4 frames submit & present cleanly.
+        let _ = std::fs::write(&probe, env!("CARGO_PKG_VERSION"));
+        false
+    }
+
+    /// Called once the app has cleanly rendered its initial frames on Android.
+    pub(crate) fn mark_boot_ok() {
+        if BOOT_VERIFIED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let probe = probe_path();
+        if probe.exists() {
+            let _ = std::fs::remove_file(&probe);
+            log::info!("rustudio: graphics startup verified; cleared Vulkan boot probe");
+        }
+    }
+}
+
+/// Marks the Android graphics backend boot probe as verified after initial frames render.
+pub(crate) fn mark_graphics_boot_ok() {
+    #[cfg(target_os = "android")]
+    android_gpu_guard::mark_boot_ok();
+}
+
+pub(crate) fn wgpu_setup(mut setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu::WgpuSetup {
+    // Native graphics driver only (Vulkan first with native GLES 3 fallback on Android).
+    #[cfg(target_os = "android")]
+    if android_gpu_guard::should_force_gles() {
+        setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::GL;
+    }
     egui_wgpu::WgpuSetup::CreateNew(setup)
 }
 
@@ -500,6 +659,7 @@ pub fn run() -> eframe::Result<()> {
     rustudio_core::load_trace::init();
     // First: a panic or fatal signal from here on leaves a report.
     rustudio_core::crash::install();
+    crate::crash::install();
     // Studio's installations of the engine's start-up hooks (the plugin API
     // domain; see src/studio_hooks.rs). Before any command below makes a
     // runtime, so the engine's tables have the registered members.

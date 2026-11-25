@@ -46,7 +46,7 @@
 //! The viewport tells this layer where things are each frame ([`Zones`]);
 //! the rest is [`Touch::filter`].
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use rustudio_core::mech;
@@ -138,6 +138,29 @@ pub enum Mode {
     Multi,
     /// Delivered a long press (its menu is open): nothing until the lift.
     Done,
+}
+
+/// Per-touch-ID ownership decided once at `TouchPhase::Start` and locked for
+/// the finger's entire lifetime (`Move`, `End`, `Cancel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchOwner {
+    /// Started on any egui chrome, menu, ribbon, panel, popup, floating window,
+    /// or `Zones::ui` overlay. Locked to UI for its entire lifetime — never
+    /// triggers 3D viewport camera look/zoom/pan, 3D tap/click, or Playtest
+    /// game/jump/stick input.
+    Ui,
+    /// Started on the Playtest 3D view with touch identity (`Zones::game`):
+    /// routed exclusively through `take_game_events()` to Roblox's GUI & UIS.
+    Game,
+    /// Started on the fallback Playtest movement stick (`!Zones::game`).
+    PlayStick,
+    /// Started on the fallback Playtest jump button (`!Zones::game`).
+    PlayJump,
+    /// Started on the Edit-mode virtual joystick overlay (`Zones::ui`).
+    EditorJoystick,
+    /// Started on the unobstructed 3D viewport (camera look, part drag, tap,
+    /// or pinch/pan).
+    Viewport,
 }
 
 struct Pointer {
@@ -248,10 +271,11 @@ pub struct Touch {
     /// the viewport last read them.
     game_fingers: BTreeSet<TouchId>,
     game_events: Vec<GameTouch>,
-    /// Edit-mode fingers that started inside `Zones::ui` (e.g. virtual joystick
-    /// or floating mobile windows): raw Touch events pass through without
-    /// creating a viewport Mode::Look camera drag.
+    /// Edit-mode fingers that started inside `Zones::ui` (e.g. virtual joystick):
+    /// raw Touch events pass through without creating a viewport Mode::Look camera drag.
     ui_fingers: BTreeSet<TouchId>,
+    /// Per-touch-ID ownership locked at `TouchPhase::Start` until `End`/`Cancel`.
+    owners: BTreeMap<TouchId, TouchOwner>,
 }
 
 fn key_event(key: Key, pressed: bool) -> Event {
@@ -272,10 +296,14 @@ impl Touch {
         self.zones.frame == frame_no
     }
 
-    /// Whether `pos` is on the 3D view itself (not a window or menu over it).
+    /// Whether `pos` is on the unobstructed 3D view itself (not a window,
+    /// popup, menu, ribbon, or `Zones::ui` / `Zones::direct_drag` overlay).
     fn on_view(&self, ctx: &egui::Context, pos: Pos2, frame_no: u64) -> bool {
         self.zones_fresh(frame_no)
             && self.zones.viewport.contains(pos)
+            && !self.zones.ui.iter().any(|r| r.contains(pos))
+            && !self.zones.direct_drag.iter().any(|r| r.contains(pos))
+            && !egui::Popup::is_any_open(ctx)
             && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
     }
 
@@ -327,9 +355,11 @@ impl Touch {
                     set_kbm_active(false);
                     self.last_touch = Some(now);
                     let control = self.on_touch(ctx, id, phase, pos, now, frame_no, &mut out);
-                    // egui keeps seeing the fingers (its multi-touch gestures,
-                    // its long press), except the stick and jump ones, which
-                    // would otherwise count as a pinch with a look finger.
+                    // egui keeps seeing Viewport / EditorJoystick fingers for
+                    // multi-touch gestures and joystick tracking, but never
+                    // Game, PlayStick, PlayJump, or Ui fingers (so a UI finger
+                    // scrolling a ribbon/panel can never combine into a viewport
+                    // pinch/pan or leak into editor_joystick).
                     if !control {
                         out.push(ev);
                     }
@@ -337,17 +367,23 @@ impl Touch {
                 Event::PointerMoved(_) | Event::PointerButton { .. } | Event::PointerGone if synthetic => {}
                 other => {
                     if !synthetic {
+                        let recent_touch = self
+                            .last_touch
+                            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(800));
                         match &other {
                             Event::PointerMoved(_)
                             | Event::PointerButton { .. }
                             | Event::MouseWheel { .. }
                             | Event::MouseMoved(_) => {
-                                if cfg!(target_os = "android") {
+                                if cfg!(target_os = "android") && !recent_touch && has_hardware_mouse() {
                                     set_kbm_active(true);
                                 }
                             }
                             Event::Key { physical_key: Some(k), .. }
-                                if *k != Key::Escape && cfg!(target_os = "android") =>
+                                if *k != Key::Escape
+                                    && cfg!(target_os = "android")
+                                    && !recent_touch
+                                    && has_hardware_keyboard() =>
                             {
                                 set_kbm_active(true);
                             }
@@ -379,47 +415,81 @@ impl Touch {
     ) -> bool {
         match phase {
             TouchPhase::Start => {
+                // If the OS reused a TouchId without sending End/Cancel first,
+                // cleanly release any stale ownership for that id.
+                if let Some(prev_owner) = self.owners.remove(&id) {
+                    match prev_owner {
+                        TouchOwner::Game => {
+                            if self.game_fingers.remove(&id) {
+                                self.push_game(GameTouch { id, phase: TouchPhase::Cancel, pos });
+                            }
+                        }
+                        TouchOwner::PlayStick => {
+                            if self.stick.is_some_and(|s| s.id == id) {
+                                self.stick = None;
+                                self.sync_stick_keys(out);
+                            }
+                        }
+                        TouchOwner::PlayJump => {
+                            if self.jump == Some(id) {
+                                self.jump = None;
+                                self.set_held(Key::Space, false, out);
+                            }
+                        }
+                        TouchOwner::EditorJoystick => {
+                            self.ui_fingers.remove(&id);
+                        }
+                        TouchOwner::Ui | TouchOwner::Viewport => {}
+                    }
+                }
                 self.active.insert(id);
                 if self.fling.take().is_some() {
                     out.push(wheel(Vec2::ZERO, TouchPhase::End));
                     out.push(Event::PointerGone);
                 }
                 let fresh = self.zones_fresh(frame_no);
-                if fresh
-                    && self.zones.playing
-                    && self.zones.game
-                    && self.on_view(ctx, pos, frame_no)
-                    && !self.zones.ui.iter().any(|r| r.contains(pos))
-                {
+                let in_view = self.on_view(ctx, pos, frame_no);
+                if fresh && self.zones.playing && self.zones.game && in_view {
                     // The game's finger: out through take_game_events,
                     // never egui's.
+                    self.owners.insert(id, TouchOwner::Game);
                     self.game_fingers.insert(id);
                     self.push_game(GameTouch { id, phase, pos });
                     return true;
                 }
-                if fresh && !self.zones.playing && self.zones.ui.iter().any(|r| r.contains(pos)) {
-                    // Finger landed on an editor overlay control (virtual joystick or
-                    // floating mobile window): keep raw Event::Touch for that control
-                    // and never convert it into a viewport Mode::Look camera drag.
+                if fresh
+                    && !self.zones.playing
+                    && self.zones.ui.iter().any(|r| r.contains(pos))
+                    && !self.zones.direct_drag.iter().any(|r| r.contains(pos))
+                    && !egui::Popup::is_any_open(ctx)
+                    && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
+                {
+                    // Finger landed on an editor overlay control (virtual joystick):
+                    // keep raw Event::Touch for that control and never convert it
+                    // into a viewport Mode::Look camera drag.
+                    self.owners.insert(id, TouchOwner::EditorJoystick);
                     self.ui_fingers.insert(id);
                     return false;
                 }
-                if fresh && self.zones.playing {
+                if fresh && self.zones.playing && !self.zones.game && in_view {
                     if self.stick.is_none() && self.zones.stick.is_some_and(|z| z.contains(pos)) {
+                        self.owners.insert(id, TouchOwner::PlayStick);
                         self.stick = Some(Stick { id, center: pos, pos, since: now, moved: false });
                         return true;
                     }
                     if self.jump.is_none() && self.zones.jump.is_some_and(|z| z.contains(pos)) {
+                        self.owners.insert(id, TouchOwner::PlayJump);
                         self.jump = Some(id);
                         self.set_held(Key::Space, true, out);
                         return true;
                     }
                 }
+                let owner = if in_view { TouchOwner::Viewport } else { TouchOwner::Ui };
+                self.owners.insert(id, owner);
                 if self.pointer.is_none() {
                     // (a lift in this same frame owes no PointerGone: the
                     // pointer is this finger now)
                     self.gone = false;
-                    let in_view = self.on_view(ctx, pos, frame_no);
                     self.pointer = Some(Pointer {
                         id,
                         start: pos,
@@ -433,9 +503,10 @@ impl Touch {
                     // and the chrome's highlights use it).
                     out.push(Event::PointerMoved(pos));
                 } else if let Some(p) = self.pointer.as_mut() {
-                    // A second finger on the 3D view: a pinch or a pan from
-                    // here on; whatever the first finger was doing ends.
-                    if p.in_view && p.mode != Mode::Multi {
+                    // A second finger on the 3D view (only if BOTH fingers are
+                    // on the unobstructed viewport): a pinch or a pan from here
+                    // on; whatever the first finger was doing ends.
+                    if in_view && p.in_view && p.mode != Mode::Multi {
                         match p.mode {
                             Mode::Look => out.push(button(p.pos, PointerButton::Secondary, false)),
                             Mode::Press => out.push(button(p.pos, PointerButton::Primary, false)),
@@ -444,8 +515,10 @@ impl Touch {
                         p.mode = Mode::Multi;
                     }
                 }
+                return owner == TouchOwner::Ui;
             }
             TouchPhase::Move => {
+                let owner = self.owners.get(&id).copied();
                 if self.ui_fingers.contains(&id) {
                     return false;
                 }
@@ -464,9 +537,11 @@ impl Touch {
                 if self.jump == Some(id) {
                     return true;
                 }
-                let Some(p) = self.pointer.as_mut() else { return false };
+                let Some(p) = self.pointer.as_mut() else {
+                    return owner == Some(TouchOwner::Ui);
+                };
                 if p.id != id {
-                    return false;
+                    return owner == Some(TouchOwner::Ui);
                 }
                 p.pos = pos;
                 p.samples.push_back((now, pos));
@@ -476,7 +551,15 @@ impl Touch {
                 match p.mode {
                     Mode::Pending => {
                         if (pos - p.start).length() > SLOP {
-                            if p.in_view {
+                            if p.in_view && self.zones.handle_hover {
+                                // Finger landed on a 3D transform gizmo or Roblox plugin
+                                // ArcHandles / Handles ring: drag with Primary instead of
+                                // orbiting the camera!
+                                out.push(Event::PointerMoved(p.start));
+                                out.push(button(p.start, PointerButton::Primary, true));
+                                out.push(Event::PointerMoved(pos));
+                                p.mode = Mode::Press;
+                            } else if p.in_view {
                                 out.push(Event::PointerMoved(p.start));
                                 out.push(button(p.start, PointerButton::Secondary, true));
                                 out.push(Event::PointerMoved(pos));
@@ -516,9 +599,11 @@ impl Touch {
                     }
                     Mode::Multi => {}
                 }
+                return owner == Some(TouchOwner::Ui);
             }
             TouchPhase::End | TouchPhase::Cancel => {
                 self.active.remove(&id);
+                let owner = self.owners.remove(&id);
                 if self.ui_fingers.remove(&id) {
                     return false;
                 }
@@ -545,9 +630,11 @@ impl Touch {
                     self.set_held(Key::Space, false, out);
                     return true;
                 }
-                let Some(p) = self.pointer.as_ref() else { return false };
+                let Some(p) = self.pointer.as_ref() else {
+                    return owner == Some(TouchOwner::Ui);
+                };
                 if p.id != id {
-                    return false;
+                    return owner == Some(TouchOwner::Ui);
                 }
                 let p = self.pointer.take().expect("checked");
                 // (the PointerGone follows at the next frame: `gone`)
@@ -563,7 +650,10 @@ impl Touch {
                     Mode::Scroll => {
                         let vel = fling_velocity(&p.samples, now);
                         if phase == TouchPhase::End && vel.length() > FLING_STOP * 2.0 {
-                            self.fling = Some(Fling { pos: p.pos, vel, last: now });
+                            // Keep fling pinned to p.start (never p.pos) so a swipe
+                            // that started on the top ribbon or a side panel and drifted
+                            // over the 3D viewport never flings wheel events into the camera.
+                            self.fling = Some(Fling { pos: p.start, vel, last: now });
                         } else {
                             out.push(wheel(Vec2::ZERO, TouchPhase::End));
                             self.gone = true;
@@ -580,16 +670,20 @@ impl Touch {
                     }
                     Mode::Multi | Mode::Done => self.gone = true,
                 }
+                owner == Some(TouchOwner::Ui)
             }
         }
-        false
     }
 
     /// Timers: the hold that turns a pending finger into a press, the
     /// handle check, the fling.
     fn tick(&mut self, ctx: &egui::Context, now: Instant, frame_no: u64, out: &mut Vec<Event>) {
-        // Play ended under a held stick or jump: their keys come up.
-        if (self.stick.is_some() || self.jump.is_some()) && self.zones_fresh(frame_no) && !self.zones.playing {
+        // Play ended or switched to native game touch under a held stick or
+        // jump: their keys come up immediately so Space/WASD never stick.
+        if (self.stick.is_some() || self.jump.is_some())
+            && self.zones_fresh(frame_no)
+            && (!self.zones.playing || self.zones.game)
+        {
             self.release_all(out);
         }
         // Play ended (or the game let go of the fingers) under the game's
@@ -694,6 +788,7 @@ impl Touch {
     /// the held keys, a press or look's button, a scroll or fling's wheel.
     fn let_go(&mut self, out: &mut Vec<Event>) {
         self.ui_fingers.clear();
+        self.owners.clear();
         self.release_all(out);
         self.cancel_game_fingers();
         if let Some(p) = self.pointer.take() {
@@ -768,6 +863,33 @@ impl Touch {
     /// Whether the jump button is held.
     pub fn jumping(&self) -> bool {
         self.jump.is_some()
+    }
+
+    /// Locked owner of touch `id`, if active.
+    pub fn owner(&self, id: TouchId) -> Option<TouchOwner> {
+        self.owners.get(&id).copied()
+    }
+
+    /// Whether `id` is locked to UI chrome/overlays (never allowed to drive the 3D viewport).
+    pub fn is_ui_touch(&self, id: TouchId) -> bool {
+        self.owners.get(&id) == Some(&TouchOwner::Ui)
+    }
+
+    /// Whether any currently active touch is locked to UI chrome/overlays.
+    pub fn any_ui_touch(&self) -> bool {
+        self.owners.values().any(|o| *o == TouchOwner::Ui)
+    }
+
+    /// Whether the active touch pointer started in UI chrome/overlays (not on the 3D view).
+    pub fn has_ui_pointer(&self) -> bool {
+        self.pointer.as_ref().is_some_and(|p| !p.in_view)
+    }
+
+    /// Whether a touch scroll or fling originating from UI chrome (such as the top
+    /// ribbon, Explorer, Properties, or Toolbox) is currently emitting wheel events.
+    pub fn is_scroll_from_ui(&self) -> bool {
+        self.fling.is_some()
+            || self.pointer.as_ref().is_some_and(|p| !p.in_view && p.mode == Mode::Scroll)
     }
 
     /// Draws the Play controls over the game view: the jump button in its
@@ -1233,5 +1355,81 @@ mod tests {
         assert!(out.iter().any(|e| matches!(e, Event::PointerGone)), "{out:?}");
         assert!(out.iter().any(|e| matches!(e, Event::WindowFocused(false))), "{out:?}");
         assert!(!t.any() && t.held.is_empty() && t.pointer.is_none());
+    }
+
+    #[test]
+    fn playtest_ui_overlay_drag_never_leaks_to_viewport_look_or_game() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        t.zones = Zones {
+            viewport: Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 400.0)),
+            playing: true,
+            game: true,
+            ui: vec![Rect::from_min_max(Pos2::new(720.0, 0.0), Pos2::new(800.0, 60.0))],
+            frame: 1,
+            ..Default::default()
+        };
+        // Start on a Playtest UI overlay button (e.g. Stop / Fill button), then drag > SLOP into the 3D view.
+        let out_start = run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, Pos2::new(750.0, 30.0))]);
+        assert_eq!(t.owner(TouchId(1)), Some(TouchOwner::Ui));
+        assert!(!out_start.iter().any(|e| matches!(e, Event::Touch { .. })), "UI touch must not leak raw Event::Touch");
+        let out_move = run(&mut t, &ctx, vec![touch(1, TouchPhase::Move, Pos2::new(650.0, 120.0))]);
+        assert_ne!(t.mode(), Some(Mode::Look), "UI touch must never become Mode::Look");
+        assert!(!out_move.iter().any(|e| matches!(e, Event::PointerButton { button: PointerButton::Secondary, .. })), "{out_move:?}");
+        assert!(t.take_game_events().is_empty());
+        let _ = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, Pos2::new(650.0, 120.0))]);
+        assert_eq!(t.owner(TouchId(1)), None);
+    }
+
+    #[test]
+    fn ribbon_scroll_and_fling_stay_pinned_to_start_and_flag_ui_scroll() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        t.zones = Zones {
+            viewport: Rect::from_min_max(Pos2::new(0.0, 100.0), Pos2::new(800.0, 500.0)),
+            playing: false,
+            frame: 1,
+            ..Default::default()
+        };
+        let ribbon_start = Pos2::new(300.0, 50.0);
+        run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, ribbon_start)]);
+        assert_eq!(t.owner(TouchId(1)), Some(TouchOwner::Ui));
+        // Swipe far left and drift down into the 3D viewport (y = 220 > 100).
+        std::thread::sleep(Duration::from_millis(10));
+        let out_move = run(&mut t, &ctx, vec![touch(1, TouchPhase::Move, Pos2::new(120.0, 220.0))]);
+        assert!(t.is_scroll_from_ui());
+        assert!(!out_move.iter().any(|e| matches!(e, Event::PointerMoved(p) if *p != ribbon_start)), "{out_move:?}");
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, Pos2::new(40.0, 240.0))]);
+        // Fling must also be pinned to ribbon_start, never to the viewport lift position.
+        assert!(t.is_scroll_from_ui());
+        let out_fling = run(&mut t, &ctx, vec![]);
+        assert!(out_fling.iter().any(|e| matches!(e, Event::PointerMoved(p) if *p == ribbon_start)), "{out_fling:?}");
+        assert!(!out_fling.iter().any(|e| matches!(e, Event::PointerMoved(p) if p.y >= 100.0)), "{out_fling:?}");
+    }
+
+    #[test]
+    fn fallback_jump_releases_when_game_touch_enables_and_ignores_ui_overlap() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        t.zones = play_zones_for_tests();
+        let jump_pos = t.zones.jump.unwrap().center();
+        // When a UI overlay covers the jump zone, tapping there must NOT trigger jump.
+        t.zones.ui.push(t.zones.jump.unwrap());
+        let out = run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, jump_pos)]);
+        assert!(!t.jumping());
+        assert!(!out.iter().any(|e| matches!(e, Event::Key { key: Key::Space, .. })), "{out:?}");
+        let _ = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, jump_pos)]);
+
+        // Without UI overlay, jump works, and switching zones.game = true releases Space immediately.
+        t.zones.ui.clear();
+        let out = run(&mut t, &ctx, vec![touch(2, TouchPhase::Start, jump_pos)]);
+        assert!(t.jumping());
+        assert!(out.iter().any(|e| matches!(e, Event::Key { key: Key::Space, pressed: true, .. })), "{out:?}");
+        t.zones.game = true;
+        let out = run(&mut t, &ctx, vec![]);
+        assert!(!t.jumping());
+        assert!(out.iter().any(|e| matches!(e, Event::Key { key: Key::Space, pressed: false, .. })), "{out:?}");
+        assert!(t.held.is_empty());
     }
 }

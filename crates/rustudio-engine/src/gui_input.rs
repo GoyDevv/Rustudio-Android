@@ -1879,12 +1879,17 @@ impl Gui {
         let mut out = Vec::with_capacity(touches.len());
         for t in touches {
             let (x, y) = gui_xy(t.pos);
-            let under: Vec<Hit> = self
+            let all_under: Vec<Hit> = self
                 .hits
                 .iter()
                 .filter(|h| point_in_quad(&h.quad, t.pos) && h.clip.is_none_or(|c| point_in_quad(&c, t.pos)))
                 .cloned()
                 .collect();
+            // Occlusion barrier: an Active GuiObject or TextBox (such as SettingsHub
+            // or a modal Frame) blocks touches from leaking through to buttons behind
+            // it (like TouchGui.JumpButton).
+            let occlude_idx = all_under.iter().rposition(|h| h.textbox || h.active).unwrap_or(0);
+            let under: Vec<Hit> = all_under[occlude_idx..].to_vec();
             let now: HashSet<Ref> = under.iter().map(|h| h.r).collect();
             let input = |state: TouchState, dx: f32, dy: f32| GuiArg::Touch { id: t.id, state, x, y, dx, dy };
             match t.state {

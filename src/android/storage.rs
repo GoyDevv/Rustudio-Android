@@ -53,7 +53,13 @@ fn roots(storage_access: bool) -> Vec<Root> {
     // app made are always readable; everything with storage access), and
     // the whole shared storage once access was granted.
     let shared = shared_storage();
-    for (label, sub) in [("Download", "Download"), ("Documents", "Documents")] {
+    for (label, sub) in [
+        ("Download", "Download"),
+        ("Documents", "Documents"),
+        ("Pictures", "Pictures"),
+        ("DCIM", "DCIM"),
+        ("Music", "Music"),
+    ] {
         let p = shared.join(sub);
         if std::fs::read_dir(&p).is_ok() {
             v.push(Root { label, path: p });
@@ -97,12 +103,58 @@ impl Listing {
     }
 }
 
+/// Launches Android's Storage Access Framework document picker
+/// (`ACTION_OPEN_DOCUMENT`, `CATEGORY_OPENABLE`, `*/*`, `EXTRA_ALLOW_MULTIPLE`).
+fn open_system_picker() -> super::jni::Result<()> {
+    use jni::objects::JValue;
+    use jni::{jni_sig, jni_str};
+
+    super::jni::with_activity(|env, activity| {
+        let action = env.new_string("android.intent.action.OPEN_DOCUMENT")?;
+        let intent = env.new_object(
+            jni_str!("android/content/Intent"),
+            jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(&action)],
+        )?;
+        let category = env.new_string("android.intent.category.OPENABLE")?;
+        env.call_method(
+            &intent,
+            jni_str!("addCategory"),
+            jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
+            &[JValue::Object(&category)],
+        )?;
+        let mime = env.new_string("*/*")?;
+        env.call_method(
+            &intent,
+            jni_str!("setType"),
+            jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
+            &[JValue::Object(&mime)],
+        )?;
+        let extra_multi = env.new_string("android.intent.extra.ALLOW_MULTIPLE")?;
+        env.call_method(
+            &intent,
+            jni_str!("putExtra"),
+            jni_sig!("(Ljava/lang/String;Z)Landroid/content/Intent;"),
+            &[JValue::Object(&extra_multi), JValue::Bool(true)],
+        )?;
+        env.call_method(
+            activity,
+            jni_str!("startActivity"),
+            jni_sig!("(Landroid/content/Intent;)V"),
+            &[JValue::Object(&intent)],
+        )?;
+        Ok(())
+    })
+}
+
 /// The in-app file dialog.
 pub struct Picker {
     request: Request,
     kind: Kind,
+    multi: bool,
     listing: Listing,
     selected: Option<PathBuf>,
+    selected_multi: Vec<PathBuf>,
     /// Save: the name to write; new folder: its name.
     name: String,
     new_folder: Option<String>,
@@ -115,6 +167,14 @@ pub struct Picker {
 
 impl Picker {
     pub fn new(request: Request, kind: Kind) -> Self {
+        Self::new_with_mode(request, kind, false)
+    }
+
+    pub fn new_multi(request: Request) -> Self {
+        Self::new_with_mode(request, Kind::PickFile, true)
+    }
+
+    fn new_with_mode(request: Request, kind: Kind, multi: bool) -> Self {
         let start = request
             .directory
             .clone()
@@ -132,7 +192,9 @@ impl Picker {
             listing: Listing::read(&start, &request),
             request,
             kind,
+            multi,
             selected: None,
+            selected_multi: Vec::new(),
             name,
             new_folder: None,
             error: None,
@@ -163,11 +225,22 @@ impl Picker {
         self.error = None;
     }
 
-    /// The answer when the dialog closes: `Some(Some(path))` chosen,
+    /// The answer when the single-file dialog closes: `Some(Some(path))` chosen,
     /// `Some(None)` cancelled, `None` while it stays open.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Option<PathBuf>> {
+        self.show_inner(ctx).map(|opt| opt.and_then(|mut v| v.pop()))
+    }
+
+    /// The answer when the multi-file dialog closes: `Some(paths)` chosen
+    /// (empty when cancelled), `None` while it stays open.
+    pub fn show_multi(&mut self, ctx: &egui::Context) -> Option<Vec<PathBuf>> {
+        self.show_inner(ctx).map(|opt| opt.unwrap_or_default())
+    }
+
+    fn show_inner(&mut self, ctx: &egui::Context) -> Option<Option<Vec<PathBuf>>> {
         let title = self.request.title.clone().unwrap_or_else(|| {
             match self.kind {
+                Kind::PickFile if self.multi => "Import Files",
                 Kind::PickFile => "Open",
                 Kind::PickFolder => "Choose folder",
                 Kind::SaveFile => "Save as",
@@ -178,7 +251,7 @@ impl Picker {
         let roots = roots(self.storage_access);
         let screen = ctx.content_rect();
         let size = egui::vec2((screen.width() - 32.0).min(720.0), (screen.height() - 32.0).min(560.0));
-        let mut result: Option<Option<PathBuf>> = None;
+        let mut result: Option<Option<Vec<PathBuf>>> = None;
         let mut open = true;
         egui::Window::new(title)
             .id(egui::Id::new("android-file-picker"))
@@ -202,20 +275,20 @@ impl Picker {
                 if !self.storage_access {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            egui::RichText::new("Files in Download, Documents or elsewhere in shared storage need file access.")
-                                .weak()
-                                .size(12.0),
+                            egui::RichText::new(
+                                "Grant storage access to browse Download, Pictures, Documents, and Music directly with multi-select right inside Rustudio.",
+                            )
+                            .weak()
+                            .size(12.0),
                         );
-                        let label = if super::jni::sdk_int() >= 30 { "Allow all files access…" } else { "Allow file access…" };
-                        if ui.small_button(label).clicked() {
+                        if ui.small_button("Grant storage access").clicked() {
                             if let Err(e) = super::jni::request_storage_access() {
                                 self.error = Some(format!("Could not open the permission page: {e}"));
                             }
                         }
-                        ui.label(egui::RichText::new("Or open the file from a Files app with rustudio.").weak().size(12.0));
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let up = self.listing.dir.parent().map(Path::to_path_buf);
                     let at_root = roots.iter().any(|r| r.path == self.listing.dir);
                     if ui.add_enabled(up.is_some() && !at_root, egui::Button::new("⬆ Up")).clicked() {
@@ -225,6 +298,11 @@ impl Picker {
                     }
                     if ui.button("New folder").clicked() {
                         self.new_folder = Some(String::new());
+                    }
+                    if ui.button("Open System Picker").clicked() {
+                        if let Err(e) = open_system_picker() {
+                            self.error = Some(format!("Could not open system picker: {e}"));
+                        }
                     }
                     ui.add(egui::Label::new(egui::RichText::new(shorten(&self.listing.dir)).weak()).truncate());
                 });
@@ -270,16 +348,44 @@ impl Picker {
                     }
                     for f in &self.listing.files {
                         let label = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        let sel = self.selected.as_deref() == Some(f.as_path());
-                        let r = ui.add_sized(row, egui::Button::selectable(sel, format!("📄 {label}")));
-                        if r.clicked() {
-                            self.selected = Some(f.clone());
-                            if self.kind == Kind::SaveFile {
-                                self.name = label.clone();
+                        if self.multi {
+                            let mut checked = self.selected_multi.iter().any(|p| p == f);
+                            let mut toggled = false;
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    toggled = true;
+                                }
+                                let btn_w = ui.available_width().max(40.0);
+                                let r = ui.add_sized(
+                                    egui::vec2(btn_w, 36.0),
+                                    egui::Button::selectable(checked, format!("📄 {label}")),
+                                );
+                                if r.clicked() {
+                                    checked = !checked;
+                                    toggled = true;
+                                }
+                            });
+                            if toggled {
+                                if checked {
+                                    if !self.selected_multi.iter().any(|p| p == f) {
+                                        self.selected_multi.push(f.clone());
+                                    }
+                                } else {
+                                    self.selected_multi.retain(|p| p != f);
+                                }
                             }
-                        }
-                        if r.double_clicked() && self.kind == Kind::PickFile {
-                            result = Some(Some(f.clone()));
+                        } else {
+                            let sel = self.selected.as_deref() == Some(f.as_path());
+                            let r = ui.add_sized(row, egui::Button::selectable(sel, format!("📄 {label}")));
+                            if r.clicked() {
+                                self.selected = Some(f.clone());
+                                if self.kind == Kind::SaveFile {
+                                    self.name = label.clone();
+                                }
+                            }
+                            if r.double_clicked() && self.kind == Kind::PickFile {
+                                result = Some(Some(vec![f.clone()]));
+                            }
                         }
                     }
                     if self.listing.folders.is_empty() && self.listing.files.is_empty() {
@@ -295,22 +401,41 @@ impl Picker {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
                 ui.horizontal(|ui| {
-                    if self.kind == Kind::SaveFile {
+                    if self.multi {
+                        if ui.add_enabled(!self.listing.files.is_empty(), egui::Button::new("Select All")).clicked() {
+                            for f in &self.listing.files {
+                                if !self.selected_multi.iter().any(|p| p == f) {
+                                    self.selected_multi.push(f.clone());
+                                }
+                            }
+                        }
+                        if ui.add_enabled(!self.selected_multi.is_empty(), egui::Button::new("Clear")).clicked() {
+                            self.selected_multi.clear();
+                        }
+                    } else if self.kind == Kind::SaveFile {
                         ui.label("Name:");
                         ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(240.0));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (verb, ready) = match self.kind {
-                            Kind::PickFile => ("Open", self.selected.is_some()),
-                            Kind::PickFolder => ("Choose", true),
-                            Kind::SaveFile => ("Save", !self.name.trim().is_empty()),
-                        };
-                        if ui.add_enabled(ready, egui::Button::new(verb)).clicked() {
-                            result = Some(match self.kind {
-                                Kind::PickFile => self.selected.clone(),
-                                Kind::PickFolder => Some(self.selected.clone().unwrap_or_else(|| self.listing.dir.clone())),
-                                Kind::SaveFile => Some(self.listing.dir.join(self.save_name())),
-                            });
+                        if self.multi {
+                            let count = self.selected_multi.len();
+                            let label = format!("Import Selected ({count})");
+                            if ui.add_enabled(count > 0, egui::Button::new(label)).clicked() {
+                                result = Some(Some(self.selected_multi.clone()));
+                            }
+                        } else {
+                            let (verb, ready) = match self.kind {
+                                Kind::PickFile => ("Open", self.selected.is_some()),
+                                Kind::PickFolder => ("Choose", true),
+                                Kind::SaveFile => ("Save", !self.name.trim().is_empty()),
+                            };
+                            if ui.add_enabled(ready, egui::Button::new(verb)).clicked() {
+                                result = Some(match self.kind {
+                                    Kind::PickFile => self.selected.clone().map(|p| vec![p]),
+                                    Kind::PickFolder => Some(vec![self.selected.clone().unwrap_or_else(|| self.listing.dir.clone())]),
+                                    Kind::SaveFile => Some(vec![self.listing.dir.join(self.save_name())]),
+                                });
+                            }
                         }
                         if ui.button("Cancel").clicked() {
                             result = Some(None);

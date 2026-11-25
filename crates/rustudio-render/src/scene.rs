@@ -821,6 +821,9 @@ impl Scene {
             };
             let p = &mut self.parts[i];
             p.xf = xf;
+            if let Some(lp) = p.light.as_mut() {
+                *lp = crate::lightgrid::Prim::new(lp.kind, lp.size, &xf, lp.transparency);
+            }
             p.draw.xf = Xform {
                 pos: xf.pos + xf.rot * p.draw_offset,
                 rot: xf.rot * p.draw_rot,

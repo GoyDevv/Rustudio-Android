@@ -309,13 +309,17 @@ impl Editor {
                     self.ui_rects.insert("avatar.character", r);
                     let setup_on = self.action_state("avatar_setup").1 == Some(true);
                     self.rb(ui, "accessible", "Setup", "avatar_setup", setup_on, a);
-                    self.rb(ui, "hanger", "Accessory", "accessory_editor", false, a);
-                    self.rb(ui, "shirt", "Adaptive…", "adaptive", false, a);
-                    self.rb(ui, "checklist", "UGC Validati…", "ugc_validation", false, a);
+                    let acc_on = self.action_state("accessory_editor").1 == Some(true);
+                    self.rb(ui, "hanger", "Accessory", "accessory_editor", acc_on, a);
+                    let adap_on = self.action_state("adaptive").1 == Some(true);
+                    self.rb(ui, "shirt", "Adaptive…", "adaptive", adap_on, a);
+                    let ugc_on = self.action_state("ugc_validation").1 == Some(true);
+                    self.rb(ui, "checklist", "UGC Validati…", "ugc_validation", ugc_on, a);
                     divider(ui);
                     let clip_on = self.action_state("clip_editor").1 == Some(true);
                     self.rb(ui, "movie", "Clip Editor", "clip_editor", clip_on, a);
-                    self.rb(ui, "chart-line", "Graph Editor", "graph_editor", false, a);
+                    let graph_on = self.action_state("graph_editor").1 == Some(true);
+                    self.rb(ui, "chart-line", "Graph Editor", "graph_editor", graph_on, a);
                 }
                 RibbonTab::Ui => {
                     self.rb(ui, "app-window", "GUI", "gui", false, a);

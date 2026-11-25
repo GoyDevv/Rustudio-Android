@@ -35,12 +35,14 @@
 
 mod assets;
 pub mod clipboard;
+pub mod crash_export;
 pub mod intent;
 pub mod jni;
 pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
 pub mod memory;
+pub mod orientation;
 pub mod perf_hint;
 pub mod sensors;
 pub mod storage;
@@ -175,6 +177,7 @@ pub fn run(app: AndroidApp) {
     // A panic or fatal signal leaves a report in the cache folder, listed
     // in Output at the next start (and logcat gets the panic message).
     rustudio_core::crash::install();
+    crate::crash::install();
     // Studio's installations of the engine's start-up hooks (src/studio_hooks.rs).
     crate::studio_hooks::install();
     // Native Android graphics driver only (Vulkan with GLES 3 fallback).

@@ -492,8 +492,21 @@ impl<Tab> DockArea<'_, Tab> {
                         .push(interact_rect);
                 });
 
-                let response = ui.allocate_rect(interact_rect, Sense::click_and_drag())
-                    .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]});
+                let response = if cfg!(target_os = "android") {
+                    egui::Area::new(ui.id().with(("dock_sep_hit", path)))
+                        .order(egui::Order::Middle)
+                        .fixed_pos(interact_rect.min)
+                        .constrain(false)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            ui.allocate_rect(interact_rect, Sense::click_and_drag())
+                        })
+                        .inner
+                        .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]})
+                } else {
+                    ui.allocate_rect(interact_rect, Sense::click_and_drag())
+                        .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]})
+                };
 
                 let should_respond_to_arrow_keys = ui.input(|i| i.modifiers.command || i.modifiers.shift);
 
@@ -545,6 +558,20 @@ impl<Tab> DockArea<'_, Tab> {
                 };
 
                 ui.painter().rect_filled(separator, CornerRadius::ZERO, color);
+                if cfg!(target_os = "android") {
+                    let pill_size = if separator.height() >= separator.width() {
+                        Vec2::new(5.0, 36.0_f32.min(separator.height() * 0.4))
+                    } else {
+                        Vec2::new(36.0_f32.min(separator.width() * 0.4), 5.0)
+                    };
+                    let pill = Rect::from_center_size(separator.center(), pill_size);
+                    let pill_col = if response.dragged() {
+                        style.separator.color_dragged
+                    } else {
+                        style.separator.color_hovered.gamma_multiply(0.75)
+                    };
+                    ui.painter().rect_filled(pill, CornerRadius::same(3), pill_col);
+                }
 
                 // Update 'fraction' interaction after drawing separator,
                 // otherwise it may overlap on other separator / bodies when

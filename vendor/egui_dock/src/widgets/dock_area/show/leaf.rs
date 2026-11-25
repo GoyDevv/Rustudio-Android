@@ -1137,23 +1137,21 @@ impl<Tab> DockArea<'_, Tab> {
         let galley = label.into_galley(ui, None, f32::INFINITY, TextStyle::Button);
         let x_spacing = 8.0;
         let text_width = galley.size().x + 2.0 * x_spacing;
-        let close_button_size = if show_close_button {
-            Style::TAB_CLOSE_BUTTON_SIZE.min(style.tab_bar.height)
+        let base_btn = if cfg!(target_os = "android") {
+            24.0_f32.min(style.tab_bar.height)
         } else {
-            0.0
+            Style::TAB_CLOSE_BUTTON_SIZE.min(style.tab_bar.height)
         };
+        let side_btn = if cfg!(target_os = "android") {
+            22.0_f32.min(style.tab_bar.height)
+        } else {
+            base_btn * 0.85
+        };
+        let close_button_size = if show_close_button { base_btn } else { 0.0 };
 
         // rustudio: minimize & pop-out buttons sit just left of the close button.
-        let min_button_size = if show_minimize_button {
-            Style::TAB_CLOSE_BUTTON_SIZE.min(style.tab_bar.height) * 0.85
-        } else {
-            0.0
-        };
-        let pop_button_size = if pop_out.is_some() {
-            Style::TAB_CLOSE_BUTTON_SIZE.min(style.tab_bar.height) * 0.85
-        } else {
-            0.0
-        };
+        let min_button_size = if show_minimize_button { side_btn } else { 0.0 };
+        let pop_button_size = if pop_out.is_some() { side_btn } else { 0.0 };
 
         // Compute total width of the tab bar.
         let minimum_width = tab_style

@@ -233,7 +233,7 @@ impl Editor {
             )
             .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
             .add_filter("Audio", &["mp3", "ogg", "wav", "flac"])
-            .add_filter("Models & Meshes", &["rbxm", "rbxmx", "fbx", "obj", "gltf", "glb"]);
+            .add_filter("Models, Animations & Meshes", &["rbxm", "rbxmx", "fbx", "obj", "gltf", "glb"]);
         self.dialogs.start_multi(Purpose::AssetManagerImport, d);
     }
 

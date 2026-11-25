@@ -961,6 +961,10 @@ impl Editor {
         let carried: Vec<Ref> = d.parts.iter().map(|(r, _)| *r).collect();
         let joints = if self.join_surfaces && d.physical.is_none() { self.surface_joints(&carried) } else { Vec::new() };
         self.game.doc.record_drag("Drag", changes, joints);
+        if let Some(rend) = self.game.renderer.as_mut() {
+            rend.invalidate_shadows();
+        }
+        self.game.lighting.refresh_lightgrid_now();
     }
 
     /// JointPairs.new + createJoints: a `Weld` from each moved part to every

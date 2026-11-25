@@ -59,6 +59,8 @@ pub enum Tab {
     AvatarSettings,
     /// Studio's Terrain Editor (Home / View > Terrain Editor).
     TerrainEditor,
+    /// Built-in dockable Animation Editor (Clip Editor & Graph Editor).
+    AnimEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
     /// Studio's Asset Manager (Home > Assets, Window > Asset Manager): src/asset_manager.
@@ -84,6 +86,7 @@ impl Tab {
             Tab::Output => "Output",
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
+            Tab::AnimEditor => "Animation Editor",
             Tab::Toolbox => "Toolbox",
             Tab::AssetManager => "Asset Manager",
             Tab::FileSync => "File Sync",
@@ -372,6 +375,7 @@ pub enum PendingAction {
 pub struct RustudioApp {
     watchdog: crate::frame_watchdog::Watchdog,
     updater: crate::update::Updater,
+    crash_dialog: crate::crash_dialog::CrashDialogState,
     pub(crate) last_ui_frame: Option<Instant>,
     last_plugin_tick: Instant,
     plugins_ticked_between_frames: bool,
@@ -690,7 +694,12 @@ impl RustudioApp {
         }
         strip_disabled_native_tabs(&mut dock, &mut panels, ed.builtin_tools);
         if let Some(rs) = ed.game.render_state.as_ref() {
-            ed.perf_overlay.set_gpu_info_from_wgpu(&rs.adapter.get_info());
+            let adapter_info = rs.adapter.get_info();
+            ed.perf_overlay.set_gpu_info_from_wgpu(&adapter_info);
+            crate::crash::set_gpu_info(format!(
+                "{} ({:?}, {}, {})",
+                adapter_info.name, adapter_info.backend, adapter_info.driver, adapter_info.driver_info
+            ));
         }
         // (a GPU validation error is a logcat line, not the end of the
         // process: src/android/mod.rs install_gpu_error_handler. Set after
@@ -714,6 +723,7 @@ impl RustudioApp {
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(egui_ctx.clone()),
             updater: crate::update::Updater::start(),
+            crash_dialog: crate::crash_dialog::CrashDialogState::from_pending_crash(),
             last_ui_frame: None,
             last_plugin_tick: Instant::now(),
             plugins_ticked_between_frames: false,
@@ -2068,6 +2078,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
+            Tab::AnimEditor => self.ed.anim_editor_panel_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
             Tab::AssetManager => self.ed.asset_manager_ui(ui),
@@ -2593,10 +2604,15 @@ impl RustudioApp {
 
     fn schedule_plugin_repaint(ed: &Editor, ctx: &egui::Context) {
         if !ed.place_loading() && ed.plugins.needs_idle_tick() {
-            // Frame-driven work (RunService, timers, and yielding services
-            // such as HTTP) still needs a tick. Cap the idle gap at 100 ms
-            // without keeping the renderer at its normal refresh rate.
-            ctx.request_repaint_after(PLUGIN_IDLE_INTERVAL);
+            // When an interactive plugin widget like Roblox's AnimationClipEditor
+            // is open, keep RunService.Heartbeat ticking smoothly at display refresh
+            // rate so animation playback and timeline scrubbing never freeze or stutter.
+            let anim_plugin_open = ed.plugin_ui.has_open_animation_widget();
+            if anim_plugin_open {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(PLUGIN_IDLE_INTERVAL);
+            }
         }
     }
 
@@ -2664,10 +2680,14 @@ impl RustudioApp {
             // Native Android graphics driver path (no Turnip/PanVK activation).
         }
         ed.poll_file_dialogs();
+        self.crash_dialog.show(&ctx);
         if let crate::update::Action::Restart = self.updater.show(&ctx) {
             ed.request(PendingAction::Restart);
         }
         ed.game.frame_no += 1;
+        if ed.game.frame_no >= 4 {
+            crate::mark_graphics_boot_ok();
+        }
         let frame_start = Instant::now();
         // The CPU governor's frame hint (src/android/perf_hint.rs): the
         // last frame's time on the CPU (eframe's, without the wait for the
@@ -2803,7 +2823,7 @@ impl RustudioApp {
             for t in popped {
                 if self.dock.find_tab(&t).is_none()
                     && native_tab_enabled(t, self.ed.builtin_tools)
-                    && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync)
+                    && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::AnimEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync)
                 {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
@@ -2821,6 +2841,7 @@ impl RustudioApp {
         }
         // The Start Page replaces the editor's chrome until something opens.
         if ed.start_page_ui(ui) {
+            ed.sync_orientation(false);
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
             ed.cloud_windows(&ctx);
@@ -2839,6 +2860,29 @@ impl RustudioApp {
         }
         self.watchdog.stage("scene synchronization", "dock UI and GPU viewport preparation");
         ed.shortcuts(&ctx);
+        let script_active = ed.is_script_maximized()
+            || matches!(self.dock.find_active_focused(), Some((_, Tab::Script(_))));
+        self.ed.sync_orientation(script_active);
+        if self.ed.is_script_maximized() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::BG))
+                .show(ui, |ui| {
+                    self.ed.maximized_script_ui(ui);
+                });
+            self.ed.game.touch.zones.viewport = egui::Rect::NOTHING;
+            self.ed.game.touch.zones.frame = self.ed.game.frame_no;
+            #[cfg(target_os = "android")]
+            {
+                crate::android::clipboard::after_frame(&ctx);
+                self.text_menu.end_frame(&ctx);
+                let want = crate::android::keyboard::wanted(&ctx, false);
+                self.text_bar.end_frame(&ctx, &self.keyboard, want);
+                self.keyboard.end_frame(&ctx, false);
+            }
+            self.watchdog.complete();
+            return;
+        }
+        let ed = &mut self.ed;
 
         {
             let _p = rustudio_core::bench::scope("editor_chrome");
@@ -2922,6 +2966,8 @@ impl RustudioApp {
 
         // Editor::start_run requests this when a playtest begins.
         if std::mem::take(&mut self.ed.switch_to_viewport) {
+            self.ed.set_script_maximized(None);
+            self.ed.sync_orientation(false);
             if let Some(loc) = self.dock.find_tab(&Tab::Viewport) {
                 let _ = self.dock.set_active_tab(loc);
             }
@@ -2938,7 +2984,8 @@ impl RustudioApp {
                 drag_rects.push(egui::Rect::from_min_max(r.min, egui::Pos2::new(r.max.x, (r.min.y + 36.0).min(r.max.y))));
             }
         }
-        self.ed.mobile_drag_rects = drag_rects;
+        self.ed.mobile_drag_rects = drag_rects.clone();
+        self.ed.game.touch.zones.direct_drag = drag_rects;
         let _dock_scope = rustudio_core::bench::scope("dock_panels");
         let windows: Vec<(String, String)> = if self.panels.popped.is_empty() {
             Vec::new()
@@ -3112,6 +3159,7 @@ impl RustudioApp {
             (Tab::Output, "Output"),
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
+            (Tab::AnimEditor, "Animation Editor"),
             (Tab::Toolbox, "Toolbox"),
             (Tab::AssetManager, "Asset Manager"),
             (Tab::FileSync, "File Sync"),
@@ -3231,10 +3279,13 @@ impl RustudioApp {
         }
         if ed.drag.is_some()
             || ed.game.play.is_some()
+            || ed.ui.anim.playing
             || (ed.game.play.is_none() && ed.game.edit_audio.has_active())
             || ed.game.assets.busy()
             || ed.game.textures.decoding()
             || ed.game.asset_gen != ed.game.draws_asset_gen
+            || ed.game.lighting.lightgrid_pending()
+            || ed.game.renderer.as_ref().is_some_and(|r| r.has_stale_shadows())
             || ctx.input(|i| i.pointer.any_down() || !i.keys_down.is_empty())
             || ed.harness.run.screenshot.is_some()
             || ed.harness.selftest.is_some()
@@ -3287,6 +3338,7 @@ impl RustudioApp {
         // (Shift+F5 stops, and the game's keys)
         ed.shortcuts(ctx);
         // (the dock's 3D view tab is the one drawn here: the same state)
+        ed.sync_orientation(false);
         self.ed.ui.viewport_hidden = false;
         let ed = &mut self.ed;
         let mut stop = false;

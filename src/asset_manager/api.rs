@@ -133,10 +133,52 @@ pub fn lookup_asset(h: &dyn Http, id: u64) -> Result<Option<AssetEntry>, Failure
     }))
 }
 
+/// User-selectable Roblox asset types for Bulk Import & Publish.
+pub const IMPORT_ASSET_TYPES: [&str; 5] = ["Model", "Animation", "Decal", "Image", "Audio"];
+
+/// Maps a chosen Roblox upload `asset_type` string back to its `AssetKind`
+/// for UI icons and Recent Uploads entries.
+pub fn kind_for_asset_type(asset_type: &str, path: &Path) -> AssetKind {
+    match asset_type {
+        "Animation" => AssetKind::Animation,
+        "Decal" | "Image" => AssetKind::Image,
+        "Audio" => AssetKind::Audio,
+        "Model" => {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if matches!(ext.as_str(), "fbx" | "obj" | "gltf" | "glb") {
+                AssetKind::MeshPart
+            } else {
+                AssetKind::Model
+            }
+        }
+        _ => AssetKind::Model,
+    }
+}
+
+/// Returns whether a local file can be inserted directly into the open place.
+pub fn is_local_model_path(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "rbxm" | "rbxmx" | "obj" | "fbx" | "glb" | "gltf")
+}
+
 /// Inspects a local file path and prepares an `ImportItem` with Roblox asset
 /// type and MIME type.
 pub fn classify_import_file(path: &Path) -> Option<ImportItem> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Asset")
+        .to_string();
+    let is_anim = stem.to_ascii_lowercase().contains("anim");
     let (asset_type, kind, mime): (&'static str, AssetKind, &'static str) = match ext.as_str() {
         "png" => ("Decal", AssetKind::Image, "image/png"),
         "jpg" | "jpeg" => ("Decal", AssetKind::Image, "image/jpeg"),
@@ -146,6 +188,8 @@ pub fn classify_import_file(path: &Path) -> Option<ImportItem> {
         "ogg" => ("Audio", AssetKind::Audio, "audio/ogg"),
         "wav" => ("Audio", AssetKind::Audio, "audio/wav"),
         "flac" => ("Audio", AssetKind::Audio, "audio/flac"),
+        "rbxm" if is_anim => ("Animation", AssetKind::Animation, "model/x-rbxm"),
+        "rbxmx" if is_anim => ("Animation", AssetKind::Animation, "model/x-rbxmx"),
         "rbxm" => ("Model", AssetKind::Model, "model/x-rbxm"),
         "rbxmx" => ("Model", AssetKind::Model, "model/x-rbxmx"),
         "fbx" => ("Model", AssetKind::MeshPart, "model/fbx"),
@@ -154,11 +198,6 @@ pub fn classify_import_file(path: &Path) -> Option<ImportItem> {
         "glb" => ("Model", AssetKind::MeshPart, "model/gltf-binary"),
         _ => return None,
     };
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Asset")
-        .to_string();
     let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     Some(ImportItem {
         path: path.to_path_buf(),

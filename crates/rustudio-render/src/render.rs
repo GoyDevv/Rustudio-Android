@@ -2924,6 +2924,10 @@ pub struct Renderer {
     /// can see (`casts_same`): the sun cascades' and light shadow maps'
     /// cache key.
     caster_gen: u64,
+    /// Bumped whenever any non-static (Dynamic/Pending) shadow-casting item is
+    /// added, moved, scaled, or removed, so sun/light shadow cascades flush as
+    /// soon as fast 3D editor moves settle instead of staying stale.
+    dyn_caster_gen: u64,
     /// Bumped when a mesh's vertices are rewritten in place (SunCache key).
     mesh_gen: u64,
     /// caster_gen bumps that came from in-place static writes (their
@@ -3778,6 +3782,7 @@ impl Renderer {
             caps,
             static_gen: 0,
             caster_gen: 0,
+            dyn_caster_gen: 0,
             mesh_gen: 0,
             caster_flushes: 0,
             sky_globals,
@@ -5266,7 +5271,8 @@ impl Renderer {
         // continuous across scene rebuilds, independently of lighting time.
         let mut globals = frame.globals;
         self.last_view_proj = Mat4::from_cols_array_2d(&frame.globals.view_proj);
-        if std::env::var_os("RUSTUDIO_RENDER_DIAGNOSTICS").is_some() {
+        static RENDER_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *RENDER_DIAG.get_or_init(|| std::env::var_os("RUSTUDIO_RENDER_DIAGNOSTICS").is_some()) {
             static LAST: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
             let state = [globals.cc_tint[3], globals.bloom[1], globals.bloom[0], globals.params[1]];
             let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -5286,11 +5292,13 @@ impl Renderer {
             globals.env_spec[3] = pf.blend;
         }
         self.last_postfx = frame.postfx;
-        self.last_postfx.terrain_capture_id = std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some();
+        static TERRAIN_CAPTURE_ID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.last_postfx.terrain_capture_id = *TERRAIN_CAPTURE_ID.get_or_init(|| std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some());
         globals.cam_pos[3] = self.material_epoch.elapsed().as_secs_f32();
         // Deterministic isolated render probes (no effect in ordinary runs).
-        if let Ok(t) = std::env::var("RUSTUDIO_MATERIAL_TIME") {
-            if let Ok(t) = t.parse::<f32>() { globals.cam_pos[3] = t; }
+        static MATERIAL_TIME: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        if let Some(t) = *MATERIAL_TIME.get_or_init(|| std::env::var("RUSTUDIO_MATERIAL_TIME").ok().and_then(|s| s.parse::<f32>().ok())) {
+            globals.cam_pos[3] = t;
         }
         if let Some(n) = crate::grass_temporal::index() {
             globals.cam_pos[3] = crate::grass_temporal::time(n);
@@ -5401,7 +5409,7 @@ impl Renderer {
 
         let r_scope = rustudio_core::bench::scope("r_static_cull");
         // Static batches: frustum + occlusion test per cell, then trim the smallest parts.
-        let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32, usize)> = Vec::new();
+        let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32, usize)> = Vec::with_capacity(self.st.batches.len());
         let mut push_range = |pass, key, start, end| {
             let lod = scene_lod(key, &self.st.raw[start as usize..end as usize]);
             match static_ranges.last_mut() {
@@ -5486,10 +5494,11 @@ impl Renderer {
         drop(r_scope);
         let r_scope = rustudio_core::bench::scope("r_per_frame_cull");
         // Per-frame items: moving, new and see-through parts.
-        let mut dyn_opaque: Vec<((usize, usize), InstanceRaw)> = Vec::new();
+        let dyn_hint = self.per_frame.len();
+        let mut dyn_opaque: Vec<((usize, usize), InstanceRaw)> = Vec::with_capacity(dyn_hint);
         let mut dyn_cutout: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut dyn_decal: Vec<((usize, usize), InstanceRaw)> = Vec::new();
-        let mut blended: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
+        let mut blended: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::with_capacity(dyn_hint / 4);
         // Decals / Textures on a solid (or invisible) host: part of the
         // surface, so drawn with the opaque scene, before terrain water and
         // glass read it. Studio's water covers a hull's Textures below the
@@ -5607,16 +5616,21 @@ impl Renderer {
             .filter(|d| shows(d))
             .map(|d| (draw_key(d), to_raw(&PartDraw { hover: true, ..*d }, 0.0)))
             .collect();
-        let raw: Vec<InstanceRaw> = dyn_opaque
-            .iter()
-            .map(|e| e.1)
-            .chain(dyn_cutout.iter().map(|e| e.1))
-            .chain(dyn_decal.iter().map(|e| e.1))
-            .chain(surface_decals.iter().map(|e| e.2))
-            .chain(blended.iter().map(|e| e.2))
-            .chain(overlay.iter().map(|e| e.1))
-            .chain(water.iter().map(|e| e.1))
-            .collect();
+        let raw_total = dyn_opaque.len()
+            + dyn_cutout.len()
+            + dyn_decal.len()
+            + surface_decals.len()
+            + blended.len()
+            + overlay.len()
+            + water.len();
+        let mut raw: Vec<InstanceRaw> = Vec::with_capacity(raw_total);
+        raw.extend(dyn_opaque.iter().map(|e| e.1));
+        raw.extend(dyn_cutout.iter().map(|e| e.1));
+        raw.extend(dyn_decal.iter().map(|e| e.1));
+        raw.extend(surface_decals.iter().map(|e| e.2));
+        raw.extend(blended.iter().map(|e| e.2));
+        raw.extend(overlay.iter().map(|e| e.1));
+        raw.extend(water.iter().map(|e| e.1));
         if raw.len() > self.instance_cap {
             self.instance_cap = raw.len().next_power_of_two();
             self.instance_buf = Self::make_buf(
@@ -5692,13 +5706,16 @@ impl Renderer {
         }
 
         // The sun's shadow cascades (sun_shadow.rs): which to redraw.
-        let diagnostic_back = std::env::var_os("RUSTUDIO_CULL_BACK").is_some() || std::env::var_os("RUSTUDIO_CULL_SWITCH").is_some_and(|p| std::path::Path::new(&p).exists());
+        static CULL_BACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static CULL_SWITCH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        let diagnostic_back = *CULL_BACK.get_or_init(|| std::env::var_os("RUSTUDIO_CULL_BACK").is_some())
+            || CULL_SWITCH.get_or_init(|| std::env::var_os("RUSTUDIO_CULL_SWITCH").map(std::path::PathBuf::from)).as_ref().is_some_and(|p| p.exists());
         let scene_gen = self.caster_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
         let sun_due = if frame.shadows {
             self.sun.upload(queue, &frame.sun_cascades);
-            self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty() || !cutout_runs.is_empty() || !self.terrain_grass.is_empty())
+            self.sun.plan(&frame.sun_cascades, scene_gen, self.dyn_caster_gen, !opaque_runs.is_empty() || !cutout_runs.is_empty() || !self.terrain_grass.is_empty())
         } else {
             self.sun.forget();
             [false; crate::sun_shadow::CASCADES]
@@ -5819,7 +5836,8 @@ impl Renderer {
                     }
                 }
             };
-            if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
+            static CULL_EXPORT: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+            if let Some(dir) = CULL_EXPORT.get_or_init(|| std::env::var_os("RUSTUDIO_CULL_EXPORT")).as_ref() {
                 let dir = std::path::PathBuf::from(dir);
                 std::fs::create_dir_all(&dir).unwrap();
                 let vp = cascade.view_proj();
@@ -5963,6 +5981,7 @@ impl Renderer {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 self.caster_gen.hash(&mut h);
+                self.dyn_caster_gen.hash(&mut h);
                 for (slot, light) in &slots {
                     slot.hash(&mut h);
                     light.pos_range.map(f32::to_bits).hash(&mut h);
@@ -6728,7 +6747,8 @@ impl Renderer {
                 ("ssao apply", &viewport.ssao_apply, 2, &target.hdr_view, false),
             ];
             for (label, pipeline, bg, view, clear) in steps {
-                if label == "ssao apply" && (std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some() || std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some()) { continue; }
+                static SKIP_SSAO_APPLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if label == "ssao apply" && *SKIP_SSAO_APPLY.get_or_init(|| std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some() || std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some()) { continue; }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -7333,6 +7353,7 @@ impl Renderer {
             dyn_occluders,
             pending,
             pending_at,
+            dyn_caster_gen,
             ..
         } = self;
         let has_dyn_occ = draws.iter().any(|d| {
@@ -7343,6 +7364,7 @@ impl Renderer {
                 && d.size.min_element() >= 0.4
         });
         let static_ok = draws.iter().all(|d| !shows(d) || pass_of(d).is_some());
+        let has_caster = draws.iter().any(|d| shows(d) && matches!(pass_of(d), Some(Pass::Opaque | Pass::Cutout)));
         let Some(item) = items.get_mut(&r) else {
             let bias = bias_of(&draws);
             items.insert(
@@ -7359,11 +7381,15 @@ impl Renderer {
                 dyn_occluders.insert(r);
             }
             *pending += 1;
+            if has_caster {
+                *dyn_caster_gen = dyn_caster_gen.wrapping_add(1);
+            }
             // Settle time counts from the first waiting part: a game that
             // spawns something every few frames would otherwise never settle.
             pending_at.get_or_insert_with(Instant::now);
             return;
         };
+        let had_caster = item.draws.iter().any(|d| shows(d) && matches!(pass_of(d), Some(Pass::Opaque | Pass::Cutout)));
         let same_place = item.draws.len() == draws.len()
             && item.draws.iter().zip(&draws).all(|(a, b)| {
                 near_xf(&a.xf, &b.xf)
@@ -7374,10 +7400,14 @@ impl Renderer {
             });
         item.draws = draws;
         update_item_slots(r, item, st, per_frame, pending, same_place, static_ok);
-        if matches!(item.state, ItemState::Static(_)) || !has_dyn_occ {
+        let is_static = matches!(item.state, ItemState::Static(_));
+        if is_static || !has_dyn_occ {
             dyn_occluders.remove(&r);
         } else {
             dyn_occluders.insert(r);
+        }
+        if !is_static && !same_place && (has_caster || had_caster) {
+            *dyn_caster_gen = dyn_caster_gen.wrapping_add(1);
         }
     }
 
@@ -7414,7 +7444,12 @@ impl Renderer {
         update_item_slots(
             r, item, &mut self.st, &mut self.per_frame, &mut self.pending, same_place, true,
         );
-        if !matches!(item.state, ItemState::Static(_))
+        let is_static = matches!(item.state, ItemState::Static(_));
+        let has_caster = item.draws.iter().any(|d| shows(d) && matches!(pass_of(d), Some(Pass::Opaque | Pass::Cutout)));
+        if !is_static && !same_place && has_caster {
+            self.dyn_caster_gen = self.dyn_caster_gen.wrapping_add(1);
+        }
+        if !is_static
             && item.draws.iter().any(|d| {
                 shows(d)
                     && pass_of(d) == Some(Pass::Opaque)
@@ -7498,8 +7533,17 @@ impl Renderer {
                     }
                 }
             }
-            ItemState::Pending => self.pending = self.pending.saturating_sub(1),
-            ItemState::Dynamic => {}
+            ItemState::Pending => {
+                self.pending = self.pending.saturating_sub(1);
+                if item.draws.iter().any(|d| shows(d) && matches!(pass_of(d), Some(Pass::Opaque | Pass::Cutout))) {
+                    self.dyn_caster_gen = self.dyn_caster_gen.wrapping_add(1);
+                }
+            }
+            ItemState::Dynamic => {
+                if item.draws.iter().any(|d| shows(d) && matches!(pass_of(d), Some(Pass::Opaque | Pass::Cutout))) {
+                    self.dyn_caster_gen = self.dyn_caster_gen.wrapping_add(1);
+                }
+            }
         }
         self.per_frame.remove(&r);
         self.dyn_occluders.remove(&r);
@@ -7514,8 +7558,24 @@ impl Renderer {
         self.st = StaticLayout::default();
         self.static_gen += 1;
         self.caster_gen += 1;
+        self.dyn_caster_gen = self.dyn_caster_gen.wrapping_add(1);
         self.pending = 0;
         self.pending_at = None;
+    }
+
+    /// Forces all sun shadow cascades and local light shadows to redraw on the
+    /// next frame (e.g. immediately after completing a 3D editor drag/rotate/scale).
+    pub fn invalidate_shadows(&mut self) {
+        self.caster_gen = self.caster_gen.wrapping_add(1);
+        self.dyn_caster_gen = self.dyn_caster_gen.wrapping_add(1);
+        self.sun.forget();
+        self.lshadow.key = None;
+    }
+
+    /// Whether any sun shadow cascade is still behind the latest dynamic-caster
+    /// move (used by the 3D editor to request a catch-up repaint before going idle).
+    pub fn has_stale_shadows(&self) -> bool {
+        self.sun.has_stale_dyn(self.dyn_caster_gen)
     }
 
     /// See `items_generation`.

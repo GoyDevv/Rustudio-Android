@@ -186,18 +186,50 @@ impl Editor {
             }
             "clip_editor" => {
                 if self.builtin_tools.plugins_enabled {
-                    self.builtin_button_state("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
-                } else {
-                    (false, None)
+                    let s = self.builtin_button_state("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+                    if s.0 {
+                        return s;
+                    }
                 }
+                (
+                    true,
+                    Some(
+                        self.ui.anim.anim_open
+                            && self.ui.anim.mode == crate::studio_panels::anim_editor::AnimViewMode::Clip,
+                    ),
+                )
             }
+            "graph_editor" => (
+                true,
+                Some(
+                    self.ui.anim.anim_open
+                        && self.ui.anim.mode == crate::studio_panels::anim_editor::AnimViewMode::Graph,
+                ),
+            ),
             "avatar_setup" => {
                 if self.builtin_tools.plugins_enabled {
-                    self.builtin_button_state("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"))
-                } else {
-                    (false, None)
+                    let s = self.builtin_button_state("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"));
+                    if s.0 {
+                        return s;
+                    }
                 }
+                (
+                    true,
+                    Some(self.is_avatar_tool_open(crate::studio_panels::anim_editor::AvatarToolPanel::AvatarSetup)),
+                )
             }
+            "accessory_editor" => (
+                true,
+                Some(self.is_avatar_tool_open(crate::studio_panels::anim_editor::AvatarToolPanel::AccessoryFitter)),
+            ),
+            "adaptive" => (
+                true,
+                Some(self.is_avatar_tool_open(crate::studio_panels::anim_editor::AvatarToolPanel::AdaptiveWrap)),
+            ),
+            "ugc_validation" => (
+                true,
+                Some(self.is_avatar_tool_open(crate::studio_panels::anim_editor::AvatarToolPanel::UgcValidation)),
+            ),
             "style_editor" => {
                 if self.builtin_tools.plugins_enabled {
                     self.builtin_button_state("StyleEditor", Some("StyleEditor"), Some("StyleEditorToolbarButton"))
@@ -212,20 +244,8 @@ impl Editor {
                     (false, None)
                 }
             }
-            "drafts" => {
-                if self.builtin_tools.plugins_enabled {
-                    self.builtin_button_state("DraftsWidget", Some("draftsToolbar"), Some("draftsButton"))
-                } else {
-                    (false, None)
-                }
-            }
-            "tag_editor" => {
-                if self.builtin_tools.plugins_enabled {
-                    self.builtin_button_state("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"))
-                } else {
-                    (false, None)
-                }
-            }
+            "drafts" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::Drafts))),
+            "tag_editor" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::TagEditor))),
             "audio_discovery" => {
                 if self.builtin_tools.plugins_enabled {
                     self.builtin_button_state("AudioDiscovery", Some("Audio Discovery"), Some("View Sounds"))
@@ -311,7 +331,14 @@ impl Editor {
             "panel_properties" => (true, open("Properties")),
             "panel_explorer" => (true, open("Explorer")),
             "panel_output" => (true, open("Output")),
-            "insert_object" => (edit, None),
+            "insert_object" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::InsertObject))),
+            "activity_history" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::ActivityHistory))),
+            "find_in_place" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::FindInPlace))),
+            "object_browser" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::ObjectBrowser))),
+            "script_analysis" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::ScriptAnalysis))),
+            "script_activity" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::ScriptActivity))),
+            "run_script" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::RunScript))),
+            "task_scheduler" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::TaskScheduler))),
             "reset_layout" => (true, None),
             "dock_all" => (!self.ui.popped.is_empty(), None),
             "documentation" | "tutorials" | "developer_forum" => (true, None),
@@ -319,7 +346,7 @@ impl Editor {
             a if a.starts_with("manage_plugins:") => (true, None),
             "plugins_folder" => (true, None),
             "save_local_plugin" | "publish_plugin" => (edit && sel, None),
-            "command_bar" => (false, Some(false)),
+            "command_bar" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::CommandBar))),
             // Ribbon-only actions.
             "transform" => (true, None),
             "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => {
@@ -606,10 +633,32 @@ impl Editor {
                 }
             }
             "clip_editor" => {
-                self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+                if !self.builtin_tools.plugins_enabled
+                    || !self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
+                {
+                    self.ui.anim.mode = crate::studio_panels::anim_editor::AnimViewMode::Clip;
+                    self.ui.panel_requests.push((Tab::AnimEditor, None));
+                }
+            }
+            "graph_editor" => {
+                self.ui.anim.mode = crate::studio_panels::anim_editor::AnimViewMode::Graph;
+                self.ui.panel_requests.push((Tab::AnimEditor, None));
             }
             "avatar_setup" => {
-                self.trigger_builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"));
+                if !self.builtin_tools.plugins_enabled
+                    || !self.trigger_builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"))
+                {
+                    self.toggle_avatar_tool_panel(crate::studio_panels::anim_editor::AvatarToolPanel::AvatarSetup);
+                }
+            }
+            "accessory_editor" => {
+                self.toggle_avatar_tool_panel(crate::studio_panels::anim_editor::AvatarToolPanel::AccessoryFitter);
+            }
+            "adaptive" => {
+                self.toggle_avatar_tool_panel(crate::studio_panels::anim_editor::AvatarToolPanel::AdaptiveWrap);
+            }
+            "ugc_validation" => {
+                self.toggle_avatar_tool_panel(crate::studio_panels::anim_editor::AvatarToolPanel::UgcValidation);
             }
             "style_editor" => {
                 self.trigger_builtin_plugin_button("StyleEditor", Some("StyleEditor"), Some("StyleEditorToolbarButton"));
@@ -617,12 +666,8 @@ impl Editor {
             "localization_tools" => {
                 self.trigger_builtin_plugin_button("LocalizationTools", Some("Localization"), Some("Tools"));
             }
-            "drafts" => {
-                self.trigger_builtin_plugin_button("DraftsWidget", Some("draftsToolbar"), Some("draftsButton"));
-            }
-            "tag_editor" => {
-                self.trigger_builtin_plugin_button("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"));
-            }
+            "drafts" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::Drafts),
+            "tag_editor" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::TagEditor),
             "audio_discovery" => {
                 self.trigger_builtin_plugin_button("AudioDiscovery", Some("Audio Discovery"), Some("View Sounds"));
             }
@@ -683,11 +728,15 @@ impl Editor {
             "panel_properties" => self.ui.panel_requests.push((Tab::Properties, None)),
             "panel_explorer" => self.ui.panel_requests.push((Tab::Explorer, None)),
             "panel_output" => self.ui.panel_requests.push((Tab::Output, None)),
-            "insert_object" => {
-                let parent = self.insert_parent();
-                let at = ctx.content_rect().center() - Vec2::new(120.0, 200.0);
-                self.open_insert_popup(parent, at);
-            }
+            "insert_object" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::InsertObject),
+            "activity_history" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::ActivityHistory),
+            "command_bar" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::CommandBar),
+            "find_in_place" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::FindInPlace),
+            "object_browser" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::ObjectBrowser),
+            "script_analysis" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::ScriptAnalysis),
+            "script_activity" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::ScriptActivity),
+            "run_script" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::RunScript),
+            "task_scheduler" => self.toggle_tool_panel(crate::studio_panels::studio_tools_panels::ToolPanel::TaskScheduler),
             "dock_all" => self.ui.dock_moves.push(crate::panels::DockMove::DockAll),
             "reset_layout" => {
                 ctx.data_mut(|d| d.insert_temp(egui::Id::new("reset_dock"), true));

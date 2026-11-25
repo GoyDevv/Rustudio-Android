@@ -2968,8 +2968,13 @@ impl Game {
         let key = (origin, self.doc.id);
         let moved = st.lightgrid_key != Some(key);
         let since = st.lightgrid_at.map(|t| rustudio_core::sim_clock::since(t).as_secs_f32());
+        let moves_interval = if self.play.is_none() {
+            mech::LIGHTGRID_REFRESH_S
+        } else {
+            mech::LIGHTGRID_MOVES_REFRESH_S
+        };
         let stale = (st.lightgrid_dirty && since.is_none_or(|t| t >= mech::LIGHTGRID_REFRESH_S))
-            || (st.lightgrid_moves && since.is_none_or(|t| t >= mech::LIGHTGRID_MOVES_REFRESH_S));
+            || (st.lightgrid_moves && since.is_none_or(|t| t >= moves_interval));
         if (moved || stale) && st.lightgrid_job.is_none() && st.lightgrid_local_job.is_none() {
             let _b = rustudio_core::bench::scope("lightgrid");
             // The terrain's share, read again only when the grid moved or

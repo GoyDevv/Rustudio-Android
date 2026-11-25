@@ -119,6 +119,8 @@ pub struct UiState {
     /// File > Studio Settings (src/studio_settings.rs).
     pub studio_settings: crate::studio_settings::Dialog,
     pub insert_popup: Option<InsertPopup>,
+    pub tools: crate::studio_panels::studio_tools_panels::StudioToolsState,
+    pub anim: crate::studio_panels::anim_editor::AnimEditorState,
     pub recent: Vec<PathBuf>,
 }
 
@@ -151,6 +153,8 @@ impl Default for UiState {
             graphics_settings: false,
             studio_settings: Default::default(),
             insert_popup: None,
+            tools: Default::default(),
+            anim: Default::default(),
             recent: load_recent(),
         }
     }

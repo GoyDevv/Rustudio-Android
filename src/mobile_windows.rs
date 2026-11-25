@@ -46,9 +46,9 @@ pub const COLLAPSED_MAX_WIDTH: f32 = 240.0;
 /// Default minimum expanded window dimensions (`[width, height]`).
 pub const DEFAULT_MIN_SIZE: [f32; 2] = [220.0, 140.0];
 /// Touch-friendly bottom-right corner resize hit target size.
-pub const RESIZE_CORNER_HIT: f32 = 22.0;
+pub const RESIZE_CORNER_HIT: f32 = 36.0;
 /// Edge resize strip thickness in touch mode.
-pub const RESIZE_EDGE_HIT_TOUCH: f32 = 12.0;
+pub const RESIZE_EDGE_HIT_TOUCH: f32 = 18.0;
 /// Edge resize strip thickness in desktop mode.
 pub const RESIZE_EDGE_HIT_DESKTOP: f32 = 8.0;
 

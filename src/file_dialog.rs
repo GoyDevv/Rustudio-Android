@@ -238,8 +238,8 @@ impl Dialogs {
         self.start_picker(purpose, request, kind, false)
     }
 
-    /// Opens rustudio's own picker for `poll_multi` (it picks one file at
-    /// a time); false while another is open.
+    /// Opens rustudio's own multi-select picker for `poll_multi`; false while
+    /// another dialog is open.
     #[cfg(target_os = "android")]
     pub fn start_multi(&mut self, purpose: Purpose, request: Request) -> bool {
         self.start_picker(purpose, request, Kind::PickFile, true)
@@ -250,7 +250,12 @@ impl Dialogs {
         if self.pending.is_some() {
             return false;
         }
-        self.pending = Some((purpose, crate::android::storage::Picker::new(request, kind), multi));
+        let picker = if multi {
+            crate::android::storage::Picker::new_multi(request)
+        } else {
+            crate::android::storage::Picker::new(request, kind)
+        };
+        self.pending = Some((purpose, picker, multi));
         if let Some(c) = &self.ctx {
             c.request_repaint();
         }
@@ -270,8 +275,8 @@ impl Dialogs {
         self.pending.take().map(|(purpose, _, _)| (purpose, done))
     }
 
-    /// The picker opened by `start_multi`: its one chosen file (empty:
-    /// cancelled).
+    /// The multi-select picker opened by `start_multi`: all chosen files
+    /// (empty: cancelled).
     #[cfg(target_os = "android")]
     pub fn poll_multi(&mut self) -> Option<(Purpose, Vec<PathBuf>)> {
         let ctx = self.ctx.clone()?;
@@ -279,8 +284,8 @@ impl Dialogs {
         if !*multi {
             return None;
         }
-        let done = picker.show(&ctx)?;
-        self.pending.take().map(|(purpose, _, _)| (purpose, done.into_iter().collect()))
+        let done = picker.show_multi(&ctx)?;
+        self.pending.take().map(|(purpose, _, _)| (purpose, done))
     }
 }
 

@@ -30,7 +30,7 @@ use egui::{Align, Event, Id, Key, Layout, Modifiers, Order, Pos2, Rect};
 use super::keyboard::{Keyboard, Want};
 
 /// The bar's band, in points.
-pub const HEIGHT: f32 = 34.0;
+pub const HEIGHT: f32 = 38.0;
 
 const ID: &str = "rustudio text bar";
 
@@ -40,6 +40,8 @@ pub struct TextBar {
     queued: Vec<Event>,
     /// The bar showed last frame.
     shown: bool,
+    /// Accumulated horizontal drag (pt) on the cursor-slide trackpad strip.
+    slide_accum: f32,
 }
 
 impl TextBar {
@@ -125,12 +127,96 @@ impl TextBar {
                                 chosen = Some(Event::Cut);
                             }
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add_space(2.0);
-                                ui.weak(match want {
-                                    Want::Field(_) if selection => "Text — selection",
-                                    Want::Field(_) => "Text",
-                                    Want::TextBox => "TextBox",
-                                });
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if field.is_some() {
+                                    if ui.add(egui::Button::new("◀").min_size(egui::vec2(30.0, 28.0))).clicked() {
+                                        chosen = Some(Event::Key {
+                                            key: Key::ArrowLeft,
+                                            physical_key: Some(Key::ArrowLeft),
+                                            pressed: true,
+                                            repeat: false,
+                                            modifiers: Modifiers::NONE,
+                                        });
+                                    }
+                                    let (pad_rect, pad_resp) = ui.allocate_exact_size(
+                                        egui::vec2(110.0, 28.0),
+                                        egui::Sense::drag(),
+                                    );
+                                    let p = ui.painter();
+                                    p.rect_filled(
+                                        pad_rect,
+                                        4.0,
+                                        if pad_resp.dragged() {
+                                            rustudio_engine::theme::ACCENT.gamma_multiply(0.35)
+                                        } else {
+                                            rustudio_engine::theme::PANEL
+                                        },
+                                    );
+                                    p.text(
+                                        pad_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "◀ | ▶",
+                                        egui::FontId::proportional(11.0),
+                                        rustudio_engine::theme::TEXT_DIM,
+                                    );
+                                    if pad_resp.dragged() {
+                                        self.slide_accum += pad_resp.drag_delta().x;
+                                        const STEP_PT: f32 = 8.0;
+                                        while self.slide_accum >= STEP_PT {
+                                            self.slide_accum -= STEP_PT;
+                                            let ev = Event::Key {
+                                                key: Key::ArrowRight,
+                                                physical_key: Some(Key::ArrowRight),
+                                                pressed: true,
+                                                repeat: false,
+                                                modifiers: Modifiers::NONE,
+                                            };
+                                            let up = Event::Key {
+                                                key: Key::ArrowRight,
+                                                physical_key: Some(Key::ArrowRight),
+                                                pressed: false,
+                                                repeat: false,
+                                                modifiers: Modifiers::NONE,
+                                            };
+                                            self.queued.push(ev);
+                                            self.queued.push(up);
+                                        }
+                                        while self.slide_accum <= -STEP_PT {
+                                            self.slide_accum += STEP_PT;
+                                            let ev = Event::Key {
+                                                key: Key::ArrowLeft,
+                                                physical_key: Some(Key::ArrowLeft),
+                                                pressed: true,
+                                                repeat: false,
+                                                modifiers: Modifiers::NONE,
+                                            };
+                                            let up = Event::Key {
+                                                key: Key::ArrowLeft,
+                                                physical_key: Some(Key::ArrowLeft),
+                                                pressed: false,
+                                                repeat: false,
+                                                modifiers: Modifiers::NONE,
+                                            };
+                                            self.queued.push(ev);
+                                            self.queued.push(up);
+                                        }
+                                        ctx.request_repaint();
+                                    } else if pad_resp.drag_stopped() {
+                                        self.slide_accum = 0.0;
+                                    }
+                                    if ui.add(egui::Button::new("▶").min_size(egui::vec2(30.0, 28.0))).clicked() {
+                                        chosen = Some(Event::Key {
+                                            key: Key::ArrowRight,
+                                            physical_key: Some(Key::ArrowRight),
+                                            pressed: true,
+                                            repeat: false,
+                                            modifiers: Modifiers::NONE,
+                                        });
+                                    }
+                                } else {
+                                    ui.add_space(2.0);
+                                    ui.weak("TextBox");
+                                }
                             });
                         });
                     });

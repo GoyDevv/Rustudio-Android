@@ -114,6 +114,7 @@ pub const PLACEMENTS: &[Placement] = &[
     row("task_scheduler", "Task Scheduler", Left, &[], 0.22),
     row("localization_tools", "Localization Tools", Left, &[], 0.2),
     row("activity_history", "Activity History", Left, &[], 0.2),
+    row("drafts", "Drafts", Left, &[], 0.2),
     row("material_generator", "Material Generator", Left, &[], 0.22),
     row("player_emulator", "Player Emulator", Left, &[], 0.2),
     row("accessory_editor", "Accessory", Left, &[], 0.2),
@@ -124,6 +125,7 @@ pub const PLACEMENTS: &[Placement] = &[
     // Shipped default Bottom (the survey's own Studio had moved it left).
     row("asset_manager", "Asset Manager", Bottom, &[TabWith("output")], 0.24),
     row("script_analysis", "Script Analysis", Bottom, &[TabWith("output")], 0.22),
+    row("run_script", "Run Script", Bottom, &[TabWith("output")], 0.24),
     row("breakpoints", "Breakpoints", Bottom, &[TabWith("watch"), TabWith("call_stack")], 0.22),
     row("watch", "Watch", Bottom, &[TabWith("breakpoints"), TabWith("call_stack")], 0.22),
     row("call_stack", "Call Stack", Bottom, &[TabWith("breakpoints"), TabWith("watch")], 0.22),
@@ -179,6 +181,7 @@ impl Tab {
             Tab::Output => "output",
             Tab::AvatarSettings => "avatar_settings",
             Tab::TerrainEditor => "terrain_editor",
+            Tab::AnimEditor => "clip_editor",
             Tab::Toolbox => "toolbox",
             Tab::AssetManager => "asset_manager",
             Tab::FileSync => "file_sync",

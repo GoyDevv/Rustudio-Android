@@ -482,6 +482,10 @@ impl Editor {
         };
         changes.extend(crate::part_drag::pivot_changes(&self.game.doc, drag.undo_pivots.as_ref().unwrap_or(&drag.pivots)));
         self.game.doc.record_props(label, changes);
+        if let Some(rend) = self.game.renderer.as_mut() {
+            rend.invalidate_shadows();
+        }
+        self.game.lighting.refresh_lightgrid_now();
     }
 
     /// Android, a game TextBox typed into (app.rs sets `keyboard_cover`):
@@ -570,13 +574,20 @@ impl Editor {
         // While playing (the client's view), the mouse and keys belong to the
         // game: its camera scripts turn and zoom the view.
         let driving = self.game.play_game_input();
-        let notches = crate::game_view::wheel_notches(&ctx);
+        let ui_scrolling = self.game.touch.is_scroll_from_ui();
+        let ui_pointer = self.game.touch.has_ui_pointer();
+        let notches = if ui_scrolling { 0.0 } else { crate::game_view::wheel_notches(&ctx) };
         if !driving && (self.game.game_grab.is_some() || self.game.game_cursor_hidden) {
             self.game.release_game_mouse(&ctx);
         }
         if driving {
-            self.game.update_game_mouse(&ctx, &resp, delta, notches);
-        } else if !context_menu_open && !over_selector && resp.hovered() && notches != 0.0 {
+            let (game_delta, game_notches) = if ui_pointer || ui_scrolling {
+                (Vec2::ZERO, 0.0)
+            } else {
+                (delta, notches)
+            };
+            self.game.update_game_mouse(&ctx, &resp, game_delta, game_notches);
+        } else if !context_menu_open && !over_selector && !ui_pointer && resp.hovered() && notches != 0.0 {
             if let Some(p) = resp.hover_pos() {
                 let ray = self.game.cam.ray(rect, p);
                 let hit = self.ray_distance(&ray);
@@ -584,7 +595,7 @@ impl Editor {
                 self.last_zoom = Some((ray.dir, hit));
             }
         }
-        if !driving && (!over_selector || self.game.look_grab.is_some()) {
+        if !driving && !ui_pointer && !ui_scrolling && (!over_selector || self.game.look_grab.is_some()) {
             let look = self.game.update_look_grab(&ctx, &resp, delta);
             if let Some(d) = look {
                 let sens = if self.game.touch.mode() == Some(rustudio_engine::touch_input::Mode::Look) {
@@ -624,7 +635,8 @@ impl Editor {
             });
             if show_joystick {
                 for (tid, phase, pos) in touch_events {
-                    if self.mobile_window_rects.iter().any(|r| r.contains(pos))
+                    if self.game.touch.is_ui_touch(tid)
+                        || self.mobile_window_rects.iter().any(|r| r.contains(pos))
                         || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
                     {
                         continue;
@@ -651,7 +663,7 @@ impl Editor {
         // Two fingers on the view (touch screens): a pinch zooms toward the
         // fingers (the game's camera through its wheel while playing) and
         // moving both pans, as the middle button does.
-        if !self.editor_joystick.is_active() {
+        if !self.editor_joystick.is_active() && !self.game.touch.any_ui_touch() && !ui_scrolling {
         if let Some(mt) = ctx.input(|i| i.multi_touch()) {
             self.touch_look.on_multi_touch(mt.num_touches);
             let on_view = rect.contains(mt.center_pos)
@@ -796,10 +808,15 @@ impl Editor {
             // fingers. (Carrying the last frame's list over kept every frame's
             // rects for the whole session: a few more each frame, never dropped.)
             let mut ui = Vec::with_capacity(
-                (if game { 8 } else { 0 }) + usize::from(joystick_zone.is_some()),
+                (if game { 8 } else { 0 })
+                    + usize::from(joystick_zone.is_some())
+                    + if driving { self.mobile_window_rects.len() } else { 0 },
             );
             if let Some(jr) = joystick_zone {
                 ui.push(jr);
+            }
+            if driving {
+                ui.extend_from_slice(&self.mobile_window_rects);
             }
             self.game.touch.zones = rustudio_engine::touch_input::Zones {
                 viewport: if menu_open { egui::Rect::NOTHING } else { visible },
@@ -809,7 +826,7 @@ impl Editor {
                 direct_drag: self.mobile_drag_rects.clone(),
                 stick,
                 jump,
-                handle_hover: hover_handle.is_some() || self.drag.is_some(),
+                handle_hover: hover_handle.is_some() || self.drag.is_some() || rustudio_engine::gui::share().adorn_hot || { let _ch = rustudio_engine::gui::share_channel(1); rustudio_engine::gui::share().adorn_hot },
                 frame: self.game.frame_no,
             };
         }
@@ -857,10 +874,11 @@ impl Editor {
         let mut lines: Vec<LineVertex> = Vec::new();
         // (RUSTUDIO_NO_GRID hides it for lighting comparisons with Studio;
         // Studio's Play view has none, tools/fidelity demo shots.)
+        static NO_GRID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if self.show_grid
             && !self.game.is_playing()
             && self.game.doc.kind == rustudio_core::doc::DocKind::Place
-            && std::env::var_os("RUSTUDIO_NO_GRID").is_none()
+            && !*NO_GRID.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRID").is_some())
             && !self.clean_view
         {
             scene::grid_lines(&mut lines, self.ui.grid_size);
@@ -868,6 +886,11 @@ impl Editor {
         drop(vp_prepare);
         let painter = ui.painter_at(rect);
         self.game.draw_world(&ctx, &painter, rect, lines, &overlay, self.harness.run.started);
+        if !self.game.is_playing()
+            && self.game.renderer.as_ref().is_some_and(|r| r.has_stale_shadows())
+        {
+            ctx.request_repaint();
+        }
         self.hud.viewport_drawn |= self.game.viewport_drawn;
         // Draw floating left-side virtual joystick in Edit mode (never during Play).
         if !self.clean_view {
@@ -1027,6 +1050,7 @@ impl Editor {
             }
             if self.part_drag.is_some() {
                 self.finish_part_drag();
+                ctx.request_repaint();
             }
             if let Some(start) = self.marquee.take() {
                 if let Some(end) = ctx.input(|i| i.pointer.interact_pos()) {

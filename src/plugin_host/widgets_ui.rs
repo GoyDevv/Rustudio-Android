@@ -955,6 +955,22 @@ impl Editor {
     /// A plugin widget's panel content (`Tab::Plugin(n)`).
     pub fn plugin_widget_ui(&mut self, ui: &mut egui::Ui, n: u32) {
         let rect = ui.available_rect_before_wrap();
+        if cfg!(target_os = "android") {
+            if let Some(slot) = self.plugin_ui.slots.get(n as usize) {
+                if slot.key.contains("Animation") {
+                    // Top timeline & scrubber strip responds immediately to finger drag
+                    // while leaving the lower joint list scrollable.
+                    let scrub_rect = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::Pos2::new(rect.max.x, (rect.min.y + 92.0).min(rect.max.y)),
+                    );
+                    ui.ctx().data_mut(|d| {
+                        d.get_temp_mut_or_default::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects"))
+                            .push(scrub_rect);
+                    });
+                }
+            }
+        }
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let ctx = ui.ctx().clone();
         let n = n as usize;
@@ -2402,5 +2418,13 @@ mod tests {
         );
         let out = run(&mut h, &mut doc, 4);
         assert!(out.iter().any(|l| l == "[T] after true DockWidgetPluginGui"), "{out:#?}");
+    }
+}
+
+impl PluginUi {
+    /// True when an interactive animation plugin widget (such as Roblox's
+    /// AnimationClipEditor) is currently open.
+    pub fn has_open_animation_widget(&self) -> bool {
+        self.slots.iter().any(|s| s.open && s.key.contains("Animation"))
     }
 }

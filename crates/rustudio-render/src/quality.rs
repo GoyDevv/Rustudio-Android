@@ -49,21 +49,39 @@ impl Profile {
         }
     }
     pub fn samples(self) -> u32 {
-        match self.0 {
-            1..=16 => 1,
-            17 => 2,
-            _ => 4,
+        if cfg!(target_os = "android") {
+            // Mobile tile-based GPUs (Mali/Adreno) stall heavily at 4x MSAA;
+            // keep crisp 2x MSAA at top levels without frame-time spikes.
+            match self.0 {
+                1..=18 => 1,
+                _ => 2,
+            }
+        } else {
+            match self.0 {
+                1..=16 => 1,
+                17 => 2,
+                _ => 4,
+            }
         }
     }
     pub fn ssao(self) -> bool {
         self.0 >= 20
     }
     pub fn shadow_tile_divisor(self) -> u32 {
-        match self.0 {
-            1..=3 => 0,
-            4..=5 => 4,
-            6..=13 => 2,
-            _ => 1,
+        if cfg!(target_os = "android") {
+            match self.0 {
+                1..=3 => 0,
+                4..=7 => 4,
+                8..=15 => 2,
+                _ => 1,
+            }
+        } else {
+            match self.0 {
+                1..=3 => 0,
+                4..=5 => 4,
+                6..=13 => 2,
+                _ => 1,
+            }
         }
     }
     pub fn grass(self) -> usize {

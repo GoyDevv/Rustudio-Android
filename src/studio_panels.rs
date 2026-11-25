@@ -17,6 +17,12 @@ use crate::app::Editor;
 use crate::studio_ui::InsertPopup;
 use rustudio_engine::theme;
 
+#[path = "studio_tools_panels.rs"]
+pub mod studio_tools_panels;
+
+#[path = "anim_editor.rs"]
+pub mod anim_editor;
+
 #[derive(Default, Clone)]
 pub struct ClassMeta {
     pub category: String,
@@ -194,6 +200,8 @@ impl Editor {
     /// The Insert Object popup: a search field, then the classes that can
     /// be made, by Studio's category; Enter or a click inserts into the parent.
     pub fn insert_popup_ui(&mut self, ctx: &egui::Context) {
+        self.studio_tools_windows_ui(ctx);
+        self.anim_and_avatar_windows_ui(ctx);
         let Some(mut pop) = self.ui.insert_popup.take() else {
             return;
         };

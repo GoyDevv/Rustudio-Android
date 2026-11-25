@@ -42,6 +42,9 @@ const PACKAGES: &[(&str, &str)] = &[
     ("extracontent-scripts.zip", "ExtraContent/scripts"),
     ("extracontent-models.zip", "ExtraContent/models"),
     ("extracontent-textures.zip", "ExtraContent/textures"),
+    ("BuiltInPlugins.zip", "BuiltInPlugins"),
+    ("extracontent-luapackages.zip", "ExtraContent/LuaPackages"),
+    ("content-studio_svg_textures.zip", "content/studio_svg_textures"),
 ];
 /// Single files pulled out of a big package by range requests.
 const SINGLE_FILES: &[(&str, &str)] = &[("RobloxStudio.zip", "ReflectionMetadata.xml")];
@@ -85,6 +88,39 @@ fn install_missing_packages(agent: &ureq::Agent, version: &str, root: &Path, pro
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadUiStatus {
+    Idle,
+    Downloading(String),
+    Ready,
+    OfflineError(String),
+}
+
+static DOWNLOAD_STATUS: Mutex<DownloadUiStatus> = Mutex::new(DownloadUiStatus::Idle);
+
+pub fn download_ui_status() -> DownloadUiStatus {
+    DOWNLOAD_STATUS.lock().map(|g| g.clone()).unwrap_or(DownloadUiStatus::Idle)
+}
+
+fn set_download_status(st: DownloadUiStatus) {
+    if let Ok(mut g) = DOWNLOAD_STATUS.lock() {
+        *g = st;
+    }
+}
+
+/// True when Roblox Studio's official BuiltInPlugins folder is present on disk.
+pub fn builtin_plugins_installed() -> bool {
+    crate::default_scripts::studio_dir()
+        .map(|r| r.join("BuiltInPlugins").is_dir())
+        .unwrap_or(false)
+}
+
+/// Retry downloading Studio content & official BuiltInPlugins in the background.
+pub fn retry_background_install() {
+    set_download_status(DownloadUiStatus::Downloading("Checking Roblox Studio packages…".into()));
+    spawn_background_install_if_missing();
+}
+
 static MESSAGES: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
 
 /// Messages for Output from the background download: (is_error, text).
@@ -125,9 +161,15 @@ pub fn spawn_background_install_if_missing() {
                         let a = agent();
                         if !packages.is_empty() {
                             let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
+                            set_download_status(DownloadUiStatus::Downloading(format!("Downloading {}…", names.join(", "))));
                             post(false, format!("Studio content: downloading {} (new in this version of rustudio)…", names.join(", ")));
-                            match install_missing_packages(&a, &version, &root, &|_| {}) {
-                                Ok(()) => post(false, "Studio content: downloaded".into()),
+                            match install_missing_packages(&a, &version, &root, &|msg| {
+                                set_download_status(DownloadUiStatus::Downloading(msg.to_string()));
+                            }) {
+                                Ok(()) => {
+                                    set_download_status(DownloadUiStatus::Ready);
+                                    post(false, "Studio content: downloaded".into());
+                                }
                                 Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
                             }
                         }
