@@ -38,6 +38,14 @@ pub trait TabViewer {
     /// rustudio: the tab's pop-out button was clicked.
     fn on_pop_out(&mut self, _tab: &mut Self::Tab) {}
 
+    /// rustudio: whether the tab shows a minimize button left of pop-out/close.
+    fn show_minimize_button(&self, _tab: &Self::Tab) -> bool {
+        false
+    }
+
+    /// rustudio: the tab's minimize button was clicked.
+    fn on_minimize(&mut self, _tab: &mut Self::Tab) {}
+
     /// rustudio: whether the tab's context menu has egui_dock's own "Eject"
     /// (a new floating window; rustudio's menu has Pop Out instead).
     fn show_eject_in_context_menu(&self, _tab: &Self::Tab) -> bool {

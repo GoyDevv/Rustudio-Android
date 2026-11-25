@@ -2124,14 +2124,14 @@ impl WorldGuiPass {
             })
         };
         let (from_hdr, from_buf) = (source(hdr), source(buf));
-        let mut step = |label: &str, view: &wgpu::TextureView, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
+        let mut step = |label: &str, view: &wgpu::TextureView, load: wgpu::LoadOp<wgpu::Color>, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -2140,13 +2140,14 @@ impl WorldGuiPass {
             });
             f(&mut pass);
         };
-        step("effects in", buf, &mut |p| {
+        // Full-screen triangle passes overwrite every pixel: Clear avoids tile RAM readback on mobile GPUs.
+        step("effects in", buf, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &mut |p| {
             p.set_pipeline(&self.fx_in);
             p.set_bind_group(0, &from_hdr, &[]);
             p.draw(0..3, 0..1);
         });
-        step("effects", buf, &mut |p| self.record(p, &self.fx_pipeline, &up));
-        step("effects out", hdr, &mut |p| {
+        step("effects", buf, wgpu::LoadOp::Load, &mut |p| self.record(p, &self.fx_pipeline, &up));
+        step("effects out", hdr, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &mut |p| {
             p.set_pipeline(&self.fx_out);
             p.set_bind_group(0, &from_buf, &[]);
             p.draw(0..3, 0..1);

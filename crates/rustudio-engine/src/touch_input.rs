@@ -106,6 +106,9 @@ pub struct Zones {
     /// The editor's own widgets over the game view (the hotbar's slots,
     /// the chat box): fingers landing there stay egui's with `game` on.
     pub ui: Vec<Rect>,
+    /// Regions (such as floating window title bars and resize grips) where a
+    /// touch drag immediately starts a Primary pointer drag instead of scrolling.
+    pub direct_drag: Vec<Rect>,
     /// Where a finger starts the movement stick / presses jump.
     pub stick: Option<Rect>,
     pub jump: Option<Rect>,
@@ -117,7 +120,7 @@ pub struct Zones {
 
 impl Default for Zones {
     fn default() -> Self {
-        Self { viewport: Rect::NOTHING, playing: false, game: false, ui: Vec::new(), stick: None, jump: None, handle_hover: false, frame: 0 }
+        Self { viewport: Rect::NOTHING, playing: false, game: false, ui: Vec::new(), direct_drag: Vec::new(), stick: None, jump: None, handle_hover: false, frame: 0 }
     }
 }
 
@@ -321,6 +324,7 @@ impl Touch {
                 }
                 Event::Touch { id, phase, pos, .. } => {
                     synthetic = true;
+                    set_kbm_active(false);
                     self.last_touch = Some(now);
                     let control = self.on_touch(ctx, id, phase, pos, now, frame_no, &mut out);
                     // egui keeps seeing the fingers (its multi-touch gestures,
@@ -331,7 +335,27 @@ impl Touch {
                     }
                 }
                 Event::PointerMoved(_) | Event::PointerButton { .. } | Event::PointerGone if synthetic => {}
-                other => out.push(other),
+                other => {
+                    if !synthetic {
+                        match &other {
+                            Event::PointerMoved(_)
+                            | Event::PointerButton { .. }
+                            | Event::MouseWheel { .. }
+                            | Event::MouseMoved(_) => {
+                                if cfg!(target_os = "android") {
+                                    set_kbm_active(true);
+                                }
+                            }
+                            Event::Key { physical_key: Some(k), .. }
+                                if *k != Key::Escape && cfg!(target_os = "android") =>
+                            {
+                                set_kbm_active(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.push(other);
+                }
             }
         }
         self.tick(ctx, now, frame_no, &mut out);
@@ -457,24 +481,26 @@ impl Touch {
                                 out.push(button(p.start, PointerButton::Secondary, true));
                                 out.push(Event::PointerMoved(pos));
                                 p.mode = Mode::Look;
-                            } else if now.duration_since(p.since) >= HOLD {
+                            } else if now.duration_since(p.since) >= HOLD || self.zones.direct_drag.iter().any(|r| r.contains(p.start)) {
                                 // Held, then moved: a drag from where it landed.
                                 out.push(Event::PointerMoved(p.start));
                                 out.push(button(p.start, PointerButton::Primary, true));
                                 out.push(Event::PointerMoved(pos));
                                 p.mode = Mode::Press;
                             } else {
+                                out.push(Event::PointerMoved(p.start));
                                 out.push(wheel(Vec2::ZERO, TouchPhase::Start));
                                 out.push(wheel(pos - p.start, TouchPhase::Move));
-                                out.push(Event::PointerMoved(pos));
                                 p.mode = Mode::Scroll;
                             }
                         }
                     }
                     Mode::Scroll => {
                         let last = p.samples.iter().rev().nth(1).map(|(_, q)| *q).unwrap_or(pos);
+                        // Keep pointer pinned to p.start so scrolling never stops if the finger
+                        // leaves the panel and never leaks wheel events into the 3D viewport.
+                        out.push(Event::PointerMoved(p.start));
                         out.push(wheel(pos - last, TouchPhase::Move));
-                        out.push(Event::PointerMoved(pos));
                     }
                     Mode::Look | Mode::Press => out.push(Event::PointerMoved(pos)),
                     Mode::Done => {
@@ -777,17 +803,55 @@ impl Touch {
 /// src/play_game.rs "Fingers in Play"): on Android unless `RUSTUDIO_TOUCH=0`,
 /// elsewhere with `RUSTUDIO_TOUCH=1` (a touch-screen laptop; the game then
 /// reports UserInputService.TouchEnabled and PreferredInput Touch too).
+static HAS_HW_KB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HAS_HW_MOUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_KBM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_hardware_kbm(keyboard: bool, mouse: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let prev = HAS_HW_KB.swap(keyboard, Relaxed) || HAS_HW_MOUSE.swap(mouse, Relaxed);
+    let now = keyboard || mouse;
+    if now && !prev {
+        ACTIVE_KBM.store(true, Relaxed);
+    } else if !now && prev {
+        ACTIVE_KBM.store(false, Relaxed);
+    }
+}
+
+pub fn has_hardware_keyboard() -> bool {
+    HAS_HW_KB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn has_hardware_mouse() -> bool {
+    HAS_HW_MOUSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_kbm_active(on: bool) {
+    ACTIVE_KBM.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn kbm_active() -> bool {
+    ACTIVE_KBM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn env_touch_override() -> Option<bool> {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| match std::env::var("RUSTUDIO_TOUCH").as_deref() {
+        Ok("0") | Ok("off") | Ok("false") => Some(false),
+        Ok("1") | Ok("on") | Ok("true") => Some(true),
+        _ => None,
+    })
+}
+
 pub fn game_touch() -> bool {
     #[cfg(test)]
     if let Some(v) = TEST_GAME_TOUCH.with(|c| c.get()) {
         return v;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("RUSTUDIO_TOUCH").as_deref() {
-        Ok("0") | Ok("off") | Ok("false") => false,
-        Ok("1") | Ok("on") | Ok("true") => true,
-        _ => cfg!(target_os = "android"),
-    })
+    match env_touch_override() {
+        Some(v) => v,
+        None => cfg!(target_os = "android") && !kbm_active(),
+    }
 }
 
 #[cfg(test)]

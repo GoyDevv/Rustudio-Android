@@ -753,8 +753,7 @@ impl Editor {
                 self.open_insert_popup(parent, at);
             }
             RowAction::ImportModel(parent) => {
-                self.game.doc.selection = vec![parent];
-                self.insert_from_file();
+                self.insert_from_file_into(Some(parent));
             }
             RowAction::SaveSelection => self.save_selection(),
             RowAction::GroupFolder => {

@@ -24,6 +24,19 @@ pub fn platform_locks() -> bool {
 }
 
 static LOCKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static CAPTURE_FN: std::sync::OnceLock<fn(bool)> = std::sync::OnceLock::new();
+
+/// Installs the platform pointer-capture callback (Android API 26+ View.requestPointerCapture).
+pub fn install_capture(f: fn(bool)) {
+    let _ = CAPTURE_FN.set(f);
+}
+
+/// Engages or releases platform pointer capture when a capture hook is installed.
+pub fn set_captured(on: bool) {
+    if let Some(f) = CAPTURE_FN.get() {
+        f(on);
+    }
+}
 
 /// The window's real backend, once it exists (app.rs, from its raw window
 /// handle): Some(true) on Wayland. Better than the environment guess (a

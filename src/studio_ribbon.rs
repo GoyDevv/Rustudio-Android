@@ -234,6 +234,11 @@ impl Editor {
             self.plugins_tab_hidden();
         }
         let a = &mut act;
+        egui::ScrollArea::horizontal()
+            .id_salt(("studio_ribbon_scroll", self.ui.tab as u8))
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
             match self.ui.tab {
@@ -352,6 +357,7 @@ impl Editor {
                 // Plugins Folder are in the Plugins menu): src/plugin_host/ui_ribbon.rs.
                 RibbonTab::Plugins => self.plugins_ribbon(ui),
             }
+        });
         });
         self.ribbon_color_popup(&ctx);
         if let Some(a) = act {

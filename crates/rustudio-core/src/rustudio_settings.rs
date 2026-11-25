@@ -348,6 +348,28 @@ pub const OPTS: &[Opt] = &[
         kind: OptKind::Bool,
     },
     Opt {
+        key: "ui_scale",
+        cat: "Interface",
+        label: "Editor UI size",
+        desc: "Scales menus, ribbon, and tool panels (50%–200%). Auto picks a size for your screen DPI.",
+        env: "RUSTUDIO_UI_SCALE",
+        kind: OptKind::Choice(&[
+            ("auto", "Auto"),
+            ("50", "50%"),
+            ("60", "60%"),
+            ("70", "70%"),
+            ("75", "75%"),
+            ("85", "85%"),
+            ("100", "100%"),
+            ("115", "115%"),
+            ("125", "125%"),
+            ("140", "140%"),
+            ("150", "150%"),
+            ("175", "175%"),
+            ("200", "200%"),
+        ]),
+    },
+    Opt {
         key: "solver",
         cat: "Physics",
         label: "Physics solver",
@@ -1108,11 +1130,47 @@ pub fn set_texture_quality_choice(id: &str) {
     set_choice("texture_quality", id, "high");
 }
 
+const UI_SCALE_CHOICES: &[&str] = &["auto", "50", "60", "70", "75", "85", "100", "115", "125", "140", "150", "175", "200"];
+
+pub fn ui_scale() -> Option<f32> {
+    let raw = std::env::var("RUSTUDIO_UI_SCALE")
+        .ok()
+        .or_else(|| saved("ui_scale").and_then(|v| v.as_str().map(str::to_string)));
+    match raw.as_deref().map(str::trim) {
+        None | Some("") | Some("auto") | Some("Auto") => None,
+        Some(s) => s
+            .trim_end_matches('%')
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 50.0 && *v <= 200.0)
+            .map(|pct| (pct / 100.0).clamp(0.50, 2.00)),
+    }
+}
+
+pub fn set_ui_scale(scale: Option<f32>) {
+    match scale {
+        None => set_choice("ui_scale", "auto", "auto"),
+        Some(s) => {
+            let pct = (s.clamp(0.50, 2.00) * 100.0).round() as u32;
+            let val = pct.to_string();
+            set_choice("ui_scale", &val, "auto");
+        }
+    }
+}
+
+pub fn ui_scale_choice_index() -> usize {
+    let Some(s) = ui_scale() else { return 0; };
+    let pct = (s * 100.0).round() as u32;
+    let key = pct.to_string();
+    UI_SCALE_CHOICES.iter().position(|&c| c == key).unwrap_or(6)
+}
+
 pub fn shown(o: &Opt) -> Shown {
     match o.key {
         "perf_overlay" => Shown::Bool(perf_overlay_enabled()),
         "mobile_floating_windows" => Shown::Bool(mobile_floating_windows()),
         "editor_joystick" => Shown::Bool(joystick_enabled()),
+        "ui_scale" => Shown::Choice(ui_scale_choice_index()),
         key if o.cat == "Performance" && matches!(o.kind, OptKind::Choice(_)) => Shown::Choice(performance_choice(key)),
         "solver" => Shown::Choice(if solver_now() == SolverKind::Rapier { 1 } else { 0 }),
         "spin_guard" => Shown::Bool(spin_guard_now()),

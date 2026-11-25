@@ -141,7 +141,11 @@ impl Game {
         #[cfg(target_os = "android")]
         {
             let _ = ctx;
-            drop(cmd);
+            if let egui::ViewportCommand::CursorGrab(mode) = cmd {
+                let want = !matches!(mode, egui::viewport::CursorGrab::None)
+                    && rustudio_engine::touch_input::kbm_active();
+                rustudio_engine::mouse_lock::set_captured(want);
+            }
             return;
         }
         #[cfg(not(target_os = "android"))]
@@ -601,10 +605,27 @@ impl Game {
             self.lighting.lightgrid_dirty = true;
             self.lighting.lightocc_dirty = true;
         } else if !changes.moved.is_empty() {
-            // Moving parts (characters, zombies, physics) refresh the grid
-            // on a slower clock: a rebuild gathers every part around it.
-            self.lighting.lightgrid_moves = true;
-            self.lighting.lightocc_dirty = true;
+            // On Android Playtest, ignore character-rig-only idle/walk motion so
+            // Motor6D breathing does not trigger 0.5s/1.5s lightgrid/lightocc stutter spikes.
+            let non_char_moved = if cfg!(target_os = "android") && self.is_playing() {
+                let char_model = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
+                changes.moved.iter().any(|&r| {
+                    char_model.is_none_or(|cm| {
+                        let mut cur = r;
+                        while let Some(inst) = self.doc.dom.get_by_ref(cur) {
+                            if cur == cm { return false; }
+                            cur = inst.parent();
+                        }
+                        true
+                    })
+                })
+            } else {
+                true
+            };
+            if non_char_moved {
+                self.lighting.lightgrid_moves = true;
+                self.lighting.lightocc_dirty = true;
+            }
         }
         let regen = self.asset_gen != self.draws_asset_gen;
         if regen && !layered {

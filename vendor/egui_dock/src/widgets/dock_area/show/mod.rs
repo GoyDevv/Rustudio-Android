@@ -487,6 +487,10 @@ impl<Tab> DockArea<'_, Tab> {
                 let mut expand = Vec2::ZERO;
                 expand.dim_point += style.separator.extra_interact_width / 2.0;
                 let interact_rect = separator.expand2(expand);
+                ui.ctx().data_mut(|d| {
+                    d.get_temp_mut_or_default::<Vec<Rect>>(egui::Id::new("egui_dock_separator_rects"))
+                        .push(interact_rect);
+                });
 
                 let response = ui.allocate_rect(interact_rect, Sense::click_and_drag())
                     .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]});

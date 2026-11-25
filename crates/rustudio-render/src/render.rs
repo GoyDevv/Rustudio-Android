@@ -5094,6 +5094,11 @@ impl Renderer {
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
     ) {
+        let has_fx = fx.is_some_and(|f| !f.draws.is_empty());
+        let has_gui = batches.iter().any(|b| !b.indices.is_empty());
+        if !has_fx && !has_gui {
+            return;
+        }
         let Some(t) = self.target.as_ref() else { return };
         let pass = self.world_gui[sample_slot(t.samples)]
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));

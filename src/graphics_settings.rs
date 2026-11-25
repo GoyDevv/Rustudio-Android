@@ -68,6 +68,34 @@ impl Editor {
             rustudio_core::rustudio_settings::set_mobile_floating_windows(float_win);
         }
         ui.separator();
+        ui.label(RichText::new("Editor UI Size").strong());
+        let screen = ui.ctx().content_rect();
+        let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0).max(0.5);
+        let longer_px = screen.width().max(screen.height()) * ui.ctx().pixels_per_point();
+        let min_comfortable = (longer_px / (native_ppp * 1100.0)).clamp(0.75, 1.60) * 0.72;
+        ui.horizontal(|ui| {
+            let mut pct = (self.ui.zoom * 100.0).round().clamp(50.0, 200.0);
+            let resp = ui.add(
+                egui::Slider::new(&mut pct, 50.0..=200.0)
+                    .step_by(5.0)
+                    .suffix("%")
+                    .text("Custom"),
+            );
+            if resp.changed() {
+                let z = (pct / 100.0).clamp(0.50, 2.00);
+                self.ui.zoom = z;
+                self.auto_zoom = false;
+                rustudio_core::rustudio_settings::set_ui_scale(Some(z));
+            }
+            if ui.button("Auto").clicked() {
+                rustudio_core::rustudio_settings::set_ui_scale(None);
+                self.auto_zoom = true;
+            }
+        });
+        if self.ui.zoom < min_comfortable {
+            ui.label(RichText::new("⚠ Current UI size may be too small for your screen").small().color(egui::Color32::from_rgb(245, 190, 70)));
+        }
+        ui.separator();
         ui.label(RichText::new("Editor Virtual Joystick & Touch Look").strong());
         let mut joy_on = rustudio_core::rustudio_settings::joystick_enabled();
         if ui.checkbox(&mut joy_on, "Enable Left-Side Editor Virtual Joystick").changed() {

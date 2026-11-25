@@ -43,6 +43,9 @@ fn shared_storage() -> PathBuf {
 
 fn roots(storage_access: bool) -> Vec<Root> {
     let mut v = vec![Root { label: "rustudio", path: super::data_dir() }];
+    let imported = super::files_dir().join("Imported");
+    let _ = std::fs::create_dir_all(&imported);
+    v.push(Root { label: "Imported", path: imported });
     if super::data_dir() != super::files_dir() {
         v.push(Root { label: "App data", path: super::files_dir() });
     }

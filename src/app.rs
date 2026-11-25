@@ -318,6 +318,7 @@ pub struct Editor {
     pub touch_look: crate::editor_joystick::TouchLookController,
     /// Screen rects occupied by in-viewport floating mobile windows this frame.
     pub mobile_window_rects: Vec<egui::Rect>,
+    pub mobile_drag_rects: Vec<egui::Rect>,
     /// Real-time performance metrics & HUD overlay (FPS, 1% low, CPU/GPU ms, memory).
     pub perf_overlay: crate::perf_overlay::PerfOverlay,
     /// Play Fills the Screen's Stop button is pressed (`play_stop_button`:
@@ -551,6 +552,7 @@ impl RustudioApp {
             editor_joystick: crate::editor_joystick::EditorJoystick::new(),
             touch_look: crate::editor_joystick::TouchLookController::new(),
             mobile_window_rects: Vec::new(),
+            mobile_drag_rects: Vec::new(),
             perf_overlay: crate::perf_overlay::PerfOverlay::default(),
             stop_pressed: false,
             full_pressed: false,
@@ -1101,10 +1103,16 @@ impl Editor {
             return;
         };
         match purpose {
-            Purpose::OpenPlace => self.open_path(path),
+            Purpose::OpenPlace => {
+                if Self::is_model_file(&path) {
+                    self.insert_model_file_into(path, Some(self.game.doc.default_parent()));
+                } else {
+                    self.open_path(path);
+                }
+            }
             Purpose::OpenFolder => self.open_folder(path, true),
             Purpose::SaveAs => self.save_to(path),
-            Purpose::InsertModel => self.insert_model_file(path),
+            Purpose::InsertModel(parent) => self.insert_model_file_into(path, parent),
             Purpose::SaveSelection(sel) => match self.game.doc.save_selection_to(&sel, &path) {
                 Ok(()) => self.info(format!("Saved selection to {}", path.display())),
                 Err(e) => self.error(format!("Save failed: {e}")),
@@ -1181,23 +1189,49 @@ impl Editor {
         }
     }
 
+    pub(crate) fn is_model_file(path: &std::path::Path) -> bool {
+        matches!(Document::kind_for(path), Some((rustudio_core::doc::DocKind::Model, _)))
+    }
+
     pub fn insert_from_file(&mut self) {
+        self.insert_from_file_into(None);
+    }
+
+    pub fn insert_from_file_into(&mut self, parent: Option<Ref>) {
         use crate::file_dialog::{Kind, Purpose};
-        let d = crate::file_dialog::Request::new().add_filter("Roblox model", &["rbxm", "rbxmx"]);
-        self.dialogs.start(Purpose::InsertModel, d, Kind::PickFile);
+        let d = crate::file_dialog::Request::new()
+            .set_title("Insert from File")
+            .add_filter("Roblox model", &["rbxm", "rbxmx"]);
+        self.dialogs.start(Purpose::InsertModel(parent), d, Kind::PickFile);
     }
 
     pub(crate) fn insert_model_file(&mut self, path: PathBuf) {
+        self.insert_model_file_into(path, None);
+    }
+
+    pub(crate) fn insert_model_file_into(&mut self, path: PathBuf, explicit_parent: Option<Ref>) {
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let parent = self.paste_target(false);
+                let target = explicit_parent
+                    .filter(|&r| self.game.doc.exists(r))
+                    .unwrap_or_else(|| self.paste_target(true));
+                let parent = if target == self.game.doc.dom.root_ref() {
+                    self.game.doc.default_parent()
+                } else {
+                    target
+                };
                 let refs = self.game.doc.paste(&bytes, parent, "Insert from file");
-                self.info(format!(
-                    "Inserted {} object(s) from {}",
-                    refs.len(),
-                    path.display()
-                ));
-                self.select(refs);
+                if refs.is_empty() {
+                    self.error(format!("Could not decode Roblox model {}", path.display()));
+                } else {
+                    self.explorer.expanded.insert(parent);
+                    self.info(format!(
+                        "Inserted {} object(s) from {}",
+                        refs.len(),
+                        path.display()
+                    ));
+                    self.select(refs);
+                }
             }
             Err(e) => self.error(format!("{}: {e}", path.display())),
         }
@@ -1871,7 +1905,7 @@ impl Editor {
                 "Snap off".into()
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("{:.0} fps", self.fps)).color(theme::TEXT_DIM));
+                ui.label(RichText::new(if self.fps >= 0.5 { format!("{:.0} fps", self.fps) } else { "idle".into() }).color(theme::TEXT_DIM));
             });
         });
     }
@@ -2079,6 +2113,16 @@ impl TabViewer for Viewer<'_> {
     fn on_pop_out(&mut self, tab: &mut Tab) {
         use crate::panels::DockMove;
         self.ed.ui.dock_moves.push(if self.window.is_some() { DockMove::DockBack(*tab) } else { DockMove::PopOut(*tab) });
+    }
+
+    fn show_minimize_button(&self, tab: &Tab) -> bool {
+        *tab != Tab::Viewport
+    }
+
+    fn on_minimize(&mut self, tab: &mut Tab) {
+        if *tab != Tab::Viewport {
+            self.ed.ui.minimize_requests.push(*tab);
+        }
     }
 
     fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
@@ -2599,7 +2643,11 @@ impl RustudioApp {
         #[cfg(target_os = "android")]
         {
             for p in crate::android::storage::take_opened() {
-                ed.request(PendingAction::Open(Some(p)));
+                if Editor::is_model_file(&p) {
+                    ed.insert_model_file_into(p, Some(ed.game.doc.default_parent()));
+                } else {
+                    ed.request(PendingAction::Open(Some(p)));
+                }
             }
             crate::android::storage::settle();
         }
@@ -2635,7 +2683,7 @@ impl RustudioApp {
                 std::time::Duration::from_secs_f32(1.0 / hz),
             );
         }
-        let causes = ctx.repaint_causes();
+        let _causes = ctx.repaint_causes();
         let now = Instant::now();
         let dt = now.duration_since(ed.last_frame).as_secs_f32();
         ed.last_frame = now;
@@ -2647,10 +2695,15 @@ impl RustudioApp {
         // phone, where no pointer hovers, a still editor's few frames a
         // second are its idleness, not its frame rate.
         // (a frame longer than this follows an idle pause, not slow drawing)
-        const IDLE_PAUSE_S: f32 = 0.1;
-        let timed = !ctx.requested_repaint_last_pass() && !causes.is_empty();
-        if dt > 0.0 && dt < IDLE_PAUSE_S && !timed {
-            ed.fps = ed.fps * 0.9 + (1.0 / dt) * 0.1;
+        const IDLE_PAUSE_S: f32 = 0.25;
+        let continuous = ed.game.play.is_some() || ctx.requested_repaint_last_pass();
+        let is_idle_gap = !continuous && dt >= IDLE_PAUSE_S;
+        if dt > 0.0 && !is_idle_gap && dt < 2.0 {
+            let prev_dt = if ed.fps > 0.5 { 1.0 / ed.fps } else { dt };
+            let avg_dt = prev_dt * 0.85 + dt * 0.15;
+            ed.fps = if avg_dt > 0.0 { 1.0 / avg_dt } else { 0.0 };
+        } else if is_idle_gap {
+            ed.fps = 0.0;
         }
         ed.hud = HudStats::default();
         ed.game.poll_assets();
@@ -2665,24 +2718,27 @@ impl RustudioApp {
             ed.play_tick(&ctx, step);
         }
         self.watchdog.stage("Play tick", "plugins");
-        if ctx.input(|i| i.viewport().visible() != Some(false)) {
-            if !std::mem::take(&mut self.plugins_ticked_between_frames) {
-                Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
-                ed.edit_audio_tick();
+        if !self.play_fills_screen() {
+            let ed = &mut self.ed;
+            if ctx.input(|i| i.viewport().visible() != Some(false)) {
+                if !std::mem::take(&mut self.plugins_ticked_between_frames) {
+                    Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
+                    ed.edit_audio_tick();
+                }
+                Self::schedule_plugin_repaint(ed, &ctx);
             }
-            Self::schedule_plugin_repaint(ed, &ctx);
-        }
-        self.watchdog.stage("plugins", "project and scene synchronization");
-        ed.project_tick();
-        ed.file_sync_tick();
-        ed.template_preview_tick();
-        ed.plugins_tick();
-        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
-            ed.toolbox_tick(&ctx);
-        }
-        ed.asset_manager_tick(&ctx);
-        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
-            ed.toolbox_harness_tick();
+            self.watchdog.stage("plugins", "project and scene synchronization");
+            ed.project_tick();
+            ed.file_sync_tick();
+            ed.template_preview_tick();
+            ed.plugins_tick();
+            if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+                ed.toolbox_tick(&ctx);
+            }
+            ed.asset_manager_tick(&ctx);
+            if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+                ed.toolbox_harness_tick();
+            }
         }
         if self.ed.harness.run.no_ui {
             self.no_ui_frame(ui, &ctx, frame_start, dt);
@@ -2756,6 +2812,10 @@ impl RustudioApp {
 
         self.reset_document_tabs();
         let ed = &mut self.ed;
+        if let Some(scale) = rustudio_core::rustudio_settings::ui_scale() {
+            ed.ui.zoom = scale;
+            ed.auto_zoom = false;
+        }
         if (ctx.zoom_factor() - ed.ui.zoom).abs() > 1e-3 {
             ctx.set_zoom_factor(ed.ui.zoom);
         }
@@ -2819,6 +2879,45 @@ impl RustudioApp {
                         .inner_margin(egui::Margin::symmetric(8, 3)),
                 )
                 .show(ui, |ui| ed.status_bar(ui));
+            let min_floating = self.mobile_windows.minimized_windows();
+            if !self.ed.ui.minimized_tabs.is_empty() || !min_floating.is_empty() {
+                egui::Panel::bottom("minimized_windows_bar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL)
+                            .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                            .inner_margin(egui::Margin::symmetric(8, 3)),
+                    )
+                    .show(ui, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("minimized_windows_scroll")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Minimized:").small().color(theme::TEXT_DIM));
+                                    let docked_min = self.ed.ui.minimized_tabs.clone();
+                                    for tab in docked_min {
+                                        if ui.button(format!("▴ {}", tab.title())).clicked() {
+                                            self.ed.ui.restore_requests.push(tab);
+                                        }
+                                    }
+                                    for (id, title, _tab) in &min_floating {
+                                        if ui.button(format!("▴ {title}")).clicked() {
+                                            self.mobile_windows.restore(id);
+                                        }
+                                    }
+                                    let total_min = self.ed.ui.minimized_tabs.len() + min_floating.len();
+                                    if total_min >= 2 && ui.button("Restore All").clicked() {
+                                        let all: Vec<Tab> = self.ed.ui.minimized_tabs.clone();
+                                        self.ed.ui.restore_requests.extend(all);
+                                        for (id, _, _) in &min_floating {
+                                            self.mobile_windows.restore(id);
+                                        }
+                                    }
+                                });
+                            });
+                    });
+            }
         }
 
         // Editor::start_run requests this when a playtest begins.
@@ -2828,6 +2927,18 @@ impl RustudioApp {
             }
         }
 
+        self.ed.mobile_window_rects = self.mobile_windows.hit_rects();
+        let mut drag_rects = self.mobile_windows.drag_handle_rects();
+        let sep_rects = ctx.data_mut(|d| {
+            std::mem::take(d.get_temp_mut_or_default::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects")))
+        });
+        drag_rects.extend(sep_rects);
+        if self.ed.ui.studio_settings.open {
+            if let Some(r) = self.ed.ui.studio_settings.rect {
+                drag_rects.push(egui::Rect::from_min_max(r.min, egui::Pos2::new(r.max.x, (r.min.y + 36.0).min(r.max.y))));
+            }
+        }
+        self.ed.mobile_drag_rects = drag_rects;
         let _dock_scope = rustudio_core::bench::scope("dock_panels");
         let windows: Vec<(String, String)> = if self.panels.popped.is_empty() {
             Vec::new()
@@ -2861,9 +2972,34 @@ impl RustudioApp {
         self.mobile_windows.set_touch_mode(
             cfg!(target_os = "android") || rustudio_core::rustudio_settings::mobile_floating_windows(),
         );
+        // Process docked minimize / restore requests.
+        let min_reqs = std::mem::take(&mut self.ed.ui.minimize_requests);
+        for tab in min_reqs {
+            if tab == Tab::Viewport { continue; }
+            crate::panels::record_homes(&self.dock, &mut self.panels.homes);
+            if let Some(loc) = self.dock.find_tab(&tab) {
+                self.dock.remove_tab(loc);
+            }
+            if !self.ed.ui.minimized_tabs.contains(&tab) {
+                self.ed.ui.minimized_tabs.push(tab);
+            }
+        }
+        let restore_reqs = std::mem::take(&mut self.ed.ui.restore_requests);
+        for tab in restore_reqs {
+            self.ed.ui.minimized_tabs.retain(|t| *t != tab);
+            if self.dock.find_tab(&tab).is_none() {
+                let mut homes = self.panels.homes.clone();
+                homes.remove("__topology");
+                crate::panels::place(&mut self.dock, tab, &homes);
+            }
+        }
+        let modal_open = self.ed.ui.studio_settings.open
+            || self.ed.ui.graphics_settings
+            || self.ed.ui.about
+            || self.ed.confirm_discard.is_some();
         let mobile_actions = {
             let mut viewer = Viewer { ed: &mut self.ed, window: None, windows: &windows };
-            self.mobile_windows.show(&ctx, dock_rect, |ui, tab| viewer.ui(ui, tab))
+            self.mobile_windows.show(&ctx, dock_rect, modal_open, |ui, tab| viewer.ui(ui, tab))
         };
         for action in mobile_actions {
             match action {
@@ -2876,6 +3012,7 @@ impl RustudioApp {
             }
         }
         self.ed.mobile_window_rects = self.mobile_windows.hit_rects();
+        self.ed.mobile_drag_rects = self.mobile_windows.drag_handle_rects();
         self.reset_document_tabs();
         // Window > Explorer / Properties / Output / Avatar Settings toggles
         // (in a panel window too), new panels where Studio docks them
@@ -3069,7 +3206,9 @@ impl RustudioApp {
                 ed.game.last_render_target[0],
                 ed.game.last_render_target[1],
             );
-            ed.perf_overlay.record_frame_auto_gpu(dt * 1000.0, work_ms);
+            if ed.game.play.is_some() || dt < 0.25 {
+                ed.perf_overlay.record_frame_auto_gpu(dt * 1000.0, work_ms);
+            }
         }
         if rustudio_core::profiler::active() {
             rustudio_player::profiler_counters::sample(&ed.game);
@@ -3095,12 +3234,15 @@ impl RustudioApp {
             || (ed.game.play.is_none() && ed.game.edit_audio.has_active())
             || ed.game.assets.busy()
             || ed.game.textures.decoding()
+            || ed.game.asset_gen != ed.game.draws_asset_gen
             || ctx.input(|i| i.pointer.any_down() || !i.keys_down.is_empty())
             || ed.harness.run.screenshot.is_some()
             || ed.harness.selftest.is_some()
             || ed.game.account.busy()
         {
             ctx.request_repaint();
+        } else if ed.fps >= 0.5 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
         // Text copied this frame goes to the system clipboard too; a long
         // press on a text field has its Cut / Copy / Paste menu.

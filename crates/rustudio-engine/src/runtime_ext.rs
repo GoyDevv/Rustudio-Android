@@ -4849,7 +4849,8 @@ fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option
         ("UserInputService", "ModalEnabled") => stored_or(lua, r, key, |_| Ok(Value::Boolean(false))),
         ("UserInputService", "AccelerometerEnabled") => b(crate::device_sensors::available().0),
         ("UserInputService", "GyroscopeEnabled") => b(crate::device_sensors::available().1),
-        ("UserInputService", "KeyboardEnabled" | "MouseEnabled") => b(!touch),
+        ("UserInputService", "KeyboardEnabled") => b(!touch || crate::touch_input::has_hardware_keyboard()),
+        ("UserInputService", "MouseEnabled") => b(!touch || crate::touch_input::has_hardware_mouse()),
         ("UserInputService", "PreferredInput") => {
             Ok(Some(enum_item(lua, "PreferredInput", if touch { "Touch" } else { "KeyboardAndMouse" })?))
         }

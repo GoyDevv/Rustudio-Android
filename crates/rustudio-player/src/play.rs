@@ -4260,7 +4260,7 @@ impl Game {
                 };
                 rt.spawn_global("__rs_input_frame_end", vec![Value::Number(dt as f64)]);
                 // The device's motion sensors' new samples (touch screens).
-                if rustudio_engine::touch_input::game_touch() {
+                if rustudio_engine::device_sensors::available() != (false, false) {
                     rt.spawn_global("__rs_sensor_frame", vec![]);
                 }
                 // A press reaches UserInputService.InputBegan before the GUI's

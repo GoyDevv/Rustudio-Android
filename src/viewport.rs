@@ -584,10 +584,10 @@ impl Editor {
                 self.last_zoom = Some((ray.dir, hit));
             }
         }
-        if !driving && !over_selector {
+        if !driving && (!over_selector || self.game.look_grab.is_some()) {
             let look = self.game.update_look_grab(&ctx, &resp, delta);
             if let Some(d) = look {
-                let sens = if self.game.touch.last_touch.is_some() {
+                let sens = if self.game.touch.mode() == Some(rustudio_engine::touch_input::Mode::Look) {
                     self.joystick_config.clamped().look_sensitivity
                 } else {
                     1.0
@@ -604,11 +604,11 @@ impl Editor {
         // Editor virtual joystick (left side) & right-side touch camera rotation (Edit mode only).
         self.joystick_config.enabled = rustudio_core::rustudio_settings::joystick_enabled();
         let joystick_cfg = self.joystick_config;
-        let joystick_zone = if !driving && joystick_cfg.enabled {
-            Some(crate::editor_joystick::joystick_rect(rect, &joystick_cfg))
-        } else {
-            None
-        };
+        let show_joystick = !driving && joystick_cfg.enabled && !rustudio_engine::touch_input::kbm_active();
+        if self.editor_joystick.update_fade(show_joystick, dt) {
+            ctx.request_repaint();
+        }
+        let joystick_zone = show_joystick.then(|| crate::editor_joystick::joystick_rect(rect, &joystick_cfg));
         if driving {
             self.editor_joystick.reset();
             self.touch_look.reset();
@@ -622,11 +622,17 @@ impl Editor {
                     })
                     .collect()
             });
-            for (tid, phase, pos) in touch_events {
-                if self.mobile_window_rects.iter().any(|r| r.contains(pos)) {
-                    continue;
+            if show_joystick {
+                for (tid, phase, pos) in touch_events {
+                    if self.mobile_window_rects.iter().any(|r| r.contains(pos))
+                        || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
+                    {
+                        continue;
+                    }
+                    let _ = self.editor_joystick.handle_touch(tid, phase, pos, rect, driving, &joystick_cfg);
                 }
-                let _ = self.editor_joystick.handle_touch(tid, phase, pos, rect, driving, &joystick_cfg);
+            } else {
+                self.editor_joystick.reset();
             }
             if self.editor_joystick.apply_to_camera(
                 &mut self.game.cam,
@@ -736,9 +742,11 @@ impl Editor {
             // The parts of the ViewportFrames the GUI drew last frame
             // (plus Toolbox detail previews, plugin widgets, and pending
             // ViewportFrame:CaptureSnapshotAsync requests).
-            self.toolbox_vf = if self
-                .builtin_tools
-                .use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox)
+            let hide_editor_vf = self.game.is_playing() && self.ui.play_full && !self.play_full_exit;
+            self.toolbox_vf = if !hide_editor_vf
+                && self
+                    .builtin_tools
+                    .use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox)
             {
                 self.toolbox.preview.frames(&mut self.game.doc)
             } else {
@@ -746,7 +754,9 @@ impl Editor {
             };
             let mut roots = self.game.gui.viewport_frames().clone();
             roots.extend(self.toolbox_vf.keys().copied());
-            self.plugin_ui.collect_viewport_frames(&mut roots);
+            if !hide_editor_vf {
+                self.plugin_ui.collect_viewport_frames(&mut roots);
+            }
             for &(_, vf) in &vf_snaps {
                 roots.insert(vf);
             }
@@ -786,17 +796,17 @@ impl Editor {
             // fingers. (Carrying the last frame's list over kept every frame's
             // rects for the whole session: a few more each frame, never dropped.)
             let mut ui = Vec::with_capacity(
-                (if game { 8 } else { 0 }) + self.mobile_window_rects.len() + usize::from(joystick_zone.is_some()),
+                (if game { 8 } else { 0 }) + usize::from(joystick_zone.is_some()),
             );
             if let Some(jr) = joystick_zone {
                 ui.push(jr);
             }
-            ui.extend(self.mobile_window_rects.iter().copied());
             self.game.touch.zones = rustudio_engine::touch_input::Zones {
                 viewport: if menu_open { egui::Rect::NOTHING } else { visible },
                 playing: driving,
                 game,
                 ui,
+                direct_drag: self.mobile_drag_rects.clone(),
                 stick,
                 jump,
                 handle_hover: hover_handle.is_some() || self.drag.is_some(),
@@ -1024,7 +1034,7 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
+        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !pointer_on_joystick && !pointer_on_mobile_win {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self.game

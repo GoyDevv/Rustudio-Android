@@ -159,6 +159,10 @@ pub fn run(app: AndroidApp) {
     // The motion sensors behind UserInputService (sensors.rs), for the
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());
+    rustudio_engine::mouse_lock::install_capture(jni::set_pointer_capture);
+    if let Ok(hw) = jni::hardware_input_devices() {
+        rustudio_engine::touch_input::set_hardware_kbm(hw.keyboard, hw.mouse);
+    }
     // The navigation and status bars out of the way (immersive mode), on
     // the main thread when it gets to it; the window grows to the screen.
     system_bars::hide();
@@ -451,7 +455,8 @@ pub mod touch {
     pub fn setup(app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
         let saved = crate::layout_store::load();
         // (the window's size isn't known until the first frame: auto_zoom)
-        app.ed.auto_zoom = saved.as_ref().and_then(|l| l.zoom).is_none();
+        let explicit_scale = rustudio_core::rustudio_settings::ui_scale();
+        app.ed.auto_zoom = explicit_scale.is_none() && saved.as_ref().and_then(|l| l.zoom).is_none();
         ctx.options_mut(|o| {
             // A finger lands less precisely than a pointer: a press that
             // drifts this far is still a tap.
@@ -476,6 +481,22 @@ pub mod touch {
     /// across the longer side of the screen (landscape), once per fresh
     /// layout.
     pub fn auto_zoom(ed: &mut crate::app::Editor, ctx: &egui::Context) {
+        // Throttled hardware KBM hot-plug poll (every ~2s).
+        static LAST_KBM_POLL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        if let Ok(mut g) = LAST_KBM_POLL.try_lock() {
+            let due = g.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
+            if due {
+                *g = Some(std::time::Instant::now());
+                if let Ok(hw) = super::jni::hardware_input_devices() {
+                    rustudio_engine::touch_input::set_hardware_kbm(hw.keyboard, hw.mouse);
+                }
+            }
+        }
+        if let Some(scale) = rustudio_core::rustudio_settings::ui_scale() {
+            ed.ui.zoom = scale;
+            ed.auto_zoom = false;
+            return;
+        }
         if !ed.auto_zoom {
             return;
         }

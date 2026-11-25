@@ -93,6 +93,9 @@ pub struct UiState {
     /// Main-window tabs in a floating window inside it (their pop-out
     /// button docks them back).
     pub floating_tabs: Vec<Tab>,
+    pub minimized_tabs: Vec<Tab>,
+    pub minimize_requests: Vec<Tab>,
+    pub restore_requests: Vec<Tab>,
     /// The panel windows last frame: key and tabs (menus and the self-test).
     pub popped: Vec<(String, Vec<Tab>)>,
     /// The tabs in the 3D view's tab group last frame.
@@ -128,6 +131,9 @@ impl Default for UiState {
             panels_open: HashSet::new(),
             dock_moves: Vec::new(),
             floating_tabs: Vec::new(),
+            minimized_tabs: Vec::new(),
+            minimize_requests: Vec::new(),
+            restore_requests: Vec::new(),
             popped: Vec::new(),
             viewport_group: Vec::new(),
             viewport_hidden: false,

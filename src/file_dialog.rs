@@ -29,7 +29,7 @@ pub enum Purpose {
     OpenPlace,
     OpenFolder,
     SaveAs,
-    InsertModel,
+    InsertModel(Option<Ref>),
     /// The selection when the dialog opened.
     SaveSelection(Vec<Ref>),
     /// Plugins > Save as Local Plugin: the selection when the dialog opened.

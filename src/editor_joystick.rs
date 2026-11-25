@@ -147,6 +147,8 @@ pub struct EditorJoystick {
     raw_deflection: Vec2,
     /// Smoothed velocity in `[-1.0, 1.0]` (length `<= 1.0`).
     velocity: Vec2,
+    /// 0.0 = visible (touch), 1.0 = faded out (KBM).
+    hidden_fade: f32,
 }
 
 impl EditorJoystick {
@@ -432,6 +434,19 @@ impl EditorJoystick {
     /// Renders the compact, translucent virtual joystick (outer ring, dead-zone
     /// guide, cardinal tick marks, and soft glowing knob) inside `viewport_rect`.
     /// Draws nothing in Play mode or when disabled.
+    /// Advances smooth fade-in (touch) / fade-out (KBM); returns true while animating.
+    pub fn update_fade(&mut self, visible: bool, dt: f32) -> bool {
+        let target = if visible { 0.0 } else { 1.0 };
+        let diff = target - self.hidden_fade;
+        if diff.abs() < 0.01 {
+            self.hidden_fade = target;
+            return false;
+        }
+        let step = (dt.clamp(0.0, 0.1) * 5.0).min(1.0);
+        self.hidden_fade = (self.hidden_fade + diff * step).clamp(0.0, 1.0);
+        true
+    }
+
     pub fn draw(
         &self,
         painter: &Painter,
@@ -439,7 +454,8 @@ impl EditorJoystick {
         playing: bool,
         config: &JoystickConfig,
     ) {
-        if playing || !config.enabled {
+        let vis = 1.0 - self.hidden_fade;
+        if playing || !config.enabled || vis <= 0.01 {
             return;
         }
         let base = Self::base_rect(viewport_rect, config);
@@ -448,11 +464,11 @@ impl EditorJoystick {
         }
         let cfg = config.clamped();
         let active = self.is_active();
-        let alpha = if active {
+        let alpha = (if active {
             (cfg.opacity + 0.22).min(1.0)
         } else {
             cfg.opacity
-        };
+        }) * vis;
         let a = |factor: f32| -> u8 { (alpha * factor * 255.0).round().clamp(0.0, 255.0) as u8 };
 
         let center = base.center();

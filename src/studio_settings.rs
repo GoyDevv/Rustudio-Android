@@ -677,6 +677,11 @@ impl Dialog {
         }
         let mut close = false;
         let resp = win.show(ctx, |ui| close = self.body(ui));
+        if let Some(r) = &resp {
+            if !egui::Popup::is_any_open(ctx) {
+                ctx.move_to_top(r.response.layer_id);
+            }
+        }
         self.rect = resp.map(|r| r.response.rect);
         if !open || close {
             self.open = false;
@@ -1214,13 +1219,36 @@ impl Dialog {
                     }
                 }
                 (OptKind::Choice(items), Shown::Choice(sel)) => {
-                    let text = items.get(sel).map(|x| x.1).unwrap_or("");
-                    p.text(Pos2::new(vx + 3.0, top.center().y), egui::Align2::LEFT_CENTER, text, font.clone(), tc);
+                    let screen = ui.ctx().content_rect();
+                    let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0).max(0.5);
+                    let longer_px = screen.width().max(screen.height()) * ui.ctx().pixels_per_point();
+                    let min_comfortable_scale = (longer_px / (native_ppp * 1100.0)).clamp(0.75, 1.60) * 0.72;
+                    let fmt_item = |val: &str, label: &str| -> String {
+                        if o.key == "ui_scale" && val != "auto" {
+                            if let Ok(pct) = val.parse::<f32>() {
+                                if (pct / 100.0) < min_comfortable_scale {
+                                    return format!("{label} (too small for your screen)");
+                                }
+                            }
+                        }
+                        label.to_string()
+                    };
+                    let text = items
+                        .get(sel)
+                        .map(|x| fmt_item(x.0, x.1))
+                        .unwrap_or_else(|| {
+                            if o.key == "ui_scale" {
+                                rs::ui_scale().map_or_else(|| "Auto".into(), |s| format!("{:.0}% (Custom)", s * 100.0))
+                            } else {
+                                String::new()
+                            }
+                        });
+                    p.text(Pos2::new(vx + 3.0, top.center().y), egui::Align2::LEFT_CENTER, &text, font.clone(), tc);
                     let id = egui::Id::new(("rustudio_option_choice", i));
                     if vresp.clicked() {
                         egui::Popup::open_id(ui.ctx(), id);
                     }
-                    let width = vr.width().clamp(140.0, 320.0);
+                    let width = vr.width().clamp(210.0, 340.0);
                     let mut picked = None;
                     egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::Position(vr.left_bottom()), ui.layer_id())
                         .kind(egui::PopupKind::Menu)
@@ -1231,16 +1259,19 @@ impl Dialog {
                         .show(|ui| {
                             ui.set_width(width - 4.0);
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
-                            for (n, (_, s)) in items.iter().enumerate() {
+                            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            for (n, (val, s)) in items.iter().enumerate() {
+                                let label = fmt_item(val, s);
                                 let (ir, iresp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 19.0), Sense::click());
                                 if n == sel || iresp.hovered() {
                                     ui.painter().rect_filled(ir, 0.0, if n == sel { c::LIST_SEL } else { c::LIST_HOVER });
                                 }
-                                ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, *s, FontId::proportional(FONT), c::TEXT);
+                                ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, &label, FontId::proportional(FONT), c::TEXT);
                                 if iresp.clicked() {
                                     picked = Some(n);
                                 }
                             }
+                            });
                         });
                     if let Some(n) = picked {
                         rs::set_choice(o.key, items[n].0, items[0].0);

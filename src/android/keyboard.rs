@@ -168,7 +168,11 @@ fn release_textbox() {
 /// Asks the activity for the keyboard (what winit's `set_ime_allowed` does).
 fn soft_input(show: bool) {
     match super::app() {
-        Some(app) if show => app.show_soft_input(true),
+        Some(app) if show => {
+            if !rustudio_engine::touch_input::has_hardware_keyboard() {
+                app.show_soft_input(true);
+            }
+        }
         Some(app) => {
             app.hide_soft_input(true);
             // (the navigation bar came up with the keyboard; API 26–29's

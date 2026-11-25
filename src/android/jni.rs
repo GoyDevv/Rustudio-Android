@@ -926,3 +926,103 @@ pub fn move_task_to_back() -> Result<()> {
         std::time::Duration::from_millis(400),
     )?
 }
+
+// ---------------------------------------------------------- KBM & pointer capture
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardwareInput {
+    pub keyboard: bool,
+    pub mouse: bool,
+}
+
+/// Probes Android's InputDevice list for a non-virtual physical alphabetic
+/// keyboard (SOURCE_KEYBOARD = 0x101, KEYBOARD_TYPE_ALPHABETIC = 2) and/or
+/// mouse / touchpad (SOURCE_MOUSE = 0x2002, SOURCE_MOUSE_RELATIVE = 0x20004,
+/// SOURCE_TOUCHPAD = 0x100008).
+pub fn hardware_input_devices() -> Result<HardwareInput> {
+    with_activity(|env, _| {
+        let ids_obj = env
+            .call_static_method(
+                jni_str!("android/view/InputDevice"),
+                jni_str!("getDeviceIds"),
+                jni_sig!("()[I"),
+                &[],
+            )?
+            .l()?;
+        if ids_obj.is_null() {
+            return Ok(HardwareInput::default());
+        }
+        let arr = unsafe { jni::objects::JIntArray::from_raw(env, ids_obj.into_raw()) };
+        let len = arr.len(env)?;
+        let mut raw = vec![0i32; len];
+        arr.get_region(env, 0, &mut raw)?;
+        let mut hw = HardwareInput::default();
+        for id in raw {
+            let dev = env
+                .call_static_method(
+                    jni_str!("android/view/InputDevice"),
+                    jni_str!("getDevice"),
+                    jni_sig!("(I)Landroid/view/InputDevice;"),
+                    &[JValue::Int(id)],
+                )?
+                .l()?;
+            if dev.is_null() {
+                continue;
+            }
+            let is_virtual = env
+                .call_method(&dev, jni_str!("isVirtual"), jni_sig!("()Z"), &[])?
+                .z()?;
+            if is_virtual {
+                continue;
+            }
+            let src = env
+                .call_method(&dev, jni_str!("getSources"), jni_sig!("()I"), &[])?
+                .i()?;
+            let ktype = env
+                .call_method(&dev, jni_str!("getKeyboardType"), jni_sig!("()I"), &[])?
+                .i()?;
+            if (src & 0x101) == 0x101 && ktype == 2 {
+                hw.keyboard = true;
+            }
+            if (src & 0x2002) == 0x2002
+                || (src & 0x20004) == 0x20004
+                || (src & 0x100008) == 0x100008
+            {
+                hw.mouse = true;
+            }
+        }
+        Ok(hw)
+    })
+}
+
+/// Requests or releases Android API 26+ pointer capture on the activity's decor view.
+pub fn set_pointer_capture(capture: bool) {
+    if sdk_int() < 26 {
+        return;
+    }
+    let _ = on_main_thread(
+        move || {
+            with_activity(|env, activity| {
+                let win = env
+                    .call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[])?
+                    .l()?;
+                if win.is_null() {
+                    return Ok(());
+                }
+                let decor = env
+                    .call_method(&win, jni_str!("getDecorView"), jni_sig!("()Landroid/view/View;"), &[])?
+                    .l()?;
+                if decor.is_null() {
+                    return Ok(());
+                }
+                if capture {
+                    env.call_method(&decor, jni_str!("requestPointerCapture"), jni_sig!("()V"), &[])?;
+                } else {
+                    env.call_method(&decor, jni_str!("releasePointerCapture"), jni_sig!("()V"), &[])?;
+                }
+                Ok(())
+            })
+        },
+        std::time::Duration::from_millis(200),
+    );
+}

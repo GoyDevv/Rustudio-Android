@@ -30,7 +30,7 @@ impl PlayWorker {
                 // jobs: its tick's server half can run before the next step
                 // arrives (Game::play_worker_idle).
                 let job = if game.play_worker_idle_due() {
-                    match queue.recv_timeout(std::time::Duration::from_micros(250)) {
+                    match queue.recv_timeout(std::time::Duration::from_micros(if cfg!(target_os = "android") { 1500 } else { 250 })) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             game.play_worker_idle();

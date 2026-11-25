@@ -131,6 +131,8 @@ pub struct FloatingWindowState {
     pub min_size: [f32; 2],
     /// Whether the window is currently collapsed to a compact title strip.
     pub collapsed: bool,
+    /// Whether the window is minimized to the bottom minimized bar.
+    pub minimized: bool,
     /// Monotonically increasing focus order (higher renders on top).
     pub z_order: u64,
 }
@@ -285,6 +287,8 @@ pub struct SavedFloatingWindow {
     #[serde(default)]
     pub collapsed: bool,
     #[serde(default)]
+    pub minimized: bool,
+    #[serde(default)]
     pub z_order: u64,
 }
 
@@ -305,6 +309,7 @@ pub struct TitleBarLayout {
     pub chevron_rect: Rect,
     pub title_text_rect: Rect,
     pub drag_rect: Rect,
+    pub min_rect: Rect,
     pub dock_rect: Rect,
     pub close_rect: Rect,
 }
@@ -314,6 +319,7 @@ impl TitleBarLayout {
     pub fn compute(title_rect: Rect, touch_mode: bool) -> Self {
         let close_w = if touch_mode { 32.0 } else { 26.0 };
         let dock_w = if touch_mode { 46.0 } else { 40.0 };
+        let min_w = if touch_mode { 32.0 } else { 26.0 };
         let pad_x = 4.0;
         let pad_y = 3.0;
         let gap = 3.0;
@@ -331,21 +337,26 @@ impl TitleBarLayout {
         let dock_rect =
             Rect::from_min_max(Pos2::new(dock_min_x, btn_top), Pos2::new(dock_max_x, btn_bottom));
 
+        let min_max_x = (dock_rect.min.x - gap).max(title_rect.min.x);
+        let min_min_x = (min_max_x - min_w).max(title_rect.min.x);
+        let min_rect =
+            Rect::from_min_max(Pos2::new(min_min_x, btn_top), Pos2::new(min_max_x, btn_bottom));
+
         let chevron_min_x = title_rect.min.x + 6.0;
-        let chevron_max_x = (chevron_min_x + 16.0).min(dock_rect.min.x);
+        let chevron_max_x = (chevron_min_x + 16.0).min(min_rect.min.x);
         let chevron_rect = Rect::from_min_max(
             Pos2::new(chevron_min_x, title_rect.min.y),
             Pos2::new(chevron_max_x.max(chevron_min_x), title_rect.max.y),
         );
 
-        let drag_max_x = (dock_rect.min.x - 2.0).max(title_rect.min.x);
+        let drag_max_x = (min_rect.min.x - 2.0).max(title_rect.min.x);
         let drag_rect = Rect::from_min_max(
             title_rect.min,
             Pos2::new(drag_max_x, title_rect.max.y),
         );
 
         let text_min_x = (chevron_rect.max.x + 4.0).min(drag_max_x);
-        let text_max_x = (dock_rect.min.x - 6.0).max(text_min_x);
+        let text_max_x = (min_rect.min.x - 6.0).max(text_min_x);
         let title_text_rect = Rect::from_min_max(
             Pos2::new(text_min_x, title_rect.min.y),
             Pos2::new(text_max_x, title_rect.max.y),
@@ -356,14 +367,15 @@ impl TitleBarLayout {
             chevron_rect,
             title_text_rect,
             drag_rect,
+            min_rect,
             dock_rect,
             close_rect,
         }
     }
 
     /// Action button rects excluded from title-bar tap-to-collapse.
-    pub fn button_rects(&self) -> [Rect; 2] {
-        [self.dock_rect, self.close_rect]
+    pub fn button_rects(&self) -> [Rect; 3] {
+        [self.min_rect, self.dock_rect, self.close_rect]
     }
 }
 
@@ -664,6 +676,7 @@ impl MobileWindowManager {
             size: [size.x, size.y],
             min_size: DEFAULT_MIN_SIZE,
             collapsed: false,
+            minimized: false,
             z_order: z,
         };
         win.clamp_to_bounds(bounds, title_h);
@@ -703,7 +716,9 @@ impl MobileWindowManager {
     /// touch drags or taps through floating windows.
     pub fn hit_rects(&self) -> Vec<Rect> {
         let title_h = self.current_title_bar_height();
-        let mut order: Vec<usize> = (0..self.windows.len()).collect();
+        let mut order: Vec<usize> = (0..self.windows.len())
+            .filter(|&i| !self.windows[i].minimized)
+            .collect();
         order.sort_by_key(|&i| (self.windows[i].z_order, i));
         order
             .into_iter()
@@ -711,10 +726,50 @@ impl MobileWindowManager {
             .collect()
     }
 
-    /// Returns `true` if `pos` falls inside any floating window.
+    /// Returns title-bar and resize-grip rects for immediate touch dragging.
+    pub fn drag_handle_rects(&self) -> Vec<Rect> {
+        let title_h = self.current_title_bar_height();
+        let grip = if self.touch_mode { 22.0 } else { 16.0 };
+        let mut out = Vec::new();
+        for w in self.windows.iter().filter(|w| !w.minimized) {
+            let r = w.visible_rect(title_h);
+            let title_r = Rect::from_min_max(r.min, Pos2::new(r.max.x, (r.min.y + title_h).min(r.max.y)));
+            let lay = TitleBarLayout::compute(title_r, self.touch_mode);
+            out.push(lay.drag_rect);
+            if !w.collapsed {
+                let corner = Rect::from_min_max(Pos2::new(r.max.x - grip, r.max.y - grip), r.max);
+                out.push(corner);
+            }
+        }
+        out
+    }
+
+    /// Returns `true` if `pos` falls inside any visible (non-minimized) floating window.
     pub fn point_in_any_window(&self, pos: Pos2) -> bool {
         let title_h = self.current_title_bar_height();
-        self.windows.iter().any(|w| w.visible_rect(title_h).contains(pos))
+        self.windows.iter().filter(|w| !w.minimized).any(|w| w.visible_rect(title_h).contains(pos))
+    }
+
+    /// Restores a minimized floating window and brings it to front.
+    pub fn restore(&mut self, id: &str) -> bool {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.minimized = false;
+            w.collapsed = false;
+            let z = self.next_z;
+            self.next_z = self.next_z.saturating_add(1);
+            w.z_order = z;
+            return true;
+        }
+        false
+    }
+
+    /// Lists currently minimized floating windows as `(id, title, tab)`.
+    pub fn minimized_windows(&self) -> Vec<(String, String, Tab)> {
+        self.windows
+            .iter()
+            .filter(|w| w.minimized)
+            .map(|w| (w.id.clone(), w.title.clone(), w.tab))
+            .collect()
     }
 
     /// Serializes all persistable floating windows for `layout.json`.
@@ -734,6 +789,7 @@ impl MobileWindowManager {
                     size: w.size,
                     min_size: w.min_size,
                     collapsed: w.collapsed,
+                    minimized: w.minimized,
                     z_order: w.z_order,
                 })
             })
@@ -781,6 +837,7 @@ impl MobileWindowManager {
                 size: [size_w, size_h],
                 min_size: [min_w, min_h],
                 collapsed: entry.collapsed,
+                minimized: entry.minimized,
                 z_order: entry.z_order,
             });
         }
@@ -795,6 +852,7 @@ impl MobileWindowManager {
         &mut self,
         ctx: &egui::Context,
         bounds: Rect,
+        modal_open: bool,
         mut render_body: impl FnMut(&mut egui::Ui, &mut Tab),
     ) -> Vec<MobileWindowAction> {
         self.clamp_all(bounds);
@@ -818,9 +876,13 @@ impl MobileWindowManager {
 
         let mut actions = Vec::new();
         let mut to_remove: Vec<String> = Vec::new();
+        let mut to_minimize: Vec<String> = Vec::new();
         let mut to_focus: Option<String> = None;
 
         for idx in order {
+            if self.windows[idx].minimized {
+                continue;
+            }
             let win_id = self.windows[idx].id.clone();
             let is_focused = self.windows[idx].z_order == top_z;
             let collapsed = self.windows[idx].collapsed;
@@ -834,12 +896,14 @@ impl MobileWindowManager {
                 .fixed_pos(pos)
                 .movable(false)
                 .constrain(false)
-                .interactable(true)
+                .interactable(!modal_open)
                 .show(ctx, |ui| {
-                    // Enforce our z_order deterministically in egui's Middle layer stack.
-                    ui.ctx().move_to_top(ui.layer_id());
+                    // Only enforce Middle z_order when no modal dialog is open above us.
+                    if !modal_open {
+                        ui.ctx().move_to_top(ui.layer_id());
+                    }
 
-                    let (win_rect, _bg_resp) = ui.allocate_exact_size(vis_size, Sense::click());
+                    let (win_rect, _bg_resp) = ui.allocate_exact_size(vis_size, Sense::click_and_drag());
                     let painter = ui.painter().clone();
 
                     // Promote focus on pointer press anywhere inside the window.
@@ -917,6 +981,35 @@ impl MobileWindowManager {
                         FontId::proportional(if self.touch_mode { 13.5 } else { 12.5 }),
                         if is_focused { theme::TEXT } else { theme::TEXT_DIM },
                     );
+
+                    // Title-bar action button: Minimize (−).
+                    let min_resp = ui
+                        .interact(layout.min_rect, ui.id().with("min_btn"), Sense::click())
+                        .on_hover_text("Minimize panel");
+                    let min_fill = if min_resp.is_pointer_button_down_on() {
+                        theme::ACTIVE_TAB
+                    } else if min_resp.hovered() {
+                        theme::HOVER_BG
+                    } else {
+                        theme::PANEL_ALT
+                    };
+                    painter.rect_filled(layout.min_rect, CornerRadius::same(4), min_fill);
+                    painter.rect_stroke(
+                        layout.min_rect,
+                        CornerRadius::same(4),
+                        Stroke::new(1.0, theme::DIVIDER),
+                        StrokeKind::Inside,
+                    );
+                    painter.text(
+                        layout.min_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "−",
+                        FontId::proportional(if self.touch_mode { 15.0 } else { 13.5 }),
+                        theme::TEXT,
+                    );
+                    if min_resp.clicked() {
+                        to_minimize.push(win_id.clone());
+                    }
 
                     // Title-bar action button: Dock back.
                     let dock_resp = ui
@@ -1198,6 +1291,11 @@ impl MobileWindowManager {
             self.focus(&focus_id);
         }
 
+        for id in to_minimize {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                w.minimized = true;
+            }
+        }
         for id in to_remove {
             self.close(&id);
         }
@@ -1267,6 +1365,7 @@ mod tests {
             size: [320.0, 260.0],
             min_size: DEFAULT_MIN_SIZE,
             collapsed: false,
+            minimized: false,
             z_order: 1,
         };
 

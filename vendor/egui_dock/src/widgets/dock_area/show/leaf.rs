@@ -417,7 +417,7 @@ impl<Tab> DockArea<'_, Tab> {
                 tabs_ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
             }
 
-            let (is_active, label, tab_style, closeable, pop_out) = {
+            let (is_active, label, tab_style, closeable, pop_out, show_minimize_button) = {
                 let leaf = self.dock_state[path]
                     .get_leaf_mut()
                     .expect("This node must be a leaf");
@@ -436,6 +436,7 @@ impl<Tab> DockArea<'_, Tab> {
                                 tab_viewer.pop_out_docks_back(&leaf.tabs[tab_index.0]),
                             )
                         }),
+                    tab_viewer.show_minimize_button(&leaf.tabs[tab_index.0]),
                 )
             };
 
@@ -461,6 +462,7 @@ impl<Tab> DockArea<'_, Tab> {
                             preferred_width,
                             show_close_button,
                             pop_out.clone(),
+                            show_minimize_button,
                             fade,
                         )
                     })
@@ -481,7 +483,7 @@ impl<Tab> DockArea<'_, Tab> {
                 if tab_index.0 != 0 {
                     tabs_ui.allocate_space(vec2(tab_style.spacing, 0.0));
                 }
-                let (mut response, close_response, pop_response) = self.tab_title(
+                let (mut response, close_response, pop_response, min_response) = self.tab_title(
                     tabs_ui,
                     &tab_style,
                     id,
@@ -492,10 +494,17 @@ impl<Tab> DockArea<'_, Tab> {
                     preferred_width,
                     show_close_button,
                     pop_out.clone(),
+                    show_minimize_button,
                     fade,
                 );
                 let title_id = response.id;
                 let close_clicked = close_response.is_some_and(|res| res.clicked());
+                if min_response.is_some_and(|res| res.clicked()) {
+                    let leaf = self.dock_state[path]
+                        .get_leaf_mut()
+                        .expect("This node must be a leaf");
+                    tab_viewer.on_minimize(&mut leaf.tabs[tab_index.0]);
+                }
                 if pop_response.is_some_and(|res| res.clicked()) {
                     let leaf = self.dock_state[path]
                         .get_leaf_mut()
@@ -1121,8 +1130,9 @@ impl<Tab> DockArea<'_, Tab> {
         preferred_width: Option<f32>,
         show_close_button: bool,
         pop_out: Option<(String, bool)>,
+        show_minimize_button: bool,
         fade: Option<&Style>,
-    ) -> (Response, Option<Response>, Option<Response>) {
+    ) -> (Response, Option<Response>, Option<Response>, Option<Response>) {
         let style = fade.unwrap_or_else(|| self.style.as_ref().unwrap());
         let galley = label.into_galley(ui, None, f32::INFINITY, TextStyle::Button);
         let x_spacing = 8.0;
@@ -1133,7 +1143,12 @@ impl<Tab> DockArea<'_, Tab> {
             0.0
         };
 
-        // rustudio: the pop-out button sits just left of the close button.
+        // rustudio: minimize & pop-out buttons sit just left of the close button.
+        let min_button_size = if show_minimize_button {
+            Style::TAB_CLOSE_BUTTON_SIZE.min(style.tab_bar.height) * 0.85
+        } else {
+            0.0
+        };
         let pop_button_size = if pop_out.is_some() {
             Style::TAB_CLOSE_BUTTON_SIZE.min(style.tab_bar.height) * 0.85
         } else {
@@ -1144,7 +1159,7 @@ impl<Tab> DockArea<'_, Tab> {
         let minimum_width = tab_style
             .minimum_width
             .unwrap_or(0.0)
-            .at_least(text_width + close_button_size + pop_button_size);
+            .at_least(text_width + close_button_size + pop_button_size + min_button_size);
         let tab_width = preferred_width.unwrap_or(0.0).at_least(minimum_width);
 
         let (_, tab_rect) = ui.allocate_space(vec2(tab_width, ui.available_height()));
@@ -1197,7 +1212,7 @@ impl<Tab> DockArea<'_, Tab> {
         }
 
         let mut text_rect = tab_rect;
-        text_rect.set_width(text_rect.width() - close_button_size - pop_button_size);
+        text_rect.set_width(text_rect.width() - close_button_size - pop_button_size - min_button_size);
         let text_pos = {
             let pos = Align2::CENTER_CENTER.pos_in_rect(&text_rect.shrink2(vec2(x_spacing, 0.0)));
             pos - galley.size() / 2.0
@@ -1206,11 +1221,39 @@ impl<Tab> DockArea<'_, Tab> {
         ui.painter()
             .add(TextShape::new(text_pos, galley, tab_style.text_color));
 
+        // rustudio: minimize button (horizontal bar) left of pop-out.
+        let min_response = show_minimize_button.then(|| {
+            let mut min_rect = tab_rect;
+            min_rect.set_left(text_rect.right());
+            min_rect.set_right(text_rect.right() + min_button_size);
+            min_rect = Rect::from_center_size(min_rect.center(), Vec2::splat(min_button_size));
+            let min_response = ui
+                .interact(min_rect, id.with("minimize-button"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("Minimize panel");
+            let hot = min_response.hovered() || min_response.has_focus();
+            let color = if hot {
+                style.buttons.close_tab_active_color
+            } else {
+                style.buttons.close_tab_color
+            };
+            if hot {
+                ui.painter().rect_filled(min_rect, 2.0, style.buttons.close_tab_bg_fill);
+            }
+            let half_w = (Style::TAB_CLOSE_X_SIZE * 0.5).max(3.5);
+            let y = min_rect.center().y + 2.0;
+            ui.painter().line_segment(
+                [pos2(min_rect.center().x - half_w, y), pos2(min_rect.center().x + half_w, y)],
+                Stroke::new(1.5, color),
+            );
+            min_response
+        });
+
         // rustudio: the pop-out button (a box with an arrow leaving it).
         let pop_response = pop_out.map(|(tip, back)| {
             let mut pop_rect = tab_rect;
-            pop_rect.set_left(text_rect.right());
-            pop_rect.set_right(text_rect.right() + pop_button_size);
+            pop_rect.set_left(text_rect.right() + min_button_size);
+            pop_rect.set_right(text_rect.right() + min_button_size + pop_button_size);
             pop_rect = Rect::from_center_size(pop_rect.center(), Vec2::splat(pop_button_size));
             let pop_response = ui
                 .interact(pop_rect, id.with("pop-out-button"), Sense::click())
@@ -1253,7 +1296,7 @@ impl<Tab> DockArea<'_, Tab> {
 
         let close_response = show_close_button.then(|| {
             let mut close_button_rect = tab_rect;
-            close_button_rect.set_left(text_rect.right() + pop_button_size);
+            close_button_rect.set_left(text_rect.right() + min_button_size + pop_button_size);
             close_button_rect =
                 Rect::from_center_size(close_button_rect.center(), Vec2::splat(close_button_size));
 
@@ -1293,7 +1336,7 @@ impl<Tab> DockArea<'_, Tab> {
             close_response
         });
 
-        (response, close_response, pop_response)
+        (response, close_response, pop_response, min_response)
     }
 
     #[allow(clippy::too_many_arguments)]

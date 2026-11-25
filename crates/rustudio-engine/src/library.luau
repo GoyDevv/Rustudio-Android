@@ -1223,6 +1223,13 @@ function M.GetLastInputType(self) return Enum.UserInputType[last_input()] end
 -- The game window gaining / losing focus (UserInputService.WindowFocused /
 -- WindowFocusReleased), sent by the play session when it changes.
 local window_focused = true
+function __rs_preferred_input_changed()
+    local uis = game:GetService("UserInputService")
+    if uis then
+        fire(uis, "PreferredInputChanged")
+    end
+end
+
 function __rs_window_focus(on)
     if on == window_focused then return end
     window_focused = on
