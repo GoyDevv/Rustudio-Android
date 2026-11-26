@@ -875,7 +875,7 @@ impl Editor {
                 playing: driving,
                 game,
                 ui,
-                direct_drag: self.mobile_drag_rects.clone(),
+                direct_drag: if driving { Vec::new() } else { self.mobile_drag_rects.clone() },
                 stick,
                 jump,
                 handle_hover: hover_handle.is_some() || self.drag.is_some() || rustudio_engine::gui::share().adorn_hot || { let _ch = rustudio_engine::gui::share_channel(1); rustudio_engine::gui::share().adorn_hot },

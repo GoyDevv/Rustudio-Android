@@ -1014,8 +1014,7 @@ impl Game {
             Receive::Stopped => return,
         }
         let dt = (dt + std::mem::take(&mut threaded.deferred_dt)).min(rustudio_core::mech::MAX_FRAME_DT);
-        let follow_input = std::mem::take(&mut threaded.follow_local_input);
-        let wait_for_publication = if cfg!(target_os = "android") { textbox_edit } else { follow_input || textbox_edit };
+        let wait_for_publication = std::mem::take(&mut threaded.follow_local_input) || textbox_edit;
         let edits = threaded.queued_edits.take().expect("edits scanned at this boundary");
         let input = Input::take(self, keyboard, edits);
         let mut source = threaded.source.take().expect("last snapshot was applied");

@@ -3880,7 +3880,8 @@ impl Renderer {
             || rustudio_core::rustudio_settings::performance_value("detail") == "low";
         // (not when the probe's set is the one-sample set already: OpenGL,
         // where it would be built twice)
-        let prebuild_1x = (r.probe_samples != 1 && one_sample_likely) || cfg!(target_os = "android");
+        let prebuild_1x = r.caps.backend != wgpu::Backend::Gl
+            && ((r.probe_samples != 1 && one_sample_likely) || cfg!(target_os = "android"));
         if prebuild_1x && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
             let (device, queue) = (device.clone(), queue.clone());
             let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
@@ -4958,7 +4959,7 @@ impl Renderer {
                         return true;
                     }
                 }
-            } else if cfg!(target_os = "android") {
+            } else if cfg!(target_os = "android") && self.caps.backend != wgpu::Backend::Gl {
                 let (device, queue) = (rs.device.clone(), rs.queue.clone());
                 let (g, t, gl, tr, reduced) = (
                     self.globals_layout.clone(),

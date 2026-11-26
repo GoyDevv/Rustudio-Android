@@ -42,9 +42,6 @@ const PACKAGES: &[(&str, &str)] = &[
     ("extracontent-scripts.zip", "ExtraContent/scripts"),
     ("extracontent-models.zip", "ExtraContent/models"),
     ("extracontent-textures.zip", "ExtraContent/textures"),
-    ("BuiltInPlugins.zip", "BuiltInPlugins"),
-    ("extracontent-luapackages.zip", "ExtraContent/LuaPackages"),
-    ("content-studio_svg_textures.zip", "content/studio_svg_textures"),
 ];
 /// Single files pulled out of a big package by range requests.
 const SINGLE_FILES: &[(&str, &str)] = &[("RobloxStudio.zip", "ReflectionMetadata.xml")];

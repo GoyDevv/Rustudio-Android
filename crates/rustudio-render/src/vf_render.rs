@@ -454,7 +454,9 @@ impl Renderer {
         glass_bg: &wgpu::BindGroup,
     ) {
         // (a frame draws at probe_samples: the set for it, made on first use)
-        self.ensure_pipelines(rs, self.probe_samples);
+        if !self.ensure_pipelines(rs, self.probe_samples) {
+            return;
+        }
         let (device, queue) = (&rs.device, &rs.queue);
         // The frame's camera: reverse-Z like the world's.
         let aspect = size[0] as f32 / size[1].max(1) as f32;

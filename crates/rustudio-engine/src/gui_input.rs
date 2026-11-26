@@ -1885,10 +1885,13 @@ impl Gui {
                 .filter(|h| point_in_quad(&h.quad, t.pos) && h.clip.is_none_or(|c| point_in_quad(&c, t.pos)))
                 .cloned()
                 .collect();
-            // Occlusion barrier: an Active GuiObject or TextBox (such as SettingsHub
-            // or a modal Frame) blocks touches from leaking through to buttons behind
-            // it (like TouchGui.JumpButton).
-            let occlude_idx = all_under.iter().rposition(|h| h.textbox || h.active).unwrap_or(0);
+            // Occlusion barrier: a non-scrolling modal Active Frame or TextBox (such as
+            // SettingsHub) blocks touches from leaking through to buttons behind it (like
+            // TouchGui.JumpButton), without slicing off ancestor ScrollingFrames or buttons.
+            let occlude_idx = all_under
+                .iter()
+                .rposition(|h| h.textbox || (h.active && !h.button && !h.scrolling))
+                .unwrap_or(0);
             let under: Vec<Hit> = all_under[occlude_idx..].to_vec();
             let now: HashSet<Ref> = under.iter().map(|h| h.r).collect();
             let input = |state: TouchState, dx: f32, dy: f32| GuiArg::Touch { id: t.id, state, x, y, dx, dy };
@@ -1926,7 +1929,7 @@ impl Gui {
                     // a phone; whether the camera turns too stays with
                     // Active, like Roblox: a frame with Active off lets the
                     // finger through to the camera while it scrolls).
-                    let scroll = under.iter().rev().find(|h| h.scrolling).map(|h| h.r);
+                    let scroll = all_under[occlude_idx..].iter().rev().find(|h| h.scrolling).map(|h| h.r);
                     if let Some(sf) = scroll {
                         // (a finger landing stops the canvas gliding)
                         self.events.push(GuiEvent::ScrollDrag(sf, [0.0, 0.0]));
