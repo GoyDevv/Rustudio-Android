@@ -278,8 +278,15 @@ fn asset_config_ui(ctx: &egui::Context, doc: &rustudio_core::doc::Document) {
                     if let Some(rx) = &cfg.status {
                         match rx.try_recv() {
                             Ok(Ok(asset)) => {
-                                ui.label(format!("Saved as asset {asset}"));
-                                close.push(cfg.id);
+                                ui.label(format!("Published as rbxassetid://{asset}"));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Copy ID").clicked() {
+                                        ui.ctx().copy_text(format!("rbxassetid://{asset}"));
+                                    }
+                                    if ui.button("Done").clicked() {
+                                        close.push(cfg.id);
+                                    }
+                                });
                             }
                             Ok(Err(e)) => {
                                 ui.label(format!("Upload failed: {e}"));
@@ -295,11 +302,12 @@ fn asset_config_ui(ctx: &egui::Context, doc: &rustudio_core::doc::Document) {
                         let ok = !cfg.title.trim().is_empty();
                         if ui.add_enabled(ok, egui::Button::new("Save")).clicked() {
                             let bytes = doc.encode(&cfg.sel, false).unwrap_or_default();
+                            let is_anim = cfg.sel.iter().any(|&r| doc.class_of(r).as_deref() == Some("KeyframeSequence"));
                             let (title, desc) = (cfg.title.clone(), cfg.description.clone());
                             let (tx, rx) = std::sync::mpsc::channel();
                             let ctx2 = ctx.clone();
                             let _ = std::thread::Builder::new().name("save-to-roblox".into()).spawn(move || {
-                                let r = upload_model(&title, &desc, &bytes);
+                                let r = upload_model(&title, &desc, &bytes, is_anim);
                                 let _ = tx.send(r);
                                 ctx2.request_repaint();
                             });
@@ -319,30 +327,17 @@ fn asset_config_ui(ctx: &egui::Context, doc: &rustudio_core::doc::Document) {
 
 /// The upload itself (multipart `request` + `fileContent`, then the
 /// operation is polled). Not run by any check: it publishes to the account.
-fn upload_model(title: &str, description: &str, rbxm: &[u8]) -> Result<u64, String> {
+fn upload_model(title: &str, description: &str, rbxm: &[u8], is_anim: bool) -> Result<u64, String> {
     let config = rustudio_account::AccountConfig::load().map_err(|e| e.to_string())?;
     let c = rustudio_account::Client::open(config).map_err(|e| e.describe())?;
-    let (method, url, request) = model_upload(title, description, c.session.profile.id);
-    const B: &str = "----rustudio-model-upload-3a91";
-    let mut body = Vec::new();
-    body.extend_from_slice(format!("--{B}\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n").as_bytes());
-    body.extend_from_slice(request.to_string().as_bytes());
-    body.extend_from_slice(format!("\r\n--{B}\r\nContent-Disposition: form-data; name=\"fileContent\"; filename=\"asset.rbxm\"\r\nContent-Type: model/x-rbxm\r\n\r\n").as_bytes());
-    body.extend_from_slice(rbxm);
-    body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
-    let (st, text) = c
-        .session
-        .send_csrf(method, &url, &format!("multipart/form-data; boundary={B}"), &body)
-        .map_err(|e| e.to_string())?;
-    if !(200..300).contains(&st) {
-        return Err(format!("HTTP {st}: {}", text.chars().take(200).collect::<String>()));
-    }
-    let op: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let id = op.pointer("/response/assetId").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
-    match id.and_then(|s| s.parse().ok()) {
-        Some(n) => Ok(n),
-        None => Err(format!("upload answered: {}", text.chars().take(200).collect::<String>())),
-    }
+    let api = rustudio_account::cloud::CloudApi::new(
+        c.session,
+        rustudio_account::cloud::Endpoints::default(),
+        None,
+    );
+    let asset_type = if is_anim { "Animation" } else { "Model" };
+    api.upload_asset(asset_type, title, description, None, "asset.rbxm", "model/x-rbxm", rbxm)
+        .map_err(|e| e.0)
 }
 
 /// Shows the dialogs plugins opened (call once a frame with the UI's

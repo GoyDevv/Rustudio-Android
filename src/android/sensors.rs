@@ -140,6 +140,27 @@ pub fn set_enabled(accelerometer: bool, gyroscope: bool) {
     }
 }
 
+static PAUSED_WANT: std::sync::Mutex<(bool, bool)> = std::sync::Mutex::new((false, false));
+
+/// Temporarily disables active hardware sensors when backgrounded and restores them on resume.
+pub fn set_backgrounded(bg: bool) {
+    if bg {
+        let cur = (SHARED.want_accel.load(Ordering::Relaxed), SHARED.want_gyro.load(Ordering::Relaxed));
+        if cur.0 || cur.1 {
+            *PAUSED_WANT.lock().unwrap_or_else(|e| e.into_inner()) = cur;
+            set_enabled(false, false);
+        }
+    } else {
+        let mut prev = PAUSED_WANT.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, g) = *prev;
+        *prev = (false, false);
+        drop(prev);
+        if a || g {
+            set_enabled(a, g);
+        }
+    }
+}
+
 /// The latest samples.
 pub fn latest() -> Reading {
     *SHARED.reading.lock().unwrap_or_else(|e| e.into_inner())

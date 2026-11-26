@@ -289,6 +289,10 @@ impl HighlightPass {
     /// Draws the highlights over `display`: per highlight, the meshes
     /// (mesh, instance) of its parts.
     #[allow(clippy::too_many_arguments)]
+    pub fn clear_target(&mut self) {
+        self.target = None;
+    }
+
     pub fn draw(
         &mut self,
         device: &wgpu::Device,

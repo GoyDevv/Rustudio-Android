@@ -693,14 +693,42 @@ impl Editor {
                 .with_property("CFrame", Variant::CFrame(cframe_identity()))
                 .with_property("Weight", Variant::Float32(1.0)),
         );
-        for j in rig_joints(&self.game.doc, rig_r) {
-            self.game.doc.insert(
-                root_pose,
-                InstanceBuilder::new("Pose")
-                    .with_name(j.part1_name)
-                    .with_property("CFrame", Variant::CFrame(cframe_identity()))
-                    .with_property("Weight", Variant::Float32(1.0)),
-            );
+        let joints = rig_joints(&self.game.doc, rig_r);
+        let mut pose_by_part: std::collections::HashMap<String, Ref> = std::collections::HashMap::new();
+        pose_by_part.insert("HumanoidRootPart".to_string(), root_pose);
+        for _pass in 0..joints.len().max(1) {
+            let mut progress = false;
+            for j in &joints {
+                if pose_by_part.contains_key(&j.part1_name) {
+                    continue;
+                }
+                if let Some(&parent_pose) = pose_by_part.get(&j.part0_name) {
+                    let pr = self.game.doc.insert(
+                        parent_pose,
+                        InstanceBuilder::new("Pose")
+                            .with_name(j.part1_name.clone())
+                            .with_property("CFrame", Variant::CFrame(cframe_identity()))
+                            .with_property("Weight", Variant::Float32(1.0)),
+                    );
+                    pose_by_part.insert(j.part1_name.clone(), pr);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        for j in &joints {
+            if !pose_by_part.contains_key(&j.part1_name) {
+                let pr = self.game.doc.insert(
+                    root_pose,
+                    InstanceBuilder::new("Pose")
+                        .with_name(j.part1_name.clone())
+                        .with_property("CFrame", Variant::CFrame(cframe_identity()))
+                        .with_property("Weight", Variant::Float32(1.0)),
+                );
+                pose_by_part.insert(j.part1_name.clone(), pr);
+            }
         }
         self.ui.anim.clip_ref = Some(clip_r);
         self.ui.anim.time = 0.0;
@@ -729,18 +757,50 @@ impl Editor {
                 .with_property("Weight", Variant::Float32(1.0)),
         );
         if let Some(rig_r) = self.ui.anim.rig_ref {
-            for j in rig_joints(&self.game.doc, rig_r) {
-                let xf = evaluated.get(&j.part1_name).copied().unwrap_or(Xform {
-                    pos: Vec3::ZERO,
-                    rot: Mat3::IDENTITY,
-                });
-                self.game.doc.insert(
-                    root_pose,
-                    InstanceBuilder::new("Pose")
-                        .with_name(j.part1_name)
-                        .with_property("CFrame", Variant::CFrame(xf.to_cframe()))
-                        .with_property("Weight", Variant::Float32(1.0)),
-                );
+            let joints = rig_joints(&self.game.doc, rig_r);
+            let mut pose_by_part: std::collections::HashMap<String, Ref> = std::collections::HashMap::new();
+            pose_by_part.insert("HumanoidRootPart".to_string(), root_pose);
+            for _pass in 0..joints.len().max(1) {
+                let mut progress = false;
+                for j in &joints {
+                    if pose_by_part.contains_key(&j.part1_name) {
+                        continue;
+                    }
+                    if let Some(&parent_pose) = pose_by_part.get(&j.part0_name) {
+                        let xf = evaluated.get(&j.part1_name).copied().unwrap_or(Xform {
+                            pos: Vec3::ZERO,
+                            rot: Mat3::IDENTITY,
+                        });
+                        let pr = self.game.doc.insert(
+                            parent_pose,
+                            InstanceBuilder::new("Pose")
+                                .with_name(j.part1_name.clone())
+                                .with_property("CFrame", Variant::CFrame(xf.to_cframe()))
+                                .with_property("Weight", Variant::Float32(1.0)),
+                        );
+                        pose_by_part.insert(j.part1_name.clone(), pr);
+                        progress = true;
+                    }
+                }
+                if !progress {
+                    break;
+                }
+            }
+            for j in &joints {
+                if !pose_by_part.contains_key(&j.part1_name) {
+                    let xf = evaluated.get(&j.part1_name).copied().unwrap_or(Xform {
+                        pos: Vec3::ZERO,
+                        rot: Mat3::IDENTITY,
+                    });
+                    let pr = self.game.doc.insert(
+                        root_pose,
+                        InstanceBuilder::new("Pose")
+                            .with_name(j.part1_name.clone())
+                            .with_property("CFrame", Variant::CFrame(xf.to_cframe()))
+                            .with_property("Weight", Variant::Float32(1.0)),
+                    );
+                    pose_by_part.insert(j.part1_name.clone(), pr);
+                }
             }
         }
         kf_r
@@ -893,7 +953,31 @@ impl Editor {
                 if let Ok(res) = rx.try_recv() {
                     pub_dlg.rx = None;
                     match res {
-                        Ok(id) => pub_dlg.status = PublishStatus::Success(id),
+                        Ok(id) => {
+                            pub_dlg.status = PublishStatus::Success(id);
+                            let anim_id = format!("rbxassetid://{id}");
+                            if let Some(clip_r) = self.ui.anim.clip_ref {
+                                if let Some(inst) = self.game.doc.dom.get_by_ref(clip_r) {
+                                    let clip_name = inst.name.clone();
+                                    let existing_anim = self.ui.anim.rig_ref.and_then(|rr| {
+                                        self.game.doc.dom.descendants_of(rr)
+                                            .find(|d| d.class == "Animation" && d.name == clip_name)
+                                            .map(|d| d.referent())
+                                    });
+                                    let val = Variant::ContentId(rbx_dom_weak::types::ContentId::from(anim_id.clone()));
+                                    if let Some(ar) = existing_anim {
+                                        self.game.doc.set_props("Update AnimationId", vec![(ar, ustr("AnimationId"), val)], None);
+                                    } else if let Some(rr) = self.ui.anim.rig_ref {
+                                        self.game.doc.insert(
+                                            rr,
+                                            InstanceBuilder::new("Animation")
+                                                .with_name(clip_name)
+                                                .with_property("AnimationId", val),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         Err(e) => pub_dlg.status = PublishStatus::Error(e),
                     }
                 } else {

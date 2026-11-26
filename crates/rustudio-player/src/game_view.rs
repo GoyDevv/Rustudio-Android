@@ -2298,6 +2298,10 @@ impl Game {
             }
         }
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
+        let sep_dragged = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged")).unwrap_or(false));
+        if sep_dragged && self.last_render_target[0] > 0 && self.last_render_target[1] > 0 {
+            size = self.last_render_target;
+        }
         self.last_render_scale = scale;
         self.last_render_target = size;
         let (globals, postfx, lights, shadows, sun_cascades) = {

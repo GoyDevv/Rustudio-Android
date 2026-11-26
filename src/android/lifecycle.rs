@@ -35,6 +35,7 @@ static ORIGINAL_LOW_MEMORY: Mutex<Option<unsafe extern "C" fn(*mut ndk_sys::ANat
 /// The system said memory is short (`Activity.onLowMemory`) since the
 /// last [`take_low_memory`].
 static LOW_MEMORY: AtomicBool = AtomicBool::new(false);
+static BACKGROUNDED: AtomicBool = AtomicBool::new(false);
 /// `run_native` has returned.
 pub static LOOP_DONE: AtomicBool = AtomicBool::new(false);
 /// [`hook`] ran: the process has its activity, the one the editor's loop
@@ -114,6 +115,38 @@ unsafe extern "C" fn on_low_memory(activity: *mut ndk_sys::ANativeActivity) {
 /// Whether the system sent a low-memory notice since the last call.
 pub fn take_low_memory() -> bool {
     LOW_MEMORY.swap(false, Ordering::SeqCst)
+}
+
+/// True while the Android Activity is paused/stopped in the background.
+pub fn is_backgrounded() -> bool {
+    BACKGROUNDED.load(Ordering::Relaxed)
+}
+
+/// Called from RustudioActivity.onPause(1) / onStop(2) / onResume(3).
+pub fn on_java_lifecycle(state: i32) {
+    match state {
+        1 | 2 => {
+            let was = BACKGROUNDED.swap(true, Ordering::SeqCst);
+            super::sensors::set_backgrounded(true);
+            if state == 2 || !was {
+                super::perf_hint::stop();
+                rustudio_core::heap::trim();
+            }
+        }
+        3 => {
+            BACKGROUNDED.store(false, Ordering::SeqCst);
+            super::sensors::set_backgrounded(false);
+        }
+        _ => {}
+    }
+}
+
+/// Called from RustudioActivity.onTrimMemory / onLowMemory.
+pub fn on_trim_memory(level: i32) {
+    if level >= 20 {
+        LOW_MEMORY.store(true, Ordering::SeqCst);
+        rustudio_core::heap::trim();
+    }
 }
 
 unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {

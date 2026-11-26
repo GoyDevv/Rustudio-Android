@@ -766,6 +766,11 @@ impl PostFx {
         });
     }
 
+    /// Releases transient resolution-dependent PostFX textures (rebuilt lazily on next frame).
+    pub fn release_targets(&mut self) {
+        self.targets = None;
+    }
+
     /// Rebuilds resolution-dependent targets and bind groups whenever the viewport
     /// target is created or resized.
     pub fn rebuild_targets(

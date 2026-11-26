@@ -15,6 +15,9 @@ use super::model;
 
 pub const SIZE: u32 = 150;
 /// Textures kept in memory.
+#[cfg(target_os = "android")]
+const MEM_CAP: usize = 120;
+#[cfg(not(target_os = "android"))]
 const MEM_CAP: usize = 600;
 /// Decoded images turned into textures per frame (keeps frames smooth).
 const UPLOADS_PER_FRAME: usize = 10;
@@ -79,6 +82,15 @@ impl Default for Thumbs {
             uploaded_last_frame: 0,
             pending_tries: HashMap::new(),
         }
+    }
+}
+
+impl Thumbs {
+    /// Drops cached GPU thumbnail textures from RAM (disk cache stays intact).
+    pub fn clear_mem(&mut self) {
+        self.mem.clear();
+        self.mem.shrink_to_fit();
+        self.ready.clear();
     }
 }
 

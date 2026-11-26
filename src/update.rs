@@ -145,7 +145,7 @@ impl Updater {
                         let (title, subtitle) = match &stage {
                             Stage::Available(r) => ("Update available".to_string(), format!("{ours}  →  {}", r.version)),
                             Stage::Downloading(r) => (format!("Downloading {}", r.version), progress_text(&self.progress)),
-                            Stage::Installed(r) => ("Update downloaded".to_string(), if cfg!(target_os = "android") { format!("v{} saved to Download/Rustudio/. Tap it in Files to install!", r.version) } else { format!("{} starts when rustudio restarts.", r.version) }),
+                            Stage::Installed(r) => ("Update downloaded".to_string(), if cfg!(target_os = "android") { format!("v{} downloaded — follow the Android installer prompt.", r.version) } else { format!("{} starts when rustudio restarts.", r.version) }),
                             Stage::Failed(..) => ("Update failed".to_string(), "Nothing was changed.".to_string()),
                             _ => unreachable!(),
                         };

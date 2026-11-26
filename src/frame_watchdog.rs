@@ -43,7 +43,11 @@ impl Watchdog {
                 reported = stalled;
                 // A fresh cross-thread repaint event recovers an event loop whose
                 // previous redraw was consumed without delivering another frame.
-                if stalled { ctx.request_repaint(); }
+                #[cfg(target_os = "android")]
+                let bg = crate::android::lifecycle::is_backgrounded();
+                #[cfg(not(target_os = "android"))]
+                let bg = false;
+                if stalled && !bg { ctx.request_repaint(); }
             }
         }).expect("frame watchdog");
         Self { state, stop }

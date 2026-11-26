@@ -625,8 +625,10 @@ local function load_sequence(id)
     end
     local seq = kfs and parse_sequence(kfs) or false
     -- The clip's authoring rig, for retargeting (anim_retarget.rs).
-    if seq then seq.rig = kfs:FindFirstChildOfClass("AnimationRigData") end
-    sequences[id] = seq
+    if seq then
+        seq.rig = kfs:FindFirstChildOfClass("AnimationRigData")
+        sequences[id] = seq
+    end
     -- Roblox's Output line for a clip that didn't come (not public, not
     -- the signed-in account's, or no such asset): the track then never
     -- plays and never fires Stopped, and the game waits on it — LBG's

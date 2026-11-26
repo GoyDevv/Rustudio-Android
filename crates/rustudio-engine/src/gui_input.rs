@@ -564,7 +564,7 @@ impl Gui {
         });
     }
 
-    fn clear_billboard_canvases(&mut self) {
+    pub(crate) fn clear_billboard_canvases(&mut self) {
         self.billboard_canvases.clear();
         self.billboard_archive_owner.clear();
     }
@@ -861,7 +861,9 @@ impl Gui {
         };
         let mut layered: Vec<Ref> = Vec::new();
         if let Some(pg) = screen_parent {
-            for g in children(d, pg) {
+            let mut stack = children(d, pg);
+            stack.reverse();
+            while let Some(g) = stack.pop() {
                 let Some(class) = d.class_of(g) else { continue };
                 if !boolp(d, g, "Enabled", true) {
                     continue;
@@ -901,6 +903,11 @@ impl Gui {
                         }
                     }
                     "SurfaceGui" | "BillboardGui" => layered.push(g),
+                    "Folder" => {
+                        let mut sub = children(d, g);
+                        sub.reverse();
+                        stack.extend(sub);
+                    }
                     _ => {}
                 }
             }

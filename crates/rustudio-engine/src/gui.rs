@@ -1720,6 +1720,37 @@ pub(crate) fn fallback_font_data(bytes: &'static [u8]) -> egui::FontData {
 }
 
 impl Gui {
+    /// Clears failed image cache entries so signed-in / retried assets reload cleanly.
+    pub fn retry(&mut self, done: &[rustudio_core::assets::AssetRef]) {
+        let mut cleared = false;
+        self.images.retain(|k, v| {
+            let drop_it = matches!(v, Img::Failed)
+                && (done.is_empty() || done.iter().any(|a| k.contains(&a.id.to_string())));
+            if drop_it {
+                cleared = true;
+            }
+            !drop_it
+        });
+        if cleared {
+            self.cache.clear();
+            self.memo.clear();
+        }
+    }
+
+    /// Resets per-document GUI caches and failed image entries when opening a new place.
+    pub fn on_document_changed(&mut self) {
+        self.clear_billboard_canvases();
+        self.cache.clear();
+        self.memo.clear();
+        self.cache_owner.clear();
+        self.cache_kids.clear();
+        self.cache_owned.clear();
+        self.focus = None;
+        self.hovered.clear();
+        self.pressed = None;
+        self.images.retain(|_, v| !matches!(v, Img::Failed));
+    }
+
     /// Faces that weren't there, looked for again once a second: true when
     /// one has turned up (what was drawn without it must be walked again).
     /// A GUI with text in a missing face (the test place's 200 NPC name tags)

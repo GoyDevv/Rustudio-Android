@@ -34,6 +34,7 @@ static CACHE: OnceLock<Option<Cache>> = OnceLock::new();
 /// Pipeline descriptors that asked for the cache ([`current`] calls).
 static MADE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+static SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII guard for background pipeline compilation threads so `save()` never
 /// calls `VkPipelineCache::get_data()` concurrently on stock Adreno 6xx drivers.
@@ -152,24 +153,43 @@ pub fn save(force: bool) {
         saved.0 = made;
         return;
     }
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = c.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let len = data.len();
+    let delta = made - saved.0;
+    *saved = (made, len);
+    let path = c.path.clone();
+    let write_sync = move || {
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+            std::fs::write(&tmp, &data)?;
+            std::fs::rename(&tmp, &path)
+        };
+        match write() {
+            Ok(()) => log::info!(
+                "pipeline cache: {} KB written after {} pipeline(s) ({} ms)",
+                len / 1024,
+                delta,
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => log::warn!("pipeline cache: writing {}: {e}", path.display()),
         }
-        let tmp = c.path.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&tmp, &data)?;
-        std::fs::rename(&tmp, &c.path)
     };
-    match write() {
-        Ok(()) => log::info!(
-            "pipeline cache: {} KB written after {} pipeline(s) ({} ms)",
-            data.len() / 1024,
-            made - saved.0,
-            t0.elapsed().as_millis()
-        ),
-        Err(e) => log::warn!("pipeline cache: writing {}: {e}", c.path.display()),
+    if force {
+        write_sync();
+    } else if !SAVING.swap(true, Ordering::AcqRel) {
+        if std::thread::Builder::new()
+            .name("rustudio-pcache".into())
+            .spawn(move || {
+                write_sync();
+                SAVING.store(false, Ordering::Release);
+            })
+            .is_err()
+        {
+            SAVING.store(false, Ordering::Release);
+        }
     }
-    *saved = (made, data.len());
 }
 
 #[cfg(test)]

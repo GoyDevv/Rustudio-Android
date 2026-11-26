@@ -4911,7 +4911,11 @@ impl Game {
                 let h = if s.showing == Side::Server {
                     self.humanoid_f32(c.humanoid, "Health", 100.0)
                 } else {
-                    100.0
+                    s.map
+                        .s2c
+                        .get(&c.humanoid)
+                        .and_then(|&ch| rustudio_render::scene::f32_of(self.doc.prop(ch, "Health")))
+                        .unwrap_or(100.0)
                 };
                 format!(" · {} · health {h:.0}", c.state.enum_name())
             }

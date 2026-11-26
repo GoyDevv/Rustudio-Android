@@ -261,8 +261,7 @@ impl Game {
             return;
         };
         let (_, auto_rotate) = self.client_move_request(humanoid);
-        let sit = matches!(self.doc.prop(humanoid, "Sit"), Some(Variant::Bool(true)))
-            || matches!(self.owned_humanoid_prop(humanoid, "Sit"), Some(Variant::Bool(true)));
+        let sit = matches!(self.owned_humanoid_prop(humanoid, "Sit"), Some(Variant::Bool(true)));
         if !auto_rotate || sit {
             return;
         }
@@ -517,10 +516,8 @@ impl Game {
                 ch.last_root = Some(xf);
             }
         }
-        let sit = matches!(self.doc.prop(humanoid, "Sit"), Some(Variant::Bool(true)))
-            || matches!(self.owned_humanoid_prop(humanoid, "Sit"), Some(Variant::Bool(true)));
-        let platform = matches!(self.doc.prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)))
-            || matches!(self.owned_humanoid_prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)));
+        let sit = matches!(self.owned_humanoid_prop(humanoid, "Sit"), Some(Variant::Bool(true)));
+        let platform = matches!(self.owned_humanoid_prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)));
         // The owner's Health (a LocalScript setting Health = 0 kills its
         // character, as in Studio's T14 probe).
         let health = self.owned_humanoid_f32(humanoid, "Health", 100.0).min(self.humanoid_f32(humanoid, "Health", 100.0));
@@ -582,7 +579,8 @@ impl Game {
         let doc = &self.doc;
         let ch = s.character.as_mut().expect("character");
         let Some((root_xf, root_v, root_w)) = s.physics.humanoid_root(model) else { return out };
-        let shape = ch.shape;
+        let mut shape = ch.shape;
+        shape.hip = legs + hip_height;
         let mut hd = std::mem::take(&mut ch.dynamic);
         if let Some(c) = s.physics.humanoid_ctl(model) {
             hd.hum = c.hum.clone();

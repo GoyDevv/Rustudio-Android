@@ -549,6 +549,11 @@ impl<Tab> DockArea<'_, Tab> {
                 );
 
                 let is_dragged = response.dragged() || pill_dragged;
+                if is_dragged {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("egui_dock_separator_dragged"), true);
+                    });
+                }
                 let color = if is_dragged {
                     style.separator.color_dragged
                 } else if response.hovered() || response.has_focus() {

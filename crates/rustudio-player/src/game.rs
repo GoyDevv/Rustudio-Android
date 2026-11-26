@@ -452,6 +452,7 @@ impl Game {
         if !done.is_empty() {
             self.meshes.retry(&done);
             self.textures.retry(&done);
+            self.gui.retry(&done);
             self.asset_gen += 1;
         }
         // Material texture packs load on their own threads.

@@ -252,6 +252,8 @@ impl Painter {
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
+            self.depth_texture_view.clear();
+            self.msaa_texture_view.clear();
         }
         Ok(())
     }
@@ -281,6 +283,8 @@ impl Painter {
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
+            self.depth_texture_view.clear();
+            self.msaa_texture_view.clear();
         }
         Ok(())
     }

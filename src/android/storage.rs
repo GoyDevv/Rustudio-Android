@@ -53,16 +53,18 @@ fn roots(storage_access: bool) -> Vec<Root> {
     // app made are always readable; everything with storage access), and
     // the whole shared storage once access was granted.
     let shared = shared_storage();
-    for (label, sub) in [
-        ("Download", "Download"),
-        ("Documents", "Documents"),
-        ("Pictures", "Pictures"),
-        ("DCIM", "DCIM"),
-        ("Music", "Music"),
-    ] {
-        let p = shared.join(sub);
-        if std::fs::read_dir(&p).is_ok() {
-            v.push(Root { label, path: p });
+    if storage_access {
+        for (label, sub) in [
+            ("Download", "Download"),
+            ("Documents", "Documents"),
+            ("Pictures", "Pictures"),
+            ("DCIM", "DCIM"),
+            ("Music", "Music"),
+        ] {
+            let p = shared.join(sub);
+            if std::fs::read_dir(&p).is_ok() {
+                v.push(Root { label, path: p });
+            }
         }
     }
     if storage_access && std::fs::read_dir(&shared).is_ok() {
@@ -412,9 +414,12 @@ impl Picker {
                         if ui.add_enabled(!self.selected_multi.is_empty(), egui::Button::new("Clear")).clicked() {
                             self.selected_multi.clear();
                         }
-                    } else if self.kind == Kind::SaveFile {
-                        ui.label("Name:");
-                        ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(240.0));
+                    }
+                    if self.kind == Kind::SaveFile {
+                        ui.horizontal(|ui| {
+                            ui.label("Name:");
+                            ui.add(egui::TextEdit::singleline(&mut self.name).desired_width((ui.available_width() - 8.0).max(120.0)));
+                        });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.multi {

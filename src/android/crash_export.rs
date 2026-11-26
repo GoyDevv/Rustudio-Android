@@ -98,20 +98,16 @@ fn export_android(file_name: &str, content: String) -> ExportStatus {
         *g = Some(content.clone());
     }
 
-    // 1. Write a guaranteed copy to Downloads (MediaStore on API 29+, or direct path).
-    let saved_copy = save_to_downloads_android(file_name, content.as_bytes());
-
-    // 2. Launch Android SAF ACTION_CREATE_DOCUMENT ("text/plain").
+    // 1. Launch Android SAF ACTION_CREATE_DOCUMENT ("text/plain").
+    // Only fall back to MediaStore Downloads if SAF launch itself fails.
     let saf_launch = launch_saf_create_document(file_name);
+    if saf_launch.is_ok() {
+        return ExportStatus::Success(format!("Opened system Save picker for {file_name}."));
+    }
 
+    let saved_copy = save_to_downloads_android(file_name, content.as_bytes());
     let status = match (saf_launch, saved_copy) {
-        (Ok(()), Ok(location)) => ExportStatus::Success(format!(
-            "Opened system Save picker for {file_name} (copy saved to {location})."
-        )),
-        (Ok(()), Err(copy_err)) => {
-            log::warn!("crash_export: fallback Download copy failed: {copy_err}");
-            ExportStatus::Success(format!("Opened system Save picker for {file_name}."))
-        }
+        (Ok(()), _) => unreachable!(),
         (Err(saf_err), Ok(location)) => {
             log::warn!("crash_export: SAF ACTION_CREATE_DOCUMENT failed ({saf_err}); using Download copy");
             ExportStatus::Success(format!("Saved crash report to {location}."))
@@ -287,6 +283,11 @@ fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::
         put_str(env, "_display_name", file_name)?;
         put_str(env, "mime_type", "text/plain")?;
         put_str(env, "relative_path", "Download/Rustudio/")?;
+        {
+            let jk = env.new_string("is_pending")?;
+            let jone = env.call_static_method(jni_str!("java/lang/Integer"), jni_str!("valueOf"), jni_sig!("(I)Ljava/lang/Integer;"), &[JValue::Int(1)])?.l()?;
+            env.call_method(&cv, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/Integer;)V"), &[JValue::Object(&jk), JValue::Object(&jone)])?;
+        }
 
         let downloads_uri = env
             .get_static_field(
@@ -336,6 +337,13 @@ fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::
         )?;
         env.call_method(&stream, jni_str!("flush"), jni_sig!("()V"), &[])?;
         env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
+        {
+            let clear_cv = env.new_object(jni_str!("android/content/ContentValues"), jni_sig!("()V"), &[])?;
+            let jk = env.new_string("is_pending")?;
+            let jzero = env.call_static_method(jni_str!("java/lang/Integer"), jni_str!("valueOf"), jni_sig!("(I)Ljava/lang/Integer;"), &[JValue::Int(0)])?.l()?;
+            env.call_method(&clear_cv, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/Integer;)V"), &[JValue::Object(&jk), JValue::Object(&jzero)])?;
+            let _ = env.call_method(&resolver, jni_str!("update"), jni_sig!("(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I"), &[JValue::Object(&inserted), JValue::Object(&clear_cv), JValue::Object(&jni::objects::JObject::null()), JValue::Object(&jni::objects::JObject::null())]);
+        }
         Ok(format!("Download/Rustudio/{file_name}"))
     })
 }
@@ -375,6 +383,41 @@ fn export_desktop(file_name: String, content: String) -> ExportStatus {
             let status = ExportStatus::Error(format!("Failed to open save dialog: {e}"));
             set_status(status.clone());
             status
+        }
+    }
+}
+
+/// Raw JNI bridge called from `crates/rustudio-android/src/lib.rs` on SAF picker result.
+///
+/// # Safety
+/// Must be called by the JVM with valid `JNIEnv*` and optional `jstring`.
+#[cfg(target_os = "android")]
+pub unsafe fn jni_on_saf_document_created(
+    env: *mut std::ffi::c_void,
+    uri: *mut std::ffi::c_void,
+) {
+    if env.is_null() || uri.is_null() {
+        if let Ok(mut g) = PENDING_SAF_CONTENT.lock() {
+            *g = None;
+        }
+        return;
+    }
+    let env_ptr = env as *mut jni::sys::JNIEnv;
+    let jstr = uri as jni::sys::jstring;
+    unsafe {
+        let Some(vtable) = (*env_ptr).as_ref() else {
+            return;
+        };
+        let get_chars = vtable.v1_1.GetStringUTFChars;
+        let rel_chars = vtable.v1_1.ReleaseStringUTFChars;
+        let ptr = get_chars(env_ptr, jstr, std::ptr::null_mut());
+        if ptr.is_null() {
+            return;
+        }
+        let s = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        rel_chars(env_ptr, jstr, ptr);
+        if let Err(e) = on_saf_document_created(&s) {
+            log::warn!("crash_export: SAF write failed: {e}");
         }
     }
 }

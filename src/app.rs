@@ -904,8 +904,10 @@ impl Editor {
         self.ui.minimized_tabs.retain(|tab| !matches!(tab, Tab::Script(_)));
         self.ui.minimize_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
         self.ui.restore_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
+        self.ui.anim = Default::default();
         self.game.doc = doc;
         self.game.edit_audio.reset();
+        self.game.gui.on_document_changed();
         self.game.scene = Scene::default();
         self.drag = None;
         self.hover = None;
@@ -1197,8 +1199,15 @@ impl Editor {
 
     pub fn save_to(&mut self, p: PathBuf) {
         match self.game.doc.save_to(&p) {
-            Ok(()) => self.info(format!("Saved {}", p.display())),
-            Err(e) => self.error(format!("Save failed: {e}")),
+            Ok(()) => {
+                crate::studio_ui::remember_recent(&mut self.ui, &p);
+                self.info(format!("Saved {}", p.display()));
+            }
+            Err(e) => {
+                let msg = format!("Save failed ({}): {e}", p.display());
+                self.error(msg.clone());
+                self.cloud.save_error = Some(msg);
+            }
         }
     }
 
@@ -2413,6 +2422,24 @@ impl eframe::App for RustudioApp {
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.mobile_windows, &self.ed);
         }
+        if self.ed.game.doc.dirty() && self.ed.game.play.is_none() {
+            let dir = rustudio_core::paths::data().join("AutoSaves");
+            let _ = std::fs::create_dir_all(&dir);
+            let tmp = dir.join("autosave.rbxl.tmp");
+            let dst = dir.join("autosave.rbxl");
+            if self.ed.game.doc.save_to(&tmp).is_ok() {
+                let _ = std::fs::rename(&tmp, &dst);
+            }
+        }
+        if crate::android::lifecycle::is_backgrounded() {
+            self.watchdog.hidden();
+            if let (Some(r), Some(rs)) = (self.ed.game.renderer.as_mut(), self.ed.game.render_state.as_ref()) {
+                r.release_transient_targets(rs);
+            }
+            self.ed.game.assets.clear_memory();
+            self.ed.game.textures.trim();
+            self.ed.toolbox.thumbs.clear_mem();
+        }
         rustudio_render::pipeline_cache::save(true);
         // Going to the background: the free heap pages go back now, so the
         // process is judged (and kept) by what it really holds.
@@ -2489,6 +2516,10 @@ impl eframe::App for RustudioApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        if crate::android::lifecycle::is_backgrounded() {
+            return;
+        }
         // eframe can run logic without a UI pass when the root is hidden.
         if ctx.input(|i| i.viewport().visible() == Some(false)) {
             Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, Instant::now());
@@ -2504,9 +2535,6 @@ impl eframe::App for RustudioApp {
         if let Some(message) = rustudio_render::gpu_health::take_uncaptured() {
             self.ed.warn(message);
         }
-        // The driver's pipeline cache goes to disk once a burst of pipeline
-        // builds is over (pipeline_cache.rs): the next start skips them.
-        rustudio_render::pipeline_cache::save(false);
         // (a phone shows black until this frame is presented: logcat
         // `RustStdoutStderr` has the renderer's and the first frame's share
         // of its start, render.rs `ensure_pipelines` the viewport's)
@@ -3096,6 +3124,7 @@ impl RustudioApp {
         self.ed.mobile_window_rects = self.mobile_windows.hit_rects();
         let mut drag_rects = self.mobile_windows.drag_handle_rects();
         let sep_rects = ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("egui_dock_separator_dragged"), false);
             std::mem::take(d.get_temp_mut_or_default::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects")))
         });
         drag_rects.extend(sep_rects);
@@ -3437,6 +3466,12 @@ impl RustudioApp {
         }
         if ed.harness.run.bench_frame(&mut ed.game, &ctx, work_ms, dt) {
             ed.finish_run(&ctx, "bench");
+        }
+        #[cfg(target_os = "android")]
+        if crate::android::lifecycle::is_backgrounded() {
+            self.watchdog.hidden();
+            self.watchdog.complete();
+            return;
         }
         if ed.drag.is_some()
             || ed.game.play.is_some()

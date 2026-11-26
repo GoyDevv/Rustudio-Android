@@ -1652,6 +1652,28 @@ impl Document {
                 let class = self.dom.get_by_ref(*r)?.class;
                 screen_insets_twin(class.as_str(), name.as_str(), value)
                     .or_else(|| lighting_time_twin(class.as_str(), name.as_str(), value))
+                    .or_else(|| {
+                        let twin = content_twin(name.as_str())?;
+                        let v = match value {
+                            Variant::ContentId(c) => {
+                                let s = c.as_str();
+                                if s.is_empty() {
+                                    Variant::Content(rbx_dom_weak::types::Content::none())
+                                } else {
+                                    Variant::Content(rbx_dom_weak::types::Content::from_uri(s.to_string()))
+                                }
+                            }
+                            Variant::String(s) => {
+                                if s.is_empty() {
+                                    Variant::Content(rbx_dom_weak::types::Content::none())
+                                } else {
+                                    Variant::Content(rbx_dom_weak::types::Content::from_uri(s.clone()))
+                                }
+                            }
+                            _ => return None,
+                        };
+                        Some((twin, v))
+                    })
                     .map(|(n, v)| (*r, ustr(n), v))
             })
             .collect();

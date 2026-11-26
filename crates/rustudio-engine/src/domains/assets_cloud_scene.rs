@@ -35,7 +35,13 @@ thread_local!{
 }
 /// Luau's thread destruction (security::userthread): no Lua access there.
 pub fn thread_died(vm:usize,thread:usize){
-    DEAD.with(|d|{let mut d=d.borrow_mut();if d.len()<1<<20{d.push((vm,thread));}});
+    let _ = DEAD.try_with(|d| {
+        if let Ok(mut d) = d.try_borrow_mut() {
+            if d.len() < 1 << 20 {
+                d.push((vm, thread));
+            }
+        }
+    });
 }
 /// Drops this VM's destroyed threads from the map (before a new thread can
 /// reuse an address).

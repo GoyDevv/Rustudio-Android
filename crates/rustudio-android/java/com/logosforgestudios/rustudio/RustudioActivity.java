@@ -2,6 +2,7 @@ package com.logosforgestudios.rustudio;
 
 import android.app.NativeActivity;
 import android.app.PendingIntent;
+import android.content.ComponentCallbacks2;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -42,6 +43,7 @@ import android.widget.FrameLayout;
  */
 public class RustudioActivity extends NativeActivity {
     private static final int REQ_UNKNOWN_SOURCES = 4107;
+    private static final int REQ_SAF_CREATE_DOC = 0x5253;
     private static final String ACTION_INSTALL_COMMIT = "com.logosforgestudios.rustudio.ACTION_INSTALL_COMMIT";
     private ImeProxyView imeView;
     private String pendingInstallApkPath = null;
@@ -58,6 +60,9 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeImeDelete(int before, int after);
     static native void nativeImeKey(int keyCode, boolean down);
     static native void nativeImeAction(int action);
+    static native void nativeOnLifecycle(int state);
+    static native void nativeOnTrimMemory(int level);
+    static native void nativeOnSafDocumentCreated(String uri);
 
     private void applyDarkFullscreenWindow() {
         Window w = getWindow();
@@ -136,8 +141,35 @@ public class RustudioActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        nativeOnLifecycle(3);
         applyDarkFullscreenWindow();
         maybeResumePendingInstall();
+    }
+
+    @Override
+    protected void onPause() {
+        nativeOnLifecycle(1);
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        nativeOnLifecycle(2);
+        super.onStop();
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            nativeOnTrimMemory(level);
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        nativeOnTrimMemory(ComponentCallbacks2.TRIM_MEMORY_COMPLETE);
     }
 
     @Override
@@ -145,6 +177,12 @@ public class RustudioActivity extends NativeActivity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_UNKNOWN_SOURCES) {
             maybeResumePendingInstall();
+        } else if (requestCode == REQ_SAF_CREATE_DOC) {
+            String uri = null;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                uri = data.getData().toString();
+            }
+            nativeOnSafDocumentCreated(uri);
         }
     }
 

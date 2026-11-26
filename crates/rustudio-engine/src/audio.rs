@@ -447,6 +447,7 @@ pub struct Audio {
     out: Output,
     /// Keeps the device thread (and its output stream) alive; dropped with `Audio`.
     hold: Option<Sender<()>>,
+    output_thread: Option<std::thread::JoinHandle<()>>,
     /// Length cache keyed by the byte buffer's address (validated through the `Weak`).
     lengths: HashMap<usize, (Weak<Vec<u8>>, Arc<LenCell>)>,
     capture_thread: Option<std::thread::JoinHandle<()>>,
@@ -456,7 +457,15 @@ pub struct Audio {
 
 impl Drop for Audio {
     fn drop(&mut self) {
+        // Clear all active sinks/mixers before closing the AAudio output stream on the audio thread.
+        self.sounds.clear();
+        self.buses.clear();
+        self.routes.clear();
+        self.out = Output::Unopened;
         self.hold.take();
+        if let Some(t) = self.output_thread.take() {
+            let _ = t.join();
+        }
         if let Some(t) = self.capture_thread.take() {
             let _ = t.join();
         }
@@ -499,6 +508,7 @@ impl Audio {
             sounds: HashMap::new(),
             out: Output::Disabled,
             hold: None,
+            output_thread: None,
             lengths: HashMap::new(),
             capture_thread: None,
             routes: HashMap::new(),
@@ -546,8 +556,9 @@ impl Audio {
                 }
             });
         match spawned {
-            Ok(_) => {
+            Ok(handle) => {
                 self.hold = Some(hold_tx);
+                self.output_thread = Some(handle);
                 Output::Opening { rx, waited: false }
             }
             Err(e) => Output::Failed(format!("cannot start audio thread: {e}")),

@@ -313,6 +313,7 @@ static PUBLIC_SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
 fn auto_export_public_crash(file_name: &str, body: &str) {
     #[cfg(target_os = "android")]
     {
+        let mut wrote_direct = false;
         for dir in [
             "/storage/emulated/0/Documents/Rustudio",
             "/storage/emulated/0/Download/Rustudio",
@@ -320,11 +321,14 @@ fn auto_export_public_crash(file_name: &str, body: &str) {
             if std::fs::create_dir_all(dir).is_ok() {
                 let p = Path::new(dir).join(file_name);
                 if std::fs::write(&p, body.as_bytes()).is_ok() {
+                    wrote_direct = true;
                     break;
                 }
             }
         }
-        let _ = crate::android::crash_export::save_to_downloads_android(file_name, body.as_bytes());
+        if !wrote_direct {
+            let _ = crate::android::crash_export::save_to_downloads_android(file_name, body.as_bytes());
+        }
     }
     #[cfg(not(target_os = "android"))]
     {

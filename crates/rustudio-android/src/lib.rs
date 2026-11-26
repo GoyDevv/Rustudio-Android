@@ -93,3 +93,33 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeIme
 ) {
     rustudio::android::ime_bridge::on_action(action);
 }
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnLifecycle(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    state: i32,
+) {
+    rustudio::android::lifecycle::on_java_lifecycle(state);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnTrimMemory(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    level: i32,
+) {
+    rustudio::android::lifecycle::on_trim_memory(level);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnSafDocumentCreated(
+    env: *mut c_void,
+    _class: *mut c_void,
+    uri: *mut c_void,
+) {
+    unsafe { rustudio::android::crash_export::jni_on_saf_document_created(env, uri) };
+}

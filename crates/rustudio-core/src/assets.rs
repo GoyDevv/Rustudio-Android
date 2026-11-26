@@ -1453,6 +1453,24 @@ pub fn cache_path(a: AssetRef) -> PathBuf {
 }
 
 impl AssetStore {
+    /// Drops cached raw asset bytes from RAM (every entry remains in the disk cache).
+    pub fn clear_memory(&mut self) {
+        self.memory.clear();
+        self.memory.shrink_to_fit();
+    }
+
+    fn cache_in_memory(&mut self, a: AssetRef, b: Arc<Vec<u8>>) {
+        #[cfg(target_os = "android")]
+        const MAX_MEM_BYTES: usize = 32 << 20;
+        #[cfg(not(target_os = "android"))]
+        const MAX_MEM_BYTES: usize = 256 << 20;
+        let total: usize = self.memory.values().map(|v| v.len()).sum();
+        if total + b.len() > MAX_MEM_BYTES {
+            self.memory.clear();
+        }
+        self.memory.insert(a, b);
+    }
+
     /// Gives the store the account's client (None when signed out).
     pub fn set_client(&mut self, client: Option<SharedClient>) {
         let had = self.client.is_some();
@@ -1492,14 +1510,14 @@ impl AssetStore {
         }
         if let Ok(b) = std::fs::read(cache_path(a)) {
             let b = Arc::new(b);
-            self.memory.insert(a, b.clone());
+            self.cache_in_memory(a, b.clone());
             return Fetch::Ready(b);
         }
         // The person's own upload's source file; the local store only once
         // Roblox's copy failed (`poll`, `local_store_path`).
         if let Some(b) = ledger_path(a.id).and_then(|p| std::fs::read(p).ok()) {
             let b = Arc::new(b);
-            self.memory.insert(a, b.clone());
+            self.cache_in_memory(a, b.clone());
             return Fetch::Ready(b);
         }
         if let Some(why) = self.failed.get(&a) {
@@ -1991,6 +2009,9 @@ pub struct LoadedTexture {
 }
 
 /// Released pixels kept around for the next composite that shares them.
+#[cfg(target_os = "android")]
+const LOOSE_PIXELS_BYTES: usize = 24 << 20;
+#[cfg(not(target_os = "android"))]
 const LOOSE_PIXELS_BYTES: usize = 192 << 20;
 
 #[derive(Default)]
@@ -2031,6 +2052,18 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
+    /// Releases non-pinned loose pixel buffers and decoded staging buffers on trim/background.
+    pub fn trim(&mut self) {
+        self.loose.retain(|id| self.pinned.contains(id));
+        self.loose_set.retain(|id| self.pinned.contains(id));
+        self.pixels.retain(|id, _| self.pinned.contains(id));
+        self.loose_bytes = self.pixels.values().map(|p| p.pixels.len()).sum();
+        self.last_wanted.retain(|id, _| self.pinned.contains(id));
+        self.decoded.clear();
+        self.pixels.shrink_to_fit();
+        self.decoded.shrink_to_fit();
+    }
+
     /// (decoding or waiting to upload, asked for so far).
     pub fn counts(&self) -> (usize, usize) {
         (self.decoding.len() + self.decoded.len(), self.entries.len())

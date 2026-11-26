@@ -24,10 +24,23 @@ use rustudio_core::math::Xform;
 /// The scene is lit in linear light into this target...
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// HDR scene render-target format: Rgba16Float whenever the adapter supports
-/// filterable/blendable float render targets (preserving alpha for SeeThrough,
-/// DoF CoC, and ViewportFrame), else Rgba8Unorm on GLES devices without float RTs.
+/// 32-bit HDR (Rg11b10Ufloat) on Android Vulkan for RGB-only scene/bloom/blur targets
+/// (halves tile memory bandwidth vs Rgba16Float); Rgba8Unorm when float RTs are unsupported.
 pub(crate) fn scene_hdr_format(caps: &crate::gpu_caps::GpuCaps) -> wgpu::TextureFormat {
+    if !caps.hdr_float_rt {
+        wgpu::TextureFormat::Rgba8Unorm
+    } else if cfg!(target_os = "android")
+        && caps.backend != wgpu::Backend::Gl
+        && caps.features.contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE)
+    {
+        wgpu::TextureFormat::Rg11b10Ufloat
+    } else {
+        HDR_FORMAT
+    }
+}
+
+/// Alpha-preserving HDR format (`Rgba16Float` when supported) for SeeThrough and ViewportFrame targets.
+pub(crate) fn scene_hdr_alpha_format(caps: &crate::gpu_caps::GpuCaps) -> wgpu::TextureFormat {
     if !caps.hdr_float_rt {
         wgpu::TextureFormat::Rgba8Unorm
     } else {
@@ -2075,7 +2088,7 @@ struct SeeThrough {
 }
 
 impl SeeThrough {
-    fn new(device: &wgpu::Device, shader: &wgpu::ShaderModule, globals: &wgpu::BindGroupLayout, ms: wgpu::MultisampleState, hdr_format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, shader: &wgpu::ShaderModule, globals: &wgpu::BindGroupLayout, ms: wgpu::MultisampleState, hdr_format: wgpu::TextureFormat, see_format: wgpu::TextureFormat) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("see-through scene"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -2119,7 +2132,7 @@ impl SeeThrough {
             })
         };
         SeeThrough {
-            encode: pipe("see-through encode", "fs_see_encode", false, hdr_format),
+            encode: pipe("see-through encode", "fs_see_encode", false, see_format),
             // (in the pass that also draws the editor's lines: with depth)
             decode: pipe("see-through decode", "fs_see_decode", true, hdr_format),
             layout,
@@ -2278,6 +2291,7 @@ impl ViewportPipelines {
             alpha_to_coverage_enabled: false,
         };
         let hdr_format = scene_hdr_format(caps);
+        let see_format = scene_hdr_alpha_format(caps);
         let make_fmt = |label: &str,
                     vs: &str,
                     fs: &str,
@@ -2522,14 +2536,17 @@ impl ViewportPipelines {
         // see_out; SeeThrough below).
         let pm = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
         let parts = [Some(vertex_layout.clone()), Some(instance_layout.clone())];
-        let see_pipes = SeePipes {
-            transparent: make_see("parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-            transparent_culled: make_see("parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
-            glass: make_see("glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None),
-            glass_culled: make_see("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
-            overlay: make_see("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
+        let make_see_alpha = |label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend| {
+            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[], see_format)
         };
-        let see = SeeThrough::new(device, &shader, &bgl, ms, hdr_format);
+        let see_pipes = SeePipes {
+            transparent: make_see_alpha("parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
+            transparent_culled: make_see_alpha("parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
+            glass: make_see_alpha("glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None),
+            glass_culled: make_see_alpha("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
+            overlay: make_see_alpha("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
+        };
+        let see = SeeThrough::new(device, &shader, &bgl, ms, hdr_format, see_format);
         let water = crate::water::WaterPass::new(
             device,
             queue,
@@ -5049,7 +5066,7 @@ impl Renderer {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING)
                 .create_view(&Default::default())
         };
-        let see_view = tex("viewport-see-through", hdr_format, samples,
+        let see_view = tex("viewport-see-through", scene_hdr_alpha_format(&self.caps), samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
         let see_encode_bg = viewport.see.bind(device, &msaa_view);
         let see_decode_bg = viewport.see.bind(device, &see_view);
@@ -7693,6 +7710,28 @@ impl Renderer {
     /// move (used by the 3D editor to request a catch-up repaint before going idle).
     pub fn caps(&self) -> &crate::gpu_caps::GpuCaps {
         &self.caps
+    }
+
+    /// Releases transient offscreen viewport/PostFX/shadow-cache GPU targets when backgrounded
+    /// so Android's unified memory / LMK keeps the process alive. Rebuilt lazily on resume.
+    pub fn release_transient_targets(&mut self, rs: &egui_wgpu::RenderState) {
+        self.target = None;
+        if let Some(id) = self.texture_id.take() {
+            rs.renderer.write().free_texture(&id);
+        }
+        self.postfx.release_targets();
+        self.sun_cache.slots = [None, None, None, None];
+        for h in &mut self.highlight {
+            if let Some(hp) = h.as_mut() {
+                hp.clear_target();
+            }
+        }
+        for ci in &mut self.clouds {
+            if let Some(c) = ci.as_mut() {
+                c.idle();
+            }
+        }
+        let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     pub fn has_stale_shadows(&self) -> bool {

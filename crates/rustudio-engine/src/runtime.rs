@@ -2396,7 +2396,7 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
         return Some(store_prop_in_world(lua, w, r, *CFRAME, value).map(|_| no_dispatch));
     }
     let canon = info.canon.as_str();
-    if key == "FontSize" || canon == "Disabled" || (canon == "Health" && class == "Humanoid")
+    if key == "FontSize" || canon == "Disabled" || (matches!(canon, "Health" | "MaxHealth") && class == "Humanoid")
         || camera_zoom_opposite(class, canon).is_some()
     {
         return None;
@@ -4199,12 +4199,33 @@ fn newindex_routed(
             });
         }
     }
+    if class == "Humanoid" && canon == "MaxHealth" {
+        let new_max = match v {
+            Variant::Float32(m) => m.max(0.0),
+            _ => 100.0,
+        };
+        store_prop(lua, r, canon, Variant::Float32(new_max))?;
+        let old_health = match world(lua)?.d().prop(r, "Health") {
+            Some(Variant::Float32(h)) => h,
+            _ => 100.0,
+        };
+        if old_health > new_max {
+            store_prop(lua, r, "Health", Variant::Float32(new_max))?;
+            let mut w = world(lua)?;
+            w.fire(r, "HealthChanged", vec![Value::Number(new_max as f64)]);
+            if new_max <= 0.0 && old_health > 0.0 {
+                w.fire(r, "Died", vec![]);
+                w.died.push(r);
+            }
+        }
+        return Ok(());
+    }
     if class == "Humanoid" && canon == "Health" {
         let max = match world(lua)?.d().prop(r, "MaxHealth") {
             Some(Variant::Float32(m)) => m,
             _ => 100.0,
         };
-        let old = match existing {
+        let old = match world(lua)?.d().prop_key(r, info.canon) {
             Some(Variant::Float32(h)) => h,
             _ => 100.0,
         };
@@ -4213,11 +4234,13 @@ fn newindex_routed(
             _ => old,
         };
         store_prop(lua, r, canon, Variant::Float32(new))?;
-        let mut w = world(lua)?;
-        w.fire(r, "HealthChanged", vec![Value::Number(new as f64)]);
-        if new <= 0.0 && old > 0.0 {
-            w.fire(r, "Died", vec![]);
-            w.died.push(r);
+        if new != old {
+            let mut w = world(lua)?;
+            w.fire(r, "HealthChanged", vec![Value::Number(new as f64)]);
+            if new <= 0.0 && old > 0.0 {
+                w.fire(r, "Died", vec![]);
+                w.died.push(r);
+            }
         }
         return Ok(());
     }

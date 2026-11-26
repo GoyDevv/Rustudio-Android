@@ -26,7 +26,7 @@ impl PlayWorker {
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
             #[cfg(unix)]
-            unsafe {
+            let alt_stack: (*mut libc::c_void, usize) = unsafe {
                 let size = 64 * 1024;
                 let stack = libc::mmap(
                     std::ptr::null_mut(),
@@ -39,8 +39,11 @@ impl PlayWorker {
                 if stack != libc::MAP_FAILED {
                     let ss = libc::stack_t { ss_sp: stack, ss_flags: 0, ss_size: size };
                     libc::sigaltstack(&ss, std::ptr::null_mut());
+                    (stack, size)
+                } else {
+                    (std::ptr::null_mut(), 0)
                 }
-            }
+            };
             let mut game = Box::new(Game::new(None));
             let mut host = WorkerHost { hooks, end_test: None };
             init(&mut game, &mut host);
@@ -66,6 +69,14 @@ impl PlayWorker {
                 job(&mut game, &mut host);
             }
             game.stop_play(&mut host);
+            #[cfg(unix)]
+            if !alt_stack.0.is_null() {
+                unsafe {
+                    let ss = libc::stack_t { ss_sp: std::ptr::null_mut(), ss_flags: libc::SS_DISABLE, ss_size: 0 };
+                    libc::sigaltstack(&ss, std::ptr::null_mut());
+                    libc::munmap(alt_stack.0, alt_stack.1);
+                }
+            }
         })?;
         Ok(Self { jobs: Some(jobs), thread: Some(thread) })
     }
@@ -1037,7 +1048,7 @@ impl Game {
                 // InputBegan was delivered while the last viewport drew.
                 // Give the following RenderStepped's pose and camera the
                 // next presentation slot instead of queueing it one deeper.
-                if !wait_for_publication || matches!(threaded.receive(self, host, true), Receive::Available) {
+                if !wait_for_publication || matches!(threaded.receive(self, host, textbox_edit), Receive::Available) {
                     self.play_thread = Some(threaded);
                 }
             }
