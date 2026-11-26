@@ -1527,6 +1527,52 @@ impl Editor {
                                     bar_acted = true;
                                 }
 
+                                // 3b. Undo / Redo — direct TextEditUndoer operations!
+                                {
+                                    let cur_state = (cur_range, buf.text.clone());
+                                    let undoer_snap = te_state.undoer();
+                                    let can_undo = undoer_snap.has_undo(&cur_state);
+                                    let can_redo = undoer_snap.has_redo(&cur_state);
+                                    if ui
+                                        .add_enabled(
+                                            can_undo,
+                                            egui::Button::new(RichText::new("Undo").size(12.5)).min_size(egui::vec2(52.0, btn_h)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let mut u = te_state.undoer();
+                                        if let Some((prev_r, prev_t)) = u.undo(&cur_state).cloned() {
+                                            buf.text = prev_t;
+                                            buf.edited = Instant::now();
+                                            changed = true;
+                                            cur_range = prev_r;
+                                            te_state.set_undoer(u);
+                                            cursor_dirty = true;
+                                        }
+                                        bar_select_mode = false;
+                                        bar_acted = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_redo,
+                                            egui::Button::new(RichText::new("Redo").size(12.5)).min_size(egui::vec2(52.0, btn_h)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let mut u = te_state.undoer();
+                                        if let Some((next_r, next_t)) = u.redo(&cur_state).cloned() {
+                                            buf.text = next_t;
+                                            buf.edited = Instant::now();
+                                            changed = true;
+                                            cur_range = next_r;
+                                            te_state.set_undoer(u);
+                                            cursor_dirty = true;
+                                        }
+                                        bar_select_mode = false;
+                                        bar_acted = true;
+                                    }
+                                }
+
                                 // 4. Select All, Cut, Copy, Paste — direct buffer & clipboard operations!
                                 if ui
                                     .add(egui::Button::new(RichText::new("Select All").size(12.5)).min_size(egui::vec2(74.0, btn_h)))
@@ -1553,6 +1599,9 @@ impl Editor {
                                     let b = hi.index.0.min(chars.len());
                                     let selected: String = chars[a..b].iter().collect();
                                     ui.ctx().copy_text(selected);
+                                    let mut u = te_state.undoer();
+                                    u.add_undo(&(cur_range, buf.text.clone()));
+                                    te_state.set_undoer(u);
                                     buf.text = chars[..a].iter().chain(chars[b..].iter()).collect();
                                     buf.edited = Instant::now();
                                     changed = true;
@@ -1595,6 +1644,9 @@ impl Editor {
                                         let b = hi.index.0.min(chars.len());
                                         let ins: Vec<char> = normalized.chars().collect();
                                         let new_cur = a + ins.len();
+                                        let mut u = te_state.undoer();
+                                        u.add_undo(&(cur_range, buf.text.clone()));
+                                        te_state.set_undoer(u);
                                         buf.text = chars[..a].iter().chain(ins.iter()).chain(chars[b..].iter()).collect();
                                         buf.edited = Instant::now();
                                         changed = true;
@@ -1622,6 +1674,172 @@ impl Editor {
             });
             if bar_acted || pointer_in_bar {
                 bar_keep_kb = true;
+            }
+        } else if cfg!(target_os = "android") {
+            let mut te_state = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            let total_chars = buf.text.chars().count();
+            let mut cur_range = te_state
+                .cursor
+                .char_range()
+                .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(total_chars)));
+            let has_selection = !cur_range.is_empty();
+            let cur_state = (cur_range, buf.text.clone());
+            let undoer_snap = te_state.undoer();
+            let can_undo = undoer_snap.has_undo(&cur_state);
+            let can_redo = undoer_snap.has_redo(&cur_state);
+            let mut land_dirty = false;
+
+            egui::ScrollArea::horizontal()
+                .id_salt(("android_land_script_bar", r))
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let btn_h = 28.0;
+
+                        if ui
+                            .add_enabled(
+                                can_undo,
+                                egui::Button::new(RichText::new("Undo").size(12.0)).min_size(egui::vec2(50.0, btn_h)),
+                            )
+                            .on_hover_text("Undo (Ctrl+Z)")
+                            .clicked()
+                        {
+                            let mut u = te_state.undoer();
+                            if let Some((prev_r, prev_t)) = u.undo(&cur_state).cloned() {
+                                buf.text = prev_t;
+                                buf.edited = Instant::now();
+                                changed = true;
+                                cur_range = prev_r;
+                                te_state.set_undoer(u);
+                                land_dirty = true;
+                            }
+                            bar_acted = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                can_redo,
+                                egui::Button::new(RichText::new("Redo").size(12.0)).min_size(egui::vec2(50.0, btn_h)),
+                            )
+                            .on_hover_text("Redo (Ctrl+Y)")
+                            .clicked()
+                        {
+                            let mut u = te_state.undoer();
+                            if let Some((next_r, next_t)) = u.redo(&cur_state).cloned() {
+                                buf.text = next_t;
+                                buf.edited = Instant::now();
+                                changed = true;
+                                cur_range = next_r;
+                                te_state.set_undoer(u);
+                                land_dirty = true;
+                            }
+                            bar_acted = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                has_selection,
+                                egui::Button::new(RichText::new("Cut").size(12.0)).min_size(egui::vec2(44.0, btn_h)),
+                            )
+                            .clicked()
+                        {
+                            let [lo, hi] = cur_range.sorted_cursors();
+                            let chars: Vec<char> = buf.text.chars().collect();
+                            let a = lo.index.0.min(chars.len());
+                            let b = hi.index.0.min(chars.len());
+                            let selected: String = chars[a..b].iter().collect();
+                            ui.ctx().copy_text(selected);
+                            let mut u = te_state.undoer();
+                            u.add_undo(&(cur_range, buf.text.clone()));
+                            te_state.set_undoer(u);
+                            buf.text = chars[..a].iter().chain(chars[b..].iter()).collect();
+                            buf.edited = Instant::now();
+                            changed = true;
+                            cur_range = egui::text::CCursorRange::one(egui::text::CCursor::new(a));
+                            land_dirty = true;
+                            bar_acted = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                has_selection,
+                                egui::Button::new(RichText::new("Copy").size(12.0)).min_size(egui::vec2(48.0, btn_h)),
+                            )
+                            .clicked()
+                        {
+                            let [lo, hi] = cur_range.sorted_cursors();
+                            let chars: Vec<char> = buf.text.chars().collect();
+                            let a = lo.index.0.min(chars.len());
+                            let b = hi.index.0.min(chars.len());
+                            let selected: String = chars[a..b].iter().collect();
+                            ui.ctx().copy_text(selected);
+                            bar_acted = true;
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("Paste").size(12.0)).min_size(egui::vec2(50.0, btn_h)))
+                            .clicked()
+                        {
+                            #[cfg(target_os = "android")]
+                            let text = crate::android::clipboard::text_now()
+                                .or_else(crate::android::clipboard::text)
+                                .unwrap_or_default();
+                            #[cfg(not(target_os = "android"))]
+                            let text = String::new();
+                            if !text.is_empty() {
+                                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                                let [lo, hi] = cur_range.sorted_cursors();
+                                let chars: Vec<char> = buf.text.chars().collect();
+                                let a = lo.index.0.min(chars.len());
+                                let b = hi.index.0.min(chars.len());
+                                let ins: Vec<char> = normalized.chars().collect();
+                                let new_cur = a + ins.len();
+                                let mut u = te_state.undoer();
+                                u.add_undo(&(cur_range, buf.text.clone()));
+                                te_state.set_undoer(u);
+                                buf.text = chars[..a].iter().chain(ins.iter()).chain(chars[b..].iter()).collect();
+                                buf.edited = Instant::now();
+                                changed = true;
+                                cur_range = egui::text::CCursorRange::one(egui::text::CCursor::new(new_cur));
+                                land_dirty = true;
+                            }
+                            bar_acted = true;
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("Select All").size(12.0)).min_size(egui::vec2(70.0, btn_h)))
+                            .clicked()
+                        {
+                            cur_range = egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(total_chars),
+                            );
+                            land_dirty = true;
+                            bar_acted = true;
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("Tab").size(12.0)).min_size(egui::vec2(42.0, btn_h)))
+                            .on_hover_text("Insert 4-space indent")
+                            .clicked()
+                        {
+                            let [lo, hi] = cur_range.sorted_cursors();
+                            let chars: Vec<char> = buf.text.chars().collect();
+                            let a = lo.index.0.min(chars.len());
+                            let b = hi.index.0.min(chars.len());
+                            let ins: Vec<char> = "    ".chars().collect();
+                            let new_cur = a + ins.len();
+                            let mut u = te_state.undoer();
+                            u.add_undo(&(cur_range, buf.text.clone()));
+                            te_state.set_undoer(u);
+                            buf.text = chars[..a].iter().chain(ins.iter()).chain(chars[b..].iter()).collect();
+                            buf.edited = Instant::now();
+                            changed = true;
+                            cur_range = egui::text::CCursorRange::one(egui::text::CCursor::new(new_cur));
+                            land_dirty = true;
+                            bar_acted = true;
+                        }
+                    });
+                });
+            ui.separator();
+            if land_dirty {
+                te_state.cursor.set_char_range(Some(cur_range));
+                te_state.store(ui.ctx(), editor_id);
             }
         }
 

@@ -141,8 +141,108 @@ impl Editor {
             let tabs_total = tab_w * 6.0 + 36.0;
             let max_right = full.max.x - 360.0;
             let ideal_x0 = full.center().x - tab_w * 7.0 / 2.0;
-            let min_left = full.min.x + 190.0;
+            let left_x = ui.cursor().min.x;
+            let base_min_left = (full.min.x + 190.0).max(left_x + 4.0);
+            let min_left = if cfg!(target_os = "android") {
+                // Make room for Android quick-action buttons when width permits,
+                // without ever pushing the ribbon tabs into the right-side buttons.
+                let desired = left_x + 172.0;
+                desired.min((max_right - tabs_total).max(base_min_left)).max(base_min_left)
+            } else {
+                base_min_left
+            };
             let x0 = ideal_x0.min(max_right - tabs_total).max(min_left);
+
+            // Android quick-action strip (Undo, Redo, Duplicate, Delete, Teleport/Focus)
+            // strictly bounded to [left_x, x0 - 8] with horizontal scroll fallback so it
+            // never overlaps tabs or breaks on large UI scales or small screens.
+            if cfg!(target_os = "android") {
+                let avail = (x0 - left_x - 8.0).max(0.0);
+                if avail >= 28.0 {
+                    let has_sel = !self.game.doc.selection.is_empty();
+                    let can_undo = mode.is_none() && self.game.doc.can_undo().is_some();
+                    let can_redo = mode.is_none() && self.game.doc.can_redo().is_some();
+                    let can_edit_sel = mode.is_none() && has_sel;
+                    let mut do_undo = false;
+                    let mut do_redo = false;
+                    let mut do_dup = false;
+                    let mut do_del = false;
+                    let mut do_focus = false;
+
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(avail, 24.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                            egui::ScrollArea::horizontal()
+                                .id_salt("android_top_quick_actions")
+                                .max_width(avail)
+                                .max_height(24.0)
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                                        let (dr, _) = ui.allocate_exact_size(Vec2::new(1.0, 16.0), Sense::hover());
+                                        ui.painter().rect_filled(dr, 0.0, theme::DIVIDER);
+                                        ui.add_space(4.0);
+
+                                        if top_icon(ui, "arrow-back-up", theme::TEXT, can_undo)
+                                            .on_hover_text("Undo (Ctrl+Z)")
+                                            .clicked()
+                                            && can_undo
+                                        {
+                                            do_undo = true;
+                                        }
+                                        if top_icon(ui, "arrow-forward-up", theme::TEXT, can_redo)
+                                            .on_hover_text("Redo (Ctrl+Y)")
+                                            .clicked()
+                                            && can_redo
+                                        {
+                                            do_redo = true;
+                                        }
+                                        if top_icon(ui, "copy", theme::TEXT, can_edit_sel)
+                                            .on_hover_text("Duplicate (Ctrl+D)")
+                                            .clicked()
+                                            && can_edit_sel
+                                        {
+                                            do_dup = true;
+                                        }
+                                        if top_icon(ui, "trash", Color32::from_rgb(230, 100, 100), can_edit_sel)
+                                            .on_hover_text("Delete (Del)")
+                                            .clicked()
+                                            && can_edit_sel
+                                        {
+                                            do_del = true;
+                                        }
+                                        if top_icon(ui, "focus-2", theme::ACCENT, has_sel)
+                                            .on_hover_text("Teleport Camera to Selection (F)")
+                                            .clicked()
+                                            && has_sel
+                                        {
+                                            do_focus = true;
+                                        }
+                                    });
+                                });
+                        },
+                    );
+
+                    if do_undo {
+                        self.undo();
+                    }
+                    if do_redo {
+                        self.redo();
+                    }
+                    if do_dup {
+                        self.duplicate();
+                    }
+                    if do_del {
+                        self.delete();
+                    }
+                    if do_focus {
+                        self.focus_selection();
+                    }
+                }
+            }
             let y = ui.min_rect().min.y;
             for (i, t) in RibbonTab::ALL.into_iter().enumerate() {
                 let r = Rect::from_min_size(egui::pos2(x0 + i as f32 * tab_w, y), egui::vec2(tab_w - 4.0, 24.0));
