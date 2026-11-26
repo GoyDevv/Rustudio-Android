@@ -17,7 +17,7 @@
 //! turns it off.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 use egui_wgpu::wgpu;
@@ -34,16 +34,22 @@ static CACHE: OnceLock<Option<Cache>> = OnceLock::new();
 /// Pipeline descriptors that asked for the cache ([`current`] calls).
 static MADE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+static CACHE_RW: RwLock<()> = RwLock::new(());
 static SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII guard for background pipeline compilation threads so `save()` never
 /// calls `VkPipelineCache::get_data()` concurrently on stock Adreno 6xx drivers.
-pub struct BuildGuard;
+/// Holds a shared read lock on `CACHE_RW` so a build cannot start while `save()`
+/// is already inside `VkPipelineCache::get_data()`.
+pub struct BuildGuard {
+    _lock: RwLockReadGuard<'static, ()>,
+}
 
 impl BuildGuard {
     pub fn enter() -> Self {
+        let lock = CACHE_RW.read().unwrap_or_else(|e| e.into_inner());
         ACTIVE_BUILDS.fetch_add(1, Ordering::AcqRel);
-        Self
+        Self { _lock: lock }
     }
 }
 
@@ -142,8 +148,13 @@ pub fn save(force: bool) {
     if !force && now_ms().saturating_sub(LAST_MADE_MS.load(Ordering::Relaxed)) < 2000 {
         return;
     }
+    let Ok(_write_guard) = CACHE_RW.try_write() else {
+        return;
+    };
     let t0 = Instant::now();
-    let Some(data) = c.cache.get_data() else {
+    let data = c.cache.get_data();
+    drop(_write_guard);
+    let Some(data) = data else {
         saved.0 = made;
         return;
     };

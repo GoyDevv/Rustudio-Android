@@ -3275,6 +3275,12 @@ impl ViewportPipelines {
     /// The plain pipelines specialised to `mask`, once made; asks a worker
     /// to make them the first time (opaque_plain draws until then).
     fn plain_for(&self, device: &wgpu::Device, mask: u32) -> Option<[wgpu::RenderPipeline; 2]> {
+        // Stock Android Vulkan drivers (especially Adreno 6xx) have internal
+        // shader-compiler mutex races under concurrent vkCreateGraphicsPipelines
+        // across detached background threads; use the already-built opaque_plain.
+        if cfg!(target_os = "android") {
+            return None;
+        }
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| std::env::var_os("RUSTUDIO_NO_SPEC_PIPELINE").is_some()) {
             return None;
@@ -3337,6 +3343,27 @@ pub(crate) fn single_sample_shader(source: String) -> String {
         .replace("textureLoad(ssao_depth_ms, p, sample)", "textureLoad(ssao_depth_ms, p, 0)")
 }
 
+/// True when viewport pipelines must be built incrementally on the UI thread
+/// (`GlPipelineBuilder`, 1-2 pipelines / 25 ms per frame) instead of on a
+/// background `rustudio-pipelines` thread:
+/// - OpenGL ES (context is single-threaded)
+/// - Stock Qualcomm Adreno Vulkan on Android (e.g. Adreno 610 `09/27/21`),
+///   where concurrent `vkCreateGraphicsPipelines` across threads can corrupt
+///   internal driver mutexes (`FORTIFY: pthread_mutex_lock called on a destroyed mutex`).
+fn use_incremental_pipelines(caps: &crate::gpu_caps::GpuCaps) -> bool {
+    if caps.backend == wgpu::Backend::Gl {
+        return true;
+    }
+    if cfg!(target_os = "android") && caps.backend == wgpu::Backend::Vulkan {
+        let name = caps.name.to_ascii_lowercase();
+        let driver = caps.driver.to_ascii_lowercase();
+        if name.contains("adreno") && !driver.contains("turnip") && !driver.contains("mesa") {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct Renderer {
     /// The viewport's passes per sample count (`sample_slot`), each built
     /// on first use (`ensure_pipelines`): a frame needs the set for its
@@ -3353,7 +3380,11 @@ pub struct Renderer {
     /// the first frame takes them instead of compiling them itself (seconds
     /// on Mesa ANV the first time a build's shaders are seen).
     lower_pending: Option<std::sync::mpsc::Receiver<ViewportPipelines>>,
-    /// Incremental GLES pipeline builder (prevents main-thread ANR on PowerVR/GLES).
+    /// Join handle for the `rustudio-pipelines` worker thread so `Drop` waits
+    /// for pipeline compilation to finish before `Renderer` / `Device` teardown.
+    lower_thread: Option<std::thread::JoinHandle<()>>,
+    /// Incremental pipeline builder (prevents main-thread ANR on GLES and
+    /// avoids background Vulkan driver mutex races on stock Adreno).
     gl_builder: Option<GlPipelineBuilder>,
     /// Cloned queue handle so `tick_pipeline_warmup` can drive `gl_builder`.
     queue: wgpu::Queue,
@@ -3512,6 +3543,17 @@ pub struct Renderer {
     line_cap: usize,
     target: Option<Target>,
     pub texture_id: Option<egui::TextureId>,
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Drop the receiver first, then join any in-flight `rustudio-pipelines`
+        // worker so it never outlives `Renderer` / `wgpu::Device` teardown.
+        self.lower_pending.take();
+        if let Some(t) = self.lower_thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl Renderer {
@@ -4240,6 +4282,7 @@ impl Renderer {
             pipelines: [None, None, None],
             probe_samples,
             lower_pending: None,
+            lower_thread: None,
             gl_builder: None,
             queue: queue.clone(),
             terrain_layout: terrain_bgl,
@@ -4355,18 +4398,18 @@ impl Renderer {
             || rustudio_core::rustudio_settings::performance_value("detail") == "low";
         // (not when the probe's set is the one-sample set already: OpenGL,
         // where it would be built twice)
-        let prebuild_1x = r.caps.backend != wgpu::Backend::Gl
+        let prebuild_1x = !use_incremental_pipelines(&r.caps)
             && ((r.probe_samples != 1 && one_sample_likely) || cfg!(target_os = "android"));
         if prebuild_1x && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
             let (device, queue) = (device.clone(), queue.clone());
             let (g, t, gl, tr, reduced, caps) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced, r.caps.clone());
             let (tx, rx) = std::sync::mpsc::channel();
-            let spawned = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
+            if let Ok(handle) = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
                 let _guard = crate::pipeline_cache::BuildGuard::enter();
                 let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced, &caps));
-            });
-            if spawned.is_ok() {
+            }) {
                 r.lower_pending = Some(rx);
+                r.lower_thread = Some(handle);
             }
         }
         r
@@ -5441,7 +5484,7 @@ impl Renderer {
     /// (shader module in step 0, then 1-2 pipelines or up to 25 ms per call).
     /// No-op on non-GLES backends or once the startup pipeline set is built.
     pub fn tick_pipeline_warmup(&mut self, device: &wgpu::Device) {
-        if self.caps.backend != wgpu::Backend::Gl {
+        if !use_incremental_pipelines(&self.caps) {
             return;
         }
         if self.gl_builder.is_none() {
@@ -5493,7 +5536,7 @@ impl Renderer {
         if self.pipelines[slot].is_some() {
             return true;
         }
-        if self.caps.backend == wgpu::Backend::Gl {
+        if use_incremental_pipelines(&self.caps) {
             if self.gl_builder.as_ref().map_or(true, |b| b.samples != samples) {
                 self.gl_builder = Some(GlPipelineBuilder::new(
                     self.globals_layout.clone(),
@@ -5514,6 +5557,9 @@ impl Renderer {
                     match rx.try_recv() {
                         Ok(p) => {
                             self.lower_pending = None;
+                            if let Some(t) = self.lower_thread.take() {
+                                let _ = t.join();
+                            }
                             self.pipelines[slot] = Some(p);
                             return true;
                         }
@@ -5522,17 +5568,24 @@ impl Renderer {
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             self.lower_pending = None;
+                            if let Some(t) = self.lower_thread.take() {
+                                let _ = t.join();
+                            }
                         }
                     }
                 } else {
                     let rx = self.lower_pending.take().unwrap();
                     let _p = rustudio_core::bench::scope("r_pipelines_wait");
-                    if let Ok(p) = rx.recv() {
+                    let got = rx.recv().ok();
+                    if let Some(t) = self.lower_thread.take() {
+                        let _ = t.join();
+                    }
+                    if let Some(p) = got {
                         self.pipelines[slot] = Some(p);
                         return true;
                     }
                 }
-            } else if cfg!(target_os = "android") && self.caps.backend != wgpu::Backend::Gl {
+            } else if cfg!(target_os = "android") && !use_incremental_pipelines(&self.caps) {
                 let (device, queue) = (rs.device.clone(), rs.queue.clone());
                 let (g, t, gl, tr, reduced, caps) = (
                     self.globals_layout.clone(),
@@ -5543,15 +5596,15 @@ impl Renderer {
                     self.caps.clone(),
                 );
                 let (tx, rx) = std::sync::mpsc::channel();
-                if std::thread::Builder::new()
+                if let Ok(handle) = std::thread::Builder::new()
                     .name("rustudio-pipelines".into())
                     .spawn(move || {
                         let _guard = crate::pipeline_cache::BuildGuard::enter();
                         let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced, &caps));
                     })
-                    .is_ok()
                 {
                     self.lower_pending = Some(rx);
+                    self.lower_thread = Some(handle);
                     return false;
                 }
             }

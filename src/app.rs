@@ -1566,58 +1566,122 @@ impl Editor {
             return;
         }
         let dir = rustudio_core::paths::config().join("rustudio");
+        let screen = ctx.content_rect();
+        let win_w = (screen.width() - 32.0).clamp(300.0, 500.0);
+        let win_h = (screen.height() - 28.0).clamp(220.0, 420.0);
         let mut open = true;
+        let mut close_clicked = false;
         egui::Window::new("Config Files")
             .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
-            .resizable(true)
-            .default_width(460.0)
+            .resizable(false)
+            .constrain_to(screen.shrink(8.0))
+            .fixed_size(egui::vec2(win_w, win_h))
+            .frame(
+                egui::Frame::window(&ctx.global_style())
+                    .fill(theme::PANEL_DARK)
+                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::same(12)),
+            )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Folder:").strong());
-                    ui.label(dir.display().to_string());
-                    if ui.small_button("Copy").clicked() {
-                        ctx.copy_text(dir.display().to_string());
+                ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(26.0);
+                let scroll_h = (ui.available_height() - 44.0).max(100.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(scroll_h)
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .fill(theme::BG)
+                            .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                            .corner_radius(5.0)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Folder:").strong());
+                                    ui.label(RichText::new(dir.display().to_string()).color(theme::TEXT_DIM));
+                                    if ui
+                                        .add(egui::Button::new("Copy Path").min_size(egui::vec2(68.0, 24.0)))
+                                        .clicked()
+                                    {
+                                        ctx.copy_text(dir.display().to_string());
+                                    }
+                                });
+                            });
+                        ui.add_space(8.0);
+                        let mut entries: Vec<(String, u64, bool)> = std::fs::read_dir(&dir)
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|e| {
+                                let name = e.file_name().to_string_lossy().into_owned();
+                                let meta = e.metadata().ok();
+                                let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+                                let len = meta.map(|m| m.len()).unwrap_or(0);
+                                (name, len, is_dir)
+                            })
+                            .collect();
+                        entries.sort_by(|a, b| a.0.cmp(&b.0));
+                        if entries.is_empty() {
+                            ui.label(RichText::new("No config files created yet.").color(theme::TEXT_DIM));
+                        } else {
+                            egui::Frame::new()
+                                .fill(theme::BG)
+                                .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::Grid::new("configs_list")
+                                        .num_columns(2)
+                                        .spacing([16.0, 6.0])
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            ui.strong("Name");
+                                            ui.strong("Size");
+                                            ui.end_row();
+                                            for (name, len, is_dir) in entries {
+                                                ui.label(if is_dir { format!("{name}/") } else { name });
+                                                ui.label(RichText::new(if is_dir {
+                                                    "folder".to_string()
+                                                } else if len >= 1024 {
+                                                    format!("{:.1} KB", len as f64 / 1024.0)
+                                                } else {
+                                                    format!("{len} B")
+                                                }).color(theme::TEXT_DIM));
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        }
+                    });
+                ui.separator();
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Done").strong().color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(0, 110, 230))
+                                .min_size(egui::vec2(76.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        close_clicked = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Close").min_size(egui::vec2(72.0, 28.0)))
+                        .clicked()
+                    {
+                        close_clicked = true;
                     }
                 });
-                ui.separator();
-                let mut entries: Vec<(String, u64, bool)> = std::fs::read_dir(&dir)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|e| {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        let meta = e.metadata().ok();
-                        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
-                        let len = meta.map(|m| m.len()).unwrap_or(0);
-                        (name, len, is_dir)
-                    })
-                    .collect();
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                if entries.is_empty() {
-                    ui.label(RichText::new("No config files created yet.").color(theme::TEXT_DIM));
-                } else {
-                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        egui::Grid::new("configs_list").num_columns(2).spacing([16.0, 4.0]).striped(true).show(ui, |ui| {
-                            ui.strong("Name");
-                            ui.strong("Size");
-                            ui.end_row();
-                            for (name, len, is_dir) in entries {
-                                ui.label(if is_dir { format!("{name}/") } else { name });
-                                ui.label(if is_dir {
-                                    "folder".to_string()
-                                } else if len >= 1024 {
-                                    format!("{:.1} KB", len as f64 / 1024.0)
-                                } else {
-                                    format!("{len} B")
-                                });
-                                ui.end_row();
-                            }
-                        });
-                    });
-                }
             });
+        if close_clicked {
+            open = false;
+        }
         self.configs_window_open = open;
     }
 
@@ -1627,106 +1691,171 @@ impl Editor {
             return;
         }
         use rustudio_core::rustudio_settings as rs;
+        let screen = ctx.content_rect();
+        let win_w = (screen.width() - 32.0).clamp(300.0, 520.0);
+        let win_h = (screen.height() - 28.0).clamp(220.0, 460.0);
         let mut open = true;
+        let mut close_clicked = false;
         let mut do_restart = false;
         egui::Window::new("Beta Features")
             .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
-            .resizable(true)
-            .default_width(480.0)
+            .resizable(false)
+            .constrain_to(screen.shrink(8.0))
+            .fixed_size(egui::vec2(win_w, win_h))
+            .frame(
+                egui::Frame::window(&ctx.global_style())
+                    .fill(theme::PANEL_DARK)
+                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::same(12)),
+            )
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Opt-in experimental and platform features. Changes are saved automatically.")
-                        .color(theme::TEXT_DIM),
-                );
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    let mut builtin = rs::builtin_plugins();
-                    if ui.checkbox(&mut builtin, "Built-in Roblox Plugins (experimental)").changed() {
-                        rs::set_bool("builtin_plugins", builtin);
-                        self.beta_features_changed = true;
-                    }
-                    ui.label(
-                        RichText::new("Loads Roblox Studio's built-in plugins in Edit mode when installed. Requires restart.")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.add_space(6.0);
-
-                    let mut core_scripts = rs::core_scripts();
-                    if ui.checkbox(&mut core_scripts, "Roblox's CoreScripts").changed() {
-                        rs::set_bool("core_scripts", core_scripts);
-                        self.beta_features_changed = true;
-                    }
-                    ui.label(
-                        RichText::new("Runs Roblox's own CoreScripts (in-game chat, top bar, player list, escape menu) during Play.")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.add_space(6.0);
-
-                    let mut floating = rs::mobile_floating_windows();
-                    if ui.checkbox(&mut floating, "Mobile Floating Windows").changed() {
-                        rs::set_mobile_floating_windows(floating);
-                        self.beta_features_changed = true;
-                    }
-                    ui.label(
-                        RichText::new("Opens Explorer, Properties, Toolbox, and other panels as draggable floating windows over the viewport.")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.add_space(6.0);
-
-                    let mut joystick = rs::joystick_enabled();
-                    if ui.checkbox(&mut joystick, "On-Screen Movement Joystick").changed() {
-                        rs::set_joystick_enabled(joystick);
-                        self.beta_features_changed = true;
-                    }
-                    ui.label(
-                        RichText::new("Shows a touch thumbstick in the viewport for camera and character movement.")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.add_space(6.0);
-
-                    let mut perf = rs::perf_overlay_enabled();
-                    if ui.checkbox(&mut perf, "Performance Overlay").changed() {
-                        rs::set_perf_overlay_enabled(perf);
-                        self.beta_features_changed = true;
-                    }
-                    ui.label(
-                        RichText::new("Shows a compact FPS, frame-time, 3D resolution scale, GPU, and memory HUD in the viewport.")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.add_space(6.0);
-
-                    let mut live_data = rs::live_data_now();
-                    if ui.checkbox(&mut live_data, "Use Live DataStores").changed() {
-                        rs::set_bool("live_data", live_data);
-                        self.beta_features_changed = true;
-                    }
-                    ui.label(
-                        RichText::new("Reads and writes the place's real DataStores, MemoryStores, and Messaging during Play.")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                });
-
-                if self.beta_features_changed {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(235, 190, 80),
-                            "Restart rustudio for all beta feature changes to take effect.",
+                ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(26.0);
+                let scroll_h = (ui.available_height() - 44.0).max(100.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(scroll_h)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Opt-in experimental and platform features. Changes are saved automatically.")
+                                .color(theme::TEXT_DIM)
+                                .small(),
                         );
-                        if ui.button("Restart Now").clicked() {
-                            do_restart = true;
+                        ui.add_space(8.0);
+
+                        let mut card = |ui: &mut egui::Ui, checked: &mut bool, title: &str, desc: &str| -> bool {
+                            let mut changed = false;
+                            egui::Frame::new()
+                                .fill(theme::BG)
+                                .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(10, 7))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    if ui.checkbox(checked, RichText::new(title).strong()).changed() {
+                                        changed = true;
+                                    }
+                                    ui.label(RichText::new(desc).small().color(theme::TEXT_DIM));
+                                });
+                            ui.add_space(6.0);
+                            changed
+                        };
+
+                        let mut builtin = rs::builtin_plugins();
+                        if card(
+                            ui,
+                            &mut builtin,
+                            "Built-in Roblox Plugins (experimental)",
+                            "Loads Roblox Studio's built-in plugins in Edit mode when installed. Requires restart.",
+                        ) {
+                            rs::set_bool("builtin_plugins", builtin);
+                            self.beta_features_changed = true;
+                        }
+
+                        let mut core_scripts = rs::core_scripts();
+                        if card(
+                            ui,
+                            &mut core_scripts,
+                            "Roblox's CoreScripts",
+                            "Runs Roblox's own CoreScripts (in-game chat, top bar, player list, escape menu) during Play.",
+                        ) {
+                            rs::set_bool("core_scripts", core_scripts);
+                            self.beta_features_changed = true;
+                        }
+
+                        let mut floating = rs::mobile_floating_windows();
+                        if card(
+                            ui,
+                            &mut floating,
+                            "Mobile Floating Windows",
+                            "Opens Explorer, Properties, Toolbox, and other panels as draggable floating windows over the viewport.",
+                        ) {
+                            rs::set_mobile_floating_windows(floating);
+                            self.beta_features_changed = true;
+                        }
+
+                        let mut joystick = rs::joystick_enabled();
+                        if card(
+                            ui,
+                            &mut joystick,
+                            "On-Screen Movement Joystick",
+                            "Shows a touch thumbstick in the viewport for camera and character movement.",
+                        ) {
+                            rs::set_joystick_enabled(joystick);
+                            self.beta_features_changed = true;
+                        }
+
+                        let mut perf = rs::perf_overlay_enabled();
+                        if card(
+                            ui,
+                            &mut perf,
+                            "Performance Overlay",
+                            "Shows a compact FPS, frame-time, 3D resolution scale, GPU, and memory HUD in the viewport.",
+                        ) {
+                            rs::set_perf_overlay_enabled(perf);
+                            self.beta_features_changed = true;
+                        }
+
+                        let mut live_data = rs::live_data_now();
+                        if card(
+                            ui,
+                            &mut live_data,
+                            "Use Live DataStores",
+                            "Reads and writes the place's real DataStores, MemoryStores, and Messaging during Play.",
+                        ) {
+                            rs::set_bool("live_data", live_data);
+                            self.beta_features_changed = true;
+                        }
+
+                        if self.beta_features_changed {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(56, 46, 22))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 125, 45)))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(10, 7))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(235, 190, 80),
+                                            "Restart rustudio for all beta feature changes to take effect.",
+                                        );
+                                        if ui
+                                            .add(egui::Button::new("Restart Now").min_size(egui::vec2(88.0, 26.0)))
+                                            .clicked()
+                                        {
+                                            do_restart = true;
+                                        }
+                                    });
+                                });
                         }
                     });
-                }
+                ui.separator();
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Save").strong().color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(0, 110, 230))
+                                .min_size(egui::vec2(76.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        close_clicked = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                        .clicked()
+                    {
+                        close_clicked = true;
+                    }
+                });
             });
+        if close_clicked {
+            open = false;
+        }
         self.beta_features_open = open;
         if do_restart {
             self.request(PendingAction::Restart);
@@ -2473,48 +2602,99 @@ impl Editor {
         };
         let mut decided: Option<bool> = None;
         let leave = self.leave_check();
-        egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
-            if let crate::cloud_ui::live_status::Leave::Ask { lacking, note } = &leave {
-                if !note.is_empty() {
-                    ui.label(RichText::new("Leave without these edits?").strong());
-                    ui.label(note);
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        for item in lacking {
-                            ui.label(format!("• {item}"));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Save As…").clicked() {
-                            self.save_as();
-                        }
-                        if ui.button("Close anyway").clicked() {
-                            decided = Some(true);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            decided = Some(false);
-                        }
-                    });
-                    return;
+        let screen = ctx.content_rect();
+        let modal_w = (screen.width() - 32.0).clamp(300.0, 440.0);
+        let max_scroll_h = (screen.height() - 120.0).clamp(100.0, 240.0);
+        egui::Modal::new(egui::Id::new("confirm_discard"))
+            .frame(
+                egui::Frame::window(&ctx.global_style())
+                    .fill(theme::PANEL_DARK)
+                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(modal_w - 28.0);
+                ui.set_max_width(modal_w - 28.0);
+                if let crate::cloud_ui::live_status::Leave::Ask { lacking, note } = &leave {
+                    if !note.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .max_height(max_scroll_h)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Leave without these edits?").strong().size(14.5));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(note).color(theme::TEXT_DIM));
+                                ui.add_space(6.0);
+                                for item in lacking {
+                                    ui.label(format!("• {item}"));
+                                }
+                            });
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Save As…").strong().color(egui::Color32::WHITE))
+                                        .fill(egui::Color32::from_rgb(0, 110, 230))
+                                        .min_size(egui::vec2(76.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                self.save_as();
+                            }
+                            if ui
+                                .add(egui::Button::new("Close anyway").min_size(egui::vec2(88.0, 28.0)))
+                                .clicked()
+                            {
+                                decided = Some(true);
+                            }
+                            if ui
+                                .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                                .clicked()
+                            {
+                                decided = Some(false);
+                            }
+                        });
+                        return;
+                    }
                 }
-            }
-            ui.label(RichText::new("Discard unsaved changes?").strong());
-            ui.label(format!(
-                "{} has changes that are not saved.",
-                self.game.doc.title
-            ));
-            ui.horizontal(|ui| {
-                if ui.button("Save first").clicked() {
-                    self.save();
-                    decided = Some(!self.game.doc.dirty());
-                }
-                if ui.button("Discard").clicked() {
-                    decided = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    decided = Some(false);
-                }
+                ui.label(RichText::new("Discard unsaved changes?").strong().size(14.5));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("{} has changes that are not saved.", self.game.doc.title))
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Save first").strong().color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(0, 110, 230))
+                                .min_size(egui::vec2(76.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.save();
+                        decided = Some(!self.game.doc.dirty());
+                    }
+                    if ui
+                        .add(egui::Button::new("Discard").min_size(egui::vec2(72.0, 28.0)))
+                        .clicked()
+                    {
+                        decided = Some(true);
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                        .clicked()
+                    {
+                        decided = Some(false);
+                    }
+                });
             });
-        });
         if let Some(go) = decided {
             self.confirm_discard = None;
             if go {
@@ -3340,22 +3520,78 @@ impl RustudioApp {
         let ed = &mut self.ed;
         // A folder with several project files: which one to open.
         if let Some((dir, files)) = ed.project_choice.clone() {
+            let screen = ctx.content_rect();
+            let win_w = (screen.width() - 32.0).clamp(300.0, 440.0);
+            let win_h = (screen.height() - 28.0).clamp(220.0, 340.0);
             let mut pick = None;
             let mut open = true;
+            let mut close_clicked = false;
             egui::Window::new("Open project")
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
                 .resizable(false)
+                .constrain_to(screen.shrink(8.0))
+                .fixed_size(egui::vec2(win_w, win_h))
+                .frame(
+                    egui::Frame::window(&ctx.global_style())
+                        .fill(theme::PANEL_DARK)
+                        .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::same(12)),
+                )
                 .open(&mut open)
                 .show(&ctx, |ui| {
-                    ui.label(format!("{} has several project files:", dir.display()));
-                    for f in &files {
-                        let n = crate::project::name_of(f).to_string();
-                        let label = if n == "default.project.json" { format!("{n} (default)") } else { n };
-                        if ui.button(label).clicked() {
-                            pick = Some(f.clone());
+                    let scroll_h = (ui.available_height() - 44.0).max(100.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(scroll_h)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!("{} has several project files:", dir.display()))
+                                    .color(theme::TEXT_DIM),
+                            );
+                            ui.add_space(8.0);
+                            for f in &files {
+                                let n = crate::project::name_of(f).to_string();
+                                let label = if n == "default.project.json" { format!("{n} (default)") } else { n };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(label).strong())
+                                            .min_size(egui::vec2(ui.available_width(), 30.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    pick = Some(f.clone());
+                                }
+                                ui.add_space(4.0);
+                            }
+                        });
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(first) = files.first() {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Open").strong().color(egui::Color32::WHITE))
+                                        .fill(egui::Color32::from_rgb(0, 110, 230))
+                                        .min_size(egui::vec2(76.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                pick = Some(first.clone());
+                            }
                         }
-                    }
+                        if ui
+                            .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                            .clicked()
+                        {
+                            close_clicked = true;
+                        }
+                    });
                 });
+            if close_clicked {
+                open = false;
+            }
             if let Some(f) = pick {
                 ed.project_choice = None;
                 ed.open_project(&f);
@@ -3653,6 +3889,9 @@ impl RustudioApp {
         let dock_modal_open = self.ed.ui.studio_settings.open
             || self.ed.ui.graphics_settings
             || self.ed.ui.about
+            || self.ed.beta_features_open
+            || self.ed.configs_window_open
+            || self.ed.project_choice.is_some()
             || self.ed.confirm_discard.is_some()
             || self.ed.game.account.open
             || egui::Popup::is_any_open(&ctx);
@@ -3711,6 +3950,9 @@ impl RustudioApp {
         let modal_open = self.ed.ui.studio_settings.open
             || self.ed.ui.graphics_settings
             || self.ed.ui.about
+            || self.ed.beta_features_open
+            || self.ed.configs_window_open
+            || self.ed.project_choice.is_some()
             || self.ed.confirm_discard.is_some();
         let mobile_actions = {
             let mut viewer = Viewer { ed: &mut self.ed, window: None, windows: &windows };

@@ -344,7 +344,10 @@ public class RustudioActivity extends NativeActivity {
             startActivity(intent);
         }
         finishAffinity();
-        Runtime.getRuntime().exit(0);
+        // Use killProcess instead of Runtime.exit(0): exit(0) runs C/C++ atexit
+        // and static destructors while background Rust/Vulkan/AAudio threads are
+        // still alive, triggering Bionic FORTIFY destroyed-mutex SIGABRT.
+        android.os.Process.killProcess(android.os.Process.myPid());
     }
 
     @Override

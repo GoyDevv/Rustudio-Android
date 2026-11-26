@@ -481,6 +481,115 @@ pub fn db() -> &'static rbx_reflection::ReflectionDatabase<'static> {
     rbx_reflection_database::get().unwrap_or_else(|_| rbx_reflection_database::get_bundled())
 }
 
+/// Coerces mismatched string/content property variants to the type expected by
+/// the reflection database so `rbx_binary::to_writer` / `rbx_xml::to_writer_default`
+/// do not fail on Toolbox/legacy models (e.g. `PackageLink.PackageContent` stored
+/// as `Variant::String` when reflection expects `VariantType::Content`).
+fn coerce_property_for_serialization(class: &str, name: &str, value: &Variant) -> Option<Variant> {
+    use rbx_dom_weak::types::{BinaryString, Content, ContentId, SharedString, VariantType};
+    let database = db();
+    let class_desc = database.classes.get(class)?;
+    let prop_desc = database
+        .superclasses_iter(class_desc)
+        .find_map(|c| c.properties.get(name))?;
+    let target_desc = match &prop_desc.kind {
+        rbx_reflection::PropertyKind::Canonical {
+            serialization: rbx_reflection::PropertySerialization::SerializesAs(alt),
+        } => database
+            .superclasses_iter(class_desc)
+            .find_map(|c| c.properties.get(alt as &str))
+            .unwrap_or(prop_desc),
+        _ => prop_desc,
+    };
+    let rbx_reflection::DataType::Value(expected) = target_desc.data_type else {
+        return None;
+    };
+    if value.ty() == expected {
+        return None;
+    }
+    match (expected, value) {
+        (VariantType::Content, Variant::String(s)) => Some(Variant::Content(if s.is_empty() {
+            Content::none()
+        } else {
+            Content::from_uri(s.clone())
+        })),
+        (VariantType::Content, Variant::ContentId(c)) => {
+            let s = c.as_str();
+            Some(Variant::Content(if s.is_empty() {
+                Content::none()
+            } else {
+                Content::from_uri(s.to_string())
+            }))
+        }
+        (VariantType::ContentId, Variant::String(s)) => {
+            Some(Variant::ContentId(ContentId::from(s.clone())))
+        }
+        (VariantType::ContentId, Variant::Content(c)) => {
+            Some(Variant::ContentId(ContentId::from(c.as_uri().unwrap_or("").to_string())))
+        }
+        (VariantType::String, Variant::ContentId(c)) => {
+            Some(Variant::String(c.as_str().to_string()))
+        }
+        (VariantType::String, Variant::Content(c)) => {
+            Some(Variant::String(c.as_uri().unwrap_or("").to_string()))
+        }
+        (VariantType::BinaryString, Variant::String(s)) => {
+            Some(Variant::BinaryString(BinaryString::from(s.as_bytes().to_vec())))
+        }
+        (VariantType::BinaryString, Variant::ContentId(c)) => {
+            Some(Variant::BinaryString(BinaryString::from(c.as_str().as_bytes().to_vec())))
+        }
+        (VariantType::SharedString, Variant::String(s)) => {
+            Some(Variant::SharedString(SharedString::new(s.as_bytes().to_vec())))
+        }
+        (VariantType::SharedString, Variant::BinaryString(b)) => {
+            Some(Variant::SharedString(SharedString::new(AsRef::<[u8]>::as_ref(b).to_vec())))
+        }
+        _ => None,
+    }
+}
+
+fn dom_needs_serialization_sanitization(dom: &WeakDom, roots: &[Ref]) -> bool {
+    let mut stack: Vec<Ref> = roots.to_vec();
+    while let Some(r) = stack.pop() {
+        let Some(inst) = dom.get_by_ref(r) else {
+            continue;
+        };
+        for (name, val) in &inst.properties {
+            if coerce_property_for_serialization(inst.class.as_str(), name.as_str(), val).is_some() {
+                return true;
+            }
+        }
+        stack.extend_from_slice(inst.children());
+    }
+    false
+}
+
+/// Sanitizes all instances reachable from `roots` in `dom` so mismatched
+/// `Content` / `ContentId` / `String` properties match the reflection database
+/// before `rbx_binary::to_writer` / `rbx_xml::to_writer_default` export.
+pub fn sanitize_dom_for_serialization(dom: &mut WeakDom, roots: &[Ref]) {
+    let mut stack: Vec<Ref> = roots.to_vec();
+    while let Some(r) = stack.pop() {
+        let Some(inst) = dom.get_by_ref_mut(r) else {
+            continue;
+        };
+        let class = inst.class;
+        let updates: Vec<(Ustr, Variant)> = inst
+            .properties
+            .iter()
+            .filter_map(|(name, val)| {
+                coerce_property_for_serialization(class.as_str(), name.as_str(), val)
+                    .map(|fixed| (*name, fixed))
+            })
+            .collect();
+        for (name, fixed) in updates {
+            inst.properties.insert(name, fixed);
+        }
+        stack.extend_from_slice(inst.children());
+    }
+}
+
 /// Services Studio keeps for the session only (never saved with the place):
 /// the plugin host puts plugin widgets and plugin GUI in them.
 pub const UNSAVED_SERVICES: &[&str] = &[
@@ -1214,7 +1323,16 @@ impl Document {
 
     pub fn encode(&self, refs: &[Ref], xml: bool) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
-        if xml {
+        if dom_needs_serialization_sanitization(&self.dom, refs) {
+            let mut tmp = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let tmp_roots = self.dom.clone_multiple_into_external(refs, &mut tmp);
+            sanitize_dom_for_serialization(&mut tmp, &tmp_roots);
+            if xml {
+                rbx_xml::to_writer_default(&mut out, &tmp, &tmp_roots).map_err(|e| e.to_string())?;
+            } else {
+                rbx_binary::to_writer(&mut out, &tmp, &tmp_roots).map_err(|e| e.to_string())?;
+            }
+        } else if xml {
             rbx_xml::to_writer_default(&mut out, &self.dom, refs).map_err(|e| e.to_string())?;
         } else {
             rbx_binary::to_writer(&mut out, &self.dom, refs).map_err(|e| e.to_string())?;
@@ -1234,6 +1352,7 @@ impl Document {
     pub fn save_snapshot(&self) -> (WeakDom, Vec<Ref>) {
         let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
         let roots = self.dom.clone_multiple_into_external(&self.save_roots(), &mut dom);
+        sanitize_dom_for_serialization(&mut dom, &roots);
         (dom, roots)
     }
 

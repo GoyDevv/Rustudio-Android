@@ -2190,17 +2190,44 @@ impl Editor {
             Some((name,own,frame,idle,guid,line))
         })).collect();
         let universe=live.map(|l|l.universe).or_else(||self.game.doc.cloud.as_ref().map(|o|o.universe_id));
-        egui::Window::new("Live Collaborators").id(egui::Id::new("live_collaborators_window")).open(&mut self.cloud.live_collaborators_open).show(ctx,|ui| {
-            if self.cloud.live.is_none() {ui.label("Open a Team Create place to join its live session.");}
-            for (name,own,frame,idle,guid,line) in peers {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{name}{}{}",if own {" (you)"} else {""},if idle {" · idle"} else {""}));
-                    if !own && frame.is_some() && ui.small_button("Fly to").clicked() {fly=frame;}
-                    if !guid.is_empty() && ui.small_button(format!("Script · line {line}")).clicked() {open_guid=Some(guid);}
-                });
-            }
-            if let Some(universe)=universe {ui.hyperlink_to("Manage collaborators",format!("https://create.roblox.com/dashboard/creations/experiences/{universe}/collaborators"));}
-        });
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 24.0).max(280.0);
+        let max_h = (screen.height() - 24.0).max(200.0);
+        egui::Window::new("Live Collaborators")
+            .id(egui::Id::new("live_collaborators_window"))
+            .open(&mut self.cloud.live_collaborators_open)
+            .collapsible(false)
+            .constrain_to(screen.shrink(8.0))
+            .max_width(max_w)
+            .max_height(max_h)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("live_collaborators_scroll")
+                    .max_height((max_h - 48.0).max(120.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if self.cloud.live.is_none() {
+                            ui.label("Open a Team Create place to join its live session.");
+                        }
+                        for (name, own, frame, idle, guid, line) in peers {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{name}{}{}", if own { " (you)" } else { "" }, if idle { " · idle" } else { "" }));
+                                if !own && frame.is_some() && ui.small_button("Fly to").clicked() {
+                                    fly = frame;
+                                }
+                                if !guid.is_empty() && ui.small_button(format!("Script · line {line}")).clicked() {
+                                    open_guid = Some(guid);
+                                }
+                            });
+                        }
+                        if let Some(universe) = universe {
+                            ui.hyperlink_to(
+                                "Manage collaborators",
+                                format!("https://create.roblox.com/dashboard/creations/experiences/{universe}/collaborators"),
+                            );
+                        }
+                    });
+            });
         if let Some(frame)=fly {
             self.game.cam.pos=glam::Vec3::new(frame.position.x,frame.position.y,frame.position.z);
             let m=frame.orientation;
@@ -2215,21 +2242,31 @@ impl Editor {
     fn conflict_modal(&mut self, ctx: &egui::Context) {
         let Some(c) = self.cloud.conflict else { return };
         let mut pick: Option<u8> = None;
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 32.0).clamp(260.0, 440.0);
+        let max_h = (screen.height() - 110.0).max(100.0);
         egui::Modal::new(egui::Id::new("cloud_conflict")).show(ctx, |ui| {
-            ui.set_max_width(440.0);
-            ui.label(RichText::new("Someone saved this place since you opened it").strong());
-            ui.label(format!(
-                "You opened version {}; Roblox now has version {}. Saving now replaces their changes with yours.",
-                c.opened, c.server
-            ));
-            if self.cloud.status.as_ref().is_some_and(|(_, s)| s.enabled == Some(true)) {
-                ui.label(
-                    RichText::new("Team Create is on for this experience. Reopen the live session to merge current changes.")
-                        .small()
-                        .color(theme::WARN),
-                );
-            }
-            ui.horizontal(|ui| {
+            ui.set_max_width(max_w);
+            egui::ScrollArea::vertical()
+                .id_salt("cloud_conflict_scroll")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Someone saved this place since you opened it").strong());
+                    ui.label(format!(
+                        "You opened version {}; Roblox now has version {}. Saving now replaces their changes with yours.",
+                        c.opened, c.server
+                    ));
+                    if self.cloud.status.as_ref().is_some_and(|(_, s)| s.enabled == Some(true)) {
+                        ui.label(
+                            RichText::new("Team Create is on for this experience. Reopen the live session to merge current changes.")
+                                .small()
+                                .color(theme::WARN),
+                        );
+                    }
+                });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Overwrite").on_hover_text("Save your version on top of theirs").clicked() {
                     pick = Some(0);
                 }
@@ -2274,14 +2311,24 @@ impl Editor {
         let Some(vt) = self.cloud.confirm_copy_save else { return };
         let exp = self.game.doc.cloud.as_ref().map(|o| o.experience.clone()).unwrap_or_default();
         let mut pick: Option<bool> = None;
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 32.0).clamp(260.0, 460.0);
+        let max_h = (screen.height() - 110.0).max(100.0);
         egui::Modal::new(egui::Id::new("cloud_copy_save")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.label(RichText::new("This is a local copy").strong());
-            ui.label(format!(
-                "Team Create is on for {exp}: others may be editing it live. {} this copy replaces the server copy with yours (Roblox's version is checked first).",
-                if vt == VersionType::Published { "Publishing" } else { "Saving" }
-            ));
-            ui.horizontal(|ui| {
+            ui.set_max_width(max_w);
+            egui::ScrollArea::vertical()
+                .id_salt("cloud_copy_save_scroll")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("This is a local copy").strong());
+                    ui.label(format!(
+                        "Team Create is on for {exp}: others may be editing it live. {} this copy replaces the server copy with yours (Roblox's version is checked first).",
+                        if vt == VersionType::Published { "Publishing" } else { "Saving" }
+                    ));
+                });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 let label = if vt == VersionType::Published { "Publish to Roblox anyway" } else { "Save to Roblox anyway" };
                 if ui.button(label).clicked() {
                     pick = Some(true);
@@ -2303,11 +2350,21 @@ impl Editor {
         let Some(e) = self.cloud.save_error.clone() else { return };
         let mut close = false;
         let mut save_as = false;
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 32.0).clamp(260.0, 460.0);
+        let max_h = (screen.height() - 110.0).max(100.0);
         egui::Modal::new(egui::Id::new("cloud_save_error")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.label(RichText::new("Not saved to Roblox").strong());
-            ui.label(&e);
-            ui.horizontal(|ui| {
+            ui.set_max_width(max_w);
+            egui::ScrollArea::vertical()
+                .id_salt("cloud_save_error_scroll")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Not saved to Roblox").strong());
+                    ui.label(&e);
+                });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Save to File As…").clicked() {
                     save_as = true;
                 }
@@ -2327,21 +2384,30 @@ impl Editor {
     fn avatar_sync_warning_modal(&mut self, ctx: &egui::Context) {
         let Some(warning) = self.cloud.avatar_sync_warning.clone() else { return };
         let mut close = false;
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 32.0).clamp(260.0, 460.0);
+        let max_h = (screen.height() - 110.0).max(100.0);
         egui::Modal::new(egui::Id::new("cloud_avatar_sync_warning")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.label(RichText::new("Avatar Type Sync Warning").strong().color(theme::WARN));
-            ui.add_space(4.0);
-            ui.label(&warning);
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "Your place changes were published, but the experience's live R6/R15 avatar setting on Roblox may still reflect the previous value.",
-                )
-                .small()
-                .color(theme::TEXT_DIM),
-            );
+            ui.set_max_width(max_w);
+            egui::ScrollArea::vertical()
+                .id_salt("cloud_avatar_sync_warning_scroll")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Avatar Type Sync Warning").strong().color(theme::WARN));
+                    ui.add_space(4.0);
+                    ui.label(&warning);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Your place changes were published, but the experience's live R6/R15 avatar setting on Roblox may still reflect the previous value.",
+                        )
+                        .small()
+                        .color(theme::TEXT_DIM),
+                    );
+                });
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("OK").clicked() {
                     close = true;
                 }
@@ -2357,13 +2423,23 @@ impl Editor {
             return;
         };
         let mut pick: Option<bool> = None;
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 32.0).clamp(260.0, 460.0);
+        let max_h = (screen.height() - 110.0).max(100.0);
         egui::Modal::new(egui::Id::new("cloud_revert_version")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.label(RichText::new("Revert place version?").strong());
-            ui.label(format!(
-                "Download version {version} of \"{place_name}\" (place {place_id}) and publish it as a new live version on Roblox?"
-            ));
-            ui.horizontal(|ui| {
+            ui.set_max_width(max_w);
+            egui::ScrollArea::vertical()
+                .id_salt("cloud_revert_version_scroll")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Revert place version?").strong());
+                    ui.label(format!(
+                        "Download version {version} of \"{place_name}\" (place {place_id}) and publish it as a new live version on Roblox?"
+                    ));
+                });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Revert & Publish").clicked() {
                     pick = Some(true);
                 }
@@ -2459,6 +2535,7 @@ impl Editor {
             .unwrap_or(89.0);
 
         let mut open = true;
+        let mut close_requested = false;
         let mut refresh_tc = false;
         let mut reload_cfg = false;
         let mut save_basic_info = false;
@@ -2467,350 +2544,557 @@ impl Editor {
         let mut set_avatar: Option<u32> = None;
         let mut world_edit: Option<(&'static str, rbx_dom_weak::types::Ref, &'static str, f32)> = None;
 
+        let screen = ctx.content_rect();
+        let win_w = (screen.width() - 32.0).clamp(320.0, 640.0);
+        let win_h = (screen.height() - 28.0).clamp(240.0, 420.0);
+
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("exp_settings_scrim"),
+        ))
+        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+
+        let frame = egui::Frame::new()
+            .fill(theme::PANEL)
+            .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(8))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(140),
+            });
+
         egui::Window::new("Experience Settings")
+            .id(egui::Id::new("experience_settings_window"))
             .open(&mut open)
-            .default_width(500.0)
-            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(egui::vec2(win_w, win_h))
+            .constrain_to(screen.shrink(8.0))
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .frame(frame)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for tab in SettingsTab::ALL {
-                        if ui
-                            .selectable_label(self.cloud.exp_settings.tab == tab, tab.label())
-                            .clicked()
-                        {
-                            self.cloud.exp_settings.tab = tab;
-                        }
-                    }
-                    if self.cloud.exp_settings.loading || self.cloud.exp_settings.saving {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.spinner();
-                        });
-                    }
-                });
-                ui.separator();
+                let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
+                let footer_h = 44.0;
+                let body_h = (ui.available_height() - footer_h).max(120.0);
+                let sidebar_w = 136.0f32.min((ui.available_width() * 0.34).max(108.0));
 
-                if let Some(err) = &self.cloud.exp_settings.error {
-                    ui.label(RichText::new(err).color(theme::WARN));
-                } else if let Some(msg) = &self.cloud.exp_settings.status_msg {
-                    ui.label(RichText::new(msg).small().color(theme::TEXT_DIM));
-                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), body_h),
+                    egui::Layout::left_to_right(egui::Align::Min),
+                    |ui| {
+                        // Left sidebar (Roblox Studio Game Settings style)
+                        egui::Frame::new()
+                            .fill(theme::PANEL_DARK)
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(0, 4))
+                            .show(ui, |ui| {
+                                ui.set_width(sidebar_w);
+                                ui.set_min_height((body_h - 8.0).max(100.0));
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    for tab in SettingsTab::ALL {
+                                        let selected = self.cloud.exp_settings.tab == tab;
+                                        let (row_rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(sidebar_w, 30.0),
+                                            egui::Sense::click(),
+                                        );
+                                        if selected {
+                                            ui.painter().rect_filled(row_rect, 2.0, theme::ACTIVE_TAB);
+                                            let accent = egui::Rect::from_min_size(
+                                                row_rect.min,
+                                                egui::vec2(3.0, row_rect.height()),
+                                            );
+                                            ui.painter().rect_filled(
+                                                accent,
+                                                1.0,
+                                                egui::Color32::from_rgb(0, 122, 255),
+                                            );
+                                        } else if resp.hovered() {
+                                            ui.painter().rect_filled(row_rect, 2.0, theme::HOVER_BG);
+                                        }
+                                        let text_color = if selected {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            theme::TEXT
+                                        };
+                                        ui.painter().text(
+                                            egui::pos2(row_rect.min.x + 14.0, row_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            tab.label(),
+                                            egui::FontId::proportional(13.0),
+                                            text_color,
+                                        );
+                                        if resp.clicked() {
+                                            self.cloud.exp_settings.tab = tab;
+                                        }
+                                    }
+                                });
+                            });
 
-                match self.cloud.exp_settings.tab {
-                    SettingsTab::BasicInfo => {
-                        let Some(o) = &origin else {
-                            ui.label("This place isn't on Roblox: it was opened from a file or made here.");
-                            ui.label(
-                                RichText::new("Open one with File > Open from Roblox to edit its Roblox Basic Info here. Local Security, Avatar and World tabs still work.")
-                                    .color(theme::TEXT_DIM),
-                            );
-                            return;
-                        };
-                        ui.label(RichText::new("Experience Configuration").strong());
-                        let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
-                        ui.add_enabled_ui(!busy_cfg, |ui| {
-                            egui::Grid::new("exp_settings_basic")
-                                .num_columns(2)
-                                .spacing([12.0, 6.0])
+                        ui.separator();
+
+                        // Right scrollable content pane
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width().max(120.0));
+                            ui.set_height(body_h);
+                            egui::ScrollArea::vertical()
+                                .id_salt("exp_settings_body")
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    ui.label("Name");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.cloud.exp_settings.name)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    ui.end_row();
+                                    ui.set_width(ui.available_width());
+                                    match self.cloud.exp_settings.tab {
+                                        SettingsTab::BasicInfo => {
+                                            if let Some(o) = &origin {
+                                                ui.label(RichText::new("Basic Info").strong().size(14.0));
+                                                ui.add_space(6.0);
+                                                ui.add_enabled_ui(!busy_cfg, |ui| {
+                                                    egui::Grid::new("exp_settings_basic")
+                                                        .num_columns(2)
+                                                        .spacing([12.0, 8.0])
+                                                        .show(ui, |ui| {
+                                                            ui.label("Name");
+                                                            ui.add(
+                                                                egui::TextEdit::singleline(&mut self.cloud.exp_settings.name)
+                                                                    .desired_width(f32::INFINITY),
+                                                            );
+                                                            ui.end_row();
 
-                                    ui.label("Description");
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut self.cloud.exp_settings.description)
-                                            .desired_rows(3)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    ui.end_row();
+                                                            ui.label("Description");
+                                                            ui.add(
+                                                                egui::TextEdit::multiline(&mut self.cloud.exp_settings.description)
+                                                                    .desired_rows(3)
+                                                                    .desired_width(f32::INFINITY),
+                                                            );
+                                                            ui.end_row();
 
-                                    ui.label("Playable Devices");
-                                    ui.horizontal_wrapped(|ui| {
-                                        for dev in PLAYABLE_DEVICES {
-                                            let mut checked = self.cloud.exp_settings.playable_devices.contains(dev);
-                                            if ui.checkbox(&mut checked, dev).changed() {
-                                                if checked {
-                                                    self.cloud.exp_settings.playable_devices.insert(dev.to_string());
-                                                } else {
-                                                    self.cloud.exp_settings.playable_devices.remove(dev);
+                                                            ui.label("Playable Devices");
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                for dev in PLAYABLE_DEVICES {
+                                                                    let mut checked =
+                                                                        self.cloud.exp_settings.playable_devices.contains(dev);
+                                                                    if ui.checkbox(&mut checked, dev).changed() {
+                                                                        if checked {
+                                                                            self.cloud
+                                                                                .exp_settings
+                                                                                .playable_devices
+                                                                                .insert(dev.to_string());
+                                                                        } else {
+                                                                            self.cloud.exp_settings.playable_devices.remove(dev);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            });
+                                                            ui.end_row();
+                                                        });
+                                                });
+                                                ui.add_space(8.0);
+                                                ui.separator();
+                                                ui.add_space(4.0);
+                                                ui.label(RichText::new("Place Info").strong().size(13.5));
+                                                ui.add_space(4.0);
+                                                egui::Grid::new("place_info")
+                                                    .num_columns(2)
+                                                    .spacing([14.0, 4.0])
+                                                    .show(ui, |ui| {
+                                                        let mut row = |k: &str, v: String| {
+                                                            ui.label(RichText::new(k).color(theme::TEXT_DIM));
+                                                            ui.label(v);
+                                                            ui.end_row();
+                                                        };
+                                                        row("Place", o.name.clone());
+                                                        row("Experience", o.experience.clone());
+                                                        row(
+                                                            "Creator",
+                                                            format!(
+                                                                "{} ({} {})",
+                                                                o.creator_label(),
+                                                                o.creator_type.as_str(),
+                                                                o.creator_id
+                                                            ),
+                                                        );
+                                                        row("Place ID", o.place_id.to_string());
+                                                        row("Universe ID", o.universe_id.to_string());
+                                                        row(
+                                                            "Start place",
+                                                            if o.root_place_id == o.place_id {
+                                                                "this place".into()
+                                                            } else {
+                                                                o.root_place_id.to_string()
+                                                            },
+                                                        );
+                                                        row(
+                                                            "Opened as",
+                                                            if o.local_copy {
+                                                                "a local copy of the last saved version (Team Create is on)".into()
+                                                            } else {
+                                                                "the saved version on Roblox".into()
+                                                            },
+                                                        );
+                                                        row(
+                                                            "Version",
+                                                            format!(
+                                                                "{}{}",
+                                                                o.version,
+                                                                if doc_dirty { " (unsaved changes)" } else { "" }
+                                                            ),
+                                                        );
+                                                        row("Cached at", self.cloud.cache.dir(o.place_id).display().to_string());
+                                                    });
+                                                ui.add_space(8.0);
+                                                ui.separator();
+                                                ui.add_space(4.0);
+                                                ui.label(RichText::new("Team Create").strong().size(13.5));
+                                                ui.add_space(4.0);
+                                                match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
+                                                    Some((_, st)) => {
+                                                        ui.label(st.describe());
+                                                        let yn = |b: Option<bool>| match b {
+                                                            Some(true) => "yes",
+                                                            Some(false) => "no",
+                                                            None => "unknown",
+                                                        };
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "Can collaborate: {}{} · can manage: {} · can edit in the cloud: {}",
+                                                                yn(st.can_collaborate),
+                                                                st.reason
+                                                                    .as_ref()
+                                                                    .map(|r| format!(" ({r})"))
+                                                                    .unwrap_or_default(),
+                                                                yn(st.can_manage),
+                                                                yn(st.can_cloud_edit)
+                                                            ))
+                                                            .small()
+                                                            .color(theme::TEXT_DIM),
+                                                        );
+                                                    }
+                                                    None => {
+                                                        ui.label(RichText::new("Not checked yet.").color(theme::TEXT_DIM));
+                                                    }
+                                                }
+                                                ui.add_space(4.0);
+                                                if ui
+                                                    .add_enabled(!self.cloud.busy(), egui::Button::new("Check again"))
+                                                    .clicked()
+                                                {
+                                                    refresh_tc = true;
+                                                }
+                                            } else {
+                                                ui.label(RichText::new("Basic Info").strong().size(14.0));
+                                                ui.add_space(6.0);
+                                                ui.label("This place isn't on Roblox: it was opened from a file or made here.");
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new("Open one with File > Open from Roblox to edit its Roblox Basic Info here. Local Security, Avatar and World tabs still work.")
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                            }
+                                        }
+                                        SettingsTab::Security => {
+                                            ui.label(RichText::new("Roblox API Access").strong().size(14.0));
+                                            ui.add_space(6.0);
+                                            if origin.is_some() {
+                                                ui.add_enabled_ui(!busy_cfg, |ui| {
+                                                    ui.checkbox(
+                                                        &mut self.cloud.exp_settings.studio_access_to_apis,
+                                                        "Enable Studio Access to API Services",
+                                                    );
+                                                });
+                                                ui.label(
+                                                    RichText::new("Controls studioAccessToApisAllowed on Roblox for DataStore and API access in Studio.")
+                                                        .small()
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new("Studio Access to API Services requires a place opened from or published to Roblox.")
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                            }
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(4.0);
+                                            ui.label(RichText::new("Local Place Security").strong().size(13.5));
+                                            ui.add_space(4.0);
+                                            if ui
+                                                .add_enabled(
+                                                    !is_playing,
+                                                    egui::Checkbox::new(
+                                                        &mut http_enabled,
+                                                        "Allow HTTP Requests (HttpService.HttpEnabled)",
+                                                    ),
+                                                )
+                                                .changed()
+                                            {
+                                                set_http_enabled = Some(http_enabled);
+                                            }
+                                            ui.label(
+                                                RichText::new("Saved with this place on HttpService.HttpEnabled (undoable).")
+                                                    .small()
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+                                        SettingsTab::Avatar => {
+                                            ui.label(RichText::new("Avatar Type").strong().size(14.0));
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new("Updates StarterPlayer.GameSettingsAvatar locally and syncs universeAvatarType on Roblox.")
+                                                    .small()
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.add_enabled_ui(sp_ref.is_some() && !is_playing && !busy_cfg, |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for (label, v, tip) in [
+                                                        ("R6", 0u32, "Characters use the classic R6 body (6 parts)."),
+                                                        ("R15", 1u32, "Characters use the R15 body (15 parts)."),
+                                                        ("Player Choice", 2u32, "Each player's own avatar decides."),
+                                                    ] {
+                                                        if ui.radio(cur_avatar == v, label).on_hover_text(tip).clicked() {
+                                                            set_avatar = Some(v);
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                            if sp_ref.is_none() {
+                                                ui.add_space(4.0);
+                                                ui.label(RichText::new("This place has no StarterPlayer.").color(theme::WARN));
+                                            }
+                                            if origin.is_some() {
+                                                if let Some(cloud_av) = self.cloud.exp_settings.cloud_avatar_type {
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "Roblox universeAvatarType: {}",
+                                                            avatar_type_label(cloud_av)
+                                                        ))
+                                                        .small()
+                                                        .color(theme::TEXT_DIM),
+                                                    );
                                                 }
                                             }
                                         }
-                                    });
-                                    ui.end_row();
+                                        SettingsTab::World => {
+                                            ui.label(RichText::new("World & Character Defaults").strong().size(14.0));
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new("Saved directly to Workspace and StarterPlayer with undo support.")
+                                                    .small()
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.add_enabled_ui(!is_playing, |ui| {
+                                                egui::Grid::new("exp_settings_world")
+                                                    .num_columns(2)
+                                                    .spacing([14.0, 8.0])
+                                                    .show(ui, |ui| {
+                                                        ui.label("Gravity (Workspace.Gravity)");
+                                                        if ui
+                                                            .add_enabled(
+                                                                ws_ref.is_some(),
+                                                                egui::DragValue::new(&mut gravity)
+                                                                    .speed(0.5)
+                                                                    .range(0.0..=1000.0)
+                                                                    .suffix(" studs/s²"),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            if let Some(ws) = ws_ref {
+                                                                world_edit =
+                                                                    Some(("Workspace.Gravity", ws, "Gravity", gravity));
+                                                            }
+                                                        }
+                                                        ui.end_row();
+
+                                                        ui.label("Walk Speed (CharacterWalkSpeed)");
+                                                        if ui
+                                                            .add_enabled(
+                                                                sp_ref.is_some(),
+                                                                egui::DragValue::new(&mut walk_speed)
+                                                                    .speed(0.5)
+                                                                    .range(0.0..=500.0)
+                                                                    .suffix(" studs/s"),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            if let Some(sp) = sp_ref {
+                                                                world_edit = Some((
+                                                                    "CharacterWalkSpeed",
+                                                                    sp,
+                                                                    "CharacterWalkSpeed",
+                                                                    walk_speed,
+                                                                ));
+                                                            }
+                                                        }
+                                                        ui.end_row();
+
+                                                        ui.label("Jump Power (CharacterJumpPower)");
+                                                        if ui
+                                                            .add_enabled(
+                                                                sp_ref.is_some(),
+                                                                egui::DragValue::new(&mut jump_power)
+                                                                    .speed(0.5)
+                                                                    .range(0.0..=500.0),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            if let Some(sp) = sp_ref {
+                                                                world_edit = Some((
+                                                                    "CharacterJumpPower",
+                                                                    sp,
+                                                                    "CharacterJumpPower",
+                                                                    jump_power,
+                                                                ));
+                                                            }
+                                                        }
+                                                        ui.end_row();
+
+                                                        ui.label("Jump Height (CharacterJumpHeight)");
+                                                        if ui
+                                                            .add_enabled(
+                                                                sp_ref.is_some(),
+                                                                egui::DragValue::new(&mut jump_height)
+                                                                    .speed(0.2)
+                                                                    .range(0.0..=200.0)
+                                                                    .suffix(" studs"),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            if let Some(sp) = sp_ref {
+                                                                world_edit = Some((
+                                                                    "CharacterJumpHeight",
+                                                                    sp,
+                                                                    "CharacterJumpHeight",
+                                                                    jump_height,
+                                                                ));
+                                                            }
+                                                        }
+                                                        ui.end_row();
+
+                                                        ui.label("Max Slope Angle (CharacterMaxSlopeAngle)");
+                                                        if ui
+                                                            .add_enabled(
+                                                                sp_ref.is_some(),
+                                                                egui::DragValue::new(&mut max_slope)
+                                                                    .speed(0.5)
+                                                                    .range(0.0..=89.9)
+                                                                    .suffix("°"),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            if let Some(sp) = sp_ref {
+                                                                world_edit = Some((
+                                                                    "CharacterMaxSlopeAngle",
+                                                                    sp,
+                                                                    "CharacterMaxSlopeAngle",
+                                                                    max_slope,
+                                                                ));
+                                                            }
+                                                        }
+                                                        ui.end_row();
+                                                    });
+                                            });
+                                            if ws_ref.is_none() || sp_ref.is_none() {
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new("Some services (Workspace or StarterPlayer) are missing from this place.")
+                                                        .small()
+                                                        .color(theme::WARN),
+                                                );
+                                            }
+                                        }
+                                    }
                                 });
                         });
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            let can_save = self.cloud.exp_settings.loaded_ok
-                                && !busy_cfg
-                                && !self.cloud.exp_settings.name.trim().is_empty();
-                            if ui.add_enabled(can_save, egui::Button::new("Save Basic Info")).clicked() {
-                                save_basic_info = true;
+                    },
+                );
+
+                // Pinned bottom footer bar (always visible)
+                ui.separator();
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if origin.is_some()
+                        && ui
+                            .add_enabled(!busy_cfg, egui::Button::new("Reload").min_size(egui::vec2(64.0, 28.0)))
+                            .clicked()
+                    {
+                        reload_cfg = true;
+                    }
+                    if busy_cfg {
+                        ui.spinner();
+                    }
+
+                    let status_w = (ui.available_width() - 164.0).max(20.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(status_w, 28.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if let Some(err) = &self.cloud.exp_settings.error {
+                                ui.add(egui::Label::new(RichText::new(err).small().color(theme::WARN)).truncate())
+                                    .on_hover_text(err);
+                            } else if let Some(msg) = &self.cloud.exp_settings.status_msg {
+                                ui.add(egui::Label::new(RichText::new(msg).small().color(theme::TEXT_DIM)).truncate())
+                                    .on_hover_text(msg);
                             }
-                            if ui
-                                .add_enabled(!busy_cfg, egui::Button::new("Reload"))
-                                .clicked()
-                            {
-                                reload_cfg = true;
+                        },
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_save = match self.cloud.exp_settings.tab {
+                            SettingsTab::BasicInfo => {
+                                origin.is_some()
+                                    && self.cloud.exp_settings.loaded_ok
+                                    && !busy_cfg
+                                    && !self.cloud.exp_settings.name.trim().is_empty()
                             }
-                        });
-                        ui.separator();
-                        ui.label(RichText::new("Place Info").strong());
-                        egui::Grid::new("place_info").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                            let mut row = |k: &str, v: String| {
-                                ui.label(RichText::new(k).color(theme::TEXT_DIM));
-                                ui.label(v);
-                                ui.end_row();
-                            };
-                            row("Place", o.name.clone());
-                            row("Experience", o.experience.clone());
-                            row("Creator", format!("{} ({} {})", o.creator_label(), o.creator_type.as_str(), o.creator_id));
-                            row("Place ID", o.place_id.to_string());
-                            row("Universe ID", o.universe_id.to_string());
-                            row(
-                                "Start place",
-                                if o.root_place_id == o.place_id { "this place".into() } else { o.root_place_id.to_string() },
-                            );
-                            row(
-                                "Opened as",
-                                if o.local_copy {
-                                    "a local copy of the last saved version (Team Create is on)".into()
+                            SettingsTab::Security => {
+                                if origin.is_some() {
+                                    self.cloud.exp_settings.loaded_ok && !busy_cfg
                                 } else {
-                                    "the saved version on Roblox".into()
-                                },
-                            );
-                            row("Version", format!("{}{}", o.version, if doc_dirty { " (unsaved changes)" } else { "" }));
-                            row("Cached at", self.cloud.cache.dir(o.place_id).display().to_string());
-                        });
-                        ui.separator();
-                        ui.label(RichText::new("Team Create").strong());
-                        match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
-                            Some((_, st)) => {
-                                ui.label(st.describe());
-                                let yn = |b: Option<bool>| match b {
-                                    Some(true) => "yes",
-                                    Some(false) => "no",
-                                    None => "unknown",
-                                };
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Can collaborate: {}{} · can manage: {} · can edit in the cloud: {}",
-                                        yn(st.can_collaborate),
-                                        st.reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default(),
-                                        yn(st.can_manage),
-                                        yn(st.can_cloud_edit)
-                                    ))
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                                );
+                                    !is_playing
+                                }
                             }
-                            None => {
-                                ui.label(RichText::new("Not checked yet.").color(theme::TEXT_DIM));
-                            }
-                        }
-                        if ui.add_enabled(!self.cloud.busy(), egui::Button::new("Check again")).clicked() {
-                            refresh_tc = true;
-                        }
-                    }
-                    SettingsTab::Security => {
-                        ui.label(RichText::new("Roblox API Access").strong());
-                        if origin.is_some() {
-                            let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
-                            ui.add_enabled_ui(!busy_cfg, |ui| {
-                                ui.checkbox(
-                                    &mut self.cloud.exp_settings.studio_access_to_apis,
-                                    "Enable Studio Access to API Services",
-                                );
-                            });
-                            ui.label(
-                                RichText::new("Controls studioAccessToApisAllowed on Roblox for DataStore and API access in Studio.")
-                                    .small()
-                                    .color(theme::TEXT_DIM),
-                            );
-                            if ui
-                                .add_enabled(
-                                    self.cloud.exp_settings.loaded_ok && !busy_cfg,
-                                    egui::Button::new("Save Security to Roblox"),
-                                )
-                                .clicked()
-                            {
-                                save_security_api = true;
-                            }
-                        } else {
-                            ui.label(
-                                RichText::new("Studio Access to API Services requires a place opened from or published to Roblox.")
-                                    .color(theme::TEXT_DIM),
-                            );
-                        }
-                        ui.separator();
-                        ui.label(RichText::new("Local Place Security").strong());
-                        if ui
-                            .add_enabled(
-                                !is_playing,
-                                egui::Checkbox::new(&mut http_enabled, "Allow HTTP Requests (HttpService.HttpEnabled)"),
-                            )
-                            .changed()
-                        {
-                            set_http_enabled = Some(http_enabled);
-                        }
-                        ui.label(
-                            RichText::new("Saved with this place on HttpService.HttpEnabled (undoable).")
-                                .small()
-                                .color(theme::TEXT_DIM),
-                        );
-                    }
-                    SettingsTab::Avatar => {
-                        ui.label(RichText::new("Avatar Type").strong());
-                        ui.label(
-                            RichText::new("Updates StarterPlayer.GameSettingsAvatar locally and syncs universeAvatarType on Roblox.")
-                                .small()
-                                .color(theme::TEXT_DIM),
-                        );
-                        ui.add_space(4.0);
-                        let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
-                        ui.add_enabled_ui(sp_ref.is_some() && !is_playing && !busy_cfg, |ui| {
-                            ui.horizontal(|ui| {
-                                for (label, v, tip) in [
-                                    ("R6", 0u32, "Characters use the classic R6 body (6 parts)."),
-                                    ("R15", 1u32, "Characters use the R15 body (15 parts)."),
-                                    ("Player Choice", 2u32, "Each player's own avatar decides."),
-                                ] {
-                                    if ui.radio(cur_avatar == v, label).on_hover_text(tip).clicked() {
-                                        set_avatar = Some(v);
+                            SettingsTab::Avatar => !busy_cfg && !is_playing && sp_ref.is_some(),
+                            SettingsTab::World => !is_playing,
+                        };
+                        let save_btn = egui::Button::new(
+                            RichText::new("Save").strong().color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(0, 110, 230))
+                        .min_size(egui::vec2(76.0, 28.0));
+                        if ui.add_enabled(can_save, save_btn).clicked() {
+                            match self.cloud.exp_settings.tab {
+                                SettingsTab::BasicInfo => save_basic_info = true,
+                                SettingsTab::Security => {
+                                    if origin.is_some() {
+                                        save_security_api = true;
+                                    } else {
+                                        close_requested = true;
                                     }
                                 }
-                            });
-                        });
-                        if sp_ref.is_none() {
-                            ui.label(RichText::new("This place has no StarterPlayer.").color(theme::WARN));
-                        }
-                        if origin.is_some() {
-                            if let Some(cloud_av) = self.cloud.exp_settings.cloud_avatar_type {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(format!("Roblox universeAvatarType: {}", avatar_type_label(cloud_av)))
-                                        .small()
-                                        .color(theme::TEXT_DIM),
-                                );
+                                SettingsTab::Avatar => {
+                                    if origin.is_some() {
+                                        set_avatar = Some(cur_avatar);
+                                    } else {
+                                        close_requested = true;
+                                    }
+                                }
+                                SettingsTab::World => close_requested = true,
                             }
                         }
-                    }
-                    SettingsTab::World => {
-                        ui.label(RichText::new("World & Character Defaults").strong());
-                        ui.label(
-                            RichText::new("Saved directly to Workspace and StarterPlayer with undo support.")
-                                .small()
-                                .color(theme::TEXT_DIM),
-                        );
-                        ui.add_space(4.0);
-                        ui.add_enabled_ui(!is_playing, |ui| {
-                            egui::Grid::new("exp_settings_world")
-                                .num_columns(2)
-                                .spacing([16.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Gravity (Workspace.Gravity)");
-                                    if ui
-                                        .add_enabled(
-                                            ws_ref.is_some(),
-                                            egui::DragValue::new(&mut gravity)
-                                                .speed(0.5)
-                                                .range(0.0..=1000.0)
-                                                .suffix(" studs/s²"),
-                                        )
-                                        .changed()
-                                    {
-                                        if let Some(ws) = ws_ref {
-                                            world_edit = Some(("Workspace.Gravity", ws, "Gravity", gravity));
-                                        }
-                                    }
-                                    ui.end_row();
 
-                                    ui.label("Walk Speed (CharacterWalkSpeed)");
-                                    if ui
-                                        .add_enabled(
-                                            sp_ref.is_some(),
-                                            egui::DragValue::new(&mut walk_speed)
-                                                .speed(0.5)
-                                                .range(0.0..=500.0)
-                                                .suffix(" studs/s"),
-                                        )
-                                        .changed()
-                                    {
-                                        if let Some(sp) = sp_ref {
-                                            world_edit = Some(("CharacterWalkSpeed", sp, "CharacterWalkSpeed", walk_speed));
-                                        }
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Jump Power (CharacterJumpPower)");
-                                    if ui
-                                        .add_enabled(
-                                            sp_ref.is_some(),
-                                            egui::DragValue::new(&mut jump_power)
-                                                .speed(0.5)
-                                                .range(0.0..=500.0),
-                                        )
-                                        .changed()
-                                    {
-                                        if let Some(sp) = sp_ref {
-                                            world_edit = Some(("CharacterJumpPower", sp, "CharacterJumpPower", jump_power));
-                                        }
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Jump Height (CharacterJumpHeight)");
-                                    if ui
-                                        .add_enabled(
-                                            sp_ref.is_some(),
-                                            egui::DragValue::new(&mut jump_height)
-                                                .speed(0.2)
-                                                .range(0.0..=200.0)
-                                                .suffix(" studs"),
-                                        )
-                                        .changed()
-                                    {
-                                        if let Some(sp) = sp_ref {
-                                            world_edit = Some(("CharacterJumpHeight", sp, "CharacterJumpHeight", jump_height));
-                                        }
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Max Slope Angle (CharacterMaxSlopeAngle)");
-                                    if ui
-                                        .add_enabled(
-                                            sp_ref.is_some(),
-                                            egui::DragValue::new(&mut max_slope)
-                                                .speed(0.5)
-                                                .range(0.0..=89.9)
-                                                .suffix("°"),
-                                        )
-                                        .changed()
-                                    {
-                                        if let Some(sp) = sp_ref {
-                                            world_edit = Some((
-                                                "CharacterMaxSlopeAngle",
-                                                sp,
-                                                "CharacterMaxSlopeAngle",
-                                                max_slope,
-                                            ));
-                                        }
-                                    }
-                                    ui.end_row();
-                                });
-                        });
-                        if ws_ref.is_none() || sp_ref.is_none() {
-                            ui.label(
-                                RichText::new("Some services (Workspace or StarterPlayer) are missing from this place.")
-                                    .small()
-                                    .color(theme::WARN),
-                            );
+                        if ui
+                            .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                            .clicked()
+                        {
+                            close_requested = true;
                         }
-                    }
-                }
+                    });
+                });
             });
 
         if reload_cfg {
@@ -2936,7 +3220,7 @@ impl Editor {
                 });
             }
         }
-        if !open {
+        if !open || close_requested {
             self.cloud.settings_open = false;
             self.cloud.exp_settings.loaded_universe = None;
         }
@@ -2949,12 +3233,24 @@ impl Editor {
         self.game.account.restore();
         let mut open = true;
         let mut todo: Vec<PickerDo> = Vec::new();
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 24.0).max(280.0);
+        let max_h = (screen.height() - 24.0).max(200.0);
         egui::Window::new("Open from Roblox")
             .open(&mut open)
-            .default_width(600.0)
-            .default_height(520.0)
+            .collapsible(false)
+            .constrain_to(screen.shrink(8.0))
+            .default_width(600.0f32.min(max_w))
+            .default_height(520.0f32.min(max_h))
+            .max_width(max_w)
+            .max_height(max_h)
             .resizable(true)
-            .show(ctx, |ui| self.picker_contents(ui, &mut todo));
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("cloud_picker_outer_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.picker_contents(ui, &mut todo));
+            });
         if !open {
             self.cloud.open = false;
         }
@@ -3180,7 +3476,7 @@ impl Editor {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut c.url_input)
                     .hint_text("roblox.com/games/… or a place ID")
-                    .desired_width(280.0),
+                    .desired_width((ui.available_width() - 68.0).clamp(120.0, 280.0)),
             );
             let go = ui.add_enabled(!c.url_input.trim().is_empty(), egui::Button::new("Open")).clicked()
                 || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));

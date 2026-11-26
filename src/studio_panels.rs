@@ -203,35 +203,106 @@ impl Editor {
 
     /// The Avatar Settings panel (Studio: File > Avatar Settings).
     pub fn avatar_settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.label(RichText::new("Avatar").strong());
-        ui.label(
-            RichText::new("Saved with the place (StarterPlayer.GameSettingsAvatar), so Play uses it here and in Roblox.")
-                .color(theme::TEXT_DIM)
-                .small(),
-        );
-        ui.add_space(6.0);
-        let cur = self.avatar_type();
-        ui.add_enabled_ui(self.game.play.is_none(), |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Avatar Type");
-                for (label, v, tip) in AVATAR_TYPES {
-                    let r = ui.radio(cur == v, label).on_hover_text(tip);
-                    self.ui_rects.insert(avatar_type_key(v), r.rect);
-                    if r.clicked() {
-                        self.set_avatar_type(v);
-                    }
-                }
+        ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(26.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Avatar Settings").strong().size(14.5));
+                ui.label(
+                    RichText::new(
+                        "Saved with the place (StarterPlayer.GameSettingsAvatar), so Play uses it here and in Roblox.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .small(),
+                );
+                ui.add_space(10.0);
+
+                // Section card: Avatar Type
+                let cur = self.avatar_type();
+                egui::Frame::new()
+                    .fill(theme::PANEL_DARK)
+                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new("Avatar Type").strong());
+                        ui.add_space(6.0);
+                        ui.add_enabled_ui(self.game.play.is_none(), |ui| {
+                            for (idx, (label, v, tip)) in AVATAR_TYPES.iter().enumerate() {
+                                if idx > 0 {
+                                    ui.add_space(6.0);
+                                }
+                                let selected = cur == *v;
+                                let row_fill = if selected {
+                                    theme::SELECT_BG
+                                } else {
+                                    theme::BG
+                                };
+                                let row_stroke = if selected {
+                                    egui::Color32::from_rgb(0, 110, 230)
+                                } else {
+                                    theme::DIVIDER
+                                };
+                                egui::Frame::new()
+                                    .fill(row_fill)
+                                    .stroke(egui::Stroke::new(1.0, row_stroke))
+                                    .corner_radius(5.0)
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        let r = ui
+                                            .radio(selected, RichText::new(*label).strong())
+                                            .on_hover_text(*tip);
+                                        self.ui_rects.insert(avatar_type_key(*v), r.rect);
+                                        if r.clicked() {
+                                            self.set_avatar_type(*v);
+                                        }
+                                        ui.label(RichText::new(*tip).color(theme::TEXT_DIM).small());
+                                    });
+                            }
+                        });
+                        if self.game.play.is_some() {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Stop Play mode to change Avatar Type.")
+                                    .color(theme::WARN)
+                                    .small(),
+                            );
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                // Section card: Active Play Rig
+                let (rig, source) = self.game.rig_choice();
+                let name = if rig == rustudio_engine::rig::RigType::R15 { "R15" } else { "R6" };
+                egui::Frame::new()
+                    .fill(theme::PANEL_DARK)
+                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Next Play Rig:").strong());
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(0, 110, 230))
+                                .corner_radius(4.0)
+                                .inner_margin(egui::Margin::symmetric(8, 2))
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(name).strong().color(egui::Color32::WHITE).small());
+                                });
+                            ui.label(
+                                RichText::new(format!("(from the {})", source.label()))
+                                    .color(theme::TEXT_DIM)
+                                    .small(),
+                            );
+                        });
+                    });
+                ui.add_space(6.0);
             });
-        });
-        let (rig, source) = self.game.rig_choice();
-        let name = if rig == rustudio_engine::rig::RigType::R15 { "R15" } else { "R6" };
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("Next Play: {name} (from the {})", source.label()))
-                .color(theme::TEXT_DIM)
-                .small(),
-        );
     }
 
     /// Opens Insert Object for `parent` at `at` (Studio's popup).
@@ -254,16 +325,27 @@ impl Editor {
         };
         let mut chosen: Option<String> = None;
         let mut close = false;
+        let screen = ctx.content_rect().shrink(8.0);
+        let popup_w = 240.0_f32.min(screen.width().max(180.0));
+        let max_list_h = (screen.height() - 48.0).clamp(120.0, 400.0);
+        let clamped_pos = egui::pos2(
+            pop.at.x.clamp(screen.min.x, (screen.max.x - popup_w - 16.0).max(screen.min.x)),
+            pop.at.y.clamp(screen.min.y, (screen.max.y - (max_list_h + 44.0).min(screen.height())).max(screen.min.y)),
+        );
         let area = egui::Area::new(egui::Id::new("insert_object_popup"))
             .order(egui::Order::Foreground)
-            .fixed_pos(pop.at)
+            .fixed_pos(clamped_pos)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).fill(theme::PANEL_DARK).show(ui, |ui| {
-                    ui.set_width(240.0);
+                egui::Frame::popup(ui.style())
+                    .fill(theme::PANEL_DARK)
+                    .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                    .corner_radius(6.0)
+                    .show(ui, |ui| {
+                    ui.set_width(popup_w);
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut pop.query)
                             .hint_text("Search object")
-                            .desired_width(230.0),
+                            .desired_width((popup_w - 10.0).max(120.0)),
                     );
                     self.ui_rects.insert("insert.search", r.rect);
                     if pop.opened_frame + 1 >= self.game.frame_no {
@@ -291,7 +373,7 @@ impl Editor {
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         chosen = classes.first().map(|s| s.to_string());
                     }
-                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(max_list_h).show(ui, |ui| {
                         let mut last = String::new();
                         for c in classes.iter().take(400) {
                             if q.is_empty() {

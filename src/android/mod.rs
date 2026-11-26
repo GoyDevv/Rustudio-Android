@@ -287,7 +287,9 @@ pub fn run(app: AndroidApp) {
             log::error!("eframe: {e}");
             log::error!("rustudio: the editor's loop ended with an error, leaving the process");
             crate::crash::record_fatal_message("eframe Error", &format!("{e}"));
-            std::process::exit(2);
+            crate::crash::begin_shutdown();
+            rustudio_core::crash::begin_shutdown();
+            unsafe { libc::_exit(2) };
         }
         Err(payload) => {
             let msg = payload
@@ -299,7 +301,9 @@ pub fn run(app: AndroidApp) {
             if let Some(p) = rustudio_core::crash::last_report() {
                 log::error!("rustudio: crash report {} (echoed to Output and logcat at the next start)", p.display());
             }
-            std::process::exit(101);
+            crate::crash::begin_shutdown();
+            rustudio_core::crash::begin_shutdown();
+            unsafe { libc::_exit(101) };
         }
     }
     // The next launch gets a fresh process: the handles kept in this one's

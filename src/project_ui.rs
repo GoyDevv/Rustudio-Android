@@ -8,6 +8,9 @@ use crate::project::FileKind;
 use crate::project_config::{kind_label, LineEndings, LuaExt, ProjectConfig, SyncRule, KINDS};
 use crate::project_export::{ExportOptions, CONTAINERS};
 
+const FOOTER_HEIGHT: f32 = 44.0;
+const PRIMARY_BLUE: egui::Color32 = egui::Color32::from_rgb(0, 110, 230);
+
 /// Save as Project Folder: where, and what goes to files.
 pub struct ExportDialog {
     pub opts: ExportOptions,
@@ -31,6 +34,24 @@ fn safe_name(s: &str) -> String {
     let s: String = s.chars().map(|c| if c.is_alphanumeric() || "-_ ".contains(c) { c } else { '_' }).collect();
     let s = s.trim().replace(' ', "-");
     if s.is_empty() { "game".into() } else { s }
+}
+
+fn modal_window<'a>(title: &'a str, screen: egui::Rect) -> egui::Window<'a> {
+    egui::Window::new(title)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .constrain_to(screen.shrink(8.0))
+}
+
+fn primary_button(label: &str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE))
+        .fill(PRIMARY_BLUE)
+        .min_size(egui::vec2(84.0, 28.0))
+}
+
+fn secondary_button(label: &str) -> egui::Button<'static> {
+    egui::Button::new(label).min_size(egui::vec2(72.0, 28.0))
 }
 
 impl Editor {
@@ -85,7 +106,11 @@ impl Editor {
 
     fn export_window(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.project_export.take() else { return };
+        let screen = ctx.content_rect();
+        let win_w = (screen.width() - 32.0).clamp(320.0, 560.0);
+        let win_h = (screen.height() - 28.0).clamp(240.0, 420.0);
         let mut open = true;
+        let mut cancel = false;
         let mut go = false;
         let mut browse: Option<String> = None;
         let root = self.game.doc.dom.root_ref();
@@ -102,64 +127,91 @@ impl Editor {
                 })
             })
             .collect();
-        egui::Window::new("Save as Project Folder")
-            .collapsible(false)
-            .resizable(false)
+        modal_window("Save as Project Folder", screen)
+            .fixed_size([win_w, win_h])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("Writes this place as a Rojo / Argon project folder: scripts become files, the rest stays in a place file beside the project.");
-                ui.add_space(6.0);
-                egui::Grid::new("export_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label("Project name");
-                    ui.text_edit_singleline(&mut d.opts.name);
-                    ui.end_row();
-                    ui.label("Create in");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut d.parent).desired_width(260.0));
-                        if ui.button("Browse…").clicked() {
-                            browse = Some(d.parent.clone());
+                let body_h = (ui.available_height() - FOOTER_HEIGHT).max(100.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("export_project_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(body_h)
+                    .show(ui, |ui| {
+                        ui.label("Writes this place as a Rojo / Argon project folder: scripts become files, the rest stays in a place file beside the project.");
+                        ui.add_space(6.0);
+                        let field_w = (ui.available_width() - 108.0).clamp(140.0, 340.0);
+                        let parent_w = (field_w - 78.0).clamp(100.0, 260.0);
+                        egui::Grid::new("export_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                            ui.label("Project name");
+                            ui.add(egui::TextEdit::singleline(&mut d.opts.name).desired_width(field_w));
+                            ui.end_row();
+                            ui.label("Create in");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut d.parent).desired_width(parent_w));
+                                if ui.button("Browse…").clicked() {
+                                    browse = Some(d.parent.clone());
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Folder");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        PathBuf::from(&d.parent).join(safe_name(&d.opts.name)).display().to_string(),
+                                    )
+                                    .weak(),
+                                )
+                                .wrap(),
+                            );
+                            ui.end_row();
+                        });
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Synced to files:").strong());
+                        ui.add_space(2.0);
+                        ui.columns(2, |cols| {
+                            for (n, (c, _)) in present.iter().enumerate() {
+                                let mut on = d.opts.containers.iter().any(|x| x == c);
+                                if cols[n % 2].checkbox(&mut on, *c).changed() {
+                                    d.opts.containers.retain(|x| x != c);
+                                    if on {
+                                        d.opts.containers.push(c.to_string());
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut d.opts.lua, "Use .lua instead of .luau");
+                        ui.checkbox(&mut d.opts.sourcemap, "Keep a sourcemap.json up to date (for luau-lsp)");
+                        if ui
+                            .checkbox(&mut d.attach_after, "Attach to this place with File Sync")
+                            .on_hover_text("Keeps this place open and links the new folder to it (Place wins: nothing in the place changes)")
+                            .changed()
+                            && d.attach_after
+                        {
+                            d.open_after = false;
+                        }
+                        if ui.checkbox(&mut d.open_after, "Open the project folder afterwards").changed() && d.open_after {
+                            d.attach_after = false;
+                        }
+                        if let Some(e) = &d.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(egui::Color32::from_rgb(230, 90, 80), e);
                         }
                     });
-                    ui.end_row();
-                    ui.label("Folder");
-                    ui.label(PathBuf::from(&d.parent).join(safe_name(&d.opts.name)).display().to_string());
-                    ui.end_row();
-                });
-                ui.add_space(6.0);
-                ui.label("Synced to files:");
-                ui.columns(2, |cols| {
-                    for (n, (c, _)) in present.iter().enumerate() {
-                        let mut on = d.opts.containers.iter().any(|x| x == c);
-                        if cols[n % 2].checkbox(&mut on, *c).changed() {
-                            d.opts.containers.retain(|x| x != c);
-                            if on {
-                                d.opts.containers.push(c.to_string());
-                            }
-                        }
+                ui.separator();
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(primary_button("Create Project")).clicked() {
+                        go = true;
+                    }
+                    if ui.add(secondary_button("Cancel")).clicked() {
+                        cancel = true;
                     }
                 });
-                ui.add_space(6.0);
-                ui.checkbox(&mut d.opts.lua, "Use .lua instead of .luau");
-                ui.checkbox(&mut d.opts.sourcemap, "Keep a sourcemap.json up to date (for luau-lsp)");
-                if ui
-                    .checkbox(&mut d.attach_after, "Attach to this place with File Sync")
-                    .on_hover_text("Keeps this place open and links the new folder to it (Place wins: nothing in the place changes)")
-                    .changed()
-                    && d.attach_after
-                {
-                    d.open_after = false;
-                }
-                if ui.checkbox(&mut d.open_after, "Open the project folder afterwards").changed() && d.open_after {
-                    d.attach_after = false;
-                }
-                if let Some(e) = &d.error {
-                    ui.colored_label(egui::Color32::from_rgb(230, 90, 80), e);
-                }
-                ui.add_space(4.0);
-                if ui.button("Save as Project Folder").clicked() {
-                    go = true;
-                }
             });
+        if cancel {
+            open = false;
+        }
         if let Some(start) = browse {
             use crate::file_dialog::{Kind, Purpose};
             let fd = crate::file_dialog::Request::new().set_directory(&start);
@@ -204,31 +256,50 @@ impl Editor {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.project_settings.take() else { return };
+        let screen = ctx.content_rect();
         if self.project.is_none() {
+            let win_w = (screen.width() - 32.0).clamp(300.0, 440.0);
+            let max_h = (screen.height() - 28.0).max(180.0);
             let mut open = true;
+            let mut cancel = false;
             let mut do_export = false;
             let mut do_open_folder = false;
-            egui::Window::new("Project Settings")
-                .collapsible(false)
-                .resizable(false)
-                .default_width(420.0)
+            modal_window("Project Settings", screen)
+                .min_width(win_w)
+                .max_width(win_w)
+                .max_height(max_h)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("No folder-based project is currently open.");
+                    let body_h = (max_h - FOOTER_HEIGHT - 44.0).max(80.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_empty_scroll")
+                        .auto_shrink([false, true])
+                        .max_height(body_h)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("No folder-based project is currently open.").strong());
+                            ui.add_space(6.0);
+                            ui.label(
+                                "Project Settings configure folder-based (Rojo / Argon) projects, including script sync rules, ignore globs, line endings, and sourcemaps.",
+                            );
+                            ui.add_space(8.0);
+                        });
+                    ui.separator();
                     ui.add_space(4.0);
-                    ui.label(
-                        "Project Settings configure folder-based (Rojo / Argon) projects, including script sync rules, ignore globs, line endings, and sourcemaps.",
-                    );
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Save as Project Folder…").clicked() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_button("Save as Project Folder…")).clicked() {
                             do_export = true;
                         }
-                        if ui.button("Open Folder…").clicked() {
+                        if ui.add(secondary_button("Open Folder…")).clicked() {
                             do_open_folder = true;
+                        }
+                        if ui.add(secondary_button("Cancel")).clicked() {
+                            cancel = true;
                         }
                     });
                 });
+            if cancel {
+                open = false;
+            }
             if do_export {
                 self.open_export_dialog();
                 return;
@@ -242,135 +313,156 @@ impl Editor {
             }
             return;
         }
+        let win_w = (screen.width() - 32.0).clamp(320.0, 560.0);
+        let win_h = (screen.height() - 28.0).clamp(240.0, 400.0);
         let mut open = true;
+        let mut cancel = false;
         let mut save = false;
         let mut write_map = false;
-        egui::Window::new("Project Settings")
-            .collapsible(false)
-            .resizable(true)
-            .default_width(560.0)
+        modal_window("Project Settings", screen)
+            .fixed_size([win_w, win_h])
             .open(&mut open)
             .show(ctx, |ui| {
-                let c = &mut d.cfg;
-                ui.label(format!("{}", c.root.display()));
-                ui.add_space(4.0);
-                egui::CollapsingHeader::new("Files").default_open(true).show(ui, |ui| {
-                    egui::Grid::new("ps_files").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                        ui.label("New script files");
-                        egui::ComboBox::from_id_salt("ps_lua")
-                            .selected_text(match c.lua_ext { LuaExt::Auto => "Match the folder", LuaExt::Luau => ".luau", LuaExt::Lua => ".lua" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut c.lua_ext, LuaExt::Auto, "Match the folder");
-                                ui.selectable_value(&mut c.lua_ext, LuaExt::Luau, ".luau");
-                                ui.selectable_value(&mut c.lua_ext, LuaExt::Lua, ".lua");
+                let body_h = (ui.available_height() - FOOTER_HEIGHT).max(100.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("project_settings_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(body_h)
+                    .show(ui, |ui| {
+                        let c = &mut d.cfg;
+                        ui.add(egui::Label::new(egui::RichText::new(format!("{}", c.root.display())).weak().small()).wrap());
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new("Files").default_open(true).show(ui, |ui| {
+                            egui::Grid::new("ps_files").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                ui.label("New script files");
+                                egui::ComboBox::from_id_salt("ps_lua")
+                                    .selected_text(match c.lua_ext { LuaExt::Auto => "Match the folder", LuaExt::Luau => ".luau", LuaExt::Lua => ".lua" })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut c.lua_ext, LuaExt::Auto, "Match the folder");
+                                        ui.selectable_value(&mut c.lua_ext, LuaExt::Luau, ".luau");
+                                        ui.selectable_value(&mut c.lua_ext, LuaExt::Lua, ".lua");
+                                    });
+                                ui.end_row();
+                                ui.label("Line endings");
+                                egui::ComboBox::from_id_salt("ps_le")
+                                    .selected_text(match c.line_endings { LineEndings::Keep => "Keep each file's", LineEndings::Lf => "LF", LineEndings::Crlf => "CRLF" })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut c.line_endings, LineEndings::Keep, "Keep each file's");
+                                        ui.selectable_value(&mut c.line_endings, LineEndings::Lf, "LF");
+                                        ui.selectable_value(&mut c.line_endings, LineEndings::Crlf, "CRLF");
+                                    });
+                                ui.end_row();
+                                ui.label("Deleted instances");
+                                egui::ComboBox::from_id_salt("ps_trash")
+                                    .selected_text(if c.trash { "Files go to the trash" } else { "Files are deleted" })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut c.trash, true, "Files go to the trash");
+                                        ui.selectable_value(&mut c.trash, false, "Files are deleted");
+                                    });
+                                ui.end_row();
                             });
-                        ui.end_row();
-                        ui.label("Line endings");
-                        egui::ComboBox::from_id_salt("ps_le")
-                            .selected_text(match c.line_endings { LineEndings::Keep => "Keep each file's", LineEndings::Lf => "LF", LineEndings::Crlf => "CRLF" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut c.line_endings, LineEndings::Keep, "Keep each file's");
-                                ui.selectable_value(&mut c.line_endings, LineEndings::Lf, "LF");
-                                ui.selectable_value(&mut c.line_endings, LineEndings::Crlf, "CRLF");
-                            });
-                        ui.end_row();
-                        ui.label("Deleted instances");
-                        egui::ComboBox::from_id_salt("ps_trash")
-                            .selected_text(if c.trash { "Files go to the trash" } else { "Files are deleted" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut c.trash, true, "Files go to the trash");
-                                ui.selectable_value(&mut c.trash, false, "Files are deleted");
-                            });
-                        ui.end_row();
-                    });
-                    ui.checkbox(&mut c.emit_legacy_scripts, "Legacy scripts (.client files are LocalScripts; off: Scripts with RunContext)");
-                });
-                egui::CollapsingHeader::new("Sourcemap").default_open(true).show(ui, |ui| {
-                    ui.checkbox(&mut c.sourcemap, "Keep a sourcemap up to date (luau-lsp reads it)");
-                    ui.horizontal(|ui| {
-                        ui.label("File");
-                        ui.text_edit_singleline(&mut c.sourcemap_path);
-                    });
-                    ui.checkbox(&mut c.sourcemap_non_scripts, "Include instances that aren't scripts");
-                    if ui.button("Write it now").clicked() {
-                        write_map = true;
-                    }
-                });
-                egui::CollapsingHeader::new("Ignored files").default_open(true).show(ui, |ui| {
-                    ui.label("Glob patterns, one per line (relative to the project folder):");
-                    ui.add(egui::TextEdit::multiline(&mut d.ignore_text).desired_rows(3).desired_width(f32::INFINITY).hint_text("**/*.spec.luau"));
-                });
-                egui::CollapsingHeader::new("Sync rules").default_open(true).show(ui, |ui| {
-                    ui.label("Tried before the defaults, top first. Pattern matches the file name or its path in the project.");
-                    let mut remove = None;
-                    let mut swap = None;
-                    egui::Grid::new("ps_rules").num_columns(6).spacing([6.0, 4.0]).striped(true).show(ui, |ui| {
-                        ui.strong("Pattern");
-                        ui.strong("Becomes");
-                        ui.strong("Name suffix");
-                        ui.strong("Folder init file");
-                        ui.strong("Except");
-                        ui.label("");
-                        ui.end_row();
-                        let n = c.rules.len();
-                        for (i, r) in c.rules.iter_mut().enumerate() {
-                            ui.add(egui::TextEdit::singleline(&mut r.pattern).desired_width(120.0).hint_text("*.server.lua"));
-                            egui::ComboBox::from_id_salt(("ps_kind", i)).selected_text(kind_label(r.kind)).show_ui(ui, |ui| {
-                                for (_, label, k) in KINDS {
-                                    ui.selectable_value(&mut r.kind, *k, *label);
-                                }
-                            });
-                            let mut suffix = r.suffix.clone().unwrap_or_default();
-                            if ui.add(egui::TextEdit::singleline(&mut suffix).desired_width(90.0).hint_text("auto")).changed() {
-                                r.suffix = (!suffix.is_empty()).then_some(suffix);
-                            }
-                            let mut child = r.child_pattern.clone().unwrap_or_default();
-                            if ui.add(egui::TextEdit::singleline(&mut child).desired_width(110.0).hint_text("init.server.lua")).changed() {
-                                r.child_pattern = (!child.is_empty()).then_some(child);
-                            }
-                            let mut ex = r.exclude.join(", ");
-                            if ui.add(egui::TextEdit::singleline(&mut ex).desired_width(100.0)).changed() {
-                                r.exclude = ex.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                            }
+                            ui.checkbox(&mut c.emit_legacy_scripts, "Legacy scripts (.client files are LocalScripts; off: Scripts with RunContext)");
+                        });
+                        egui::CollapsingHeader::new("Sourcemap").default_open(true).show(ui, |ui| {
+                            ui.checkbox(&mut c.sourcemap, "Keep a sourcemap up to date (luau-lsp reads it)");
                             ui.horizontal(|ui| {
-                                if ui.add_enabled(i > 0, egui::Button::new("↑").small()).clicked() {
-                                    swap = Some((i, i - 1));
-                                }
-                                if ui.add_enabled(i + 1 < n, egui::Button::new("↓").small()).clicked() {
-                                    swap = Some((i, i + 1));
-                                }
-                                if ui.small_button(rustudio_engine::ti::text("x", 12.0)).clicked() {
-                                    remove = Some(i);
-                                }
+                                ui.label("File");
+                                ui.text_edit_singleline(&mut c.sourcemap_path);
                             });
-                            ui.end_row();
+                            ui.checkbox(&mut c.sourcemap_non_scripts, "Include instances that aren't scripts");
+                            if ui.button("Write it now").clicked() {
+                                write_map = true;
+                            }
+                        });
+                        egui::CollapsingHeader::new("Ignored files").default_open(true).show(ui, |ui| {
+                            ui.label("Glob patterns, one per line (relative to the project folder):");
+                            ui.add(egui::TextEdit::multiline(&mut d.ignore_text).desired_rows(3).desired_width(f32::INFINITY).hint_text("**/*.spec.luau"));
+                        });
+                        egui::CollapsingHeader::new("Sync rules").default_open(true).show(ui, |ui| {
+                            ui.label("Tried before the defaults, top first. Pattern matches the file name or its path in the project.");
+                            let mut remove = None;
+                            let mut swap = None;
+                            egui::ScrollArea::horizontal().id_salt("ps_rules_hscroll").show(ui, |ui| {
+                                egui::Grid::new("ps_rules").num_columns(6).spacing([6.0, 4.0]).striped(true).show(ui, |ui| {
+                                    ui.strong("Pattern");
+                                    ui.strong("Becomes");
+                                    ui.strong("Name suffix");
+                                    ui.strong("Folder init file");
+                                    ui.strong("Except");
+                                    ui.label("");
+                                    ui.end_row();
+                                    let n = c.rules.len();
+                                    for (i, r) in c.rules.iter_mut().enumerate() {
+                                        ui.add(egui::TextEdit::singleline(&mut r.pattern).desired_width(120.0).hint_text("*.server.lua"));
+                                        egui::ComboBox::from_id_salt(("ps_kind", i)).selected_text(kind_label(r.kind)).show_ui(ui, |ui| {
+                                            for (_, label, k) in KINDS {
+                                                ui.selectable_value(&mut r.kind, *k, *label);
+                                            }
+                                        });
+                                        let mut suffix = r.suffix.clone().unwrap_or_default();
+                                        if ui.add(egui::TextEdit::singleline(&mut suffix).desired_width(90.0).hint_text("auto")).changed() {
+                                            r.suffix = (!suffix.is_empty()).then_some(suffix);
+                                        }
+                                        let mut child = r.child_pattern.clone().unwrap_or_default();
+                                        if ui.add(egui::TextEdit::singleline(&mut child).desired_width(110.0).hint_text("init.server.lua")).changed() {
+                                            r.child_pattern = (!child.is_empty()).then_some(child);
+                                        }
+                                        let mut ex = r.exclude.join(", ");
+                                        if ui.add(egui::TextEdit::singleline(&mut ex).desired_width(100.0)).changed() {
+                                            r.exclude = ex.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui.add_enabled(i > 0, egui::Button::new("↑").small()).clicked() {
+                                                swap = Some((i, i - 1));
+                                            }
+                                            if ui.add_enabled(i + 1 < n, egui::Button::new("↓").small()).clicked() {
+                                                swap = Some((i, i + 1));
+                                            }
+                                            if ui.small_button(rustudio_engine::ti::text("x", 12.0)).clicked() {
+                                                remove = Some(i);
+                                            }
+                                        });
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                            if let Some((a, b)) = swap {
+                                c.rules.swap(a, b);
+                            }
+                            if let Some(i) = remove {
+                                c.rules.remove(i);
+                            }
+                            if ui.button("Add rule").clicked() {
+                                c.rules.push(SyncRule {
+                                    pattern: String::new(),
+                                    kind: Some(FileKind::Module),
+                                    child_pattern: None,
+                                    exclude: Vec::new(),
+                                    suffix: None,
+                                });
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.label("Saved to rustudio.toml, and the shared keys (syncRules, ignore globs, emitLegacyScripts) into the project file so Rojo / Argon use them too.");
+                        if let Some(e) = &d.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(egui::Color32::from_rgb(230, 90, 80), e);
                         }
                     });
-                    if let Some((a, b)) = swap {
-                        c.rules.swap(a, b);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(primary_button("Save")).on_hover_text("Save and reload project").clicked() {
+                        save = true;
                     }
-                    if let Some(i) = remove {
-                        c.rules.remove(i);
-                    }
-                    if ui.button("Add rule").clicked() {
-                        c.rules.push(SyncRule {
-                            pattern: String::new(),
-                            kind: Some(FileKind::Module),
-                            child_pattern: None,
-                            exclude: Vec::new(),
-                            suffix: None,
-                        });
+                    if ui.add(secondary_button("Cancel")).clicked() {
+                        cancel = true;
                     }
                 });
-                ui.add_space(6.0);
-                ui.label("Saved to rustudio.toml, and the shared keys (syncRules, ignore globs, emitLegacyScripts) into the project file so Rojo / Argon use them too.");
-                if let Some(e) = &d.error {
-                    ui.colored_label(egui::Color32::from_rgb(230, 90, 80), e);
-                }
-                if ui.button("Save and reload project").clicked() {
-                    save = true;
-                }
             });
+        if cancel {
+            open = false;
+        }
         if write_map {
             let doc = &self.game.doc;
             if let Some(st) = self.project.as_mut() {
