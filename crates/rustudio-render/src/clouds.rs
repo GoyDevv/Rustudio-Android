@@ -79,10 +79,10 @@ fn child_of_class(d: &Document, parent: rbx_dom_weak::types::Ref, class: &str) -
 pub fn look(d: &Document) -> Option<CloudsLook> {
     let ws = d.workspace()?;
     let terrain = child_of_class(d, ws, "Terrain")?;
-    let c = child_of_class(d, terrain, "Clouds")?;
-    if matches!(d.prop(c, "Enabled"), Some(Variant::Bool(false))) {
-        return None;
-    }
+    let c = d.dom.get_by_ref(terrain)?.children().iter().copied().rfind(|r| {
+        d.class_of(*r).is_some_and(|cl| cl == "Clouds")
+            && !matches!(d.prop(*r, "Enabled"), Some(Variant::Bool(false)))
+    })?;
     let f = |n: &str, dflt: f32| crate::scene::f32_of(d.prop(c, n)).unwrap_or(dflt);
     let color = match d.prop(c, "Color") {
         Some(Variant::Color3(c)) => [c.r, c.g, c.b],
@@ -90,11 +90,15 @@ pub fn look(d: &Document) -> Option<CloudsLook> {
         _ => [1.0; 3],
     };
     let wind = crate::scene::vec3_of(d.prop(ws, "GlobalWind")).unwrap_or(Vec3::ZERO);
-    let fog = match crate::lighting::atmosphere(d) {
+    let lighting = d.find_child(d.dom.root_ref(), "Lighting");
+    let has_sky = lighting
+        .and_then(|l| d.dom.get_by_ref(l))
+        .is_some_and(|l| l.children().iter().any(|r| d.class_of(*r).is_some_and(|c| c == "Sky")));
+    let fog = match if has_sky { crate::lighting::atmosphere(d) } else { None } {
         // (0, Offset, −0.14427 · clamp(Density)⁴, 0): fog_k is that in natural log.
         Some(a) => [0.0, a.offset, -a.fog_k / std::f32::consts::LN_2, 0.0],
         None => {
-            let l = d.find_child(d.dom.root_ref(), "Lighting");
+            let l = lighting;
             let g = |n: &str, dflt: f32| l.and_then(|l| crate::scene::f32_of(d.prop(l, n))).unwrap_or(dflt);
             let (s, e) = (g("FogStart", 0.0), g("FogEnd", 100_000.0));
             let span = (e - s).max(1e-3);
@@ -177,15 +181,20 @@ fn read_dds(bytes: &[u8]) -> Option<(Dds, bool)> {
     let mut out = Vec::new();
     let (mut mw, mut mh, mut md) = (w, h, depth);
     for _ in 0..mips {
+        let slice_n = (mw.div_ceil(4) * mh.div_ceil(4) * 8) as usize;
         let n = if bc1 {
-            (mw.div_ceil(4) * mh.div_ceil(4) * 8) as usize * md as usize
+            slice_n * md as usize
         } else {
             (mw * mh * md) as usize * bpp
         };
         let src = bytes.get(off..off + n)?;
         off += n;
         let data = if bc1 {
-            decode_bc1(src, mw, mh)
+            let mut decoded = Vec::with_capacity((mw * mh * md * 4) as usize);
+            for z in 0..md as usize {
+                decoded.extend_from_slice(&decode_bc1(&src[z * slice_n..(z + 1) * slice_n], mw, mh));
+            }
+            decoded
         } else if swap {
             src.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect()
         } else {
@@ -235,11 +244,12 @@ fn decode_bc1(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 /// A texture from Studio's content (`rbxasset://sky/…`), all its mips; a
 /// 1-texel stand-in when missing.
-fn content_texture(device: &wgpu::Device, queue: &wgpu::Queue, id: &str, three_d: bool) -> wgpu::TextureView {
+fn content_texture(device: &wgpu::Device, queue: &wgpu::Queue, id: &str, three_d: bool) -> (wgpu::TextureView, bool) {
     let parsed = rustudio_core::assets::resolve(id, None)
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| read_dds(&b));
-    if parsed.is_none() {
+    let found = parsed.is_some();
+    if !found {
         eprintln!("[clouds] {id} missing: clouds will not draw right");
     }
     let (dds, rgba) = parsed.unwrap_or_else(|| (Dds { mips: vec![(1, 1, 1, vec![255; 4])] }, true));
@@ -264,10 +274,11 @@ fn content_texture(device: &wgpu::Device, queue: &wgpu::Queue, id: &str, three_d
             wgpu::Extent3d { width: *mw, height: *mh, depth_or_array_layers: *md },
         );
     }
-    tex.create_view(&wgpu::TextureViewDescriptor {
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
         dimension: Some(if three_d { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 }),
         ..Default::default()
-    })
+    });
+    (view, found)
 }
 
 struct Sized {
@@ -314,6 +325,8 @@ pub struct CloudsGpu {
     have_cover: bool,
     /// Whether this frame draws clouds (set by `encode`, read by `composite`).
     active: bool,
+    /// True when initial Studio cloud DDS assets were unavailable and fell back to 1x1 dummies.
+    missing_content: bool,
 }
 
 impl CloudsGpu {
@@ -448,13 +461,18 @@ impl CloudsGpu {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        let (dist, ok_dist) = content_texture(device, queue, "rbxasset://sky/clouds.dds", true);
+        let (adv, ok_adv) = content_texture(device, queue, "rbxasset://sky/cloudAdvection.dds", false);
+        let (detail, ok_detail) = content_texture(device, queue, "rbxasset://sky/cloudDetail3D.dds", true);
+        let (noise, ok_noise) = content_texture(device, queue, "rbxasset://sky/bn.dds", false);
+        let missing_content = !(ok_dist && ok_adv && ok_detail && ok_noise);
         Self {
             buf,
             layout,
-            dist: content_texture(device, queue, "rbxasset://sky/clouds.dds", true),
-            adv: content_texture(device, queue, "rbxasset://sky/cloudAdvection.dds", false),
-            detail: content_texture(device, queue, "rbxasset://sky/cloudDetail3D.dds", true),
-            noise: content_texture(device, queue, "rbxasset://sky/bn.dds", false),
+            dist,
+            adv,
+            detail,
+            noise,
             bsm,
             cover_tex,
             cover_view,
@@ -481,6 +499,7 @@ impl CloudsGpu {
             cover: 1.0,
             have_cover: false,
             active: false,
+            missing_content,
         }
     }
 
@@ -578,6 +597,23 @@ impl CloudsGpu {
         sun_y: f32,
         full: [u32; 2],
     ) {
+        if self.f16 == wgpu::TextureFormat::Rgba8Unorm {
+            self.active = false;
+            COVER.store(1.0f32.to_bits(), Ordering::Relaxed);
+            return;
+        }
+        if self.missing_content && rustudio_core::studio_content::installed().is_some() {
+            let (dist, ok_dist) = content_texture(device, queue, "rbxasset://sky/clouds.dds", true);
+            let (adv, ok_adv) = content_texture(device, queue, "rbxasset://sky/cloudAdvection.dds", false);
+            let (detail, ok_detail) = content_texture(device, queue, "rbxasset://sky/cloudDetail3D.dds", true);
+            let (noise, ok_noise) = content_texture(device, queue, "rbxasset://sky/bn.dds", false);
+            self.dist = dist;
+            self.adv = adv;
+            self.detail = detail;
+            self.noise = noise;
+            self.missing_content = !(ok_dist && ok_adv && ok_detail && ok_noise);
+            self.bsm_key = None;
+        }
         let now = rustudio_core::sim_clock::now();
         let dt = now.duration_since(self.last).as_secs_f32().min(1.0);
         self.last = now;

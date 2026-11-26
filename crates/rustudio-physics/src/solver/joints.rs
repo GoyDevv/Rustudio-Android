@@ -717,8 +717,9 @@ impl JointList {
         let frame_changed = |old: instance::End, new: instance::End| {
             old.body != new.body || old.pos != new.pos || old.rot != new.rot
         };
+        let prop_changed = inst.props.as_ref() != Some(&desc.class);
         let wake = wake_for_edit && desc.in_world
-            && (!inst.in_world || frame_changed(inst.a, desc.a) || frame_changed(inst.b, desc.b));
+            && (!inst.in_world || frame_changed(inst.a, desc.a) || frame_changed(inst.b, desc.b) || prop_changed);
         inst.apply(desc, next_key);
         inst.seen = true;
         if wake { [desc.a.body, desc.b.body] } else { [None; 2] }
@@ -827,13 +828,8 @@ impl JointList {
     pub fn build_rows(&mut self, c: usize, rec: &dyn Fn(u32) -> (Rec, Pose), cfg: &JointCfg, h: f32, rows: &mut [DualRow]) {
         let get = |s: u32| if s == NONE { (Rec::default(), Pose::IDENTITY) } else { rec(s) };
         let (ra, pa) = get(self.pose_a[c]);
-        let (mut rb, pb) = get(self.pose_b[c]);
+        let (rb, pb) = get(self.pose_b[c]);
         let conn = self.conn_mut(c);
-        if conn.no_reaction {
-            // D1.1 step 2 (conn bit 1): B's record with v = 0, not in the solve
-            rb.v = Vec3::ZERO;
-            rb.w = Vec3::ZERO;
-        }
         let cx = Ctx { ra: &ra, rb: &rb, pa: &pa, pb: &pb, cfg, h, gs: None, lam0: [0.0; MAX_ROWS] };
         conn.prepare_rows(rows, h, cfg);
         conn.build(rows, &cx);
@@ -866,15 +862,25 @@ impl JointList {
             let Some(f) = inst.force else { continue };
             let slot = |h: Option<rp::RigidBodyHandle>| h.map_or(NONE, |h| bodies.slot(h));
             let (sa, sb) = (slot(inst.a.body), slot(inst.b.body));
-            // body = the root assembly's solver body; none → nothing
-            if sa == NONE || bodies.flags[sa as usize] & body::flag::DYNAMIC == 0 || !due(sa) {
+            let a_dyn = sa != NONE && bodies.flags[sa as usize] & body::flag::DYNAMIC != 0;
+            let b_dyn = f.reaction() && sb != NONE && bodies.flags[sb as usize] & body::flag::DYNAMIC != 0;
+            let active_due = if a_dyn {
+                due(sa)
+            } else if b_dyn {
+                due(sb)
+            } else {
+                false
+            };
+            if !active_due {
                 continue;
             }
             let (ra, pa) = rec(sa);
             let (rb, pb) = rec(sb);
             let (fa, ta, fb, tb) = f.eval(&ra, &pa, &rb, &pb);
-            self.force_out.push((sa, fa, ta));
-            if f.reaction() && sb != NONE {
+            if a_dyn {
+                self.force_out.push((sa, fa, ta));
+            }
+            if b_dyn {
                 self.force_out.push((sb, fb, tb));
             }
         }
@@ -915,7 +921,14 @@ impl JointList {
                         let r = bodies.mat[s] * c.gyro.as_ref().unwrap().part_rot;
                         let i = match bodies.inertia_body[s] {
                             Some(m) => Vec3::new(m.x_axis.x, m.y_axis.y, m.z_axis.z),
-                            None => Vec3::ONE / bodies.inv_inertia[s],
+                            None => {
+                                let inv = bodies.inv_inertia[s];
+                                Vec3::new(
+                                    if inv.x > 1.0e-12 { 1.0 / inv.x } else { 1.0 },
+                                    if inv.y > 1.0e-12 { 1.0 / inv.y } else { 1.0 },
+                                    if inv.z > 1.0e-12 { 1.0 / inv.z } else { 1.0 },
+                                )
+                            }
                         };
                         dual_rows::gyro_step(c, r, bodies.angvel[s], i, dual_rows::MOVER_DT);
                     }
@@ -1000,13 +1013,8 @@ impl JointList {
                 (Rec { v: r.vf, w: r.wf, com: r.x, v_ref: r.v0, w_ref: r.w0 }, Pose { r: bodies.mat[su], p: bodies.pos[su] })
             };
             let (ra, pa) = rec(la, self.pose_a[j]);
-            let (mut rb, pb) = rec(lb_pose, self.pose_b[j]);
+            let (rb, pb) = rec(lb_pose, self.pose_b[j]);
             let conn = self.conn_ref(j);
-            if conn.no_reaction {
-                // D1.1 step 2 (conn bit 1): B's record with v = 0, not in the solve
-                rb.v = Vec3::ZERO;
-                rb.w = Vec3::ZERO;
-            }
             let n = conn.n_rows as usize;
             let kept: [(f64, f64, f32, f32); MAX_ROWS] = std::array::from_fn(|r| {
                 let k = &conn.kept[r];

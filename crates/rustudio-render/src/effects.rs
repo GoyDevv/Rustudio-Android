@@ -29,7 +29,7 @@ use rustudio_core::doc::{self, Document};
 use rustudio_core::math::Xform;
 use rustudio_core::mech;
 use crate::scene::{content_string, enum_u32, f32_of, vec3_of, xform_of};
-use crate::world_gui::{FxFrame, FxLook, FxParticle, FxVertex};
+use crate::world_gui::{FX_FALLBACK_PUFF, FX_FALLBACK_SPARKLES, FxFrame, FxKind, FxLook, FxParticle, FxVertex};
 
 #[path = "effects_constraints.rs"]
 mod constraints;
@@ -303,17 +303,16 @@ fn glass_in_front(glass: &[Glass], cam: Vec3, c: Vec3, r: f32, host: Option<Ref>
     let seg = c - cam;
     let len = seg.length();
     let d = seg / len.max(1e-6);
-    // (`glass` is nearest first: what lies past the effect can stop)
     glass
         .iter()
         .enumerate()
-        .take_while(move |(_, g)| g.dist < len)
+        .filter(move |(_, g)| g.dist - g.radius < len + r)
         .filter(move |(_, g)| {
             if Some(g.part) == host {
                 return false;
             }
             // The glass's sphere against the capsule from the camera to the effect.
-            let t = (g.centre - cam).dot(d).clamp(0.0, len);
+            let t = (g.centre - cam).dot(d).clamp(0.0, len + r);
             (cam + d * t - g.centre).length() < g.radius + r
         })
         .map(|(i, _)| i)
@@ -1471,10 +1470,19 @@ struct Draw {
 
 enum Geom {
     Strip(Vec<FxVertex>, Vec<u32>),
-    Particles(Vec<FxParticle>),
-    Sparkles(Vec<FxParticle>),
     /// A beam's kept strip (`Effects::kept`).
     Kept(Ref),
+}
+
+/// One visible particle collected across all emitters for global far-to-near
+/// sorting and consecutive-run batching into `FxDraw`s.
+struct SortedParticle {
+    sort_depth: f32,
+    emitter_seq: u32,
+    seed: u32,
+    kind: FxKind,
+    texture: TextureId,
+    particle: FxParticle,
 }
 
 /// A beam's strip kept from frame to frame: with the light and the glass on
@@ -1509,7 +1517,7 @@ impl Kept {
     fn frame(&mut self, view: &View, scroll: f32) -> f32 {
         let glass = view.glass_ids(self.centre, self.radius, None);
         let scroll = if self.tex.1 { scroll } else { 0.0 };
-        let mut far = 0.0f32;
+        let mut far = f32::NEG_INFINITY;
         for v in self.vertices.iter_mut() {
             v.glass = glass;
             v.scroll = scroll;
@@ -1520,7 +1528,7 @@ impl Kept {
             let shifted = if v.zoff != 0.0 { p + (view.pos - p).normalize_or_zero() * v.zoff } else { p };
             far = far.max((shifted - view.pos).dot(view.forward));
         }
-        far
+        if far.is_finite() { far } else { 0.0 }
     }
 }
 
@@ -1536,18 +1544,47 @@ fn texture_id(
     }
 }
 
-fn particles_draw(
+/// Particle texture lookup with built-in procedural fallbacks for Studio's
+/// `fire_main.dds`, `smoke_main.dds`, and `sparkles_main.dds` when Studio
+/// content is not yet installed.
+fn particle_texture_id(
+    tex: &Option<String>,
+    sparkles: bool,
+    load: &mut dyn FnMut(&str) -> Option<TextureId>,
+) -> Option<(TextureId, bool)> {
+    let id = tex.as_deref()?;
+    if let Some(t) = load(id) {
+        return Some((t, true));
+    }
+    if sparkles || id.eq_ignore_ascii_case("rbxasset://textures/particles/sparkles_main.dds") {
+        Some((FX_FALLBACK_SPARKLES, true))
+    } else if id.eq_ignore_ascii_case("rbxasset://textures/particles/fire_main.dds")
+        || id.eq_ignore_ascii_case("rbxasset://textures/particles/smoke_main.dds")
+    {
+        Some((FX_FALLBACK_PUFF, true))
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn particles_collect(
     c: &EmitterCfg,
     st: &EmitterState,
     xf: &Xform,
     view: &View,
     tex: (TextureId, bool),
+    emitter_seq: u32,
     budget: &mut usize,
-) -> Option<Draw> {
+    out: &mut Vec<SortedParticle>,
+) {
+    if st.particles.is_empty() || *budget == 0 {
+        return;
+    }
     let white = egui::epaint::WHITE_UV;
     let (cols, rows) = (c.grid.0.max(1), c.grid.1.max(1));
     let frames = cols * rows;
-    // (centre, distance) of each live particle, far first; and their
+    // World position and camera depth of each live particle, plus the cloud's
     // bounding sphere (lights and glass are picked per emitter).
     let mut lo = Vec3::splat(f32::MAX);
     let mut hi = Vec3::splat(f32::MIN);
@@ -1562,9 +1599,6 @@ fn particles_draw(
             ((w - view.pos).dot(view.forward), i, w)
         })
         .collect();
-    // (far first, ties in particle order: the order a stable sort by
-    // distance gives, the index making every key distinct)
-    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     let max_size = c.size.0.iter().map(|k| (k.1 + k.2.abs()) * mech::FX_PARTICLE_HALF_SIZE).fold(0.0f32, f32::max);
     let centre = (lo + hi) * 0.5;
     let radius = (hi - lo).length() * 0.5 + max_size;
@@ -1579,10 +1613,9 @@ fn particles_draw(
         Host::Part(p) => Some(p),
         _ => None,
     };
-    let glass = view.glass_ids(xf.pos, radius + (xf.pos - centre).length(), host);
-    let mut out = Vec::with_capacity(order.len().min(*budget));
-    let mut far = 0.0f32;
-    for (depth, i, center) in order {
+    let glass = view.glass_ids(centre, radius, host);
+    let kind = if c.sparkles { FxKind::Sparkles } else { FxKind::Particles };
+    for (depth, i, center) in order.drain(..) {
         if *budget == 0 {
             break;
         }
@@ -1701,29 +1734,30 @@ fn particles_draw(
         // ParticleCurveVS + ParticleCurveCrazySparklesFS with no soft fade).
         let soft = if c.orientation == 0 && !c.sparkles { 1.0 / half.max(1e-3) } else { 0.0 };
         // The quad's corners: centre ± e1 ± e2 (ParticleCustomVS).
-        out.push(FxParticle {
-            centre: center.to_array(),
-            zoffset: c.zoffset,
-            e1: (ax * m[0] + ay * m[2]).to_array(),
-            soft,
-            e2: (ax * m[1] + ay * m[3]).to_array(),
-            blend,
-            uv0,
-            uv1,
-            cell,
-            color,
-            look: p_look,
-            check,
-            glass,
+        out.push(SortedParticle {
+            sort_depth: depth - c.zoffset,
+            emitter_seq,
+            seed: p.seed,
+            kind,
+            texture: tex.0,
+            particle: FxParticle {
+                centre: center.to_array(),
+                zoffset: c.zoffset,
+                e1: (ax * m[0] + ay * m[2]).to_array(),
+                soft,
+                e2: (ax * m[1] + ay * m[3]).to_array(),
+                blend,
+                uv0,
+                uv1,
+                cell,
+                color,
+                look: p_look,
+                check,
+                glass,
+            },
         });
-        far = far.max(depth);
         *budget -= 1;
     }
-    if out.is_empty() {
-        return None;
-    }
-    let geom = if c.sparkles { Geom::Sparkles(out) } else { Geom::Particles(out) };
-    Some(Draw { dist: far, texture: tex.0, wrap: false, geom })
 }
 
 /// A strip of (point, side half-vector, t along, u) rows as triangles;
@@ -1768,7 +1802,7 @@ fn strip(
     let gpu = look.gpu(beam_shadow);
     let mut vertices = Vec::with_capacity(rows.len() * 2);
     let mut indices = Vec::with_capacity((rows.len() - 1) * 6);
-    let mut far = 0.0f32;
+    let mut far = f32::NEG_INFINITY;
     for (i, &(p, side, t, u)) in rows.iter().enumerate() {
         // Beams: ZOffset moves the whole beam toward the camera (TrailVS;
         // the GPU moves the row, as here).
@@ -1810,7 +1844,8 @@ fn strip(
     }
     // (clamped when untextured: repeat would filter egui's white texel at
     // the atlas corner with the far edges' empty ones)
-    Some(Draw { dist: far, texture: tex.0, wrap: tex.1, geom: Geom::Strip(vertices, indices) })
+    let dist = if far.is_finite() { far } else { 0.0 };
+    Some(Draw { dist, texture: tex.0, wrap: tex.1, geom: Geom::Strip(vertices, indices) })
 }
 
 fn bezier(p: [Vec3; 4], t: f32) -> (Vec3, Vec3) {
@@ -2353,7 +2388,7 @@ impl Effects {
         let _l = rustudio_core::bench::scope("fx_loop");
         let (mut n_beams, mut n_kept) = (0u64, 0u64);
         // Emitters nearest first get the particle budget.
-        let mut emitters: Vec<(f32, Ref, Xform, Vec3)> = Vec::new();
+        let mut emitters: Vec<(f32, u32, Ref, Xform, Vec3)> = Vec::new();
         let fixed_clock = rustudio_core::sim_clock::on();
         for (index, &r) in self.list.iter().enumerate() {
             // Serialized instances receive new random Ref values on load.
@@ -2406,7 +2441,7 @@ impl Effects {
                     t_sim += rustudio_core::bench::now() - t0;
                     if !st.particles.is_empty() {
                         live = true;
-                        emitters.push((dist, r, xf, size));
+                        emitters.push((dist, index as u32, r, xf, size));
                     }
                 }
                 Cfg::Sparkles(pair) => {
@@ -2432,7 +2467,7 @@ impl Effects {
                     t_sim += rustudio_core::bench::now() - t0;
                     if !st1.particles.is_empty() || !st2.particles.is_empty() {
                         live = true;
-                        emitters.push((dist, r, xf, size));
+                        emitters.push((dist, index as u32, r, xf, size));
                     }
                 }
                 Cfg::Beam(c) => {
@@ -2527,7 +2562,8 @@ impl Effects {
         emitters.sort_by(|a, b| a.0.total_cmp(&b.0));
         let particle_budget = f.quality.map_or(mech::FX_PARTICLES_MAX, |profile| profile.particle_budget());
         let mut budget = particle_budget;
-        for (_, r, xf, _) in emitters {
+        let mut sorted_particles: Vec<SortedParticle> = Vec::new();
+        for (_, emitter_idx, r, xf, _) in emitters {
             match self.cfg.get(&r) {
                 Some(Cfg::Emitter(c)) => {
                     let Some(st) = self.emitters.get(&r) else { continue };
@@ -2535,25 +2571,33 @@ impl Effects {
                     if c.texture.is_none() {
                         continue;
                     }
-                    let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
-                    if let Some(dr) = particles_draw(c, st, &xf, &view, tex, &mut budget) {
-                        draws.push(dr);
-                    }
+                    let Some(tex) = particle_texture_id(&c.texture, c.sparkles, &mut texture) else { continue };
+                    particles_collect(c, st, &xf, &view, tex, emitter_idx * 2, &mut budget, &mut sorted_particles);
                 }
                 Some(Cfg::Sparkles(pair)) => {
-                    for (c, st) in [
+                    for (sub_idx, (c, st)) in [
                         (&pair[0], self.emitters.get(&r)),
                         (&pair[1], self.sparkles_extra.get(&r)),
-                    ] {
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
                         let Some(st) = st else { continue };
                         if st.particles.is_empty() || c.texture.is_none() {
                             continue;
                         }
                         n_particles += st.particles.len();
-                        let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
-                        if let Some(dr) = particles_draw(c, st, &xf, &view, tex, &mut budget) {
-                            draws.push(dr);
-                        }
+                        let Some(tex) = particle_texture_id(&c.texture, c.sparkles, &mut texture) else { continue };
+                        particles_collect(
+                            c,
+                            st,
+                            &xf,
+                            &view,
+                            tex,
+                            emitter_idx * 2 + sub_idx as u32,
+                            &mut budget,
+                            &mut sorted_particles,
+                        );
                     }
                 }
                 _ => continue,
@@ -2566,8 +2610,15 @@ impl Effects {
 
         drop(_pd);
         let _push = rustudio_core::bench::scope("fx_push");
-        // Far to near, so nearer effects blend over farther ones.
+        // Far to near across all strips and particles, with deterministic tie-breakers
+        // so overlapping Fire / Smoke / ParticleEmitter / Sparkles never swap order.
         draws.sort_by(|a, b| b.dist.total_cmp(&a.dist));
+        sorted_particles.sort_unstable_by(|a, b| {
+            b.sort_depth
+                .total_cmp(&a.sort_depth)
+                .then_with(|| a.emitter_seq.cmp(&b.emitter_seq))
+                .then_with(|| a.seed.cmp(&b.seed))
+        });
         let out = &mut self.out;
         out.clear();
         out.glass_idx = view.glass_idx.take();
@@ -2586,15 +2637,47 @@ impl Effects {
         out.cam_back = [-view.forward.x, -view.forward.y, -view.forward.z, 0.0];
         let l = f.light;
         out.light = [l.ambient, l.outdoor, l.sun, l.env].map(|v| [v.x, v.y, v.z, 0.0]);
-        for dr in draws {
-            match dr.geom {
-                Geom::Strip(v, i) => out.push_strip(dr.texture, dr.wrap, &v, &i),
-                Geom::Particles(p) => out.push_particles(dr.texture, &p),
-                Geom::Sparkles(p) => out.push_sparkles(dr.texture, &p),
-                Geom::Kept(r) => {
-                    if let Some(k) = self.kept.get(&r) {
-                        out.push_strip(dr.texture, dr.wrap, &k.vertices, &k.indices);
+        let mut di = 0usize;
+        let mut pi = 0usize;
+        let mut run: Vec<FxParticle> = Vec::new();
+        while di < draws.len() || pi < sorted_particles.len() {
+            let take_strip = match (draws.get(di), sorted_particles.get(pi)) {
+                (Some(d), Some(p)) => d.dist.total_cmp(&p.sort_depth).is_ge(),
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_strip {
+                let dr = &draws[di];
+                match &dr.geom {
+                    Geom::Strip(v, i) => out.push_strip(dr.texture, dr.wrap, v, i),
+                    Geom::Kept(r) => {
+                        if let Some(k) = self.kept.get(r) {
+                            out.push_strip(dr.texture, dr.wrap, &k.vertices, &k.indices);
+                        }
                     }
+                }
+                di += 1;
+            } else {
+                let next_strip_dist = draws.get(di).map(|d| d.dist);
+                let first = &sorted_particles[pi];
+                let kind = first.kind;
+                let texture = first.texture;
+                run.clear();
+                while pi < sorted_particles.len() {
+                    let p = &sorted_particles[pi];
+                    if next_strip_dist.is_some_and(|sd| sd.total_cmp(&p.sort_depth).is_ge())
+                        || p.kind != kind
+                        || p.texture != texture
+                    {
+                        break;
+                    }
+                    run.push(p.particle);
+                    pi += 1;
+                }
+                match kind {
+                    FxKind::Sparkles => out.push_sparkles(texture, &run),
+                    FxKind::Particles | FxKind::Strip => out.push_particles(texture, &run),
                 }
             }
         }
@@ -2879,9 +2962,21 @@ mod tests {
         assert!((many.transmit(cam, Vec3::new(0.5, 0.0, -10.0)) - 0.4f32.powi(9)).abs() < 1e-5);
         let set = GlassSet::new(list, vp, cam);
         assert!((set.transmit(cam, Vec3::new(0.5, 0.0, -10.0)) - 0.4).abs() < 1e-5);
-        // Beside it, or in front of it: untouched.
+        // Beside it, or in front of it: untouched (the wide pane's bounding
+        // sphere overlaps z = -3 so it remains a candidate, while the OBB hit
+        // test leaves particles in front of the plane untouched).
         assert_eq!(set.transmit(cam, Vec3::new(9.0, 0.0, -10.0)), 1.0);
-        assert!(glass_between(&all, cam, Vec3::new(0.0, 0.0, -3.0), 1.0, None).is_empty());
+        assert_eq!(set.transmit(cam, Vec3::new(0.0, 0.0, -3.0)), 1.0);
+        let far_pane = Glass {
+            xf: Xform { pos: Vec3::new(0.0, 0.0, -20.0), rot: Mat3::IDENTITY },
+            half: Vec3::new(1.0, 1.0, 0.1),
+            alpha: 0.6,
+            centre: Vec3::new(0.0, 0.0, -20.0),
+            radius: 1.5,
+            dist: 20.0,
+            part: Ref::new(),
+        };
+        assert!(glass_between(&[far_pane], cam, Vec3::new(0.0, 0.0, -3.0), 1.0, None).is_empty());
     }
 
     #[test]

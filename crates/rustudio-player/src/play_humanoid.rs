@@ -75,6 +75,9 @@ pub(crate) struct HumDyn {
     deferred_server_root: Option<Xform>,
     /// Last WalkToPart ref observed so changing it resets the MoveTo timeout.
     last_walk_to_part: Option<Ref>,
+    /// Part-local offset computed when MoveTo(world_pos, part) is called, so
+    /// world-space WalkToPoint is not double-transformed while tracking moving parts.
+    pub(super) walk_to_local: Option<Vec3>,
 }
 
 /// Frames from a character part entering a Seat to the Humanoid being
@@ -89,7 +92,7 @@ impl Default for HumDyn {
     /// A new character is in the air (it spawns above its SpawnLocation).
     fn default() -> Self {
         let hum = Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() };
-        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None, deferred_server_root: None, last_walk_to_part: None }
+        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None, deferred_server_root: None, last_walk_to_part: None, walk_to_local: None }
     }
 }
 
@@ -438,9 +441,16 @@ impl Game {
                 matches!(d.prop(r, "Anchored"), Some(Variant::Bool(true)))
                     || (unseated && rustudio_engine::runtime::domains::world::part::with_graph(d, |g| g.grounded(d, r)))
             };
-            let held = anchored(&self.doc, root)
-                || s.map.s2c.get(&root).is_some_and(|c| s.other_doc.as_ref().is_some_and(|cd| anchored(cd, *c)));
-            let at = if held {
+            let server_held = anchored(&self.doc, root);
+            let client_root = s.map.s2c.get(&root).copied();
+            let client_held = client_root
+                .is_some_and(|c| s.other_doc.as_ref().is_some_and(|cd| anchored(cd, c)));
+            let at = if client_held {
+                client_root
+                    .and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, c)))
+                    .or_else(|| rustudio_render::scene::xform_of(&self.doc, root))
+                    .or(ch.last_root)
+            } else if server_held {
                 rustudio_render::scene::xform_of(&self.doc, root).or(ch.last_root)
             } else {
                 None
@@ -497,21 +507,40 @@ impl Game {
         };
         if let Some(s) = self.play.as_mut() {
             if let Some(ch) = s.character.as_mut() {
-                if walk_to_part.is_some() && walk_to_part != ch.dynamic.last_walk_to_part {
-                    s.game.move_target_elapsed = 0.0;
+                if walk_to_part != ch.dynamic.last_walk_to_part {
+                    if walk_to_part.is_some() {
+                        s.game.move_target_elapsed = 0.0;
+                    }
+                    ch.dynamic.walk_to_local = None;
                 }
                 ch.dynamic.last_walk_to_part = walk_to_part;
             }
         }
         let effective_target: Option<Vec3> = if let Some(part) = walk_to_part {
             if let Some(part_xf) = rustudio_render::scene::xform_of(&self.doc, part) {
-                let local = rustudio_render::scene::vec3_of(
-                    self.owned_humanoid_prop(humanoid, "WalkToPoint")
-                        .or_else(|| self.doc.prop(humanoid, "WalkToPoint")),
-                )
-                .or(target)
-                .unwrap_or(Vec3::ZERO);
-                Some(part_xf.pos + part_xf.rot * local)
+                if let Some(world_t) = target {
+                    // MoveTo(world_pos, part) stores world_pos in WalkToPoint and
+                    // move_target: convert to part-local once so we track moving
+                    // parts without double-transforming the world point.
+                    let local = self
+                        .play
+                        .as_mut()
+                        .and_then(|s| s.character.as_mut())
+                        .map(|ch| {
+                            *ch.dynamic
+                                .walk_to_local
+                                .get_or_insert_with(|| part_xf.rot.transpose() * (world_t - part_xf.pos))
+                        })
+                        .unwrap_or_else(|| part_xf.rot.transpose() * (world_t - part_xf.pos));
+                    Some(part_xf.pos + part_xf.rot * local)
+                } else {
+                    let local = rustudio_render::scene::vec3_of(
+                        self.owned_humanoid_prop(humanoid, "WalkToPoint")
+                            .or_else(|| self.doc.prop(humanoid, "WalkToPoint")),
+                    )
+                    .unwrap_or(Vec3::ZERO);
+                    Some(part_xf.pos + part_xf.rot * local)
+                }
             } else {
                 target
             }
@@ -527,6 +556,7 @@ impl Game {
                 s.game.move_target_elapsed = 0.0;
                 if let Some(ch) = s.character.as_mut() {
                     ch.dynamic.last_walk_to_part = None;
+                    ch.dynamic.walk_to_local = None;
                 }
             }
             if walk_to_part.is_some() {
@@ -541,12 +571,16 @@ impl Game {
                     s.game.move_target_elapsed = 0.0;
                     if let Some(ch) = s.character.as_mut() {
                         ch.dynamic.last_walk_to_part = None;
+                        ch.dynamic.walk_to_local = None;
                     }
                 }
                 if walk_to_part.is_some() {
                     self.clear_walk_to_part(humanoid);
                 }
                 self.with_side(Side::Server, |rt, _, _| rt.fire(humanoid, "MoveToFinished", vec![Value::Boolean(true)]));
+                if let Some(ch_hum) = self.client_of(humanoid) {
+                    self.with_side(Side::Client, |rt, _, _| rt.fire(ch_hum, "MoveToFinished", vec![Value::Boolean(true)]));
+                }
                 dir = Vec3::ZERO;
                 mag = 0.0;
             } else {
@@ -564,12 +598,16 @@ impl Game {
                         s.game.move_target_elapsed = 0.0;
                         if let Some(ch) = s.character.as_mut() {
                             ch.dynamic.last_walk_to_part = None;
+                            ch.dynamic.walk_to_local = None;
                         }
                     }
                     if walk_to_part.is_some() {
                         self.clear_walk_to_part(humanoid);
                     }
                     self.with_side(Side::Server, |rt, _, _| rt.fire(humanoid, "MoveToFinished", vec![Value::Boolean(false)]));
+                    if let Some(ch_hum) = self.client_of(humanoid) {
+                        self.with_side(Side::Client, |rt, _, _| rt.fire(ch_hum, "MoveToFinished", vec![Value::Boolean(false)]));
+                    }
                     dir = Vec3::ZERO;
                     mag = 0.0;
                 } else {
@@ -645,11 +683,20 @@ impl Game {
         // part's face is climbed from a root centre up to 1.1994 studs away
         // (1.2 × scale 1), a TrussPart from 1.8001 (the broad query).
         let head_y = rustudio_render::scene::f32_of(self.doc.prop(model, "Scale")).unwrap_or(1.0);
-        let anchored = matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true)))
-            || (!seated_state
-                && !had_seat
-                && seat_root.is_none()
-                && rustudio_engine::runtime::domains::world::part::with_graph(&self.doc, |g| g.grounded(&self.doc, root)));
+        let is_anchored = |d: &doc::Document, r: Ref| {
+            matches!(d.prop(r, "Anchored"), Some(Variant::Bool(true)))
+                || (!seated_state
+                    && !had_seat
+                    && seat_root.is_none()
+                    && rustudio_engine::runtime::domains::world::part::with_graph(d, |g| g.grounded(d, r)))
+        };
+        let anchored = is_anchored(&self.doc, root)
+            || self.play.as_ref().is_some_and(|s| {
+                s.map
+                    .s2c
+                    .get(&root)
+                    .is_some_and(|c| s.other_doc.as_ref().is_some_and(|cd| is_anchored(cd, *c)))
+            });
         let hip_height = self.owned_humanoid_f32(humanoid, "HipHeight", 0.0);
         let legs = if rig_type == RigType::R6 {
             ["Left Leg", "Right Leg"]
@@ -1225,10 +1272,10 @@ impl Game {
             }
         }
         if fell {
-            if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
-                inst.properties.insert(ustr("Health"), Variant::Float32(0.0));
-            }
-            self.doc.mark_prop(humanoid, ustr("Health"));
+            self.with_side(Side::Server, |rt, _, _| {
+                rt.apply_prop(humanoid, "Health", Variant::Float32(0.0));
+                rt.dispatch();
+            });
             self.record(RepOp::Prop(humanoid, "Health".into()));
             self.kill_character();
         }

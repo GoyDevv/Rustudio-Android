@@ -24,7 +24,7 @@
 
 use glam::Vec3;
 use rbx_dom_weak::types::{Ref, Variant, Vector3};
-use rbx_dom_weak::WeakDom;
+use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 use super::api::{self, Failure, Http};
 use super::categories::Kind;
@@ -141,6 +141,30 @@ pub fn prepare(h: &dyn Http, job: u64, mut asset: Asset, target: Target, cancel:
         Kind::Video => Prepared::Video,
         Kind::Font => Prepared::Font,
         Kind::Plugin => Prepared::Plugin,
+        _ if asset.type_id == 1 => {
+            let name = if asset.name.is_empty() { format!("Asset {}", asset.id) } else { asset.name.clone() };
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let root = dom.root_ref();
+            dom.insert(
+                root,
+                InstanceBuilder::new("Decal")
+                    .with_name(name)
+                    .with_property("Texture", Variant::ContentId(format!("rbxassetid://{}", asset.id).into())),
+            );
+            Prepared::Model { dom, scripts: 0 }
+        }
+        _ if asset.type_id == 4 => {
+            let name = if asset.name.is_empty() { format!("Asset {}", asset.id) } else { asset.name.clone() };
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let root = dom.root_ref();
+            dom.insert(
+                root,
+                InstanceBuilder::new("MeshPart")
+                    .with_name(name)
+                    .with_property("MeshId", Variant::ContentId(format!("rbxassetid://{}", asset.id).into())),
+            );
+            Prepared::Model { dom, scripts: 0 }
+        }
         _ => {
             stage(1);
             // Test seam: RUSTUDIO_TOOLBOX_INSERT_DELAY_MS holds the download
@@ -323,15 +347,35 @@ pub fn face_of(xf: &Xform, size: Vec3, p: Vec3) -> u32 {
 pub enum Home {
     World,
     Lighting,
+    Terrain,
     MaterialService,
     /// Tool / HopperBin: Studio asks.
     AskToolHome,
 }
 
 pub fn home_of(class: &str, sub_types: &[String]) -> Home {
-    if rustudio_core::doc::is_a(class, "Sky") || rustudio_core::doc::is_a(class, "Atmosphere") || class == "Sky" || class == "Atmosphere" {
+    if rustudio_core::doc::is_a(class, "Sky")
+        || rustudio_core::doc::is_a(class, "Atmosphere")
+        || rustudio_core::doc::is_a(class, "PostEffect")
+        || matches!(
+            class,
+            "Sky"
+                | "Atmosphere"
+                | "BloomEffect"
+                | "BlurEffect"
+                | "ColorCorrectionEffect"
+                | "DepthOfFieldEffect"
+                | "SunRaysEffect"
+                | "ColorGradingEffect"
+        )
+    {
         Home::Lighting
-    } else if sub_types.iter().any(|s| s == "MaterialPack") {
+    } else if rustudio_core::doc::is_a(class, "Clouds") || class == "Clouds" {
+        Home::Terrain
+    } else if rustudio_core::doc::is_a(class, "MaterialVariant")
+        || class == "MaterialVariant"
+        || sub_types.iter().any(|s| s == "MaterialPack")
+    {
         Home::MaterialService
     } else if class == "Tool" || class == "HopperBin" {
         Home::AskToolHome
@@ -341,17 +385,16 @@ pub fn home_of(class: &str, sub_types: &[String]) -> Home {
 }
 
 /// Encodes `refs` of `dom` as binary model bytes (for Document::paste_groups).
-pub fn encode(dom: &WeakDom, refs: &[Ref]) -> Vec<u8> {
+pub fn encode(dom: &WeakDom, refs: &[Ref]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let _ = rbx_binary::to_writer(&mut out, dom, refs);
-    out
+    rbx_binary::to_writer(&mut out, dom, refs).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rbx_dom_weak::types::CFrame;
-    use rbx_dom_weak::InstanceBuilder;
 
     fn part(dom: &mut WeakDom, parent: Ref, pos: Vec3, size: Vec3) -> Ref {
         dom.insert(
@@ -391,6 +434,11 @@ mod tests {
         assert_eq!(face_of(&xf, s, Vec3::new(-2.0, 0.0, 0.0)), 3);
         assert_eq!(face_of(&xf, s, Vec3::new(0.0, 0.0, -3.0)), 5);
         assert_eq!(home_of("Sky", &[]), Home::Lighting);
+        assert_eq!(home_of("Atmosphere", &[]), Home::Lighting);
+        assert_eq!(home_of("BloomEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("SunRaysEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("Clouds", &[]), Home::Terrain);
+        assert_eq!(home_of("MaterialVariant", &[]), Home::MaterialService);
         assert_eq!(home_of("Tool", &[]), Home::AskToolHome);
         assert_eq!(home_of("Model", &["MaterialPack".into()]), Home::MaterialService);
         assert_eq!(home_of("Model", &[]), Home::World);

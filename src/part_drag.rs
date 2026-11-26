@@ -856,6 +856,8 @@ impl Editor {
             .zip(&d.parts)
             .any(|((_, a), (_, b))| (a.pos - b.pos).length() > 1e-4 || !a.rot.abs_diff_eq(b.rot, 1e-6));
         let pivots = d.pivots.clone();
+        let part_refs: Vec<Ref> = moves.iter().map(|(r, _)| *r).collect();
+        self.snapshot_rest_pose_for_parts(&part_refs);
         apply_model_pivots(&mut self.game.doc, &pivots, t);
         for (r, xf) in moves {
             self.game.doc

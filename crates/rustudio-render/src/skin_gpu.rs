@@ -100,8 +100,8 @@ struct Job {
     corners: u32,
     /// The mesh slot (Renderer::meshes index without built-ins) it writes.
     slot: u32,
-    /// The vertex buffer the bind group writes into (to notice a reslot).
-    vbuf_id: usize,
+    /// Monotonic vertex buffer ID the bind group writes into (to notice a reslot).
+    vbuf_id: u64,
 }
 
 pub struct SkinGpu {
@@ -182,12 +182,15 @@ impl SkinGpu {
         queue: &wgpu::Queue,
         slot: u32,
         vbuf: &wgpu::Buffer,
+        vbuf_id: u64,
         req: &Request,
     ) {
         let Some(pipeline) = self.pipeline.clone() else { return };
+        if req.base.positions.is_empty() {
+            return;
+        }
         let src = self.source(device, req.key, req.base);
         let bones = req.palette.len().max(1) as u32;
-        let vbuf_id = vbuf as *const wgpu::Buffer as usize;
         let stale = self
             .jobs
             .get(&slot)

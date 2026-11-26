@@ -349,6 +349,8 @@ struct TouchFinger {
     scroll: Option<Ref>,
     /// It has dragged the canvas past the tap slop: no click on the lift.
     scrolled: bool,
+    /// Active scrollbar thumb drag for this finger (Android touch).
+    scrollbar_drag: Option<ScrollBarDrag>,
     /// Its speed over the last moves (GUI pixels a second), and when the
     /// last move was.
     speed: (f32, f32),
@@ -375,7 +377,9 @@ pub(super) struct ScrollBarHit {
 struct ScrollBarDrag {
     r: Ref,
     vertical: bool,
-    last_pos: f32,
+    axis: egui::Vec2,
+    start_proj: f32,
+    start_cp: f32,
     canvas_per_px: f32,
     max_scroll: f32,
     current_cp: f32,
@@ -2484,35 +2488,83 @@ fn parse_color(s: &str) -> Option<[f32; 3]> {
     let s = s.trim();
     if let Some(h) = s.strip_prefix('#') {
         let v = u32::from_str_radix(h, 16).ok()?;
-        return Some([
-            ((v >> 16) & 255) as f32 / 255.0,
-            ((v >> 8) & 255) as f32 / 255.0,
-            (v & 255) as f32 / 255.0,
-        ]);
+        return match h.len() {
+            3 => Some([
+                (((v >> 8) & 15) * 17) as f32 / 255.0,
+                (((v >> 4) & 15) * 17) as f32 / 255.0,
+                ((v & 15) * 17) as f32 / 255.0,
+            ]),
+            6 => Some([
+                ((v >> 16) & 255) as f32 / 255.0,
+                ((v >> 8) & 255) as f32 / 255.0,
+                (v & 255) as f32 / 255.0,
+            ]),
+            8 => Some([
+                ((v >> 24) & 255) as f32 / 255.0,
+                ((v >> 16) & 255) as f32 / 255.0,
+                ((v >> 8) & 255) as f32 / 255.0,
+            ]),
+            _ => None,
+        };
     }
-    let inner = s.strip_prefix("rgb(").and_then(|x| x.strip_suffix(')'))?;
-    let v: Vec<f32> = inner
-        .split(',')
-        .filter_map(|x| x.trim().parse().ok())
-        .collect();
-    (v.len() == 3).then(|| [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0])
+    if s.len() >= 5 && s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("rgb(")) && s.ends_with(')') {
+        let inner = &s[4..s.len() - 1];
+        let v: Vec<f32> = inner
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        return (v.len() == 3).then(|| [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0]);
+    }
+    None
 }
 
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let i = tag.find(&format!("{name}="))?;
-    let rest = &tag[i + name.len() + 1..];
-    let q = rest.chars().next()?;
-    if q == '"' || q == '\'' {
-        let end = rest[1..].find(q)?;
-        Some(rest[1..1 + end].to_string())
-    } else {
-        Some(
-            rest.split_whitespace()
-                .next()?
-                .trim_end_matches('>')
-                .to_string(),
-        )
+    let bytes = tag.as_bytes();
+    let nbytes = name.as_bytes();
+    if nbytes.is_empty() || bytes.len() <= nbytes.len() {
+        return None;
     }
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i + nbytes.len() < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        let boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if boundary && bytes[i..i + nbytes.len()].eq_ignore_ascii_case(nbytes) {
+            let mut j = i + nbytes.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                let rest = tag[j + 1..].trim_start();
+                let q = rest.chars().next()?;
+                if q == '"' || q == '\'' {
+                    let end = rest[1..].find(q)?;
+                    return Some(rest[1..1 + end].to_string());
+                } else {
+                    return Some(
+                        rest.split_whitespace()
+                            .next()?
+                            .trim_end_matches(['>', '/'])
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn unescape(s: &str) -> String {
@@ -2675,7 +2727,9 @@ fn rich_runs(src: &str) -> Vec<Run> {
                 continue;
             }
         }
-        if !self_closing {
+        if self_closing {
+            st = prev;
+        } else {
             stack.push((name, prev));
         }
     }

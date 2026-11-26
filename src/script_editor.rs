@@ -1688,6 +1688,30 @@ impl Editor {
                     toggle_portrait = true;
                 }
 
+                let find_btn = if buf.find.open {
+                    egui::Button::new(RichText::new("Find").size(13.0).strong().color(Color32::WHITE))
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(56.0, btn_h))
+                } else {
+                    egui::Button::new(RichText::new("Find").size(13.0))
+                        .min_size(egui::vec2(56.0, btn_h))
+                };
+                if ui
+                    .add(find_btn)
+                    .on_hover_text("Find & Replace (Ctrl+F / Ctrl+H)")
+                    .clicked()
+                {
+                    if buf.find.open {
+                        buf.find.open = false;
+                    } else {
+                        buf.find.open = true;
+                        buf.find.show_replace = true;
+                        buf.find.focus_find = true;
+                        buf.goto_bar.open = false;
+                        buf.ac.open = false;
+                    }
+                }
+
             });
         });
 
@@ -1844,14 +1868,19 @@ impl Editor {
                         if find_resp.changed() {
                             query_changed = true;
                         }
-                        if find_resp.has_focus() {
-                            let shift = ui.input(|i| i.modifiers.shift);
-                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
-                                jump_delta = Some(-1);
-                            } else if !shift
-                                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                            {
-                                jump_delta = Some(1);
+                        if find_resp.lost_focus() {
+                            let (enter, shift, esc) = ui.input(|i| {
+                                (
+                                    i.key_pressed(egui::Key::Enter),
+                                    i.modifiers.shift,
+                                    i.key_pressed(egui::Key::Escape),
+                                )
+                            });
+                            if esc {
+                                close_find = true;
+                            } else if enter {
+                                jump_delta = Some(if shift { -1 } else { 1 });
+                                ui.ctx().memory_mut(|m| m.request_focus(find_id));
                             }
                         }
 
@@ -1914,11 +1943,16 @@ impl Editor {
                                 ui.ctx().memory_mut(|m| m.request_focus(replace_id));
                                 buf.find.focus_replace = false;
                             }
-                            if repl_resp.has_focus()
-                                && !matches.is_empty()
-                                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                            {
-                                do_replace_one = true;
+                            if repl_resp.lost_focus() {
+                                let (enter, esc) = ui.input(|i| {
+                                    (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape))
+                                });
+                                if esc {
+                                    close_find = true;
+                                } else if enter && !matches.is_empty() {
+                                    do_replace_one = true;
+                                    ui.ctx().memory_mut(|m| m.request_focus(replace_id));
+                                }
                             }
                             if ui
                                 .add_enabled(!matches.is_empty(), egui::Button::new("Replace").small())
@@ -2045,10 +2079,15 @@ impl Editor {
                             ui.ctx().memory_mut(|m| m.request_focus(goto_id));
                             buf.goto_bar.focus_input = false;
                         }
-                        if resp.has_focus()
-                            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                        {
-                            commit_goto = true;
+                        if resp.lost_focus() {
+                            let (enter, esc) = ui.input(|i| {
+                                (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape))
+                            });
+                            if esc {
+                                close_goto = true;
+                            } else if enter {
+                                commit_goto = true;
+                            }
                         }
                         if ui.small_button("Go").clicked() {
                             commit_goto = true;
@@ -2464,7 +2503,6 @@ impl Editor {
                 te_state.store(ui.ctx(), editor_id);
             }
             let bar_rect = bar_panel.response.rect;
-            bar_slider_rect = Some(bar_rect.expand(4.0));
             let pointer_in_bar = ui.ctx().input(|i| {
                 (i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released() || i.pointer.any_click())
                     && i.pointer
@@ -2489,7 +2527,7 @@ impl Editor {
             let can_redo = undoer_snap.has_redo(&cur_state);
             let mut land_dirty = false;
 
-            egui::ScrollArea::horizontal()
+            let land_bar = egui::ScrollArea::horizontal()
                 .id_salt(("android_land_script_bar", r))
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
@@ -2640,6 +2678,17 @@ impl Editor {
             if land_dirty {
                 te_state.cursor.set_char_range(Some(cur_range));
                 te_state.store(ui.ctx(), editor_id);
+            }
+            let land_rect = land_bar.inner_rect;
+            let pointer_in_land = ui.ctx().input(|i| {
+                (i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released() || i.pointer.any_click())
+                    && i.pointer
+                        .interact_pos()
+                        .or_else(|| i.pointer.hover_pos())
+                        .is_some_and(|p| land_rect.expand(8.0).contains(p))
+            });
+            if bar_acted || pointer_in_land {
+                bar_keep_kb = true;
             }
         }
 
@@ -2996,8 +3045,9 @@ impl Editor {
                 vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text.clone()))],
                 merge_key,
             );
-            let typing_word = word_end.is_some_and(|i| {
+            let typing_word = word_end.is_some_and(|word_end| {
                 let c: Vec<char> = text.chars().collect();
+                let i = word_end.min(c.len());
                 i > 0
                     && (c[i - 1].is_alphanumeric()
                         || c[i - 1] == '_'

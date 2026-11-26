@@ -48,6 +48,8 @@ pub struct PlayInput {
 
 struct Equipped {
     tool: Ref,
+    /// All BaseParts in the tool added to physics.skip / client_sim.hold.
+    parts: Vec<Ref>,
     /// Each tool part relative to the handle.
     offsets: Vec<(Ref, Xform)>,
     client_told: bool,
@@ -448,6 +450,18 @@ fn scrolls_mut(lua: &mlua::Lua) -> mlua::AppDataRefMut<'_, SmoothScrolls> {
     lua.app_data_mut::<SmoothScrolls>().expect("smooth scroll state")
 }
 
+/// Sub-pixel touch-drag remainders per ScrollingFrame (`(last_written, rem)`),
+/// so slow drags on 90/120 Hz screens accumulate instead of rounding to zero.
+#[derive(Default)]
+struct DragRemainders(HashMap<Ref, (glam::Vec2, glam::Vec2)>);
+
+fn drag_rem_mut(lua: &mlua::Lua) -> mlua::AppDataRefMut<'_, DragRemainders> {
+    if lua.app_data_ref::<DragRemainders>().is_none() {
+        lua.set_app_data(DragRemainders::default());
+    }
+    lua.app_data_mut::<DragRemainders>().expect("drag remainder state")
+}
+
 /// A ScrollingFrame's CanvasPosition and how far it can scroll now (canvas
 /// less the frame), from its last layout and its CanvasSize as it is now
 /// (so a canvas a script resized is seen before the next layout). None
@@ -493,6 +507,7 @@ fn scroll_by(rt: &rustudio_engine::runtime::Runtime, r: Ref, d: [f32; 2]) {
         return;
     };
     let delta = glam::Vec2::new(d[0], d[1]) * mech::GUI_SCROLL_PX_PER_POINT;
+    drag_rem_mut(&rt.lua).0.remove(&r);
     let mut m = scrolls_mut(&rt.lua);
     let fresh = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0, fling: false };
     let s = m.0.entry(r).or_insert(fresh);
@@ -511,8 +526,20 @@ fn scroll_drag(rt: &rustudio_engine::runtime::Runtime, r: Ref, d: [f32; 2]) {
     };
     // (ScrollingDirection is in the range: the other axis has none)
     let delta = glam::Vec2::new(d[0], d[1]) * mech::GUI_SCROLL_PX_PER_POINT;
-    let next = (cur + delta).clamp(glam::Vec2::ZERO, max).round();
     scrolls_mut(&rt.lua).0.remove(&r);
+    if delta == glam::Vec2::ZERO {
+        drag_rem_mut(&rt.lua).0.remove(&r);
+        return;
+    }
+    let rem = drag_rem_mut(&rt.lua)
+        .0
+        .get(&r)
+        .filter(|(written, _)| *written == cur)
+        .map(|(_, rem)| *rem)
+        .unwrap_or(glam::Vec2::ZERO);
+    let exact = (cur + rem + delta).clamp(glam::Vec2::ZERO, max);
+    let next = exact.round();
+    drag_rem_mut(&rt.lua).0.insert(r, (next, exact - next));
     if next != cur {
         if let Ok(u) = rt.lua.create_userdata(rustudio_engine::ltypes::LVector2(next)) {
             rt.set(r, "CanvasPosition", Value::UserData(u));
@@ -527,6 +554,7 @@ fn scroll_fling(rt: &rustudio_engine::runtime::Runtime, r: Ref, v: [f32; 2]) {
     let Some((cur, _)) = scroll_range(rt, r) else {
         return;
     };
+    drag_rem_mut(&rt.lua).0.remove(&r);
     let per_frame = glam::Vec2::new(v[0], v[1]) * mech::GUI_SCROLL_PX_PER_POINT / 60.0;
     if per_frame.abs().max_element() < 0.5 {
         return;
@@ -791,7 +819,7 @@ impl Game {
         }
     }
 
-    fn client_of(&self, server: Ref) -> Option<Ref> {
+    pub(super) fn client_of(&self, server: Ref) -> Option<Ref> {
         self.play.as_ref()?.map.s2c.get(&server).copied()
     }
 
@@ -1207,6 +1235,9 @@ impl Game {
                 if let Some(s) = self.play.as_mut() {
                     s.game.move_target = Some(target);
                     s.game.move_target_elapsed = 0.0;
+                    if let Some(ch) = s.character.as_mut() {
+                        ch.dynamic.walk_to_local = None;
+                    }
                 }
             } else if side == Side::Server {
                 let now = self.play.as_ref().map(|s| s.time).unwrap_or(0.0);
@@ -1267,11 +1298,20 @@ impl Game {
                     // not.
                     if side == Side::Client {
                         let ct = self.client_of(t);
+                        let mouse = self
+                            .play
+                            .as_ref()
+                            .and_then(|s| s.client.as_ref())
+                            .and_then(|c| c.world.as_ref())
+                            .and_then(|w| w.input.mouse);
                         let told = self.play.as_mut().and_then(|s| s.game.equipped.as_mut()).filter(|e| e.tool == t);
                         if let (Some(ct), Some(e)) = (ct, told) {
                             if !e.client_told {
                                 e.client_told = true;
-                                self.with_side(Side::Client, |rt, _, _| rt.fire(ct, "Equipped", vec![Value::Nil]));
+                                self.with_side(Side::Client, |rt, _, _| {
+                                    let m = mouse.map(|m| rt.inst(m)).unwrap_or(Value::Nil);
+                                    rt.fire(ct, "Equipped", vec![m]);
+                                });
                             }
                         }
                     }
@@ -1361,9 +1401,18 @@ impl Game {
         let requires_handle = !matches!(self.doc.prop(tool, "RequiresHandle"), Some(Variant::Bool(false)));
         let handle = tool_handle(&self.doc, tool);
         if requires_handle && handle.is_none() {
+            // EquipTool's immediate Lua hook (`equip_now`) may have already
+            // reparented this tool into the character; return it to Backpack.
+            if self.doc.dom.get_by_ref(tool).map(|i| i.parent()) == Some(model) {
+                if let Some(bp) = self.backpack() {
+                    self.with_side(Side::Server, |rt, _, _| rt.apply_parent(tool, bp));
+                }
+            }
+            self.check_equipped_tool();
             return;
         }
         self.unequip_tool();
+        self.unequip_client_tool(true);
         self.with_side(Side::Server, |rt, _, _| rt.apply_parent(tool, model));
         let parts: Vec<Ref> = self
             .doc
@@ -1385,9 +1434,10 @@ impl Game {
         };
         if let Some(s) = self.play.as_mut() {
             s.physics.skip.extend(parts.iter().copied());
-            s.physics.refresh(parts);
+            s.physics.refresh(parts.iter().copied());
             s.game.equipped = Some(Equipped {
                 tool,
+                parts,
                 offsets,
                 client_told: false,
             });
@@ -1409,6 +1459,21 @@ impl Game {
             !requires_handle || tool_handle(cd, tool).is_some()
         });
         if !allowed {
+            let in_hand = self
+                .play
+                .as_ref()
+                .and_then(|s| s.other_doc.as_ref())
+                .is_some_and(|cd| cd.dom.get_by_ref(tool).map(|i| i.parent()) == Some(model));
+            if in_hand {
+                let player = self.play.as_ref().map(|s| s.player);
+                let bp = player
+                    .and_then(|p| self.client_of(p))
+                    .and_then(|cp| self.play.as_ref()?.other_doc.as_ref()?.find_child(cp, "Backpack"));
+                if let Some(bp) = bp {
+                    self.with_side(Side::Client, |rt, _, _| rt.apply_parent(tool, bp));
+                }
+            }
+            self.check_client_tool();
             return;
         }
         self.unequip_tool();
@@ -1427,7 +1492,7 @@ impl Game {
         };
         let in_hand = cd.dom.get_by_ref(tool).map(|i| i.parent()) == Some(model);
         s.client_sim.hold(&parts, true);
-        s.game.client_tool = Some(Equipped { tool, offsets, client_told: true });
+        s.game.client_tool = Some(Equipped { tool, parts, offsets, client_told: true });
         let mouse = s.client.as_ref().and_then(|c| c.world.as_ref()).and_then(|w| w.input.mouse);
         // In the hand before Equipped fires: Roblox has the grip made by then, so a script
         // that reads Handle.CFrame there (a hanging lantern's, building on it) gets the hand.
@@ -1446,7 +1511,12 @@ impl Game {
     fn unequip_client_tool(&mut self, to_backpack: bool) {
         let Some(s) = self.play.as_mut() else { return };
         let Some(e) = s.game.client_tool.take() else { return };
-        let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
+        let mut parts = e.parts;
+        for (r, _) in &e.offsets {
+            if !parts.contains(r) {
+                parts.push(*r);
+            }
+        }
         s.client_sim.hold(&parts, false);
         s.client_sim.set_keep_awake(Vec::new());
         let player = s.player;
@@ -1521,9 +1591,15 @@ impl Game {
         let loose: Vec<Ref> = in_tool.iter().copied().filter(|r| !reach.contains(r)).collect();
         s.client_sim.set_keep_awake(loose);
         if !added.is_empty() {
+            for r in &added {
+                if !e.parts.contains(r) {
+                    e.parts.push(*r);
+                }
+            }
             s.client_sim.hold(&added, true);
         }
         if !gone.is_empty() {
+            e.parts.retain(|r| !gone.contains(r));
             s.client_sim.hold(&gone, false);
         }
     }
@@ -1531,6 +1607,27 @@ impl Game {
     /// The character died or respawned: the client-only Tool it held is let go of.
     pub(super) fn unequip_client_tool_dropped(&mut self) {
         self.unequip_client_tool(false);
+    }
+
+    /// Once a frame: a server Tool a script moved out of the character (or
+    /// destroyed) isn't held any more.
+    pub(super) fn check_equipped_tool(&mut self) {
+        let Some(s) = self.play.as_ref() else { return };
+        let Some(e) = s.game.equipped.as_ref() else { return };
+        let model = s.character.as_ref().filter(|c| !c.dead).map(|c| c.model);
+        let held = model.is_some_and(|m| self.doc.dom.get_by_ref(e.tool).map(|i| i.parent()) == Some(m));
+        if !held {
+            let Some(e) = self.play.as_mut().and_then(|s| s.game.equipped.take()) else {
+                return;
+            };
+            if let Some(s) = self.play.as_mut() {
+                s.physics.skip.retain(|r| !e.parts.contains(r));
+                s.physics.refresh(e.parts);
+            }
+            if self.doc.exists(e.tool) {
+                self.fire_both(e.tool, "Unequipped");
+            }
+        }
     }
 
     /// Once a frame: a client-only Tool a script moved out of the character (or
@@ -1586,9 +1683,9 @@ impl Game {
         let Some(e) = self.play.as_mut().and_then(|s| s.game.equipped.take()) else {
             return;
         };
-        let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
         if let Some(s) = self.play.as_mut() {
-            s.physics.skip.retain(|r| !parts.contains(r));
+            s.physics.skip.retain(|r| !e.parts.contains(r));
+            s.physics.refresh(e.parts);
         }
     }
 
@@ -1596,10 +1693,9 @@ impl Game {
         let Some(e) = self.play.as_mut().and_then(|s| s.game.equipped.take()) else {
             return;
         };
-        let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
         if let Some(s) = self.play.as_mut() {
-            s.physics.skip.retain(|r| !parts.contains(r));
-            s.physics.refresh(parts);
+            s.physics.skip.retain(|r| !e.parts.contains(r));
+            s.physics.refresh(e.parts);
         }
         if let Some(bp) = self.backpack() {
             if self.doc.exists(e.tool) {
@@ -1629,7 +1725,6 @@ impl Game {
             let Some(e) = self.play.as_mut().and_then(|s| s.game.equipped.take()) else {
                 return;
             };
-            let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
             if let Some(ws) = self.doc.workspace() {
                 if self.doc.exists(e.tool) {
                     self.with_side(Side::Server, |rt, _, _| {
@@ -1644,8 +1739,8 @@ impl Game {
                 }
             }
             if let Some(s) = self.play.as_mut() {
-                s.physics.skip.retain(|r| !parts.contains(r));
-                s.physics.refresh(parts);
+                s.physics.skip.retain(|r| !e.parts.contains(r));
+                s.physics.refresh(e.parts);
             }
             self.fire_both(e.tool, "Unequipped");
             return;
@@ -2646,9 +2741,22 @@ impl Game {
             // (the tap's part as a mouse click's: through the see-through
             // parts to a ClickDetector, with the terrain in front counted)
             let ray = self.cam.ray(rect, p);
-            let hit = self.mouse_pick(side, &ray).map(|(r, t)| (r, ray.at(t)));
-            if let Some((r, at)) = self.click_pick(side, &ray, hit) {
-                clicks.push((r, at, 1));
+            if threaded {
+                let ptr = Pointer {
+                    origin: ray.origin,
+                    dir: ray.dir,
+                    hit: None,
+                    click: None,
+                    xy: [p.x - rect.min.x, p.y - rect.min.y],
+                    view: [rect.width(), rect.height()],
+                    side,
+                };
+                ray_clicks.push((ptr, 1));
+            } else {
+                let hit = self.mouse_pick(side, &ray).map(|(r, t)| (r, ray.at(t)));
+                if let Some((r, at)) = self.click_pick(side, &ray, hit) {
+                    clicks.push((r, at, 1));
+                }
             }
             buttons.push((1, true));
             buttons.push((1, false));
@@ -2945,7 +3053,11 @@ impl Game {
         self
             .play
             .as_ref()
-            .map(|s| match s.showing {
+            .map(|s| {
+                if s.presentation.is_some() {
+                    return s.physics_skip().clone();
+                }
+                match s.showing {
                 Side::Server => s.physics_skip().clone(),
                 Side::Client => {
                     // (Mapped again only when the set or the map changed:
@@ -2968,6 +3080,7 @@ impl Game {
                             set
                         }
                     }
+                }
                 }
             })
             .unwrap_or_default()

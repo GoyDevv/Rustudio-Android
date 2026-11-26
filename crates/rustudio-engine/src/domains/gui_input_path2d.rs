@@ -196,7 +196,23 @@ fn points(lua: &Lua, r: Ref) -> Vec<LPath2DControlPoint> {
 
 fn set_points(lua: &Lua, r: Ref, v: Vec<LPath2DControlPoint>) -> mlua::Result<()> {
     let snap: Vec<Path2DPointData> = v.iter().map(Path2DPointData::from).collect();
+    let stale: Vec<Ref> = {
+        let w = world(lua)?;
+        let d = w.d();
+        let mut stale = Vec::new();
+        if let Ok(cache) = path2d_cache().read() {
+            for &k in cache.keys() {
+                if k != r && !d.exists(k) {
+                    stale.push(k);
+                }
+            }
+        }
+        stale
+    };
     if let Ok(mut cache) = path2d_cache().write() {
+        for k in &stale {
+            cache.remove(k);
+        }
         if snap.is_empty() {
             cache.remove(&r);
         } else {
@@ -204,7 +220,14 @@ fn set_points(lua: &Lua, r: Ref, v: Vec<LPath2DControlPoint>) -> mlua::Result<()
         }
     }
     if let Some(mut p) = lua.app_data_mut::<Paths>() {
-        p.0.insert(r, v);
+        for k in &stale {
+            p.0.remove(k);
+        }
+        if v.is_empty() {
+            p.0.remove(&r);
+        } else {
+            p.0.insert(r, v);
+        }
     }
     world(lua)?.fire(r, "ControlPointChanged", vec![]);
     Ok(())

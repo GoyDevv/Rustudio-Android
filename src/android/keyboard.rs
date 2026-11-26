@@ -121,6 +121,8 @@ pub struct Keyboard {
     focus_since: Option<Instant>,
     /// The activity was last asked to show (true) or hide the keyboard.
     shown: bool,
+    /// The text field or TextBox that last held focus while the keyboard was shown.
+    last_want: Option<Want>,
     /// Since when nothing has wanted the keyboard, while `shown`.
     unwanted_since: Option<Instant>,
     /// The keyboard lies over the window (up for a game's TextBox): no
@@ -230,6 +232,7 @@ impl Keyboard {
         CHANGED.store(false, Ordering::Relaxed);
         if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false))) {
             self.shown = false;
+            self.last_want = None;
             self.unwanted_since = None;
             self.up_for = None;
             self.zero_since = None;
@@ -344,6 +347,7 @@ impl Keyboard {
             Want::TextBox => release_textbox(),
         }
         self.shown = false;
+        self.last_want = None;
         self.up_for = None;
         self.zero_since = None;
         self.set_height(0);
@@ -363,6 +367,7 @@ impl Keyboard {
         match (want, self.shown) {
             (Some(w), false) => {
                 self.shown = true;
+                self.last_want = Some(w);
                 self.unwanted_since = None;
                 log::info!("soft keyboard asked up for {}", match w {
                     Want::Field(_) => "a text field",
@@ -370,12 +375,19 @@ impl Keyboard {
                 });
                 soft_input(true);
             }
-            (Some(_), true) => self.unwanted_since = None,
+            (Some(w), true) => {
+                self.unwanted_since = None;
+                if self.last_want != Some(w) {
+                    self.last_want = Some(w);
+                    super::ime_bridge::reset_composing();
+                }
+            }
             (None, true) => {
                 let since = *self.unwanted_since.get_or_insert(now);
                 let for_ms = now.duration_since(since);
                 if for_ms >= HIDE_AFTER {
                     self.shown = false;
+                    self.last_want = None;
                     self.unwanted_since = None;
                     log::info!("soft keyboard asked down: nothing to type into for {} ms", for_ms.as_millis());
                     soft_input(false);

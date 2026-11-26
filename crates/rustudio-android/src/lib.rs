@@ -123,3 +123,13 @@ pub unsafe extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_na
 ) {
     unsafe { rustudio::android::crash_export::jni_on_saf_document_created(env, uri) };
 }
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnSafDocumentOpened(
+    env: *mut c_void,
+    _class: *mut c_void,
+    uri: *mut c_void,
+) {
+    unsafe { rustudio::android::storage::jni_on_saf_document_opened(env, uri) };
+}

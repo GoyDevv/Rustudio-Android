@@ -1078,7 +1078,12 @@ impl Game {
         // One collision-group table for the session: the server's scripts
         // set it, the client's queries and the physics read it.
         let mut client = client;
-        let groups = rustudio_core::collision_groups::shared();
+        let groups = rustudio_core::collision_groups::shared_from_doc(&self.doc);
+        if let Ok(mut g) = groups.lock() {
+            if g.names().len() > 1 {
+                g.version = g.version.max(1);
+            }
+        }
         for w in [server.world.as_mut(), client.as_mut().and_then(|c| c.world.as_mut())]
             .into_iter()
             .flatten()
@@ -1295,6 +1300,9 @@ impl Game {
         }
         self.stop_play_worker();
         self.quiet_stop = false;
+        self.play_here = None;
+        crate::emote_wheel::close();
+        drag_input::reset();
         // A TextBox focused in Play (the chat bar) doesn't keep the
         // editor's keyboard after the session ends.
         self.gui.drop_focus();
@@ -1920,13 +1928,43 @@ impl Game {
             return (p, 0.0);
         }
         let d = &self.doc;
-        // A team player spawns on a Neutral spawn or one in the team's colour.
+        let spawn_at = |r: Ref| -> Option<(Vec3, f32)> {
+            let xf = rustudio_render::scene::xform_of(d, r)?;
+            let size = rustudio_render::scene::vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ONE);
+            let top = xf.pos + Vec3::Y * (size.y * 0.5);
+            // rot_y(yaw) * -Z = (-sin yaw, 0, -cos yaw).
+            let look = xf.rot * Vec3::NEG_Z;
+            let yaw = if look.x.abs() + look.z.abs() > 1e-4 {
+                (-look.x).atan2(-look.z)
+            } else {
+                0.0
+            };
+            Some((
+                top + Vec3::Y * (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + 0.5),
+                yaw,
+            ))
+        };
         let player = self.play.as_ref().map(|p| p.player).filter(|p| p.is_some());
+        // Player.RespawnLocation overrides automatic SpawnLocation selection.
+        if let Some(p) = player {
+            if let Some(Variant::Ref(rl)) = d.prop(p, "RespawnLocation") {
+                if rl.is_some()
+                    && d.exists(rl)
+                    && d.class_of(rl).is_some_and(|c| c == "SpawnLocation")
+                {
+                    if let Some(pt) = spawn_at(rl) {
+                        return pt;
+                    }
+                }
+            }
+        }
+        // A team player spawns on a Neutral spawn or one in the team's colour;
+        // a neutral player only spawns on Neutral spawns.
         let team_color = player
             .filter(|p| !matches!(d.prop(*p, "Neutral"), Some(Variant::Bool(true))))
             .and_then(|p| d.prop(p, "TeamColor"));
         let fits = |s: Ref| match &team_color {
-            None => true,
+            None => !matches!(d.prop(s, "Neutral"), Some(Variant::Bool(false))),
             Some(c) => {
                 !matches!(d.prop(s, "Neutral"), Some(Variant::Bool(false)))
                     || d.prop(s, "TeamColor").as_ref() == Some(c)
@@ -1938,22 +1976,8 @@ impl Game {
                     && !matches!(d.prop(i.referent(), "Enabled"), Some(Variant::Bool(false)))
                     && fits(i.referent())
                 {
-                    if let Some(xf) = rustudio_render::scene::xform_of(d, i.referent()) {
-                        let size = rustudio_render::scene::vec3_of(d.prop(i.referent(), "Size"))
-                            .unwrap_or(Vec3::ONE);
-                        let top = xf.pos + Vec3::Y * (size.y * 0.5);
-                        // rot_y(yaw) * -Z = (-sin yaw, 0, -cos yaw).
-                        let look = xf.rot * Vec3::NEG_Z;
-                        let yaw = if look.x.abs() + look.z.abs() > 1e-4 {
-                            (-look.x).atan2(-look.z)
-                        } else {
-                            0.0
-                        };
-                        return (
-                            top + Vec3::Y
-                                * (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + 0.5),
-                            yaw,
-                        );
+                    if let Some(pt) = spawn_at(i.referent()) {
+                        return pt;
                     }
                 }
             }
@@ -1975,6 +1999,14 @@ impl Game {
                 )
             })
             .unwrap_or(false);
+        let break_joints = sp
+            .map(|s| {
+                !matches!(
+                    d.prop(s, "CharacterBreakJointsOnDeath"),
+                    Some(Variant::Bool(false))
+                )
+            })
+            .unwrap_or(true);
         InstanceBuilder::new("Humanoid")
             .with_name("Humanoid")
             .with_property("Health", 100.0f32)
@@ -1983,6 +2015,7 @@ impl Game {
             .with_property("JumpHeight", f("CharacterJumpHeight", mech::JUMP_HEIGHT))
             .with_property("JumpPower", f("CharacterJumpPower", mech::JUMP_POWER))
             .with_property("UseJumpPower", use_power)
+            .with_property("BreakJointsOnDeath", break_joints)
             .with_property(
                 "MaxSlopeAngle",
                 f("CharacterMaxSlopeAngle", mech::MAX_SLOPE_DEG),
@@ -2177,7 +2210,16 @@ impl Game {
             .into_iter()
             .filter_map(|c| {
                 let i = self.doc.dom.get_by_ref(c)?;
-                doc::is_a(&i.class, "BasePart").then(|| (c, rig::studio_collides(&i.name, rig_type)))
+                if !doc::is_a(&i.class, "BasePart") {
+                    return None;
+                }
+                if custom_starter
+                    && i.name != "HumanoidRootPart"
+                    && !rustudio_core::body::is_body_part_name(&i.name)
+                {
+                    return None;
+                }
+                Some((c, rig::studio_collides(&i.name, rig_type)))
             })
             .collect();
         for (c, on) in body {
@@ -2186,6 +2228,7 @@ impl Game {
             }
         }
         let (start, start_yaw) = self.character_spawn_point();
+        self.play_here = None;
         let mut ch = self.character_at(m, rig_type, humanoid, start, start_yaw);
         let pose = character_pose(&ch, &HashMap::new());
         // Where it stands now: a script moving it before the first frame
@@ -2490,6 +2533,7 @@ impl Game {
             // setter); the tool it held goes with it; its body leaves the
             // controller; it leaves Workspace.
             self.fire_character_removing_on(old, false, true);
+            self.unseat_character();
             self.drop_equipped();
             self.unequip_client_tool_dropped();
             let parts: Vec<Ref> = self
@@ -2503,8 +2547,14 @@ impl Game {
                 s.character = None;
                 s.physics.remove_humanoid(old);
                 s.physics.skip.retain(|x| !parts.contains(x));
+                s.physics.dead_parts.retain(|x| !parts.contains(x));
                 s.physics.refresh(parts.iter().copied());
+                s.game.states_off.clear();
+                s.game.forced_state = None;
+                s.game.sit_on = None;
+                s.game.jump = false;
                 s.game.move_target = None;
+                s.game.move_target_elapsed = 0.0;
             }
             if self.doc.exists(old) {
                 self.with_side(Side::Server, |rt, _, _| {
@@ -2516,6 +2566,7 @@ impl Game {
         if let Some(s) = self.play.as_mut() {
             s.respawn_at = None;
             s.character_client_pending = None;
+            s.initial_spawn_frames = None;
         }
         let destroy_old = |this: &mut Self| {
             if let Some(old) = old.filter(|o| this.doc.exists(*o)) {
@@ -2801,11 +2852,36 @@ impl Game {
         f32_of(self.doc.prop(h, name)).unwrap_or(default)
     }
 
+    /// Unseats the local character via `__rs_unseat` if it is currently seated.
+    fn unseat_character(&mut self) {
+        let seated = self
+            .play
+            .as_mut()
+            .and_then(|s| s.character.as_mut())
+            .and_then(|ch| ch.seat.take().map(|seat| (ch.humanoid, seat)));
+        if let Some((humanoid, seat)) = seated {
+            self.with_side(Side::Server, |rt, _, _| {
+                rt.spawn_global("__rs_unseat", vec![rt.inst(humanoid), rt.inst(seat)]);
+                rt.dispatch();
+            });
+        }
+    }
+
+    fn respawn_time(&self) -> f32 {
+        let root = self.doc.dom.root_ref();
+        self.doc
+            .find_child(root, "Players")
+            .and_then(|p| f32_of(self.doc.prop(p, "RespawnTime")))
+            .map(|t| t.max(0.0))
+            .unwrap_or(mech::RESPAWN_TIME)
+    }
+
     /// Death: joints break (BreakJointsOnDeath), the parts fall loose, and
     /// the character respawns after Players.RespawnTime.
     fn kill_character(&mut self) {
         let auto = self.character_auto_loads();
-        let (model, parts) = {
+        let respawn_time = self.respawn_time();
+        let (model, humanoid, parts) = {
             let Some(s) = self.play.as_mut() else { return };
             let Some(ch) = s.character.as_mut() else {
                 return;
@@ -2815,7 +2891,7 @@ impl Game {
             }
             ch.dead = true;
             ch.state = State::Dead;
-            s.respawn_at = auto.then(|| s.time + mech::RESPAWN_TIME as f64);
+            s.respawn_at = auto.then(|| s.time + respawn_time as f64);
             let parts: Vec<Ref> = self
                 .doc
                 .dom
@@ -2823,36 +2899,46 @@ impl Game {
                 .filter(|i| doc::is_a(&i.class, "BasePart"))
                 .map(|i| i.referent())
                 .collect();
-            (ch.model, parts)
+            (ch.model, ch.humanoid, parts)
         };
-        let motors: Vec<Ref> = self
-            .doc
-            .dom
-            .descendants_of(model)
-            .filter(|i| rustudio_engine::rig::is_animated_joint(&i.class))
-            .map(|i| i.referent())
-            .collect();
-        for m in &motors {
-            self.doc.dom.transfer_within(*m, Ref::none());
-            self.doc.mark_tree(*m);
-        }
-        // An upgraded R15 body's ball sockets are disabled with it (Studio).
-        for b in rustudio_engine::rig::ball_sockets(&self.doc, model) {
-            if let Some(inst) = self.doc.dom.get_by_ref_mut(b) {
-                inst.properties.insert(ustr("Enabled"), Variant::Bool(false));
+        self.unseat_character();
+        self.drop_equipped();
+        self.unequip_client_tool_dropped();
+        let break_joints = !matches!(
+            self.doc.prop(humanoid, "BreakJointsOnDeath"),
+            Some(Variant::Bool(false))
+        );
+        let mut motors = Vec::new();
+        if break_joints {
+            motors = self
+                .doc
+                .dom
+                .descendants_of(model)
+                .filter(|i| rustudio_engine::rig::is_animated_joint(&i.class))
+                .map(|i| i.referent())
+                .collect();
+            for m in &motors {
+                self.doc.dom.transfer_within(*m, Ref::none());
+                self.doc.mark_tree(*m);
             }
-            self.doc.mark_prop(b, ustr("Enabled"));
-            self.record(RepOp::Prop(b, "Enabled".into()));
-        }
-        for r in &parts {
-            if let Some(inst) = self.doc.dom.get_by_ref_mut(*r) {
-                inst.properties
-                    .insert(ustr("CanCollide"), Variant::Bool(true));
+            // An upgraded R15 body's ball sockets are disabled with it (Studio).
+            for b in rustudio_engine::rig::ball_sockets(&self.doc, model) {
+                if let Some(inst) = self.doc.dom.get_by_ref_mut(b) {
+                    inst.properties.insert(ustr("Enabled"), Variant::Bool(false));
+                }
+                self.doc.mark_prop(b, ustr("Enabled"));
+                self.record(RepOp::Prop(b, "Enabled".into()));
             }
-            self.doc.mark_prop(*r, ustr("CanCollide"));
-            // (The client reads it too: Studio's probe T14 sees every limb
-            // CanCollide true in the frame the joints go.)
-            self.record(RepOp::Prop(*r, "CanCollide".into()));
+            for r in &parts {
+                if let Some(inst) = self.doc.dom.get_by_ref_mut(*r) {
+                    inst.properties
+                        .insert(ustr("CanCollide"), Variant::Bool(true));
+                }
+                self.doc.mark_prop(*r, ustr("CanCollide"));
+                // (The client reads it too: Studio's probe T14 sees every limb
+                // CanCollide true in the frame the joints go.)
+                self.record(RepOp::Prop(*r, "CanCollide".into()));
+            }
         }
         if let Some(s) = self.play.as_mut() {
             // The character's assembly splits (BreakJointsOnDeath): each part
@@ -2885,7 +2971,7 @@ impl Game {
             self.warn(format!(
                 "{} died; respawning in {:.0} s",
                 self.player_name(),
-                mech::RESPAWN_TIME
+                respawn_time
             ));
         } else {
             self.warn(format!(
@@ -2951,21 +3037,43 @@ impl Game {
         if let Some(old) = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model) {
             self.fire_character_removing(old);
         }
+        self.unseat_character();
         // The tool it held goes with it (it isn't put back in the Backpack).
         self.drop_equipped();
         self.unequip_client_tool_dropped();
         // The old character leaves Workspace before the new one is stored and
         // CharacterAdded fires, and is destroyed (Destroying on it and all it
-        // holds; a no-op when a script destroyed it already) only after: the        // Character setter's pre-store hook emits
-        // CharacterRemoving, detaches and defers the disposal
-        // (Studio Play's server: Removing,
-        // detach -> new CharacterAdded -> old Destroying).
+        // holds; a no-op when a script destroyed it already) only after: the
+        // Character setter's pre-store hook emits CharacterRemoving, detaches
+        // and defers the disposal (Studio Play's server: Removing, detach ->
+        // new CharacterAdded -> old Destroying).
         let old = self.play.as_mut().and_then(|s| s.character.take()).map(|c| c.model);
         if let Some(old) = old {
+            let parts: Vec<Ref> = self
+                .doc
+                .dom
+                .descendants_of(old)
+                .filter(|i| doc::is_a(&i.class, "BasePart"))
+                .map(|i| i.referent())
+                .collect();
+            if let Some(s) = self.play.as_mut() {
+                s.physics.remove_humanoid(old);
+                s.physics.skip.retain(|x| !parts.contains(x));
+                s.physics.dead_parts.retain(|x| !parts.contains(x));
+                s.physics.refresh(parts.iter().copied());
+            }
             self.with_side(Side::Server, |rt, _, _| {
                 rt.apply_parent(old, Ref::none());
                 rt.dispatch();
             });
+        }
+        if let Some(s) = self.play.as_mut() {
+            s.game.states_off.clear();
+            s.game.forced_state = None;
+            s.game.sit_on = None;
+            s.game.jump = false;
+            s.game.move_target = None;
+            s.game.move_target_elapsed = 0.0;
         }
         self.spawn_character();
         if let Some(old) = old {
@@ -4049,6 +4157,7 @@ impl Game {
                 None => (None, None),
             };
             self.game_client_inputs();
+            self.check_equipped_tool();
             self.check_client_tool();
             let client_touches = self
                 .play
@@ -4720,7 +4829,10 @@ impl Game {
             s.initial_spawn_frames = None;
             true
         });
-        if initial_due && self.character_auto_loads() {
+        if initial_due
+            && self.character_auto_loads()
+            && self.play.as_ref().is_some_and(|s| s.character.is_none())
+        {
             self.spawn_character();
         }
         self.replicate();

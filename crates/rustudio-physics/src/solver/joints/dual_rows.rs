@@ -141,6 +141,9 @@ pub struct Align2Axes {
     pub s2_b: Vec3,    //
     pub s1_w: Vec3,    // (world, last build)
     pub s2_w: Vec3,    //
+    pub look_at: bool,
+    pub p_a: Vec3,
+    pub p_b: Vec3,
     pub servo: bool,   //
     pub max_torque: f32, //
     pub max_speed: f32,  //
@@ -150,7 +153,7 @@ pub struct Align2Axes {
 
 impl Align2Axes {
     pub fn new(axis_a: Vec3, axis_b: Vec3, s1_b: Vec3, s2_b: Vec3) -> Self {
-        Align2Axes { axis_a, axis_b, s1_b, s2_b, s1_w: Vec3::ZERO, s2_w: Vec3::ZERO, servo: false, max_torque: 0.0, max_speed: 0.0, k: 0.0, d: 0.0 }
+        Align2Axes { axis_a, axis_b, s1_b, s2_b, s1_w: Vec3::ZERO, s2_w: Vec3::ZERO, look_at: false, p_a: Vec3::ZERO, p_b: Vec3::ZERO, servo: false, max_torque: 0.0, max_speed: 0.0, k: 0.0, d: 0.0 }
     }
 }
 
@@ -192,12 +195,22 @@ fn align_error(wa: Vec3, wb: Vec3, s1: Vec3, cx: &Ctx) -> Vec3 {
 
 pub fn align2axes(rows: &mut [DualRow], cx: &Ctx, c: &mut Align2Axes) {
     let wa = cx.pa.rot(c.axis_a);
-    let wb = cx.pb.rot(c.axis_b);
+    let (wb, s1_fb, s2_fb) = if c.look_at {
+        let chord = cx.pb.point(c.p_b) - cx.pa.point(c.p_a);
+        if chord.length_squared() > 1.0e-12 {
+            let dir = chord.normalize();
+            let (s1, s2) = perp_pair_b(dir);
+            (dir, s1, s2)
+        } else {
+            (cx.pb.rot(c.axis_b), cx.pb.rot(c.s1_b), cx.pb.rot(c.s2_b))
+        }
+    } else {
+        (cx.pb.rot(c.axis_b), cx.pb.rot(c.s1_b), cx.pb.rot(c.s2_b))
+    };
     let dw = cx.rb.w - cx.ra.w;
     if !c.servo {
         // 1–2. warm starts re-projected from the old basis onto s1 = R_B·(), s2 = R_B·()
-        let s1 = cx.pb.rot(c.s1_b);
-        let s2 = cx.pb.rot(c.s2_b);
+        let (s1, s2) = (s1_fb, s2_fb);
         reproject(rows, c.s1_w, c.s2_w, s1, s2);
         c.s1_w = s1;
         c.s2_w = s2;
@@ -221,7 +234,7 @@ pub fn align2axes(rows: &mut [DualRow], cx: &Ctx, c: &mut Align2Axes) {
     let theta = s.atan2(cdot);
     let active = if cdot < 0.0017453f32.cos() { 1.0 } else { 0.0 };
     let (s1, s2) = if s <= 0.0017453 {
-        (cx.pb.rot(c.s1_b), cx.pb.rot(c.s2_b))
+        (s1_fb, s2_fb)
     } else {
         let s1 = n / s;
         (s1, s1.cross(wb))
@@ -236,8 +249,8 @@ pub fn align2axes(rows: &mut [DualRow], cx: &Ctx, c: &mut Align2Axes) {
     let h = cx.h;
     let wr = (cx.ra.w_ref - cx.rb.w_ref).dot(s1);
     let mut t = if cx.cfg.adaptive && active > 0.0 {
-        // level-1 identity: −(K'x + D'v)h = (Kθ − Dωr)h with K' = −K, x = θ, D' = D, v = ωr
-        substep(h, -c.k, c.d, theta, wr, 1) + wr
+        // level-1 identity: −(K·(−θ) + D·ωr)h = (Kθ − Dωr)h; positive K keeps adaptive levels > 1 stable
+        substep(h, c.k, c.d, -theta, wr, 1) + wr
     } else {
         (c.k * theta - c.d * wr) * h + wr
     };
@@ -365,8 +378,8 @@ pub fn servo(rows: &mut [DualRow], cx: &Ctx, s: &Servo) {
     // 4. ωref = (ω_ref,B − ω_ref,A)·w; t = h·(K·err − D·ωref) + ωref (cfg: substep with −K)
     let wref = (cx.rb.w_ref - cx.ra.w_ref).dot(w);
     let t = if cx.cfg.adaptive {
-        // Studio(h, −K, …): level-1 identity gives x = err, D' = D, v = ωref
-        substep(h, -s.k, s.d, err, wref, 1) + wref
+        // level-1 identity: −(K·(−err) + D·ωref)h = (K·err − D·ωref)h; positive K keeps adaptive levels > 1 stable
+        substep(h, s.k, s.d, -err, wref, 1) + wref
     } else {
         (err * s.k - wref * s.d) * h + wref
     };
@@ -996,8 +1009,8 @@ pub fn orientation(rows: &mut [DualRow], cx: &Ctx, o: &mut Orient) {
         rows[2].set_j(Vec3::ZERO, t2, Vec3::ZERO, -t2);
         let wr = (cx.ra.w_ref - cx.rb.w_ref).dot(u);
         let t = if cx.cfg.adaptive {
-            // level-1 identity: (Kθ − Dωr)h = Σa with K' = −K, x = θ, D' = D, v = ωr
-            substep(h, -o.k, o.d, theta, wr, 1) + wr
+            // level-1 identity: −(K·(−θ) + D·ωr)h = (Kθ − Dωr)h; positive K keeps adaptive levels > 1 stable
+            substep(h, o.k, o.d, -theta, wr, 1) + wr
         } else {
             wr + (o.k * theta - o.d * wr) * h
         };
@@ -1113,7 +1126,11 @@ pub fn gyro_step(c: &mut BodyAngVel, r: Mat3, w: Vec3, i: Vec3, dt: f32) {
 pub fn body_angular_velocity(rows: &mut [DualRow], cx: &Ctx, c: &BodyAngVel) {
     let h = cx.h;
     let (m, rel) = if c.legacy {
-        (cx.pa.r, if c.use_current { cx.rb.w - cx.ra.w } else { cx.rb.w_ref - cx.ra.w_ref })
+        let m = match c.gyro.as_deref() {
+            Some(g) => cx.pa.r * g.part_rot,
+            None => cx.pa.r,
+        };
+        (m, if c.use_current { cx.rb.w - cx.ra.w } else { cx.rb.w_ref - cx.ra.w_ref })
     } else {
         (frame_basis(c.frame, cx, &c.basis), cx.rb.w - cx.ra.w)
     };

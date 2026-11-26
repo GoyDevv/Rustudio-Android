@@ -2187,6 +2187,13 @@ struct Target {
     display_view: wgpu::TextureView,
 }
 
+struct VfAlphaPipelines {
+    opaque: wgpu::RenderPipeline,
+    opaque_two_sided: wgpu::RenderPipeline,
+    transparent: wgpu::RenderPipeline,
+    transparent_culled: wgpu::RenderPipeline,
+}
+
 struct ViewportPipelines {
     water: crate::water::WaterPass,
     glass_resolve: wgpu::RenderPipeline,
@@ -2224,6 +2231,7 @@ struct ViewportPipelines {
     overlay: wgpu::RenderPipeline,
     see_pipes: SeePipes,
     see: SeeThrough,
+    vf_alpha: Option<VfAlphaPipelines>,
 }
 
 // Some OpenGL drivers lack the color-buffer-float extension that wgpu
@@ -2555,6 +2563,12 @@ impl ViewportPipelines {
             glass_culled: make_see_alpha("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
             overlay: make_see_alpha("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
         };
+        let vf_alpha = (see_format != hdr_format).then(|| VfAlphaPipelines {
+            opaque: make_see_alpha("vf-parts", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None),
+            opaque_two_sided: make_see_alpha("vf-parts-two-sided", "vs_part", "fs_part", &parts, T::TriangleList, None, true, C::Greater, None),
+            transparent: make_see_alpha("vf-parts-transparent", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
+            transparent_culled: make_see_alpha("vf-parts-transparent-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
+        });
         let see = SeeThrough::new(device, &shader, &bgl, ms, hdr_format, see_format);
         let water = crate::water::WaterPass::new(
             device,
@@ -2750,6 +2764,7 @@ impl ViewportPipelines {
             overlay,
             see_pipes,
             see,
+            vf_alpha,
         }
     }
 }
@@ -3812,7 +3827,7 @@ impl Renderer {
             gui_lightgrid: [0.0; 4],
             gui_sun_params: [0.0, 580.0, 0.05, 0.0],
             gui_n_lights: 0,
-            postfx: crate::postfx::PostFx::new(device, queue, scene_hdr_format(&caps), DISPLAY_FORMAT, caps.r16_float_rt),
+            postfx: crate::postfx::PostFx::new(device, queue, scene_hdr_format(&caps), scene_hdr_alpha_format(&caps), DISPLAY_FORMAT, caps.r16_float_rt),
             last_postfx: crate::postfx::PostFxParams::default(),
             defer_postfx: false,
             world_gui: [None, None, None],
@@ -4113,42 +4128,69 @@ impl Renderer {
         width: u32, height: u32, rgba: &[u8],
         mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
-        let (sw, sh, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
-        let surface_mips = if sp.len() == (sw * sh * 4) as usize {
+        let (sw, sh, sp): (u32, u32, &[u8]) = match surface {
+            Some((w, h, p))
+                if w > 0
+                    && h > 0
+                    && (w as usize)
+                        .checked_mul(h as usize)
+                        .and_then(|n| n.checked_mul(4))
+                        .is_some_and(|need| p.len() >= need) =>
+            {
+                (w, h, p)
+            }
+            _ => (1, 1, &[128, 128, 255, 0]),
+        };
+        let surface_base_len = (sw as usize) * (sh as usize) * 4;
+        let surface_full_levels = mip_levels(sw, sh);
+        let surface_mips = if sp.len() == surface_base_len {
             std::borrow::Cow::Owned(data_mip_chain(sw, sh, sp))
         } else {
-            std::borrow::Cow::Borrowed(sp)
+            let full_size: usize = (0..surface_full_levels)
+                .map(|level| ((sw >> level).max(1) * (sh >> level).max(1) * 4) as usize)
+                .sum();
+            if sp.len() == full_size {
+                std::borrow::Cow::Borrowed(sp)
+            } else {
+                std::borrow::Cow::Owned(data_mip_chain(sw, sh, &sp[..surface_base_len]))
+            }
         };
         let surface_view = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
             label: Some("SurfaceAppearance normal roughness metalness"),
             size: wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
-            mip_level_count: mip_levels(sw, sh), sample_count: 1,
+            mip_level_count: surface_full_levels, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }, wgpu::util::TextureDataOrder::LayerMajor, &surface_mips)
             .create_view(&Default::default());
-        let mask_view = mask.map(|(w, h, px)| {
-            device
-                .create_texture_with_data(
-                    queue,
-                    &wgpu::TextureDescriptor {
-                        label: Some("emissive mask"),
-                        size: wgpu::Extent3d {
-                            width: w.max(1),
-                            height: h.max(1),
-                            depth_or_array_layers: 1,
+        let mask_view = mask.and_then(|(w, h, px)| {
+            let need = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+            if w == 0 || h == 0 || px.len() < need {
+                return None;
+            }
+            Some(
+                device
+                    .create_texture_with_data(
+                        queue,
+                        &wgpu::TextureDescriptor {
+                            label: Some("emissive mask"),
+                            size: wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
                         },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    },
-                    wgpu::util::TextureDataOrder::LayerMajor,
-                    px,
-                )
-                .create_view(&Default::default())
+                        wgpu::util::TextureDataOrder::LayerMajor,
+                        &px[..need],
+                    )
+                    .create_view(&Default::default()),
+            )
         });
         let (w, h) = (width.max(1), height.max(1));
         let full_levels = mip_levels(w, h);
@@ -5323,7 +5365,8 @@ impl Renderer {
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
         self.pool.flush();
-        let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
+        let max_dim = self.caps.limits.max_texture_dimension_2d.min(8192).max(1);
+        let size = [size[0].clamp(1, max_dim), size[1].clamp(1, max_dim)];
         crate::gpu_timing::set_automatic(frame.quality.is_some());
         // (bench: the Automatic level averaged over the run, and the share of
         // frames per shading tier, as "ms per frame")
@@ -5428,8 +5471,15 @@ impl Renderer {
             let mut f=std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/frames.jsonl")).unwrap();
             writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
         }
+        let shadows_on = frame.shadows && self.caps.hdr_float_rt;
+        let max_lights = if self.caps.storage_lights() { rustudio_core::mech::MAX_LIGHTS } else { 64 };
+        let n_lights = frame.lights.len().min(max_lights);
         self.update_sky_env(queue, &mut globals);
         let mut globals = globals;
+        if !shadows_on {
+            globals.bloom[2] = 0.0;
+        }
+        globals.params[0] = globals.params[0].min(n_lights as f32);
         globals.low_outdoor[3] = self.sky_tex.mip_level_count().saturating_sub(1) as f32;
         globals.fog_color[3] = (env_probe_gpu::LEVELS - 1) as f32;
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -5437,7 +5487,6 @@ impl Renderer {
         self.gui_fog = Self::gui_fog(&frame.globals);
         self.gui_exposure = frame.globals.params[1];
         self.gui_lightgrid = frame.globals.lightgrid;
-        let shadows_on = frame.shadows && self.caps.hdr_float_rt;
         self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, rustudio_core::mech::SUN_DIST, rustudio_core::mech::HYBRID_LERP_SLOPE, if shadows_on { 1.0 } else { 0.0 }];
         self.gui_sun = crate::world_gui::SunCascades { local: frame.globals.sun_casc, sphere: frame.globals.sun_sphere, rect: frame.globals.sun_rect };
         let mut stats = RenderStats {
@@ -5828,8 +5877,6 @@ impl Renderer {
         }
 
         drop(r_scope);
-        let max_lights = if self.caps.storage_lights() { rustudio_core::mech::MAX_LIGHTS } else { 64 };
-        let n_lights = frame.lights.len().min(max_lights);
         self.gui_n_lights = n_lights as u32;
         if n_lights > 0 {
             queue.write_buffer(
@@ -5867,7 +5914,7 @@ impl Renderer {
         // Skinned parts' vertices for this frame, before anything draws them.
         self.skin.encode(&mut encoder);
         crate::gpu_timing::mark(&mut encoder, "gpu: skinning");
-        match frame.clouds.as_ref().filter(|_| frame.sky) {
+        match frame.clouds.as_ref().filter(|_| frame.sky && self.caps.hdr_float_rt) {
             Some(look) => {
                 let (globals_layout, globals_bg) = match &self.sky_globals {
                     Some((layout, bg)) => (layout, bg),
@@ -6739,12 +6786,10 @@ impl Renderer {
                     draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
                 }
             }
-            let ssao_will_run = frame.globals.ssao[3] >= 0.5
-                && frame.quality.map_or_else(
-                    || rustudio_core::rustudio_settings::performance_value("ssao") != "off",
-                    |profile| profile.ssao(),
-                );
-            if encoded || split || ssao_will_run {
+            let has_blend_decals = blend_runs.iter().any(|r| {
+                raw[r.1 as usize..r.2 as usize].iter().any(|part| part.extra[3] == DECAL_TEX_MODE)
+            });
+            if !surface_decal_runs.is_empty() || has_blend_decals {
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 pass.set_pipeline(&viewport.decal_depth);
                 for r in &surface_decal_runs {
@@ -7259,13 +7304,16 @@ impl Renderer {
             })
             .collect();
         // (a skinning slot stays a list: the compute pass writes corners)
-        let mesh = if storage {
+        let max_storage = self.caps.limits.max_storage_buffer_binding_size as usize;
+        let storage_bytes = verts.len().saturating_mul(std::mem::size_of::<Vertex>());
+        let use_storage = storage && !verts.is_empty() && storage_bytes <= max_storage;
+        let mesh = if use_storage {
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("loaded mesh"),
                 contents: bytemuck::cast_slice(&verts),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             });
-            Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage, occluder: None }
+            Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage: true, occluder: None }
         } else {
             Mesh::upload_pooled(&mut self.pool, device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, None)
         };
@@ -7384,7 +7432,9 @@ impl Renderer {
             }
         };
         let m = &self.meshes[idx as usize + BUILTIN_MESHES];
-        self.skin.queue(device, queue, idx, &m.vbuf, req);
+        if m.storage {
+            self.skin.queue(device, queue, idx, &m.vbuf, m.bind_key, req);
+        }
         idx
     }
 

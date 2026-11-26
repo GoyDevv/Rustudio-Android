@@ -176,9 +176,20 @@ pub fn install_vector3(lua: &Lua) -> LResult<()> {
     method!("Sign", (), |a, ()| {
         Ok(LVector3(a.map(|c| if c == 0.0 { 0.0 } else { c.signum() })).into_value())
     });
-    method!("Min", LVector3, |a, o| Ok(LVector3(a.min(o.0)).into_value()));
-    method!("Max", LVector3, |a, o| Ok(LVector3(a.max(o.0)).into_value()));
-    method!("Angle", LVector3, |a, o| Ok(Value::Number(a.angle_between(o.0) as f64)));
+    method!("Min", mlua::Variadic<LVector3>, |a, rest| {
+        Ok(LVector3(rest.into_iter().fold(a, |acc, o| acc.min(o.0))).into_value())
+    });
+    method!("Max", mlua::Variadic<LVector3>, |a, rest| {
+        Ok(LVector3(rest.into_iter().fold(a, |acc, o| acc.max(o.0))).into_value())
+    });
+    method!("Angle", (LVector3, Option<LVector3>), |a, (o, axis)| {
+        let ang = a.angle_between(o.0);
+        let signed = match axis {
+            Some(ax) if a.cross(o.0).dot(ax.0) < 0.0 => -ang,
+            _ => ang,
+        };
+        Ok(Value::Number(signed as f64))
+    });
     method!("FuzzyEq", (LVector3, Option<f32>), |a, (o, eps)| {
         Ok(Value::Boolean((a - o.0).abs().max_element() <= eps.unwrap_or(1e-5)))
     });
@@ -548,45 +559,72 @@ impl LCFrame {
                 rot: Mat3::from_quat(q),
             }))
         });
-        m.add_method("ToWorldSpace", |_, this, o: LCFrame| {
-            Ok(LCFrame(cf_mul(&this.0, &o.0)))
-        });
-        m.add_method("ToObjectSpace", |_, this, o: LCFrame| {
-            Ok(LCFrame(cf_mul(&cf_inv(&this.0), &o.0)))
-        });
-        m.add_method("PointToWorldSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.pos + this.0.rot * v.0))
-        });
-        m.add_method("PointToObjectSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.rot.transpose() * (v.0 - this.0.pos)))
-        });
-        m.add_method("VectorToWorldSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.rot * v.0))
-        });
-        m.add_method("VectorToObjectSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.rot.transpose() * v.0))
-        });
-        // Deprecated spellings still used by Roblox's own scripts (round 19:
-        // Studio also answers lerp, toAxisAngle, toEulerAngles(XYZ / YXZ)
-        // and toOrientation; Place B's Poppercam calls toAxisAngle).
-        m.add_method("toWorldSpace", |_, this, o: LCFrame| {
-            Ok(LCFrame(cf_mul(&this.0, &o.0)))
-        });
-        m.add_method("toObjectSpace", |_, this, o: LCFrame| {
-            Ok(LCFrame(cf_mul(&cf_inv(&this.0), &o.0)))
-        });
-        m.add_method("pointToWorldSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.pos + this.0.rot * v.0))
-        });
-        m.add_method("pointToObjectSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.rot.transpose() * (v.0 - this.0.pos)))
-        });
-        m.add_method("vectorToWorldSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.rot * v.0))
-        });
-        m.add_method("vectorToObjectSpace", |_, this, v: LVector3| {
-            Ok(LVector3(this.0.rot.transpose() * v.0))
-        });
+        for name in ["ToWorldSpace", "toWorldSpace"] {
+            m.add_method(name, |_, this, args: mlua::Variadic<LCFrame>| {
+                if args.is_empty() {
+                    return Ok(mlua::Variadic::from_iter([LCFrame(this.0)]));
+                }
+                Ok(mlua::Variadic::from_iter(
+                    args.into_iter().map(|o| LCFrame(cf_mul(&this.0, &o.0))),
+                ))
+            });
+        }
+        for name in ["ToObjectSpace", "toObjectSpace"] {
+            m.add_method(name, |_, this, args: mlua::Variadic<LCFrame>| {
+                let inv = cf_inv(&this.0);
+                if args.is_empty() {
+                    return Ok(mlua::Variadic::from_iter([LCFrame(Xform {
+                        pos: Vec3::ZERO,
+                        rot: Mat3::IDENTITY,
+                    })]));
+                }
+                Ok(mlua::Variadic::from_iter(
+                    args.into_iter().map(|o| LCFrame(cf_mul(&inv, &o.0))),
+                ))
+            });
+        }
+        for name in ["PointToWorldSpace", "pointToWorldSpace"] {
+            m.add_method(name, |_, this, args: mlua::Variadic<LVector3>| {
+                if args.is_empty() {
+                    return Ok(mlua::Variadic::from_iter([LVector3(this.0.pos)]));
+                }
+                Ok(mlua::Variadic::from_iter(
+                    args.into_iter().map(|v| LVector3(this.0.pos + this.0.rot * v.0)),
+                ))
+            });
+        }
+        for name in ["PointToObjectSpace", "pointToObjectSpace"] {
+            m.add_method(name, |_, this, args: mlua::Variadic<LVector3>| {
+                let rt = this.0.rot.transpose();
+                if args.is_empty() {
+                    return Ok(mlua::Variadic::from_iter([LVector3(rt * (-this.0.pos))]));
+                }
+                Ok(mlua::Variadic::from_iter(
+                    args.into_iter().map(|v| LVector3(rt * (v.0 - this.0.pos))),
+                ))
+            });
+        }
+        for name in ["VectorToWorldSpace", "vectorToWorldSpace"] {
+            m.add_method(name, |_, this, args: mlua::Variadic<LVector3>| {
+                if args.is_empty() {
+                    return Ok(mlua::Variadic::from_iter([LVector3(Vec3::ZERO)]));
+                }
+                Ok(mlua::Variadic::from_iter(
+                    args.into_iter().map(|v| LVector3(this.0.rot * v.0)),
+                ))
+            });
+        }
+        for name in ["VectorToObjectSpace", "vectorToObjectSpace"] {
+            m.add_method(name, |_, this, args: mlua::Variadic<LVector3>| {
+                let rt = this.0.rot.transpose();
+                if args.is_empty() {
+                    return Ok(mlua::Variadic::from_iter([LVector3(Vec3::ZERO)]));
+                }
+                Ok(mlua::Variadic::from_iter(
+                    args.into_iter().map(|v| LVector3(rt * v.0)),
+                ))
+            });
+        }
         m.add_method("GetComponents", |_, this, ()| {
             Ok(mlua::Variadic::from_iter(components(&this.0)))
         });
@@ -1626,11 +1664,23 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
     )?;
     bc.set(
         "palette",
-        lua.create_function(|_, i: u16| {
-            Ok(LBrickColor(
-                BrickColor::from_number(i.max(1))
-                    .unwrap_or_else(|| BrickColor::from_number(194).expect("default")),
-            ))
+        lua.create_function(|_, i: i64| {
+            const PALETTE: [u16; 128] = [
+                141, 301, 107, 26, 1012, 303, 1011, 304, 28, 1018, 302, 305, 306, 307, 308, 1021,
+                309, 310, 1019, 135, 102, 23, 1010, 312, 313, 37, 1022, 1020, 1027, 311, 315, 1023,
+                1031, 316, 151, 317, 318, 319, 1024, 314, 1013, 1006, 321, 322, 104, 1008, 119, 323,
+                324, 325, 320, 11, 1026, 1016, 1032, 1015, 327, 1005, 1009, 29, 328, 1028, 208, 45,
+                329, 330, 331, 1004, 21, 332, 333, 24, 334, 226, 1029, 335, 336, 342, 343, 338,
+                1007, 339, 133, 106, 340, 341, 1001, 1, 9, 1025, 337, 344, 345, 1014, 105, 346,
+                347, 348, 349, 1030, 125, 101, 350, 192, 351, 352, 353, 354, 1002, 5, 18, 217,
+                355, 356, 153, 357, 358, 359, 360, 38, 361, 362, 199, 194, 363, 364, 365, 1003,
+            ];
+            let bc = usize::try_from(i)
+                .ok()
+                .and_then(|idx| PALETTE.get(idx).copied())
+                .and_then(BrickColor::from_number)
+                .unwrap_or_else(|| BrickColor::from_number(194).expect("default"));
+            Ok(LBrickColor(bc))
         })?,
     )?;
     let random_brick = lua.create_function(|lua, ()| {
@@ -1682,7 +1732,7 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
     u2.set(
         "new",
         lua.create_function(|_, a: mlua::Variadic<Value>| {
-            if a.len() == 2 {
+            if a.len() == 2 && (ud::<LUDim>(&a[0]).is_some() || ud::<LUDim>(&a[1]).is_some()) {
                 return Ok(LUDim2 {
                     x: ud::<LUDim>(&a[0]).unwrap_or(LUDim {
                         scale: 0.0,

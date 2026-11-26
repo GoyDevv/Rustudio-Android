@@ -457,6 +457,8 @@ impl Editor {
                 crate::part_drag::apply_model_pivots(&mut self.game.doc, &drag.pivots, Xform { pos: new.pos - rot * old.pos, rot });
             }
         }
+        let part_refs: Vec<Ref> = updates.iter().map(|(r, _, _)| *r).collect();
+        self.snapshot_rest_pose_for_parts(&part_refs);
         for (r, xf, size) in updates {
             self.game.doc
                 .set_prop_live(r, ustr("CFrame"), Variant::CFrame(xf.to_cframe()));
@@ -870,12 +872,20 @@ impl Editor {
             if driving {
                 ui.extend_from_slice(&self.mobile_window_rects);
             }
+            let mut direct_drag = if driving {
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.game.touch.zones.direct_drag)
+            };
+            if !driving {
+                direct_drag.extend_from_slice(&self.mobile_drag_rects);
+            }
             self.game.touch.zones = rustudio_engine::touch_input::Zones {
                 viewport: if menu_open { egui::Rect::NOTHING } else { visible },
                 playing: driving,
                 game,
                 ui,
-                direct_drag: if driving { Vec::new() } else { self.mobile_drag_rects.clone() },
+                direct_drag,
                 stick,
                 jump,
                 handle_hover: hover_handle.is_some() || self.drag.is_some() || rustudio_engine::gui::share().adorn_hot || { let _ch = rustudio_engine::gui::share_channel(1); rustudio_engine::gui::share().adorn_hot },
@@ -1241,7 +1251,12 @@ impl Editor {
                 painter.circle_filled(c, 2.5, Color32::WHITE);
             }
         }
-        if let (Some(start), Some(end), false) = (self.marquee, pointer, self.clean_view) {
+        let marquee_end = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .or(pointer)
+            .map(|p| rect.clamp(p));
+        if let (Some(start), Some(end), false) = (self.marquee, marquee_end, self.clean_view) {
             if (end - start).length() > mech::DRAG_SELECT_MIN_PX {
                 let r = Rect::from_two_pos(start, end);
                 painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(90, 170, 255, 30));

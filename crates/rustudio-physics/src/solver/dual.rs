@@ -287,8 +287,8 @@ fn side_w(j: &[f32; 24], o: usize, m: &MassRec, s: f32, w: &mut [f32; 24]) {
 /// an exact 1/a stands in, one Newton step later the difference is ≤ 1 ulp.)
 #[inline]
 fn rcp(a: f32) -> f32 {
-    if a.is_infinite() {
-        return 0.0f32.copysign(a);
+    if !a.is_finite() || a.abs() <= 1e-30 {
+        return 0.0;
     }
     let r = 1.0 / a;
     let r2 = (2.0 - r * a) * r;

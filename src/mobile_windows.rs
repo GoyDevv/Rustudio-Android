@@ -430,6 +430,7 @@ pub fn default_placement_for(
             // anchor to the bottom-right so Explorer can still open above it.
             let explorer_bottom = existing
                 .iter()
+                .filter(|w| !w.minimized)
                 .find(|w| w.id == "explorer" || w.tab.key() == "explorer")
                 .map(|w| w.pos[1] + w.size[1]);
             let (y, h) = if let Some(exp_bot) = explorer_bottom {
@@ -493,6 +494,7 @@ pub fn default_placement_for(
     let primary = clamp_pos(pref_pos);
     let existing_rects: Vec<Rect> = existing
         .iter()
+        .filter(|w| !w.minimized)
         .map(|w| {
             let vis = if w.collapsed {
                 Vec2::new(collapsed_width(w.size[0]), TITLE_BAR_HEIGHT_TOUCH)
@@ -636,6 +638,7 @@ impl MobileWindowManager {
     pub fn focused_id(&self) -> Option<&str> {
         self.windows
             .iter()
+            .filter(|w| !w.minimized)
             .max_by_key(|w| w.z_order)
             .map(|w| w.id.as_str())
     }
@@ -660,6 +663,7 @@ impl MobileWindowManager {
             if !title.is_empty() {
                 self.windows[idx].title = title;
             }
+            self.windows[idx].minimized = false;
             self.windows[idx].collapsed = false;
             self.windows[idx].z_order = self.alloc_z();
             self.windows[idx].clamp_to_bounds(bounds, title_h);
@@ -729,7 +733,8 @@ impl MobileWindowManager {
     /// Returns title-bar and resize-grip rects for immediate touch dragging.
     pub fn drag_handle_rects(&self) -> Vec<Rect> {
         let title_h = self.current_title_bar_height();
-        let grip = if self.touch_mode { 22.0 } else { 16.0 };
+        let edge_in = if self.touch_mode { 10.0 } else { 6.0 };
+        let edge_out = if self.touch_mode { 14.0 } else { 8.0 };
         let mut out = Vec::new();
         for w in self.windows.iter().filter(|w| !w.minimized) {
             let r = w.visible_rect(title_h);
@@ -737,7 +742,10 @@ impl MobileWindowManager {
             let lay = TitleBarLayout::compute(title_r, self.touch_mode);
             out.push(lay.drag_rect);
             if !w.collapsed {
-                let corner = Rect::from_min_max(Pos2::new(r.max.x - grip, r.max.y - grip), r.max);
+                let corner = Rect::from_min_max(
+                    Pos2::new(r.max.x - edge_in, r.max.y - edge_in),
+                    Pos2::new(r.max.x + edge_out, r.max.y + edge_out),
+                );
                 out.push(corner);
             }
         }
@@ -866,7 +874,7 @@ impl MobileWindowManager {
         } else {
             RESIZE_EDGE_HIT_DESKTOP
         };
-        let top_z = self.windows.iter().map(|w| w.z_order).max().unwrap_or(0);
+        let top_z = self.windows.iter().filter(|w| !w.minimized).map(|w| w.z_order).max().unwrap_or(0);
 
         let mut order: Vec<usize> = (0..self.windows.len()).collect();
         order.sort_by_key(|&i| (self.windows[i].z_order, i));
@@ -1171,11 +1179,17 @@ impl MobileWindowManager {
                         }
                     }
 
-                    // Expanded body content & resize grips.
+                    // Expanded body content & non-occluding resize grips.
                     if !self.windows[idx].collapsed {
+                        let edge_in = if self.touch_mode { 10.0 } else { 6.0 };
+                        let edge_out = (edge_hit - edge_in).max(6.0);
+                        let corner_out = if self.touch_mode { 14.0 } else { 8.0 };
                         let body_rect = Rect::from_min_max(
                             Pos2::new(win_rect.min.x + 2.0, title_rect.max.y + 1.0),
-                            Pos2::new(win_rect.max.x - 2.0, win_rect.max.y - 2.0),
+                            Pos2::new(
+                                (win_rect.max.x - edge_in).max(win_rect.min.x + 2.0),
+                                (win_rect.max.y - edge_in).max(title_rect.max.y + 1.0),
+                            ),
                         );
                         if body_rect.is_positive() {
                             let mut child_ui =
@@ -1184,13 +1198,10 @@ impl MobileWindowManager {
                             render_body(&mut child_ui, &mut self.windows[idx].tab);
                         }
 
-                        // Bottom-right corner resize grip (22 pt touch target).
+                        // Bottom-right corner resize grip straddling the outer border (disjoint from body_rect).
                         let corner_rect = Rect::from_min_max(
-                            Pos2::new(
-                                (win_rect.max.x - RESIZE_CORNER_HIT).max(win_rect.min.x),
-                                (win_rect.max.y - RESIZE_CORNER_HIT).max(title_rect.max.y),
-                            ),
-                            win_rect.max,
+                            Pos2::new(body_rect.max.x, body_rect.max.y),
+                            Pos2::new(win_rect.max.x + corner_out, win_rect.max.y + corner_out),
                         );
                         let corner_resp = ui.interact(
                             corner_rect,
@@ -1205,13 +1216,10 @@ impl MobileWindowManager {
                             self.windows[idx].resize_by(corner_resp.drag_delta(), bounds, title_h);
                         }
 
-                        // Right edge resize strip.
+                        // Right edge resize strip outside body_rect.
                         let right_rect = Rect::from_min_max(
-                            Pos2::new(
-                                (win_rect.max.x - edge_hit).max(win_rect.min.x),
-                                title_rect.max.y,
-                            ),
-                            Pos2::new(win_rect.max.x, corner_rect.min.y.max(title_rect.max.y)),
+                            Pos2::new(body_rect.max.x, title_rect.max.y),
+                            Pos2::new(win_rect.max.x + edge_out, corner_rect.min.y.max(title_rect.max.y)),
                         );
                         if right_rect.is_positive() {
                             let right_resp = ui.interact(
@@ -1232,13 +1240,10 @@ impl MobileWindowManager {
                             }
                         }
 
-                        // Bottom edge resize strip.
+                        // Bottom edge resize strip outside body_rect.
                         let bottom_rect = Rect::from_min_max(
-                            Pos2::new(
-                                win_rect.min.x,
-                                (win_rect.max.y - edge_hit).max(title_rect.max.y),
-                            ),
-                            Pos2::new(corner_rect.min.x.max(win_rect.min.x), win_rect.max.y),
+                            Pos2::new(win_rect.min.x, body_rect.max.y),
+                            Pos2::new(corner_rect.min.x.max(win_rect.min.x), win_rect.max.y + edge_out),
                         );
                         if bottom_rect.is_positive() {
                             let bottom_resp = ui.interact(

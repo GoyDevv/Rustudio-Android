@@ -125,9 +125,17 @@ function DataStore:RemoveAsync(key)
     if ordered(self) or old == nil then return old end
     return old, key_info(rec)
 end
-function DataStore:GetSortedAsync(ascending, page_size)
+function DataStore:GetSortedAsync(ascending, page_size, min_value, max_value)
+    local min_v = tonumber(min_value)
+    local max_v = tonumber(max_value)
     local rows = {}
-    for k, v in pairs(self.data) do table.insert(rows, { key = k, value = v }) end
+    for k, v in pairs(self.data) do
+        local nv = tonumber(v)
+        if (min_v == nil or (nv ~= nil and nv >= min_v))
+            and (max_v == nil or (nv ~= nil and nv <= max_v)) then
+            table.insert(rows, { key = k, value = v })
+        end
+    end
     table.sort(rows, function(a, b)
         local x, y = tonumber(a.value) or 0, tonumber(b.value) or 0
         if ascending then return x < y end

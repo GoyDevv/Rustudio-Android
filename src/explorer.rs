@@ -548,16 +548,22 @@ impl Editor {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         // Drag over this row: above / into / below by the pointer's height.
-        let drop = resp.dnd_hover_payload::<DragRefs>().and_then(|_| {
-            let y = ui.ctx().pointer_hover_pos()?.y;
+        let drop_at = |y: f32| {
             let t = (y - rect.min.y) / rect.height();
-            Some(if t < 0.25 {
+            if t < 0.25 {
                 Drop::Above
             } else if t > 0.75 && !expanded {
                 Drop::Below
             } else {
                 Drop::Into
-            })
+            }
+        };
+        let drop = resp.dnd_hover_payload::<DragRefs>().map(|_| {
+            let pos = resp
+                .interact_pointer_pos()
+                .or_else(|| ui.ctx().pointer_latest_pos())
+                .unwrap_or(rect.center());
+            drop_at(pos.y)
         });
         if selected {
             painter.rect_filled(rect, 0.0, theme::SELECT_BG);
@@ -604,7 +610,9 @@ impl Editor {
         let name_w = ui.fonts_mut(|f| f.layout_no_wrap(label, egui::FontId::proportional(13.0), theme::TEXT).size().x);
         let plus_x = (text_pos.x + name_w + 6.0 + 8.0).min(rect.max.x - 10.0);
         let plus_rect = Rect::from_center_size(Pos2::new(plus_x, rect.center().y), Vec2::splat(16.0));
-        let row_hot = ui.rect_contains_pointer(rect) && !egui::DragAndDrop::has_any_payload(ui.ctx());
+        let touch_mode = cfg!(target_os = "android") || rustudio_core::rustudio_settings::mobile_floating_windows();
+        let row_hot = (ui.rect_contains_pointer(rect) || (touch_mode && selected))
+            && !egui::DragAndDrop::has_any_payload(ui.ctx());
         let plus = row_hot.then(|| ui.interact(plus_rect, egui::Id::new(("explorer_plus", r)), Sense::click()));
         if let Some(p) = &plus {
             if p.hovered() {
@@ -650,9 +658,9 @@ impl Editor {
             actions.push(RowAction::InsertDialog(r, p.rect.right_bottom()));
             return;
         }
+        let tri_pad = if cfg!(target_os = "android") { 6.0 } else { 3.0 };
+        let on_tri = has_children && resp.interact_pointer_pos().is_some_and(|p| tri_rect.expand(tri_pad).contains(p));
         if resp.clicked() {
-            let tri_pad = if cfg!(target_os = "android") { 6.0 } else { 3.0 };
-            let on_tri = has_children && resp.interact_pointer_pos().is_some_and(|p| tri_rect.expand(tri_pad).contains(p));
             if on_tri {
                 actions.push(RowAction::Toggle(r));
             } else {
@@ -660,7 +668,7 @@ impl Editor {
                 actions.push(RowAction::Click(r, m.command, m.shift));
             }
         }
-        if resp.double_clicked() {
+        if resp.double_clicked() && !on_tri {
             if matches!(class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
                 actions.push(RowAction::OpenScript(r));
             } else {
@@ -692,7 +700,14 @@ impl Editor {
             }
         }
         if let Some(p) = resp.dnd_release_payload::<DragRefs>() {
-            let target = match drop.unwrap_or(Drop::Into) {
+            let rel_drop = drop.unwrap_or_else(|| {
+                let pos = resp
+                    .interact_pointer_pos()
+                    .or_else(|| ui.ctx().pointer_latest_pos())
+                    .unwrap_or(rect.center());
+                drop_at(pos.y)
+            });
+            let target = match rel_drop {
                 Drop::Into => r,
                 // Above / below: beside this row, in its parent (Studio then
                 // orders siblings by ExplorerOrder and name).
@@ -754,7 +769,10 @@ impl Editor {
                     ui.close();
                 }
                 if item(ui, "Insert Object…", true) {
-                    let at = ui.ctx().pointer_hover_pos().unwrap_or_default();
+                    let at = resp
+                        .interact_pointer_pos()
+                        .or_else(|| ui.ctx().pointer_latest_pos())
+                        .unwrap_or(rect.center());
                     actions.push(RowAction::InsertDialog(r, at));
                     ui.close();
                 }

@@ -1087,9 +1087,17 @@ impl Document {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<WeakDom, String> {
-        let xml = bytes.starts_with(b"<roblox") && !bytes.starts_with(b"<roblox!");
+        let trimmed = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+        let trimmed = trimmed
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(&trimmed[trimmed.len()..], |i| &trimmed[i..]);
+        let xml = !trimmed.starts_with(b"<roblox!")
+            && (trimmed.starts_with(b"<roblox")
+                || trimmed.starts_with(b"<?xml")
+                || trimmed.starts_with(b"<!--"));
         if xml {
-            rbx_xml::from_reader_default(Cursor::new(bytes)).map_err(|e| e.to_string())
+            rbx_xml::from_reader_default(Cursor::new(trimmed)).map_err(|e| e.to_string())
         } else {
             rbx_binary::from_reader(Cursor::new(bytes)).map_err(|e| e.to_string())
         }
@@ -1242,7 +1250,7 @@ impl Document {
     pub fn save_to(&mut self, path: &Path) -> Result<(), String> {
         let (kind, xml) = Self::kind_for(path).ok_or("save as .rbxl, .rbxlx, .rbxm or .rbxmx")?;
         let bytes = self.encode_all(xml)?;
-        std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        write_atomic(path, &bytes)?;
         self.kind = kind;
         self.path = Some(path.to_path_buf());
         self.title = path
@@ -1259,7 +1267,7 @@ impl Document {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("rbxmx"));
         let bytes = self.encode(&self.top_level(refs), xml)?;
-        std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+        write_atomic(path, &bytes)
     }
 
     pub fn dirty(&self) -> bool {
@@ -1733,9 +1741,43 @@ impl Document {
 
     /// Changes a property without recording undo (live preview while dragging).
     pub fn set_prop_live(&mut self, r: Ref, name: Ustr, value: Variant) {
+        let twin = self.dom.get_by_ref(r).and_then(|inst| {
+            let class = inst.class.as_str();
+            screen_insets_twin(class, name.as_str(), &value)
+                .or_else(|| lighting_time_twin(class, name.as_str(), &value))
+                .or_else(|| {
+                    let twin = content_twin(name.as_str())?;
+                    let v = match &value {
+                        Variant::ContentId(c) => {
+                            let s = c.as_str();
+                            if s.is_empty() {
+                                Variant::Content(rbx_dom_weak::types::Content::none())
+                            } else {
+                                Variant::Content(rbx_dom_weak::types::Content::from_uri(s.to_string()))
+                            }
+                        }
+                        Variant::String(s) => {
+                            if s.is_empty() {
+                                Variant::Content(rbx_dom_weak::types::Content::none())
+                            } else {
+                                Variant::Content(rbx_dom_weak::types::Content::from_uri(s.clone()))
+                            }
+                        }
+                        _ => return None,
+                    };
+                    Some((twin, v))
+                })
+        });
         if let Some(inst) = self.dom.get_by_ref_mut(r) {
             inst.properties.insert(name, value);
             self.mark_prop(r, name);
+        }
+        if let Some((twin_name, twin_val)) = twin {
+            let twin_ustr = ustr(twin_name);
+            if let Some(inst) = self.dom.get_by_ref_mut(r) {
+                inst.properties.insert(twin_ustr, twin_val);
+                self.mark_prop(r, twin_ustr);
+            }
         }
     }
 
@@ -1857,11 +1899,61 @@ impl Document {
         }
     }
 
-    /// Inserts clipboard bytes under `parent`; returns the new top-level refs.
-    pub fn paste(&mut self, bytes: &[u8], parent: Ref, label: &str) -> Vec<Ref> {
-        let Ok(mut tmp) = Self::decode(bytes) else {
-            return Vec::new();
-        };
+    /// Removes pre-existing `Sky` / `Atmosphere` children of `Lighting` when
+    /// incoming instances include a replacement of the same singleton class,
+    /// recording `Change::Remove` in the caller's undo batch.
+    fn replace_lighting_singletons(
+        &mut self,
+        lighting_ref: Ref,
+        incoming_classes: &[&str],
+        changes: &mut Vec<Change>,
+    ) {
+        if !self.dom.get_by_ref(lighting_ref).is_some_and(|i| i.class == "Lighting") {
+            return;
+        }
+        let want_sky = incoming_classes.iter().any(|c| *c == "Sky" || is_a(c, "Sky"));
+        let want_atmo = incoming_classes
+            .iter()
+            .any(|c| *c == "Atmosphere" || is_a(c, "Atmosphere"));
+        if !want_sky && !want_atmo {
+            return;
+        }
+        let existing: Vec<Ref> = self
+            .dom
+            .get_by_ref(lighting_ref)
+            .map(|l| {
+                l.children()
+                    .iter()
+                    .copied()
+                    .filter(|ch| {
+                        self.dom.get_by_ref(*ch).is_some_and(|c| {
+                            (want_sky && (c.class == "Sky" || is_a(c.class.as_str(), "Sky")))
+                                || (want_atmo
+                                    && (c.class == "Atmosphere"
+                                        || is_a(c.class.as_str(), "Atmosphere")))
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for old in existing {
+            let lr = self.limbo.root_ref();
+            self.dom.transfer(old, &mut self.limbo, lr);
+            changes.push(Change::Remove {
+                r: old,
+                parent: lighting_ref,
+            });
+        }
+    }
+
+    /// Shared unpacking/insertion core used by both `paste` and `paste_groups`.
+    fn paste_decoded(
+        &mut self,
+        mut tmp: WeakDom,
+        parent: Ref,
+        changes: &mut Vec<Change>,
+        inserted: &mut Vec<Ref>,
+    ) {
         let parent = if self.exists(parent) {
             parent
         } else {
@@ -1871,8 +1963,6 @@ impl Document {
         let has_service = roots.iter().any(|r| {
             tmp.get_by_ref(*r).is_some_and(|i| is_service(i.class.as_str()))
         });
-        let mut inserted = Vec::new();
-        let mut changes = Vec::new();
         if has_service {
             let doc_root = self.dom.root_ref();
             for r in roots {
@@ -1883,39 +1973,130 @@ impl Document {
                     continue;
                 }
                 if is_service(&cls) {
-                    let children = tmp.get_by_ref(r).map(|i| i.children().to_vec()).unwrap_or_default();
-                    if children.is_empty() {
+                    let children = tmp
+                        .get_by_ref(r)
+                        .map(|i| i.children().to_vec())
+                        .unwrap_or_default();
+                    let props: Vec<(Ustr, Variant)> = tmp
+                        .get_by_ref(r)
+                        .map(|i| {
+                            i.properties
+                                .iter()
+                                .filter(|(k, v)| k.as_str() != "SourceAssetId" && !matches!(v, Variant::Ref(_)))
+                                .map(|(k, v)| (*k, v.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if children.is_empty() && props.is_empty() {
                         continue;
                     }
                     let target_svc = self.find_child(doc_root, &cls).unwrap_or_else(|| {
-                        let new_svc = self.dom.insert(doc_root, InstanceBuilder::new(&cls).with_name(&cls));
-                        changes.push(Change::Create { r: new_svc, parent: doc_root });
+                        let new_svc = self
+                            .dom
+                            .insert(doc_root, InstanceBuilder::new(&cls).with_name(&cls));
+                        changes.push(Change::Create {
+                            r: new_svc,
+                            parent: doc_root,
+                        });
                         new_svc
                     });
-                    for ch in children {
-                        // Do not duplicate default Workspace Camera or Terrain when importing a .rbxl into an existing place.
-                        if cls == "Workspace"
-                            && tmp.get_by_ref(ch).is_some_and(|c| c.class == "Camera" || c.class == "Terrain")
+                    if !props.is_empty() {
+                        let mut merged = Vec::with_capacity(props.len());
+                        for (k, v) in &props {
+                            if let Some((twin_k, twin_v)) = lighting_time_twin(&cls, k.as_str(), v) {
+                                if !props.iter().any(|(pk, _)| pk.as_str() == twin_k) {
+                                    merged.push((ustr(twin_k), twin_v));
+                                }
+                            }
+                            merged.push((*k, v.clone()));
+                        }
+                        for (k, v) in merged {
+                            if let Some(svc) = self.dom.get_by_ref_mut(target_svc) {
+                                let old = svc.properties.insert(k, v.clone());
+                                if old.as_ref() != Some(&v) {
+                                    changes.push(Change::Prop {
+                                        r: target_svc,
+                                        name: k,
+                                        old,
+                                        new: Some(v),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if cls == "Lighting" {
+                        let incoming: Vec<String> = children
+                            .iter()
+                            .filter_map(|ch| tmp.get_by_ref(*ch).map(|c| c.class.as_str().to_owned()))
+                            .collect();
+                        let incoming_refs: Vec<&str> = incoming.iter().map(String::as_str).collect();
+                        self.replace_lighting_singletons(target_svc, &incoming_refs, changes);
+                    }
+                    // When unpacking Workspace, skip Terrain and only skip the default
+                    // CurrentCamera when the target Workspace already has a Camera,
+                    // preserving any custom Camera instances.
+                    let skip_cam: Option<Ref> = if cls == "Workspace"
+                        && self.find_child(target_svc, "Camera").is_some()
+                    {
+                        match tmp
+                            .get_by_ref(r)
+                            .and_then(|w| w.properties.get(&ustr("CurrentCamera")))
                         {
-                            continue;
+                            Some(Variant::Ref(c)) if c.is_some() => Some(*c),
+                            _ => children.iter().copied().find(|ch| {
+                                tmp.get_by_ref(*ch)
+                                    .is_some_and(|c| c.class == "Camera" && c.name == "Camera")
+                            }),
+                        }
+                    } else {
+                        None
+                    };
+                    for ch in children {
+                        if cls == "Workspace" {
+                            if tmp.get_by_ref(ch).is_some_and(|c| c.class == "Terrain") {
+                                continue;
+                            }
+                            if skip_cam == Some(ch) {
+                                continue;
+                            }
                         }
                         tmp.transfer(ch, &mut self.dom, target_svc);
-                        changes.push(Change::Create { r: ch, parent: target_svc });
+                        changes.push(Change::Create {
+                            r: ch,
+                            parent: target_svc,
+                        });
                         inserted.push(ch);
                     }
                 } else {
+                    self.replace_lighting_singletons(parent, &[cls.as_str()], changes);
                     tmp.transfer(r, &mut self.dom, parent);
                     changes.push(Change::Create { r, parent });
                     inserted.push(r);
                 }
             }
         } else {
+            let incoming: Vec<String> = roots
+                .iter()
+                .filter_map(|r| tmp.get_by_ref(*r).map(|i| i.class.as_str().to_owned()))
+                .collect();
+            let incoming_refs: Vec<&str> = incoming.iter().map(String::as_str).collect();
+            self.replace_lighting_singletons(parent, &incoming_refs, changes);
             for r in roots {
                 tmp.transfer(r, &mut self.dom, parent);
                 changes.push(Change::Create { r, parent });
                 inserted.push(r);
             }
         }
+    }
+
+    /// Inserts clipboard bytes under `parent`; returns the new top-level refs.
+    pub fn paste(&mut self, bytes: &[u8], parent: Ref, label: &str) -> Vec<Ref> {
+        let Ok(tmp) = Self::decode(bytes) else {
+            return Vec::new();
+        };
+        let mut inserted = Vec::new();
+        let mut changes = Vec::new();
+        self.paste_decoded(tmp, parent, &mut changes, &mut inserted);
         self.renew_script_guids(&inserted);
         self.push(label, changes, None);
         inserted
@@ -1928,14 +2109,8 @@ impl Document {
         let mut changes = Vec::new();
         let mut out = Vec::new();
         for (bytes, parent) in groups {
-            let Ok(mut tmp) = Self::decode(&bytes) else { continue };
-            let parent = if self.exists(parent) { parent } else { self.default_parent() };
-            let roots = tmp.root().children().to_vec();
-            for r in &roots {
-                tmp.transfer(*r, &mut self.dom, parent);
-                changes.push(Change::Create { r: *r, parent });
-            }
-            out.extend(roots);
+            let Ok(tmp) = Self::decode(&bytes) else { continue };
+            self.paste_decoded(tmp, parent, &mut changes, &mut out);
         }
         self.renew_script_guids(&out);
         self.push(label, changes, None);
@@ -2676,6 +2851,38 @@ fn screen_insets_read(inst: &rbx_dom_weak::Instance, name: &str) -> Variant {
     } else {
         Variant::Enum(Enum::from_u32(si))
     }
+}
+
+/// Atomically writes `bytes` to `path` via a sibling temp file + `sync_all()` + `rename()`.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "place".to_string());
+    let pid = std::process::id();
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file_name}.{pid}.{seq}.tmp"));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(())
 }
 
 /// The other half of a ScreenGui inset write: IgnoreGuiInset true/false sets

@@ -312,7 +312,12 @@ pub fn shapes(id: u32, scale: Vec3, size: Vec3) -> Option<Arc<Vec<rapier3d::prel
     }
     let p = pieces(id)?;
     let half = size * 0.5;
-    let pull = Vec3::select(half.cmpgt(Vec3::splat(SWEEP_SHRINK)), (half - SWEEP_SHRINK) / half, Vec3::ZERO);
+    let pull = Vec3::select(
+        half.cmpgt(Vec3::splat(SWEEP_SHRINK)),
+        (half - SWEEP_SHRINK) / half,
+        Vec3::splat(1.0e-3),
+    )
+    .max(Vec3::splat(1.0e-3));
     let k = scale * pull;
     let v = |q: Vec3| Vector::new(q.x * k.x, q.y * k.y, q.z * k.z);
     let mut out: Vec<SharedShape> = p
@@ -402,7 +407,7 @@ pub fn ray(p: &Pieces, xf: &rustudio_core::math::Xform, scale: Vec3, o: Vec3, di
         // Only touching an edge or corner (no length inside) is a miss;
         // crossing a flat piece is a hit.
         let chord = (exit - enter) * (ld * s).length();
-        if enter.is_finite() && enter >= 0.0 && (h.flat || chord > 1e-4) && enter <= len && best.is_none_or(|b| enter < b.0) {
+        if enter.is_finite() && enter >= 0.0 && ((h.flat && enter <= exit + 1e-5) || chord > 1e-4) && enter <= len && best.is_none_or(|b| enter < b.0) {
             // The faces entered there: through an edge or corner, their
             // normals summed (as Studio does for a box's).
             let at = lo + ld * enter;

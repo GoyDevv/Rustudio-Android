@@ -205,14 +205,18 @@ pub fn vibrate(millis: u32, strength: f32) -> Result<()> {
         if vib.is_null() {
             return Ok(());
         }
-        let effect = env.call_static_method(
-            jni_str!("android/os/VibrationEffect"),
-            jni_str!("createOneShot"),
-            jni_sig!("(JI)Landroid/os/VibrationEffect;"),
-            &[JValue::Long(i64::from(millis)), JValue::Int(amplitude)],
-        )?;
-        let effect = effect.l()?;
-        env.call_method(&vib, jni_str!("vibrate"), jni_sig!("(Landroid/os/VibrationEffect;)V"), &[JValue::Object(&effect)])?;
+        if sdk_int() >= 26 {
+            let effect = env.call_static_method(
+                jni_str!("android/os/VibrationEffect"),
+                jni_str!("createOneShot"),
+                jni_sig!("(JI)Landroid/os/VibrationEffect;"),
+                &[JValue::Long(i64::from(millis)), JValue::Int(amplitude)],
+            )?;
+            let effect = effect.l()?;
+            env.call_method(&vib, jni_str!("vibrate"), jni_sig!("(Landroid/os/VibrationEffect;)V"), &[JValue::Object(&effect)])?;
+        } else {
+            env.call_method(&vib, jni_str!("vibrate"), jni_sig!("(J)V"), &[JValue::Long(i64::from(millis))])?;
+        }
         Ok(())
     })
 }
@@ -236,17 +240,21 @@ pub fn vibrate_pattern(steps: &[(u32, f32)]) -> Result<()> {
             .collect();
         let jt = env.new_long_array(timings.len())?;
         jt.set_region(env, 0, &timings)?;
-        let ja = env.new_int_array(amplitudes.len())?;
-        ja.set_region(env, 0, &amplitudes)?;
-        let effect = env
-            .call_static_method(
-                jni_str!("android/os/VibrationEffect"),
-                jni_str!("createWaveform"),
-                jni_sig!("([J[II)Landroid/os/VibrationEffect;"),
-                &[JValue::Object(&jt), JValue::Object(&ja), JValue::Int(-1)],
-            )?
-            .l()?;
-        env.call_method(&vib, jni_str!("vibrate"), jni_sig!("(Landroid/os/VibrationEffect;)V"), &[JValue::Object(&effect)])?;
+        if sdk_int() >= 26 {
+            let ja = env.new_int_array(amplitudes.len())?;
+            ja.set_region(env, 0, &amplitudes)?;
+            let effect = env
+                .call_static_method(
+                    jni_str!("android/os/VibrationEffect"),
+                    jni_str!("createWaveform"),
+                    jni_sig!("([J[II)Landroid/os/VibrationEffect;"),
+                    &[JValue::Object(&jt), JValue::Object(&ja), JValue::Int(-1)],
+                )?
+                .l()?;
+            env.call_method(&vib, jni_str!("vibrate"), jni_sig!("(Landroid/os/VibrationEffect;)V"), &[JValue::Object(&effect)])?;
+        } else {
+            env.call_method(&vib, jni_str!("vibrate"), jni_sig!("([JI)V"), &[JValue::Object(&jt), JValue::Int(-1)])?;
+        }
         Ok(())
     })
 }

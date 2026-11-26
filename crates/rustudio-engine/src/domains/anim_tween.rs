@@ -80,6 +80,7 @@ pub struct Tween {
     reverses: bool,
     delay: f64,
     goals: Vec<(String, Value)>,
+    active_goals: Vec<bool>,
     starts: Option<Vec<Option<(Value, bool)>>>,
     state: State,
     elapsed: f64,
@@ -284,6 +285,7 @@ fn create(lua: &Lua, (inst, info, goals): (Value, Value, Value)) -> mlua::Result
             repeats,
             reverses,
             delay,
+            active_goals: vec![true; list.len()],
             goals: list,
             starts: None,
             state: State::Begin,
@@ -307,6 +309,7 @@ fn play(lua: &Lua, me: Value) -> mlua::Result<bool> {
             tw.delay_elapsed = 0.0;
             tw.rep = 0;
             tw.starts = None;
+            tw.active_goals.fill(true);
             tw.state = if tw.delay > 0.0 { State::Delayed } else { State::Playing };
         }
     }
@@ -451,8 +454,13 @@ fn step_one(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
         let list: Vec<(String, Value, Value, bool)> = tw
             .goals
             .iter()
+            .zip(&tw.active_goals)
             .zip(starts)
-            .filter_map(|((key, goal), s)| s.map(|(sv, int)| (key.clone(), sv, goal.clone(), int)))
+            .filter_map(|(((key, goal), &active), s)| {
+                active.then_some(()).and_then(|()| {
+                    s.map(|(sv, int)| (key.clone(), sv, goal.clone(), int))
+                })
+            })
             .collect();
         (tw.inst, list, k, rep_end)
     };
@@ -524,7 +532,17 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         let cancelled: Vec<Ref> = {
             let mut t = tweens(lua);
             let Some(new) = t.all.get(&r) else { continue };
-            let (inst, keys): (Ref, Vec<String>) = (new.inst, new.goals.iter().map(|g| g.0.clone()).collect());
+            if !matches!(new.state, State::Playing | State::Delayed) {
+                continue;
+            }
+            let (inst, keys): (Ref, Vec<String>) = (
+                new.inst,
+                new.goals
+                    .iter()
+                    .zip(&new.active_goals)
+                    .filter_map(|(g, &active)| active.then(|| g.0.clone()))
+                    .collect(),
+            );
             let by_inst = by_inst.get_or_insert_with(|| {
                 let mut m: rustc_hash::FxHashMap<Ref, Vec<Ref>> = Default::default();
                 for &o in &t.active {
@@ -544,20 +562,13 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
                 if old.inst != inst || !matches!(old.state, State::Playing | State::Delayed) {
                     continue;
                 }
-                let before = old.goals.len();
-                let mut i = 0;
-                old.goals.retain(|g| {
-                    let keep = !keys.contains(&g.0);
-                    if let Some(s) = old.starts.as_mut() {
-                        if !keep && i < s.len() {
-                            s.remove(i);
-                        } else {
-                            i += 1;
-                        }
+                let before = old.active_goals.iter().filter(|a| **a).count();
+                for (g, active) in old.goals.iter().zip(&mut old.active_goals) {
+                    if *active && keys.contains(&g.0) {
+                        *active = false;
                     }
-                    keep
-                });
-                if old.goals.is_empty() && before > 0 {
+                }
+                if before > 0 && !old.active_goals.iter().any(|a| *a) {
                     old.state = State::Cancelled;
                     old.me = None;
                     out.push(o);

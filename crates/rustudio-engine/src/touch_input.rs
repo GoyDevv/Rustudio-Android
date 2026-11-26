@@ -168,6 +168,7 @@ struct Pointer {
     start: Pos2,
     pos: Pos2,
     since: Instant,
+    start_frame: u64,
     in_view: bool,
     mode: Mode,
     /// Recent positions for the fling speed.
@@ -496,6 +497,7 @@ impl Touch {
                         start: pos,
                         pos,
                         since: now,
+                        start_frame: frame_no,
                         in_view,
                         mode: if is_direct { Mode::Press } else { Mode::Pending },
                         samples: VecDeque::from([(now, pos)]),
@@ -564,6 +566,9 @@ impl Touch {
                                 out.push(button(p.start, PointerButton::Primary, true));
                                 out.push(Event::PointerMoved(pos));
                                 p.mode = Mode::Press;
+                            } else if p.in_view && frame_no == p.start_frame {
+                                // Defer Pending -> Look by 1 frame so the viewport has a frame
+                                // to hover-test 3D gizmo handles at p.start before orbiting.
                             } else if p.in_view {
                                 out.push(Event::PointerMoved(p.start));
                                 out.push(button(p.start, PointerButton::Secondary, true));

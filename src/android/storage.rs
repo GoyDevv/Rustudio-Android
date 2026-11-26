@@ -43,7 +43,7 @@ fn shared_storage() -> PathBuf {
 
 fn roots(storage_access: bool) -> Vec<Root> {
     let mut v = vec![Root { label: "rustudio", path: super::data_dir() }];
-    let imported = super::files_dir().join("Imported");
+    let imported = super::data_dir().join("Imported");
     let _ = std::fs::create_dir_all(&imported);
     v.push(Root { label: "Imported", path: imported });
     if super::data_dir() != super::files_dir() {
@@ -105,6 +105,8 @@ impl Listing {
     }
 }
 
+const SAF_OPEN_DOC_REQUEST_CODE: i32 = 0x5254;
+
 /// Launches Android's Storage Access Framework document picker
 /// (`ACTION_OPEN_DOCUMENT`, `CATEGORY_OPENABLE`, `*/*`, `EXTRA_ALLOW_MULTIPLE`).
 fn open_system_picker() -> super::jni::Result<()> {
@@ -141,9 +143,9 @@ fn open_system_picker() -> super::jni::Result<()> {
         )?;
         env.call_method(
             activity,
-            jni_str!("startActivity"),
-            jni_sig!("(Landroid/content/Intent;)V"),
-            &[JValue::Object(&intent)],
+            jni_str!("startActivityForResult"),
+            jni_sig!("(Landroid/content/Intent;I)V"),
+            &[JValue::Object(&intent), JValue::Int(SAF_OPEN_DOC_REQUEST_CODE)],
         )?;
         Ok(())
     })
@@ -600,6 +602,45 @@ pub fn push_opened(p: PathBuf) {
 /// The files pushed since the last call (the editor opens them).
 pub fn take_opened() -> Vec<PathBuf> {
     std::mem::take(&mut *OPENED.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Raw JNI bridge called from `crates/rustudio-android/src/lib.rs` on SAF open-document result.
+///
+/// # Safety
+/// Must be called by the JVM with valid `JNIEnv*` and optional `jstring`.
+pub unsafe fn jni_on_saf_document_opened(
+    env: *mut std::ffi::c_void,
+    uri: *mut std::ffi::c_void,
+) {
+    if env.is_null() || uri.is_null() {
+        return;
+    }
+    let env_ptr = env as *mut jni::sys::JNIEnv;
+    let jstr = uri as jni::sys::jstring;
+    let s = unsafe {
+        let Some(vtable) = (*env_ptr).as_ref() else {
+            return;
+        };
+        let len = (vtable.v1_1.GetStringLength)(env_ptr, jstr);
+        if len <= 0 {
+            return;
+        }
+        let ptr = (vtable.v1_1.GetStringChars)(env_ptr, jstr, std::ptr::null_mut());
+        if ptr.is_null() {
+            return;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len as usize);
+        let decoded = String::from_utf16_lossy(slice);
+        (vtable.v1_1.ReleaseStringChars)(env_ptr, jstr, ptr);
+        decoded
+    };
+    if s.is_empty() {
+        return;
+    }
+    if let Some(path) = import_uri(&s) {
+        push_opened(path);
+        super::lifecycle::wake();
+    }
 }
 
 // ------------------------------------------------------- the opening marker

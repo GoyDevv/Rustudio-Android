@@ -124,6 +124,61 @@ struct Root {
 }
 
 impl Gui {
+    /// True while a button is held by either mouse or touch.
+    pub(super) fn is_pressed(&self, r: Ref) -> bool {
+        self.pressed.is_some_and(|(p, _)| p == r)
+            || self.touch_fingers.values().any(|f| f.pressed == Some(r))
+    }
+
+    fn start_scrollbar_drag(t: &Hit, sb: ScrollBarHit, p: Pos2) -> ScrollBarDrag {
+        let axis_vec = if sb.vertical {
+            t.quad[3] - t.quad[0]
+        } else {
+            t.quad[1] - t.quad[0]
+        };
+        let thumb_screen_len = axis_vec.length();
+        let axis = if thumb_screen_len > 1e-4 {
+            axis_vec / thumb_screen_len
+        } else if sb.vertical {
+            egui::vec2(0.0, 1.0)
+        } else {
+            egui::vec2(1.0, 0.0)
+        };
+        let scale = if sb.thumb_len > 0.0 && thumb_screen_len > 0.0 {
+            thumb_screen_len / sb.thumb_len
+        } else {
+            1.0
+        };
+        let screen_travel = (sb.track_travel * scale).max(1e-3);
+        let start_cp = sb.current_cp.clamp(0.0, sb.max_scroll);
+        ScrollBarDrag {
+            r: t.r,
+            vertical: sb.vertical,
+            axis,
+            start_proj: p.to_vec2().dot(axis),
+            start_cp,
+            canvas_per_px: sb.max_scroll / screen_travel,
+            max_scroll: sb.max_scroll,
+            current_cp: start_cp,
+            remainder: 0.0,
+        }
+    }
+
+    fn step_scrollbar_drag(drag: &mut ScrollBarDrag, dp: Pos2) -> Option<[f32; 2]> {
+        let proj = dp.to_vec2().dot(drag.axis);
+        let target_cp = (drag.start_cp + (proj - drag.start_proj) * drag.canvas_per_px)
+            .clamp(0.0, drag.max_scroll);
+        let applied = target_cp - drag.current_cp;
+        if applied.abs() <= 0.0 {
+            return None;
+        }
+        drag.current_cp = target_cp;
+        let total = applied + drag.remainder;
+        let step = total.round();
+        drag.remainder = total - step;
+        (step != 0.0).then(|| if drag.vertical { [0.0, step] } else { [step, 0.0] })
+    }
+
     /// Drops TextBox keyboard focus without firing FocusLost (the session
     /// it belonged to has ended: Play stopping with the chat bar focused
     /// would otherwise leave the editor's keys going to a box that's gone).
@@ -670,7 +725,7 @@ impl Gui {
         let selection_visible = super::share().selection_visible;
         let now = CacheWith {
             hovered: self.hovered.clone(),
-            pressed: self.pressed.map(|p| p.0),
+            pressed: self.pressed.map(|p| p.0).or_else(|| self.touch_fingers.values().find_map(|f| f.pressed)),
             focus: self.focus,
             selected,
             selected_core,
@@ -1146,10 +1201,17 @@ impl Gui {
                     screen_gui: class == "ScreenGui",
                     clips: doc::is_a(class, "PluginGui")
                         || boolp(d, g, "ClipsDescendants", class == "SurfaceGui"),
+                    active: if class == "SurfaceGui" {
+                        boolp(d, g, "Active", true)
+                    } else if class == "BillboardGui" {
+                        boolp(d, g, "Active", false)
+                    } else {
+                        true
+                    },
                 }
             };
             // (kept while the journal is this document's: see cache_marks)
-            let RootProps { global_z, screen_gui, clips } = if specs_ok {
+            let RootProps { global_z, screen_gui, clips, active: root_active } = if specs_ok {
                 *self.root_props.entry(g).or_insert_with(read_props)
             } else {
                 read_props()
@@ -1409,12 +1471,13 @@ impl Gui {
                             scale: root_scale,
                             z: 0,
                             turn: 0.0,
+                            interactable: true,
                         },
                     );
                     drop(walk_scope);
                     let _mesh_scope = rustudio_core::bench::scope("gui_mesh");
                     let mut items = std::mem::take(&mut w.items);
-                    let hits = std::mem::take(&mut w.hits);
+                    let mut hits = std::mem::take(&mut w.hits);
                     let boxes = std::mem::take(&mut w.boxes);
                     if verify {
                         // The same walk without memos must give the same.
@@ -1439,7 +1502,7 @@ impl Gui {
                             replaying: 0,
                             table_cells: HashMap::new(),
                         };
-                        w.children(g, padded(d, g, canvas_rect, root_ui_scale(d, g)), Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: root_ui_scale(d, g), z: 0, turn: 0.0 });
+                        w.children(g, padded(d, g, canvas_rect, root_ui_scale(d, g)), Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: root_ui_scale(d, g), z: 0, turn: 0.0, interactable: true });
                         let (items2, hits2, boxes2) = (std::mem::take(&mut w.items), std::mem::take(&mut w.hits), std::mem::take(&mut w.boxes));
                         self.memo_off = false;
                         self.no_cache = saved.0;
@@ -1501,6 +1564,7 @@ impl Gui {
                     self.cache_own(g);
                     if global_z {
                         items.sort_by_key(|i| (i.z, i.seq));
+                        hits.sort_by_key(|h| (h.z, h.seq));
                     }
                     let _tess = rustudio_core::bench::scope("gui_tessellate");
                     let mut citems = Vec::with_capacity(items.len());
@@ -1652,7 +1716,7 @@ impl Gui {
             triangle_counts[2] += n_out;
             drop(project_scope);
             let hit_scope = (!lhits.is_empty()).then(|| rustudio_core::bench::scope("gui_project_hits"));
-            for h in &lhits {
+            for h in if !inp.playing || root_active { &lhits[..] } else { &[] } {
                 let corners = [
                     h.rect.left_top(),
                     h.rect.right_top(),
@@ -1907,34 +1971,92 @@ impl Gui {
             let input = |state: TouchState, dx: f32, dy: f32| GuiArg::Touch { id: t.id, state, x, y, dx, dy };
             match t.state {
                 TouchState::Begin => {
-                    let top = under.iter().rev().find(|h| h.textbox || h.active).cloned();
+                    let sb_hit = self
+                        .hits
+                        .iter()
+                        .rev()
+                        .find(|h| h.scrollbar.is_some() && point_in_quad(&h.quad, t.pos) && h.clip.is_none_or(|c| point_in_quad(&c, t.pos)))
+                        .cloned();
+                    let top_sink = under.iter().rev().find(|h| h.textbox || h.active || h.drag).cloned();
+                    let top_press = under.iter().rev().find(|h| h.textbox || h.active || h.button || h.drag).cloned();
                     // A finger anywhere else ends text editing.
-                    if let Some(f) = self.focus.filter(|f| top.as_ref().is_none_or(|t| t.r != *f)) {
+                    if let Some(f) = self.focus.filter(|f| sb_hit.is_some() || top_press.as_ref().is_none_or(|t| t.r != *f)) {
                         let mut sh = super::share();
                         sh.focus_events.push((f, false, false, Some((1, x, y))));
                         sh.focus = None;
+                        sh.tb_cursor.insert(f, -1);
+                        sh.tb_sel.insert(f, -1);
                         self.focus = None;
+                        self.tb_cursor = -1;
+                        self.tb_sel = -1;
+                        self.tb_selecting = None;
+                        self.tb_held_key = None;
+                    }
+                    let now_t = std::time::Instant::now();
+                    if let Some(ref sh_hit) = sb_hit {
+                        if let Some(sb) = sh_hit.scrollbar {
+                            let drag = Self::start_scrollbar_drag(sh_hit, sb, t.pos);
+                            self.events.push(GuiEvent::ScrollDrag(sh_hit.r, [0.0, 0.0]));
+                            self.touch_fingers.insert(
+                                t.id,
+                                TouchFinger {
+                                    x,
+                                    y,
+                                    start: (x, y),
+                                    since: now_t,
+                                    sunk: true,
+                                    pressed: None,
+                                    under: HashSet::new(),
+                                    began_on: Vec::new(),
+                                    scroll: None,
+                                    scrolled: true,
+                                    scrollbar_drag: Some(drag),
+                                    speed: (0.0, 0.0),
+                                    moved_at: now_t,
+                                },
+                            );
+                            out.push(TouchOut { id: t.id, state: t.state, x, y, dx: 0.0, dy: 0.0, sunk: true, began_on: Vec::new() });
+                            continue;
+                        }
                     }
                     for h in &under {
                         self.events.push(GuiEvent::Fire(h.r, "MouseEnter", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
                         self.events.push(GuiEvent::Fire(h.r, "InputBegan", vec![input(TouchState::Begin, 0.0, 0.0)]));
                     }
                     let mut pressed = None;
-                    if let Some(top) = &top {
+                    if let Some(top) = &top_press {
                         if top.button {
                             self.events.push(GuiEvent::Fire(top.r, "MouseButton1Down", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
                             pressed = Some(top.r);
                             super::share().pressed = Some(top.r);
                         }
-                        if top.textbox && self.focus != Some(top.r) {
-                            self.focus = Some(top.r);
-                            let mut sh = super::share();
-                            sh.focus_events.push((top.r, true, false, Some((1, x, y))));
-                            sh.focus = Some(top.r);
+                        if top.textbox {
+                            let caret = self.textbox_pos_from_screen(top.r, t.pos);
+                            if self.focus != Some(top.r) {
+                                self.focus = Some(top.r);
+                                self.tb_sel = -1;
+                                if let Some(c) = caret {
+                                    self.tb_cursor = c as i32;
+                                }
+                                let mut sh = super::share();
+                                sh.focus_events.push((top.r, true, false, Some((1, x, y))));
+                                sh.focus = Some(top.r);
+                                if let Some(c) = caret {
+                                    sh.tb_cursor.insert(top.r, c as i32);
+                                }
+                                sh.tb_sel.insert(top.r, -1);
+                            } else if let Some(c) = caret {
+                                // Re-tap on already-focused TextBox repositions the caret.
+                                self.tb_cursor = c as i32;
+                                self.tb_sel = -1;
+                                let mut sh = super::share();
+                                sh.tb_cursor.insert(top.r, c as i32);
+                                sh.tb_sel.insert(top.r, -1);
+                            }
                         }
                     }
                     let began_on: Vec<Ref> = under.iter().filter(|h| h.button).map(|h| h.r).collect();
-                    let sunk = top.is_some();
+                    let sunk = top_sink.is_some();
                     // The top ScrollingFrame under it scrolls with it (as on
                     // a phone; whether the camera turns too stays with
                     // Active, like Roblox: a frame with Active off lets the
@@ -1944,7 +2066,6 @@ impl Gui {
                         // (a finger landing stops the canvas gliding)
                         self.events.push(GuiEvent::ScrollDrag(sf, [0.0, 0.0]));
                     }
-                    let now_t = std::time::Instant::now();
                     self.touch_fingers.insert(
                         t.id,
                         TouchFinger {
@@ -1958,6 +2079,7 @@ impl Gui {
                             began_on: began_on.clone(),
                             scroll,
                             scrolled: false,
+                            scrollbar_drag: None,
                             speed: (0.0, 0.0),
                             moved_at: now_t,
                         },
@@ -1969,6 +2091,15 @@ impl Gui {
                     let (dx, dy) = (x - f.x, y - f.y);
                     f.x = x;
                     f.y = y;
+                    if let Some(mut drag) = f.scrollbar_drag {
+                        if let Some(delta) = Self::step_scrollbar_drag(&mut drag, t.pos) {
+                            self.events.push(GuiEvent::ScrollDrag(drag.r, delta));
+                        }
+                        f.scrollbar_drag = Some(drag);
+                        let (sunk, began_on) = (f.sunk, f.began_on.clone());
+                        out.push(TouchOut { id: t.id, state: t.state, x, y, dx, dy, sunk, began_on });
+                        continue;
+                    }
                     if let Some(sf) = f.scroll {
                         // The canvas moves against the finger, by the
                         // finger's own pixels (direction-limited where it
@@ -2009,17 +2140,24 @@ impl Gui {
                 TouchState::End | TouchState::Cancel => {
                     let Some(f) = self.touch_fingers.remove(&t.id) else { continue };
                     let (dx, dy) = (x - f.x, y - f.y);
+                    if f.scrollbar_drag.is_some() {
+                        out.push(TouchOut { id: t.id, state: t.state, x, y, dx, dy, sunk: f.sunk, began_on: f.began_on });
+                        continue;
+                    }
                     for h in &under {
                         self.events.push(GuiEvent::Fire(h.r, "InputEnded", vec![input(t.state, dx, dy)]));
                     }
                     // Lifted from a ScrollingFrame it dragged: the canvas
                     // keeps its speed and slows down, unless the finger had
-                    // stopped (its last move is older than a frame or two).
-                    if let (Some(sf), true) = (f.scroll, f.scrolled) {
-                        let fresh = f.moved_at.elapsed() <= std::time::Duration::from_millis(mech::GUI_TOUCH_FLING_HOLD_MS);
-                        let (vx, vy) = if fresh { f.speed } else { (0.0, 0.0) };
-                        if vx.abs() + vy.abs() > mech::GUI_TOUCH_FLING_MIN_PX_S {
-                            self.events.push(GuiEvent::Fling(sf, [-vx, -vy]));
+                    // stopped (its last move is older than a frame or two) or
+                    // the touch was cancelled.
+                    if t.state == TouchState::End {
+                        if let (Some(sf), true) = (f.scroll, f.scrolled) {
+                            let fresh = f.moved_at.elapsed() <= std::time::Duration::from_millis(mech::GUI_TOUCH_FLING_HOLD_MS);
+                            let (vx, vy) = if fresh { f.speed } else { (0.0, 0.0) };
+                            if vx.abs() + vy.abs() > mech::GUI_TOUCH_FLING_MIN_PX_S {
+                                self.events.push(GuiEvent::Fling(sf, [-vx, -vy]));
+                            }
                         }
                     }
                     if let Some(pr) = f.pressed {
@@ -2029,7 +2167,7 @@ impl Gui {
                         if t.state == TouchState::End {
                             if let Some(h) = self.hits.iter().find(|h| h.r == pr && h.button).cloned() {
                                 self.events.push(GuiEvent::Fire(pr, "MouseButton1Up", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
-                                let top = under.iter().rev().find(|h| h.textbox || h.active);
+                                let top = under.iter().rev().find(|h| h.textbox || h.active || h.button || h.drag);
                                 // (a finger that scrolled the list the button
                                 // is in was scrolling, not clicking)
                                 if top.is_some_and(|t| t.r == pr) && !f.scrolled {
@@ -2198,21 +2336,8 @@ impl Gui {
                     ctx.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
                 });
                 if let Some(dp) = drag_pos {
-                    let axis_pos = if drag.vertical { dp.y } else { dp.x };
-                    let delta_px = axis_pos - drag.last_pos;
-                    if delta_px.abs() > 0.0 {
-                        drag.last_pos = axis_pos;
-                        let raw_delta = delta_px * drag.canvas_per_px;
-                        let target_cp = (drag.current_cp + raw_delta).clamp(0.0, drag.max_scroll);
-                        let applied = target_cp - drag.current_cp;
-                        drag.current_cp = target_cp;
-                        let total = applied + drag.remainder;
-                        let step = total.round();
-                        drag.remainder = total - step;
-                        if step != 0.0 {
-                            let delta = if drag.vertical { [0.0, step] } else { [step, 0.0] };
-                            self.events.push(GuiEvent::ScrollDrag(drag.r, delta));
-                        }
+                    if let Some(delta) = Self::step_scrollbar_drag(&mut drag, dp) {
+                        self.events.push(GuiEvent::ScrollDrag(drag.r, delta));
                     }
                 }
                 self.scrollbar_drag = Some(drag);
@@ -2281,26 +2406,7 @@ impl Gui {
                 // the click so it does not leak to underlying GUI buttons.
                 if b == 1 {
                     if let Some((t, sb)) = top.as_ref().and_then(|t| t.scrollbar.map(|sb| (t, sb))) {
-                        let thumb_screen_len = if sb.vertical {
-                            (t.quad[3] - t.quad[0]).length()
-                        } else {
-                            (t.quad[1] - t.quad[0]).length()
-                        };
-                        let scale = if sb.thumb_len > 0.0 && thumb_screen_len > 0.0 {
-                            thumb_screen_len / sb.thumb_len
-                        } else {
-                            1.0
-                        };
-                        let screen_travel = (sb.track_travel * scale).max(1e-3);
-                        self.scrollbar_drag = Some(ScrollBarDrag {
-                            r: t.r,
-                            vertical: sb.vertical,
-                            last_pos: if sb.vertical { p.y } else { p.x },
-                            canvas_per_px: sb.max_scroll / screen_travel,
-                            max_scroll: sb.max_scroll,
-                            current_cp: sb.current_cp.clamp(0.0, sb.max_scroll),
-                            remainder: 0.0,
-                        });
+                        self.scrollbar_drag = Some(Self::start_scrollbar_drag(t, sb, p));
                         self.events.push(GuiEvent::ScrollDrag(t.r, [0.0, 0.0]));
                         took = true;
                         continue;
@@ -2553,7 +2659,7 @@ impl Gui {
         let local_p = if layout.aff.is_id() {
             canvas_p
         } else {
-            canvas_p
+            layout.aff.inv_apply(canvas_p)
         };
         let rel = local_p - layout.text_origin;
         let cc = layout.galley.cursor_from_pos(rel);
@@ -3488,6 +3594,7 @@ pub(crate) struct RootProps {
     global_z: bool,
     screen_gui: bool,
     clips: bool,
+    active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]

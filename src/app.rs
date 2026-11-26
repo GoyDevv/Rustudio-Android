@@ -1718,6 +1718,15 @@ impl Editor {
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         let mut actions: Vec<&str> = Vec::new();
         let textbox = (self.game.play.is_some() && self.game.gui.focus.is_some()) || self.plugin_ui.has_text_focus();
+        let script_editor_active = self.scripts.maximized.is_some()
+            || self.scripts.bufs.keys().any(|&r| {
+                ctx.memory(|m| {
+                    m.has_focus(egui::Id::new(("script_text", r)))
+                        || m.has_focus(egui::Id::new(("script_find_input", r)))
+                        || m.has_focus(egui::Id::new(("script_replace_input", r)))
+                        || m.has_focus(egui::Id::new(("script_goto_input", r)))
+                })
+            });
         ctx.input_mut(|i| {
             let mut check = |s: KeyboardShortcut, name: &'static str| {
                 if i.consume_shortcut(&s) {
@@ -1731,7 +1740,9 @@ impl Editor {
             check(sc(Modifiers::COMMAND, Key::Z), "undo");
             check(sc(Modifiers::COMMAND, Key::Y), "redo");
             check(sc(Modifiers::COMMAND, Key::D), "duplicate");
-            check(sc(Modifiers::COMMAND, Key::G), "group");
+            if !script_editor_active {
+                check(sc(Modifiers::COMMAND, Key::G), "group");
+            }
             check(sc(Modifiers::COMMAND, Key::U), "ungroup");
             check(sc(Modifiers::COMMAND, Key::S), "save");
             check(sc(Modifiers::COMMAND, Key::O), "open");
@@ -2251,6 +2262,10 @@ impl TabViewer for Viewer<'_> {
             self.ed.plugin_widget_close(n);
             return egui_dock::tab_viewer::OnCloseResponse::Ignore;
         }
+        if *tab == Tab::AnimEditor {
+            self.ed.ui.anim.anim_open = false;
+            self.ed.stop_anim_preview();
+        }
         if !matches!(*tab, Tab::Viewport | Tab::Script(_))
             && !self.ed.ui.minimized_tabs.contains(tab)
         {
@@ -2414,6 +2429,18 @@ impl RustudioApp {
                     }
                     continue;
                 }
+                crate::panels::DockMove::DockAll => {
+                    let ids: Vec<String> = self.mobile_windows.windows().iter().map(|w| w.id.clone()).collect();
+                    let mut homes = self.panels.homes.clone();
+                    homes.remove("__topology");
+                    for id in ids {
+                        if let Some(tab) = self.mobile_windows.close(&id) {
+                            if self.dock.find_tab(&tab).is_none() {
+                                crate::panels::place(&mut self.dock, tab, &homes);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
             // A popped tab opens about where it sat, at its size.
@@ -2459,8 +2486,10 @@ impl eframe::App for RustudioApp {
             let _ = std::fs::create_dir_all(&dir);
             let tmp = dir.join("autosave.rbxl.tmp");
             let dst = dir.join("autosave.rbxl");
-            if self.ed.game.doc.save_to(&tmp).is_ok() {
-                let _ = std::fs::rename(&tmp, &dst);
+            if let Ok(bytes) = self.ed.game.doc.encode_all(false) {
+                if std::fs::write(&tmp, bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &dst);
+                }
             }
         }
         if crate::android::lifecycle::is_backgrounded() {
@@ -2998,10 +3027,9 @@ impl RustudioApp {
                 self.text_menu.end_frame(&ctx);
                 let want = crate::android::keyboard::wanted(&ctx, false);
                 self.text_bar.end_frame(&ctx, &self.keyboard, want);
+                self.ed.game.touch.zones.direct_drag.clear();
                 if let Some(sr) = self.text_bar.slider_rect.or(self.ed.scripts.portrait_slider_rect) {
-                    self.ed.game.touch.zones.direct_drag = vec![sr];
-                } else {
-                    self.ed.game.touch.zones.direct_drag.clear();
+                    self.ed.game.touch.zones.direct_drag.push(sr);
                 }
                 self.keyboard.end_frame(&ctx, false, self.ed.scripts.portrait_bar_keep_kb);
             }
@@ -3172,7 +3200,8 @@ impl RustudioApp {
             }
         }
         self.ed.mobile_drag_rects = drag_rects.clone();
-        self.ed.game.touch.zones.direct_drag = drag_rects;
+        self.ed.game.touch.zones.direct_drag.clear();
+        self.ed.game.touch.zones.direct_drag.extend(drag_rects);
         let _dock_scope = rustudio_core::bench::scope("dock_panels");
         let windows: Vec<(String, String)> = if self.panels.popped.is_empty() {
             Vec::new()
@@ -3253,6 +3282,10 @@ impl RustudioApp {
                     crate::panels::place(&mut self.dock, tab, &homes);
                 }
                 crate::mobile_windows::MobileWindowAction::Closed(tab) => {
+                    if tab == Tab::AnimEditor {
+                        self.ed.ui.anim.anim_open = false;
+                        self.ed.stop_anim_preview();
+                    }
                     if !matches!(tab, Tab::Viewport | Tab::Script(_))
                         && !self.ed.ui.minimized_tabs.contains(&tab)
                     {
@@ -3275,11 +3308,11 @@ impl RustudioApp {
             end_drag_rects.push(tr);
         }
         self.ed.mobile_drag_rects = end_drag_rects.clone();
-        self.ed.game.touch.zones.direct_drag = if self.ed.game.play_game_input() {
-            Vec::new()
+        if self.ed.game.play_game_input() {
+            self.ed.game.touch.zones.direct_drag.clear();
         } else {
-            end_drag_rects
-        };
+            self.ed.game.touch.zones.direct_drag.extend(end_drag_rects);
+        }
         self.reset_document_tabs();
         // Window > Explorer / Properties / Output / Avatar Settings toggles
         // (in a panel window too), new panels where Studio docks them
@@ -3316,10 +3349,37 @@ impl RustudioApp {
                 continue;
             }
             let found = self.panels.locate(&self.dock, &tab);
-            let open = want.unwrap_or(found.is_none());
+            let mobile_id = self
+                .mobile_windows
+                .windows()
+                .iter()
+                .find(|w| w.tab == tab)
+                .map(|w| (w.id.clone(), !w.minimized));
+            let is_open = found.is_some() || mobile_id.as_ref().is_some_and(|(_, vis)| *vis);
+            let open = want.unwrap_or(!is_open);
+            if let Some((mid, _)) = mobile_id {
+                if !open {
+                    self.mobile_windows.close(&mid);
+                    if tab == Tab::AnimEditor {
+                        self.ed.ui.anim.anim_open = false;
+                        self.ed.stop_anim_preview();
+                    }
+                    if matches!(tab, Tab::Plugin(_)) && !self.ed.ui.minimized_tabs.contains(&tab) {
+                        self.ed.ui.minimized_tabs.push(tab);
+                    }
+                } else {
+                    let title = tab.title().to_string();
+                    self.mobile_windows.open_or_focus(tab, title, dock_rect);
+                }
+                continue;
+            }
             match (found, open) {
                 (Some(_), false) => {
                     self.panels.take(&mut self.dock, &tab);
+                    if tab == Tab::AnimEditor {
+                        self.ed.ui.anim.anim_open = false;
+                        self.ed.stop_anim_preview();
+                    }
                     if matches!(tab, Tab::Plugin(_)) && !self.ed.ui.minimized_tabs.contains(&tab) {
                         self.ed.ui.minimized_tabs.push(tab);
                     }
@@ -3363,8 +3423,11 @@ impl RustudioApp {
         }
         {
             crate::plugin_host::widgets_ui::set_dock_area(dock_rect);
-            let (dock, panels) = (&self.dock, &self.panels);
-            self.ed.plugin_ui_note_open(|t| panels.locate(dock, t).is_some());
+            let (dock, panels, mobile_windows) = (&self.dock, &self.panels, &self.mobile_windows);
+            self.ed.plugin_ui_note_open(|t| {
+                panels.locate(dock, t).is_some()
+                    || mobile_windows.windows().iter().any(|w| !w.minimized && w.tab == *t)
+            });
             // Float widgets' windows sized so their content is Studio's client area.
             for (tab, size) in self.ed.plugin_float_fixes() {
                 if let Some(path) = self.dock.find_tab(&tab) {
@@ -3389,7 +3452,10 @@ impl RustudioApp {
             (Tab::Profiler, "MicroProfiler"),
         ]
         .into_iter()
-        .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())
+        .filter(|(t, _)| {
+            self.panels.locate(&self.dock, t).is_some()
+                || self.mobile_windows.windows().iter().any(|w| !w.minimized && w.tab == *t)
+        })
         .map(|(_, n)| n)
         .collect();
         // Closing the MicroProfiler stops recording.
@@ -3442,7 +3508,11 @@ impl RustudioApp {
             if let Some(sr) = self.text_bar.slider_rect {
                 self.ed.game.touch.zones.direct_drag.push(sr);
             }
-            let keep_kb = self.ed.scripts.portrait_bar_keep_kb && self.ed.game.play.is_none() && (self.ed.scripts.maximized.is_some() || self.ed.scripts.script_portrait);
+            let keep_kb = self.ed.scripts.portrait_bar_keep_kb
+                && self.ed.game.play.is_none()
+                && (self.ed.scripts.maximized.is_some()
+                    || self.ed.scripts.script_portrait
+                    || !self.ed.scripts.bufs.is_empty());
             if !keep_kb { self.ed.scripts.portrait_bar_keep_kb = false; self.ed.scripts.portrait_bar_keep_kb_frames = 0; }
             self.keyboard.end_frame(&ctx, textbox, keep_kb);
         }

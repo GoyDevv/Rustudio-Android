@@ -121,7 +121,7 @@ pub enum Msg {
     /// category's, then each other category's.
     Suggest { key: (String, String), current: Vec<String>, others: Vec<(&'static str, Vec<String>)> },
     Groups(Result<Vec<(u64, String)>, Failure>),
-    Details(Vec<u64>, Vec<Asset>),
+    Details(Vec<u64>, Result<Vec<Asset>, Failure>),
     Favorites { id: u64, count: Option<u64>, mine: Option<bool> },
     Owned { id: u64, owned: bool },
     Acquired { id: u64, result: Result<bool, Failure> },
@@ -291,6 +291,7 @@ pub struct Toolbox {
     pub inserts: Vec<InsertJob>,
     next_job: u64,
     pub ask: Option<Ask>,
+    pub ask_queue: VecDeque<Ask>,
     /// A card dragged into the 3D view while a plugin holds the mouse
     /// (inserted as it enters: PluginMouse.DragEnter).
     pub drag_in: Option<insert::DragIn>,
@@ -335,6 +336,7 @@ impl Default for Toolbox {
             inserts: Vec::new(),
             next_job: 1,
             ask: None,
+            ask_queue: VecDeque::new(),
             drag_in: None,
             player: Player::default(),
             preview: preview::Previews::default(),
@@ -391,6 +393,7 @@ impl Toolbox {
         self.lists.clear();
         self.groups = None;
         self.owned.clear();
+        self.missing.clear();
         self.reask_suggestions();
     }
 
@@ -480,8 +483,8 @@ impl Toolbox {
             self.assets.entry(i).or_insert_with(|| Asset { id: i, ..Default::default() });
         }
         self.pool.run(move |h| {
-            let found = api::fetch_details(h, &ids, &|| false).unwrap_or_default();
-            Some(Msg::Details(ids, found))
+            let result = api::fetch_details(h, &ids, &|| false);
+            Some(Msg::Details(ids, result))
         });
     }
 
@@ -613,6 +616,29 @@ impl Toolbox {
         }
     }
 
+    pub fn push_ask(&mut self, ask: Ask) {
+        if self.ask.is_none() {
+            self.ask = Some(ask);
+        } else {
+            self.ask_queue.push_back(ask);
+        }
+    }
+
+    pub fn pop_next_ask(&mut self) {
+        if self.ask.is_none() {
+            self.ask = self.ask_queue.pop_front();
+        }
+    }
+
+    pub fn cancel_ask_job(&mut self, job: u64) {
+        if matches!(&self.ask, Some(Ask::Scripts { ready, .. } | Ask::ToolHome { ready }) if ready.job == job) {
+            self.ask = None;
+            self.pop_next_ask();
+        }
+        self.ask_queue
+            .retain(|a| !matches!(a, Ask::Scripts { ready, .. } | Ask::ToolHome { ready } if ready.job == job));
+    }
+
     pub fn note_recent(&mut self, id: u64, type_id: u32) {
         self.st.recent_local.retain(|r| r.0 != id);
         self.st.recent_local.insert(0, (id, type_id));
@@ -675,18 +701,21 @@ impl Toolbox {
                 }
                 Msg::Suggest { key, current, others } => self.accept_suggestions(key, &current, &others),
                 Msg::Groups(g) => self.groups = Some(g),
-                Msg::Details(asked, list) => {
-                    // Asked for and not in the reply: removed, private or never existed.
-                    for id in asked {
-                        if !list.iter().any(|a| a.id == id) {
-                            self.missing.insert(id);
+                Msg::Details(asked, result) => {
+                    if let Ok(list) = result {
+                        // Asked for and not in the reply: removed, private or never existed.
+                        for id in asked {
+                            if !list.iter().any(|a| a.id == id) {
+                                self.missing.insert(id);
+                            }
                         }
-                    }
-                    for a in list {
-                        let e = self.assets.entry(a.id).or_default();
-                        let mut n = a.clone();
-                        n.merge(e);
-                        *e = n;
+                        for a in list {
+                            self.missing.remove(&a.id);
+                            let e = self.assets.entry(a.id).or_default();
+                            let mut n = a.clone();
+                            n.merge(e);
+                            *e = n;
+                        }
                     }
                 }
                 Msg::Favorites { id, count, mine } => {

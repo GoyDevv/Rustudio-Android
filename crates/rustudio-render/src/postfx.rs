@@ -329,6 +329,7 @@ struct PostFxTargets {
 
 pub struct PostFx {
     hdr_format: wgpu::TextureFormat,
+    dof_format: wgpu::TextureFormat,
     r16_format: wgpu::TextureFormat,
     ubo_stride: u32,
     ubo_capacity_slots: usize,
@@ -373,6 +374,7 @@ impl PostFx {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hdr_format: wgpu::TextureFormat,
+        dof_format: wgpu::TextureFormat,
         display_format: wgpu::TextureFormat,
         r16_float_rt: bool,
     ) -> Self {
@@ -650,7 +652,7 @@ impl PostFx {
         let fx_composite = make_pipe("postfx fx composite", "fs_fx_composite", hdr_format, None);
         let blur_1d = make_pipe("postfx blur 1d", "fs_blur_1d", hdr_format, None);
         let dof_cheap = make_pipe("postfx dof cheap", "fs_dof_cheap", hdr_format, None);
-        let dof_down_v = make_pipe("postfx dof down v", "fs_dof_down_v", hdr_format, None);
+        let dof_down_v = make_pipe("postfx dof down v", "fs_dof_down_v", dof_format, None);
         let r16_fmt = if !r16_float_rt || hdr_format == wgpu::TextureFormat::Rgba8Unorm {
             wgpu::TextureFormat::Rgba8Unorm
         } else {
@@ -662,16 +664,17 @@ impl PostFx {
             r16_fmt,
             None,
         );
-        let dof_edge_fatten = make_pipe("postfx dof edge fatten", "fs_dof_edge_fatten", hdr_format, None);
-        let dof_fixup_coc = make_pipe("postfx dof fixup coc", "fs_dof_fixup_coc", hdr_format, None);
-        let dof_bokeh_far = make_pipe("postfx dof bokeh far", "fs_dof_bokeh_far", hdr_format, None);
-        let dof_bokeh_near = make_pipe("postfx dof bokeh near", "fs_dof_bokeh_near", hdr_format, None);
-        let dof_tent = make_pipe("postfx dof tent", "fs_dof_tent", hdr_format, None);
+        let dof_edge_fatten = make_pipe("postfx dof edge fatten", "fs_dof_edge_fatten", dof_format, None);
+        let dof_fixup_coc = make_pipe("postfx dof fixup coc", "fs_dof_fixup_coc", dof_format, None);
+        let dof_bokeh_far = make_pipe("postfx dof bokeh far", "fs_dof_bokeh_far", dof_format, None);
+        let dof_bokeh_near = make_pipe("postfx dof bokeh near", "fs_dof_bokeh_near", dof_format, None);
+        let dof_tent = make_pipe("postfx dof tent", "fs_dof_tent", dof_format, None);
         let image_process = make_pipe("postfx image process", "fs_image_process", display_format, None);
         let image_process_plain = make_pipe("postfx image process plain", "fs_image_process_plain", display_format, None);
 
         Self {
             hdr_format,
+            dof_format,
             r16_format: r16_fmt,
             ubo_stride,
             ubo_capacity_slots: INITIAL_UBO_SLOTS,
@@ -758,9 +761,9 @@ impl PostFx {
         };
         self.depth_pipes[slot] = Some(DepthPipelines {
             sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", self.r16_format),
-            dof_cheap_prep: make("postfx dof cheap prep", "fs_dof_cheap_prep", self.hdr_format),
-            dof_far_down_h: make("postfx dof far down h", "fs_dof_far_down_h", self.hdr_format),
-            dof_near_down_h: make("postfx dof near down h", "fs_dof_near_down_h", self.hdr_format),
+            dof_cheap_prep: make("postfx dof cheap prep", "fs_dof_cheap_prep", self.dof_format),
+            dof_far_down_h: make("postfx dof far down h", "fs_dof_far_down_h", self.dof_format),
+            dof_near_down_h: make("postfx dof near down h", "fs_dof_near_down_h", self.dof_format),
             dof_resolve_far: make("postfx dof resolve far", "fs_dof_resolve_far", self.hdr_format),
             dof_resolve_near: make("postfx dof resolve near", "fs_dof_resolve_near", self.hdr_format),
         });
@@ -860,35 +863,35 @@ impl PostFx {
             }],
         });
 
-        let dof_full_prep = mk_view("postfx dof prep", w, h, self.hdr_format);
+        let dof_full_prep = mk_view("postfx dof prep", w, h, self.dof_format);
         let dof_scene_a = mk_view("postfx dof scene a", w, h, self.hdr_format);
         let dof_scene_b = mk_view("postfx dof scene b", w, h, self.hdr_format);
 
-        let dof_half_h = mk_view("postfx dof half h", half_size[0], h, self.hdr_format);
-        let dof_half_col = mk_view("postfx dof half col", half_size[0], half_size[1], self.hdr_format);
-        let dof_half_a = mk_view("postfx dof half a", half_size[0], half_size[1], self.hdr_format);
-        let dof_half_b = mk_view("postfx dof half b", half_size[0], half_size[1], self.hdr_format);
+        let dof_half_h = mk_view("postfx dof half h", half_size[0], h, self.dof_format);
+        let dof_half_col = mk_view("postfx dof half col", half_size[0], half_size[1], self.dof_format);
+        let dof_half_a = mk_view("postfx dof half a", half_size[0], half_size[1], self.dof_format);
+        let dof_half_b = mk_view("postfx dof half b", half_size[0], half_size[1], self.dof_format);
         let dof_half_coc_a = mk_view("postfx dof half coc a", half_size[0], half_size[1], r16);
         let dof_half_coc_b = mk_view("postfx dof half coc b", half_size[0], half_size[1], r16);
 
-        let dof_q_h = mk_view("postfx dof q h", quarter_dof_size[0], h, self.hdr_format);
+        let dof_q_h = mk_view("postfx dof q h", quarter_dof_size[0], h, self.dof_format);
         let dof_q_col = mk_view(
             "postfx dof q col",
             quarter_dof_size[0],
             quarter_dof_size[1],
-            self.hdr_format,
+            self.dof_format,
         );
         let dof_q_a = mk_view(
             "postfx dof q a",
             quarter_dof_size[0],
             quarter_dof_size[1],
-            self.hdr_format,
+            self.dof_format,
         );
         let dof_q_b = mk_view(
             "postfx dof q b",
             quarter_dof_size[0],
             quarter_dof_size[1],
-            self.hdr_format,
+            self.dof_format,
         );
         let dof_q_coc_a = mk_view("postfx dof q coc a", quarter_dof_size[0], quarter_dof_size[1], r16);
         let dof_q_coc_b = mk_view("postfx dof q coc b", quarter_dof_size[0], quarter_dof_size[1], r16);
@@ -1250,7 +1253,7 @@ impl PostFx {
                 let hw = t.half_size[0] as f32;
                 let hh = t.half_size[1] as f32;
                 let red_x = 2.0 * (full_w - hw) / full_w;
-                let red_y = (full_w - hh) / full_w;
+                let red_y = 2.0 * (full_h - hh) / full_h;
 
                 let mut uh = base_u;
                 uh.extra = [0.5 * red_x / hw, 0.0, 0.0, 0.0];
@@ -1370,7 +1373,6 @@ impl PostFx {
                     &t.bg_dof_resolve_half[scene_idx],
                     Some(&t.depth_bg),
                 );
-                let _ = full_h;
             }
             scene_idx = 1;
         }
@@ -1409,6 +1411,7 @@ impl PostFx {
                 // Studio Near HQ chain: div=2 (h<=540 || near<0.36) else div=4.
                 let div = studio_near_dof_div(size[1], near_i);
                 let full_w = size[0] as f32;
+                let full_h = size[1] as f32;
                 let (rw, rh, taps, v_h, v_col, v_a, v_b, v_ca, v_cb, bg_dv, bg_ccol, bg_ca, bg_cb, bg_fx, bg_bk, bg_tn, bg_rs) =
                     if div == 2 {
                         (
@@ -1452,7 +1455,7 @@ impl PostFx {
                         )
                     };
                 let red_x = 2.0 * (full_w - rw) / full_w;
-                let red_y = (full_w - rh) / full_w;
+                let red_y = 2.0 * (full_h - rh) / full_h;
 
                 let mut uh = base_u;
                 uh.extra = [red_x / rw, taps, 0.0, 0.0];

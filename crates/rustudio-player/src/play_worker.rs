@@ -1048,7 +1048,7 @@ impl Game {
                 // InputBegan was delivered while the last viewport drew.
                 // Give the following RenderStepped's pose and camera the
                 // next presentation slot instead of queueing it one deeper.
-                if !wait_for_publication || matches!(threaded.receive(self, host, textbox_edit), Receive::Available) {
+                if !wait_for_publication || !matches!(threaded.receive(self, host, wait_for_publication), Receive::Stopped) {
                     self.play_thread = Some(threaded);
                 }
             }

@@ -353,6 +353,27 @@ impl Editor {
         self.ui_rects.insert("props.panel", ui.max_rect());
         let sel = self.game.doc.selection.clone();
         let Some(&first) = sel.first() else {
+            if self.props.active_for.is_some() {
+                self.props.active_for = None;
+                self.props.active_row = None;
+                self.props.adding_attr = None;
+                self.props.editing = None;
+                self.props.edit_layout = None;
+                if let Some(d) = self.props.slider_drag.take() {
+                    let prop_u = ustr(&d.prop);
+                    let changes: Vec<_> = d
+                        .originals
+                        .into_iter()
+                        .filter_map(|(r, old)| {
+                            let new = self.game.doc.dom.get_by_ref(r)?.properties.get(&prop_u).cloned()?;
+                            (new != old).then(|| (r, prop_u, Some(old), new))
+                        })
+                        .collect();
+                    if !changes.is_empty() {
+                        self.game.doc.record_props(&format!("Set {}", d.prop), changes);
+                    }
+                }
+            }
             self.hud.property_rows = 0;
             return;
         };
@@ -363,6 +384,22 @@ impl Editor {
             self.props.active_for = Some(first);
             self.props.active_row = None;
             self.props.adding_attr = None;
+            self.props.editing = None;
+            self.props.edit_layout = None;
+            if let Some(d) = self.props.slider_drag.take() {
+                let prop_u = ustr(&d.prop);
+                let changes: Vec<_> = d
+                    .originals
+                    .into_iter()
+                    .filter_map(|(r, old)| {
+                        let new = self.game.doc.dom.get_by_ref(r)?.properties.get(&prop_u).cloned()?;
+                        (new != old).then(|| (r, prop_u, Some(old), new))
+                    })
+                    .collect();
+                if !changes.is_empty() {
+                    self.game.doc.record_props(&format!("Set {}", d.prop), changes);
+                }
+            }
         }
         let can_collide = sel
             .iter()
@@ -771,10 +808,14 @@ impl Editor {
     #[allow(clippy::too_many_arguments)]
     fn prop_row(&mut self, p: &mut Painter, sel: &[Ref], first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
         // ClassName / Parent aren't stored properties.
-        let value = self.read_prop_value(first, class, name);
+        let value = self.read_prop_value(first, class, name).or_else(|| {
+            sel.iter().skip(1).find_map(|&r| {
+                let c = self.game.doc.class_of(r)?;
+                self.read_prop_value(r, c.as_str(), name)
+            })
+        });
         let mixed = sel.len() > 1
-            && value.is_some()
-            && sel[1..].iter().any(|&r| {
+            && sel.iter().any(|&r| {
                 let Some(c) = self.game.doc.class_of(r) else {
                     return false;
                 };
@@ -827,6 +868,15 @@ impl Editor {
         }
         let clicked_value = resp.clicked() && !on_name;
         let Some(value) = value else {
+            if mixed {
+                p.ui.painter().text(
+                    Pos2::new(v.min.x + 2.0, v.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    MIXED_LABEL,
+                    FontId::proportional(FONT),
+                    MIXED_COLOR,
+                );
+            }
             return;
         };
         match &value {
@@ -1024,6 +1074,54 @@ impl Editor {
                                     let mut n = g;
                                     n[i] = x;
                                     edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Variant::Vector2(v2) => {
+                let g = [v2.x, v2.y];
+                let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, &value) };
+                let init = if mixed { "" } else { shown.as_str() };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                if let Some(t) = self.text_cell_ex(p, name, v, &shown, init, col, ro, clicked_value) {
+                    if let Some(nv) = parse_like(&value, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
+                    }
+                }
+                if open {
+                    for (i, axis) in ["X", "Y"].iter().enumerate() {
+                        let key = format!("{name}.{axis}");
+                        let (r, vv, resp) = Self::cells(p, &key);
+                        Self::name_text(p, r, 1.0, axis, color, None);
+                        let axis_mixed = mixed
+                            && sel[1..].iter().any(|&sr| {
+                                let Some(c) = self.game.doc.class_of(sr) else {
+                                    return false;
+                                };
+                                match self.read_prop_value(sr, c.as_str(), name) {
+                                    Some(Variant::Vector2(ov)) => {
+                                        let o = [ov.x, ov.y];
+                                        (o[i] - g[i]).abs() > 1e-4
+                                    }
+                                    _ => true,
+                                }
+                            });
+                        let ax_shown = if axis_mixed { MIXED_LABEL.to_string() } else { fmt_num(g[i] as f64) };
+                        let ax_init = if axis_mixed { "" } else { ax_shown.as_str() };
+                        let ax_col = if ro { READ_ONLY } else if axis_mixed { MIXED_COLOR } else { TEXT };
+                        if let Some(t) = self.text_cell_ex(p, &key, vv, &ax_shown, ax_init, ax_col, ro, resp.clicked()) {
+                            if let Ok(x) = t.trim().parse::<f32>() {
+                                if sel.len() > 1 {
+                                    edits.push(Edit::PropAxis(name.to_string(), i, x));
+                                } else {
+                                    let mut n = g;
+                                    n[i] = x;
+                                    edits.push(Edit::Prop(
+                                        name.to_string(),
+                                        Variant::Vector2(rbx_dom_weak::types::Vector2::new(n[0], n[1])),
+                                    ));
                                 }
                             }
                         }
@@ -1372,17 +1470,17 @@ impl Editor {
             Frame::PivotOffset => Some(offset),
             Frame::ModelOrigin | Frame::WorldPivot => cf_of(self.game.doc.prop(r, "WorldPivotData")).or_else(|| {
                 let pp = match self.game.doc.prop(r, "PrimaryPart") {
-                    Some(Variant::Ref(p)) if p.is_some() => p,
+                    Some(Variant::Ref(p)) if p.is_some() => Some(p),
                     _ => self
                         .game
                         .doc
                         .dom
                         .descendants_of(r)
                         .find(|i| doc::is_a(i.class.as_str(), "BasePart"))
-                        .map(|i| i.referent())
-                        .or_else(|| self.selected_parts().first().copied())?,
+                        .map(|i| i.referent()),
                 };
-                cf_of(self.game.doc.prop(pp, "CFrame"))
+                pp.and_then(|p| cf_of(self.game.doc.prop(p, "CFrame")))
+                    .or(Some(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY }))
             }),
         }
     }
@@ -1560,7 +1658,7 @@ impl Editor {
             let (enter, esc) = p.ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
             if esc || cancel_resp.clicked() {
                 // Cancelled: drop adding_attr.
-            } else if valid_name && (add_resp.clicked() || (enter && te.has_focus())) {
+            } else if valid_name && (add_resp.clicked() || (enter && (te.lost_focus() || te.has_focus()))) {
                 edits.push(Edit::SetAttr(trimmed, adding.kind.default_variant()));
             } else {
                 self.props.adding_attr = Some(adding);
@@ -1791,12 +1889,23 @@ impl Editor {
                         if !has_prop(c.as_str(), &name) {
                             continue;
                         }
-                        let mut g = match self.game.doc.prop(r, &name) {
-                            Some(Variant::Vector3(v3)) => rustudio_core::math::v3(v3),
-                            _ => Vec3::ZERO,
-                        };
-                        g[axis] = val;
-                        changes.push((r, ustr(&name), Variant::Vector3(rustudio_core::math::rv3(g))));
+                        match self.read_prop_value(r, c.as_str(), &name) {
+                            Some(Variant::Vector3(v3)) if axis < 3 => {
+                                let mut g = rustudio_core::math::v3(v3);
+                                g[axis] = val;
+                                changes.push((r, ustr(&name), Variant::Vector3(rustudio_core::math::rv3(g))));
+                            }
+                            Some(Variant::Vector2(v2)) if axis < 2 => {
+                                let mut xy = [v2.x, v2.y];
+                                xy[axis] = val;
+                                changes.push((
+                                    r,
+                                    ustr(&name),
+                                    Variant::Vector2(rbx_dom_weak::types::Vector2::new(xy[0], xy[1])),
+                                ));
+                            }
+                            _ => {}
+                        }
                     }
                     if !changes.is_empty() {
                         self.game.doc.set_props(&format!("Set {name}"), changes, None);
@@ -1863,7 +1972,22 @@ impl Editor {
     fn set_frame(&mut self, sel: &[Ref], f: Frame, pos: Option<Vec3>, ori: Option<Vec3>) {
         let cf = |x: &Xform| Variant::CFrame(x.to_cframe());
         let mut changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = Vec::new();
+        let sel_set: HashSet<Ref> = sel.iter().copied().collect();
         for &r in sel {
+            if f == Frame::ModelOrigin {
+                let mut cur_anc = self.game.doc.dom.get_by_ref(r).map(|i| i.parent());
+                let mut has_selected_anc = false;
+                while let Some(anc) = cur_anc {
+                    if sel_set.contains(&anc) {
+                        has_selected_anc = true;
+                        break;
+                    }
+                    cur_anc = self.game.doc.dom.get_by_ref(anc).map(|i| i.parent());
+                }
+                if has_selected_anc {
+                    continue;
+                }
+            }
             let Some(cur) = self.frame_value(r, f) else {
                 continue;
             };
@@ -1878,20 +2002,19 @@ impl Editor {
                 }
                 Frame::WorldPivot => changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe())))),
                 Frame::ModelOrigin => {
-                    // Move every part of the model by new × old⁻¹.
+                    // Move every part and nested model pivot by new × old⁻¹.
                     let delta = mul(&new, &cur.inverse());
-                    changes.extend(
-                        self.game
-                            .doc
-                            .dom
-                            .descendants_of(r)
-                            .map(|i| i.referent())
-                            .filter_map(|p| {
-                                cf_of(self.game.doc.prop(p, "CFrame"))
-                                    .filter(|_| self.game.scene.get(p).is_some())
-                                    .map(|c| (p, ustr("CFrame"), cf(&mul(&delta, &c))))
-                            }),
-                    );
+                    for desc in self.game.doc.dom.descendants_of(r) {
+                        let p = desc.referent();
+                        if let Some(c) = cf_of(self.game.doc.prop(p, "CFrame")).filter(|_| self.game.scene.get(p).is_some()) {
+                            changes.push((p, ustr("CFrame"), cf(&mul(&delta, &c))));
+                        }
+                        if desc.class == "Model" {
+                            if let Some(wp) = cf_of(self.game.doc.prop(p, "WorldPivotData")) {
+                                changes.push((p, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(mul(&delta, &wp).to_cframe()))));
+                            }
+                        }
+                    }
                     changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe()))));
                 }
             }

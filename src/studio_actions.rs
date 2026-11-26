@@ -361,7 +361,7 @@ impl Editor {
             "run_script" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::RunScript))),
             "task_scheduler" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::TaskScheduler))),
             "reset_layout" => (true, None),
-            "dock_all" => (!self.ui.popped.is_empty(), None),
+            "dock_all" => (!self.ui.popped.is_empty() || !self.mobile_window_rects.is_empty(), None),
             "documentation" | "tutorials" | "developer_forum" => (true, None),
             "manage_plugins" => (true, Some(self.plugin_store.ui.open)),
             a if a.starts_with("manage_plugins:") => (true, None),
@@ -704,13 +704,25 @@ impl Editor {
                 if !self.builtin_tools.plugins_enabled
                     || !self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
                 {
+                    let already_open = self.ui.panels_open.iter().any(|&p| p == "Animation Editor");
+                    let want = if already_open && self.ui.anim.mode == crate::studio_panels::anim_editor::AnimViewMode::Clip {
+                        Some(false)
+                    } else {
+                        Some(true)
+                    };
                     self.ui.anim.mode = crate::studio_panels::anim_editor::AnimViewMode::Clip;
-                    self.ui.panel_requests.push((Tab::AnimEditor, None));
+                    self.ui.panel_requests.push((Tab::AnimEditor, want));
                 }
             }
             "graph_editor" => {
+                let already_open = self.ui.panels_open.iter().any(|&p| p == "Animation Editor");
+                let want = if already_open && self.ui.anim.mode == crate::studio_panels::anim_editor::AnimViewMode::Graph {
+                    Some(false)
+                } else {
+                    Some(true)
+                };
                 self.ui.anim.mode = crate::studio_panels::anim_editor::AnimViewMode::Graph;
-                self.ui.panel_requests.push((Tab::AnimEditor, None));
+                self.ui.panel_requests.push((Tab::AnimEditor, want));
             }
             "avatar_setup" => {
                 if !self.builtin_tools.plugins_enabled
@@ -878,13 +890,15 @@ impl Editor {
                 {
                 } else {
                     let parts = self.selected_parts();
-                    let (p0, p1) = (parts[0], parts[1]);
-                    let builder = rbx_dom_weak::InstanceBuilder::new("WeldConstraint")
-                        .with_name("WeldConstraint")
-                        .with_property("Part0", Variant::Ref(p0))
-                        .with_property("Part1", Variant::Ref(p1));
-                    let w = self.game.doc.insert(p0, builder);
-                    self.select(vec![w]);
+                    if parts.len() >= 2 {
+                        let (p0, p1) = (parts[0], parts[1]);
+                        let builder = rbx_dom_weak::InstanceBuilder::new("WeldConstraint")
+                            .with_name("WeldConstraint")
+                            .with_property("Part0", Variant::Ref(p0))
+                            .with_property("Part1", Variant::Ref(p1));
+                        let w = self.game.doc.insert(p0, builder);
+                        self.select(vec![w]);
+                    }
                 }
             }
             other => {

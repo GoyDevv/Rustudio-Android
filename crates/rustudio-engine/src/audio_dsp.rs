@@ -79,7 +79,7 @@ impl State {
     }
     fn process(&mut self, mut x: [f32; 2]) -> [f32; 2] {
         let p = &self.spec.p;
-        let v = |i: usize, d: f32| p.get(i).copied().unwrap_or(d);
+        let v = |i: usize, d: f32| p.get(i).copied().filter(|x| x.is_finite()).unwrap_or(d);
         match self.spec.kind.as_str() {
             "EchoSoundEffect" => {
                 let n = (v(0, 1.).clamp(0.001, 5.) * RATE as f32) as usize;
@@ -97,7 +97,7 @@ impl State {
                 let wet = db(v(3, -6.));
                 let mut sum = [0.; 2];
                 for (i, t) in [0.0297, 0.0371, 0.0411, 0.0437].iter().enumerate() {
-                    let n = (*t * RATE as f32 * (0.7 + 0.3 * v(1, 1.).clamp(0., 1.))) as usize;
+                    let n = ((*t * RATE as f32 * (0.7 + 0.3 * v(1, 1.).clamp(0., 1.))) as usize).max(1);
                     let j = i * (RATE as usize / 5) + self.cursor % n;
                     let g = 10f32.powf(-3. * *t / v(0, 1.).max(0.1));
                     for c in 0..2 {

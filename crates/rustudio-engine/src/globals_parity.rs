@@ -334,8 +334,10 @@ pub fn install(lua: &Lua, public: &Table) -> mlua::Result<()> {
             let len = bytes.len() as i64;
             let norm = |v: i64| if v < 0 { (len + v + 1).max(1) } else { v };
             let start = norm(i.unwrap_or(1)).max(1) as usize;
-            let end = (norm(j.unwrap_or(len)).min(len)) as usize;
-            let text = String::from_utf8_lossy(&bytes[(start - 1).min(bytes.len())..end.max(start - 1)]).into_owned();
+            let end = norm(j.unwrap_or(len)).clamp(0, len) as usize;
+            let lo = (start - 1).min(bytes.len());
+            let hi = end.min(bytes.len()).max(lo);
+            let text = String::from_utf8_lossy(&bytes[lo..hi]).into_owned();
             let mut spans: Vec<(usize, usize)> = Vec::new();
             for (off, c) in text.char_indices() {
                 let a = start + off;

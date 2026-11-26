@@ -36,11 +36,16 @@ pub unsafe fn jni_commit_text(env: *mut std::ffi::c_void, text: *mut std::ffi::c
     let jstr = text as jni::sys::jstring;
     unsafe {
         let Some(vtable) = (*env_ptr).as_ref() else { return };
-        let get_chars = vtable.v1_1.GetStringUTFChars;
-        let rel_chars = vtable.v1_1.ReleaseStringUTFChars;
+        let len = (vtable.v1_1.GetStringLength)(env_ptr, jstr);
+        if len <= 0 {
+            return;
+        }
+        let get_chars = vtable.v1_1.GetStringChars;
+        let rel_chars = vtable.v1_1.ReleaseStringChars;
         let raw = get_chars(env_ptr, jstr, std::ptr::null_mut());
         if !raw.is_null() {
-            let s = std::ffi::CStr::from_ptr(raw.cast()).to_string_lossy().into_owned();
+            let slice = std::slice::from_raw_parts(raw, len as usize);
+            let s = String::from_utf16_lossy(slice);
             rel_chars(env_ptr, jstr, raw);
             on_commit_text(s);
         }
@@ -91,6 +96,20 @@ pub fn set_ime_open(open: bool) -> bool {
             false
         }
     }
+}
+
+/// Resets `ImeProxyView.composingLen` and restarts input when focus switches
+/// between text fields while the soft keyboard stays open.
+pub fn reset_composing() {
+    let _ = super::jni::with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            jni_str!("resetImeComposing"),
+            jni_sig!("()V"),
+            &[],
+        )?;
+        Ok(())
+    });
 }
 
 fn push_key_tap(events: &mut Vec<Event>, key: Key) {

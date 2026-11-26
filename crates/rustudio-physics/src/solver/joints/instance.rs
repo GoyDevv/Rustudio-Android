@@ -56,7 +56,7 @@ impl End {
 }
 
 /// Roblox properties of each class, as the Instance holds them (degrees as degrees).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Class {
     Hinge { actuator: u32, ang_resp: f32, ang_speed: f32, ang_vel: f32, lower: f32, upper: f32, motor_max_acc: f32, motor_max_torque: f32, restitution: f32, servo_max_torque: f32, target: f32, limits: bool },
     BallSocket { max_friction: f32, restitution: f32, twist_lower: f32, twist_upper: f32, upper: f32, limits: bool, twist_limits: bool },
@@ -72,7 +72,7 @@ pub enum Class {
     /// frame's rotation for PerAxis (0 Attachment0, 1 Attachment1, 2 World).
     AlignPosition { one_attachment: bool, position: Vec3, magnitude_mode: bool, relative_to: u8, max_force: f32, max_axes_force: Vec3, max_velocity: f32, responsiveness: f32, at_com: bool, reaction: bool, rigid: bool },
     /// `target` = the world frame (PrimaryAxis / SecondaryAxis) for OneAttachment.
-    AlignOrientation { one_attachment: bool, target: Mat3, align_type: u32, primary_only: bool, max_ang_vel: f32, max_torque: f32, responsiveness: f32, reaction: bool, rigid: bool },
+    AlignOrientation { one_attachment: bool, target: Mat3, look_at_pos: Vec3, align_type: u32, primary_only: bool, max_ang_vel: f32, max_torque: f32, responsiveness: f32, reaction: bool, rigid: bool },
     AngularVelocity { ang_vel: Vec3, max_torque: f32, relative_to: u8, reaction: bool },
     /// JOINT I.13 [J2]: mode 0 Line / 1 Plane / 2 Vector (VelocityConstraintMode),
     /// relative_to (0 Attachment0, 1 Attachment1, 2 World), force_limit_mode (0 Magnitude,
@@ -136,7 +136,7 @@ impl Class {
 
 /// CylindricalConstraint's rotation part (its second apply table Studio, sub-object
 /// Inst; JOINT I.3 [J2]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CylAngular {
     pub actuator: u32,
     pub resp: f32,
@@ -687,11 +687,18 @@ impl Inst {
                 }
                 active = 1 | if *limits { 1 << 1 } else { 0 };
                 // §5: the spring arbiter picks conn at insertion and on every re-add
-                // (Stiffness / Damping change, I.8), from K, D and the parts' reduced mass.
-                let pick = (*stiffness, *damping, a.mass, b.mass);
+                // (Stiffness / Damping change, I.8), from K, D and the dynamic parts' reduced mass.
+                let ma = if a.body.is_some() && a.mass > 0.0 { a.mass } else { 0.0 };
+                let mb = if b.body.is_some() && b.mass > 0.0 { b.mass } else { 0.0 };
+                let pick = (*stiffness, *damping, ma, mb);
                 if self.spring_pick != Some(pick) || was & 1 == 0 {
-                    let m = a.mass * b.mass / (a.mass + b.mass);
-                    self.conns[0].max_level = spring_level(*stiffness, *damping, m);
+                    let m = match (ma > 0.0, mb > 0.0) {
+                        (true, true) => ma * mb / (ma + mb),
+                        (true, false) => ma,
+                        (false, true) => mb,
+                        (false, false) => 0.0,
+                    };
+                    self.conns[0].max_level = if m > 0.0 { spring_level(*stiffness, *damping, m) } else { 0 };
                     self.spring_pick = Some(pick);
                 }
             }
@@ -706,6 +713,8 @@ impl Inst {
                     t.max_torque = clamp_f(*max_torque); // slot 3
                     if *limits {
                         t.max_angle = rad(*max_angle); // slot 2, only while LimitsEnabled
+                    } else {
+                        t.max_angle = f32::INFINITY;
                     }
                 }
                 if let Kind::Cone(c) = &mut self.conns[1].kind {
@@ -739,9 +748,10 @@ impl Inst {
                         };
                     }
                 }
-                if let Kind::BallInSocket { p_a, p_b, .. } = &mut self.conns[1].kind {
+                if let Kind::BallInSocket { p_a, p_b, use_com_a } = &mut self.conns[1].kind {
                     *p_a = a.pos;
                     *p_b = pb;
+                    *use_com_a = *at_com;
                 }
                 // slot 12: ReactionForceEnabled → conn bit 1 of both
                 for c in &mut self.conns {
@@ -750,7 +760,7 @@ impl Inst {
                 // slot 15: RigidityEnabled swaps AchievePosition for BallInSocket
                 active = if *rigid { 1 << 1 } else { 1 };
             }
-            Class::AlignOrientation { one_attachment, target, align_type, primary_only, max_ang_vel, max_torque, responsiveness, reaction, rigid } => {
+            Class::AlignOrientation { one_attachment, target, look_at_pos, align_type, primary_only, max_ang_vel, max_torque, responsiveness, reaction, rigid } => {
                 // OneAttachment: B = world, B's axes = the target frame's (I.11 has no
                 // OneAttachment row: inferred like AlignPosition's, JOINT-NOTES)
                 let (b1, b2) = if *one_attachment { (target.x_axis, target.y_axis) } else { (b.x(), b.y()) };
@@ -767,17 +777,14 @@ impl Inst {
                     o.k = k;
                     o.d = dd;
                 }
-                let look_dir = if *align_type == 4 && !*one_attachment {
-                    let chord = b.pos - a.pos;
-                    if chord.length_squared() > 1.0e-12 { chord.normalize() } else { b1 }
-                } else {
-                    b1
-                };
                 if let Kind::Align2Axes(c) = &mut self.conns[1].kind {
                     c.axis_a = a.x();
-                    c.axis_b = look_dir;
+                    c.axis_b = b1;
                     // [J3] Studio: s1 / s2 = Studio(B axis)
-                    (c.s1_b, c.s2_b) = d::perp_pair_b(look_dir);
+                    (c.s1_b, c.s2_b) = d::perp_pair_b(b1);
+                    c.look_at = *align_type == 4;
+                    c.p_a = a.pos;
+                    c.p_b = if *one_attachment { *look_at_pos } else { b.pos };
                     c.servo = servo;
                     c.max_speed = *max_ang_vel;
                     c.max_torque = clamp_f(*max_torque);
@@ -863,6 +870,7 @@ impl Inst {
                     }
                     m.bits = bits;
                     m.frame = frame;
+                    m.basis = att_rot;
                     m.target = att_rot * *vector_velocity;
                     m.p_a = a.pos;
                     m.p_b = b.pos;
@@ -1057,7 +1065,9 @@ fn servo_off(a: Vec3, b: Vec3, axis: Vec3, target_deg: f32) -> bool {
     let th = a.cross(b).dot(axis).atan2(a.dot(b));
     let t = target_deg * std::f32::consts::PI / 180.0;
     let tw = t - ((t + std::f32::consts::PI) / std::f32::consts::TAU).floor() * std::f32::consts::TAU;
-    deg(th - tw).abs() > DEG
+    let diff = th - tw;
+    let diff_w = diff - ((diff + std::f32::consts::PI) / std::f32::consts::TAU).floor() * std::f32::consts::TAU;
+    deg(diff_w).abs() > DEG
 }
 
 impl Inst {
@@ -1136,7 +1146,7 @@ impl Inst {
                 (p0 - goal).length_squared() > POS2
             }
             // Studio.
-            Class::AlignOrientation { one_attachment, target, align_type, primary_only, max_ang_vel, max_torque, responsiveness, rigid, .. } => {
+            Class::AlignOrientation { one_attachment, target, look_at_pos, align_type, primary_only, max_ang_vel, max_torque, responsiveness, rigid, .. } => {
                 if !self.in_world || *rigid || *max_ang_vel < EPS || *responsiveness < EPS || *max_torque < EPS {
                     return false;
                 }
@@ -1149,13 +1159,9 @@ impl Inst {
                 };
                 if *align_type == 4 {
                     let (_, p0) = world_end(&self.a, body);
-                    let dir = if *one_attachment {
-                        xg
-                    } else {
-                        let (_, p1) = world_end(&self.b, body);
-                        let chord = p1 - p0;
-                        if chord.length_squared() > 1.0e-12 { chord.normalize() } else { xg }
-                    };
+                    let target_pos = if *one_attachment { *look_at_pos } else { world_end(&self.b, body).1 };
+                    let chord = target_pos - p0;
+                    let dir = if chord.length_squared() > 1.0e-12 { chord.normalize() } else { xg };
                     return deg(angle(r0.x_axis, dir)).abs() > DEG;
                 }
                 let tx = deg(angle(r0.x_axis, xg)).abs();
@@ -1175,7 +1181,7 @@ impl Inst {
             Class::LinearVelocity { mode, force_limit_mode, limits, max_force, max_axes_force, vector_velocity, line_velocity, plane_velocity, max_planar_axes_force, .. } => match mode {
                 0 => line_velocity.abs() >= EPS && (!*limits || *max_force >= EPS),
                 1 => {
-                    if plane_velocity[0] < EPS && plane_velocity[1] < EPS {
+                    if plane_velocity[0].abs() < EPS && plane_velocity[1].abs() < EPS {
                         return false;
                     }
                     !*limits || if *force_limit_mode == 0 { *max_force >= EPS } else { max_planar_axes_force[0] >= EPS || max_planar_axes_force[1] >= EPS }

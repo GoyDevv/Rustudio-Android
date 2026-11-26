@@ -400,24 +400,38 @@ pub unsafe fn jni_on_saf_document_created(
         if let Ok(mut g) = PENDING_SAF_CONTENT.lock() {
             *g = None;
         }
+        set_status(ExportStatus::Cancelled);
+        super::lifecycle::wake();
         return;
     }
     let env_ptr = env as *mut jni::sys::JNIEnv;
     let jstr = uri as jni::sys::jstring;
     unsafe {
         let Some(vtable) = (*env_ptr).as_ref() else {
+            if let Ok(mut g) = PENDING_SAF_CONTENT.lock() {
+                *g = None;
+            }
+            set_status(ExportStatus::Error("Missing JNI vtable during SAF export".to_string()));
+            super::lifecycle::wake();
             return;
         };
         let get_chars = vtable.v1_1.GetStringUTFChars;
         let rel_chars = vtable.v1_1.ReleaseStringUTFChars;
         let ptr = get_chars(env_ptr, jstr, std::ptr::null_mut());
         if ptr.is_null() {
+            if let Ok(mut g) = PENDING_SAF_CONTENT.lock() {
+                *g = None;
+            }
+            set_status(ExportStatus::Error("Failed to read SAF destination URI".to_string()));
+            super::lifecycle::wake();
             return;
         }
         let s = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
         rel_chars(env_ptr, jstr, ptr);
         if let Err(e) = on_saf_document_created(&s) {
             log::warn!("crash_export: SAF write failed: {e}");
+            set_status(ExportStatus::Error(e));
         }
+        super::lifecycle::wake();
     }
 }

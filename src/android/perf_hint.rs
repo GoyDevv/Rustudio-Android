@@ -41,6 +41,7 @@ struct Session {
 
 enum State {
     Untried,
+    Paused,
     Off,
     On(Session),
 }
@@ -108,10 +109,12 @@ pub fn frame(actual: Duration, target: Duration) {
         return;
     }
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let State::Untried = *state {
-        match raise_priority() {
-            Ok(()) => log::info!("frame thread {}: display priority", tid()),
-            Err(e) => log::info!("frame thread {}: priority unchanged ({e})", tid()),
+    if matches!(*state, State::Untried | State::Paused) {
+        if matches!(*state, State::Untried) {
+            match raise_priority() {
+                Ok(()) => log::info!("frame thread {}: display priority", tid()),
+                Err(e) => log::info!("frame thread {}: priority unchanged ({e})", tid()),
+            }
         }
         *state = match open(target) {
             Ok(s) => {
@@ -161,6 +164,6 @@ pub fn stop() {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let State::On(s) = &*state {
         let _ = with_env(|env| env.call_method(s.session.as_obj(), jni_str!("close"), jni_sig!("()V"), &[]).map(|_| ()));
+        *state = State::Paused;
     }
-    *state = State::Off;
 }

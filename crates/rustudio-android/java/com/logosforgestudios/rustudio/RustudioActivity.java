@@ -2,6 +2,7 @@ package com.logosforgestudios.rustudio;
 
 import android.app.NativeActivity;
 import android.app.PendingIntent;
+import android.content.ClipData;
 import android.content.ComponentCallbacks2;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -44,6 +45,7 @@ import android.widget.FrameLayout;
 public class RustudioActivity extends NativeActivity {
     private static final int REQ_UNKNOWN_SOURCES = 4107;
     private static final int REQ_SAF_CREATE_DOC = 0x5253;
+    private static final int REQ_SAF_OPEN_DOC = 0x5254;
     private static final String ACTION_INSTALL_COMMIT = "com.logosforgestudios.rustudio.ACTION_INSTALL_COMMIT";
     private ImeProxyView imeView;
     private String pendingInstallApkPath = null;
@@ -63,6 +65,7 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeOnLifecycle(int state);
     static native void nativeOnTrimMemory(int level);
     static native void nativeOnSafDocumentCreated(String uri);
+    static native void nativeOnSafDocumentOpened(String uri);
 
     private void applyDarkFullscreenWindow() {
         Window w = getWindow();
@@ -183,6 +186,20 @@ public class RustudioActivity extends NativeActivity {
                 uri = data.getData().toString();
             }
             nativeOnSafDocumentCreated(uri);
+        } else if (requestCode == REQ_SAF_OPEN_DOC) {
+            if (resultCode == RESULT_OK && data != null) {
+                ClipData clip = data.getClipData();
+                if (clip != null && clip.getItemCount() > 0) {
+                    for (int i = 0; i < clip.getItemCount(); i++) {
+                        ClipData.Item item = clip.getItemAt(i);
+                        if (item != null && item.getUri() != null) {
+                            nativeOnSafDocumentOpened(item.getUri().toString());
+                        }
+                    }
+                } else if (data.getData() != null) {
+                    nativeOnSafDocumentOpened(data.getData().toString());
+                }
+            }
         }
     }
 
@@ -367,6 +384,26 @@ public class RustudioActivity extends NativeActivity {
         });
     }
 
+    /**
+     * Called from Rust (src/android/keyboard.rs) when focus moves between
+     * text fields while the soft keyboard remains open.
+     */
+    public void resetImeComposing() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (imeView == null) {
+                    return;
+                }
+                imeView.resetComposing();
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.restartInput(imeView);
+                }
+            }
+        });
+    }
+
     private static final class ImeProxyView extends View {
         private int composingLen = 0;
 
@@ -447,6 +484,14 @@ public class RustudioActivity extends NativeActivity {
                 if (beforeLength > 0 || afterLength > 0) {
                     nativeImeDelete(beforeLength, afterLength);
                 }
+                return true;
+            }
+
+            @Override
+            public boolean performEditorAction(int editorAction) {
+                composingLen = 0;
+                nativeImeKey(KeyEvent.KEYCODE_ENTER, true);
+                nativeImeKey(KeyEvent.KEYCODE_ENTER, false);
                 return true;
             }
 

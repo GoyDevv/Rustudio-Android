@@ -325,10 +325,45 @@ fn fs_clouds_sky(in: ClOut) -> @location(0) vec4<f32> {
         discard;
     }
     var dst = sky_color_lod_k(dir, 0.0, sky_level(dir));
-    if (g.sky_rot.x > 0.5 && dir.y > 0.0) {
+    let haze_vis = atmos_t(dir);
+    if (g.sky_rot.x > 0.0 && dir.y > 0.0) {
+        let star_density = clamp(g.sky_rot.x / 3000.0, 0.0, 2.0);
+        let star_thresh = 1.0 - 0.0015 * star_density;
         let cell = floor(dir * 300.0);
-        let s = step(0.9985, hash3(cell)) * pow(hash3(cell + vec3<f32>(7.31, 1.7, 3.9)), 4.0);
-        dst += vec3<f32>(s * 0.6) * (1.0 - g.fog.w) * atmos_t(dir);
+        let s = step(star_thresh, hash3(cell)) * pow(hash3(cell + vec3<f32>(7.31, 1.7, 3.9)), 4.0);
+        dst += vec3<f32>(s * 0.6) * (1.0 - g.fog.w) * haze_vis;
+    }
+    if (abs(g.ambient.w) > 0.5) {
+        let sun_sign = select(-1.0, 1.0, g.ambient.w > 0.0);
+        let sun_dir = normalize(g.sun_dir.xyz) * sun_sign;
+        let moon_dir = -sun_dir;
+        let above_ground = smoothstep(-0.02, 0.02, dir.y);
+        let sun_half = g.sky_top.w * 0.5;
+        if (sun_half > 1e-4 && sun_dir.y > -0.1) {
+            let sun_elev = smoothstep(-0.08, 0.05, sun_dir.y);
+            let sun_ang = acos(clamp(dot(dir, sun_dir), -1.0, 1.0));
+            let core_r = sun_half * 0.28;
+            let disc = 1.0 - smoothstep(core_r * 0.82, core_r * 1.08, sun_ang);
+            let u1 = sun_ang / max(sun_half * 0.65, 1e-4);
+            let u2 = sun_ang / max(sun_half * 1.45, 1e-4);
+            let halo = exp(-u1 * u1) * 0.55 + exp(-u2 * u2) * 0.18;
+            let sun_vis = sun_elev * above_ground * mix(0.35, 1.0, haze_vis);
+            let sun_col = vec3<f32>(1.0, 0.96, 0.88);
+            dst += sun_col * (disc * 4.5 + halo * 0.9) * sun_vis;
+        }
+        let moon_half = g.sky_horizon.w * 0.5;
+        if (moon_half > 1e-4 && moon_dir.y > -0.05) {
+            let moon_elev = smoothstep(-0.05, 0.05, moon_dir.y);
+            let moon_ang = acos(clamp(dot(dir, moon_dir), -1.0, 1.0));
+            let moon_r = moon_half * 0.45;
+            let moon_disc = 1.0 - smoothstep(moon_r * 0.92, moon_r * 1.03, moon_ang);
+            let um = moon_ang / max(moon_half * 0.9, 1e-4);
+            let moon_glow = exp(-um * um) * 0.12;
+            let moon_vis = moon_elev * above_ground * haze_vis;
+            let moon_col = vec3<f32>(0.84, 0.90, 1.0);
+            dst = mix(dst, moon_col * 1.15, moon_disc * moon_vis);
+            dst += moon_col * moon_glow * moon_vis;
+        }
     }
     let e = g.params.y * 0.25;
     let ec = sqrt(clamp(c.rgb * e, vec3<f32>(0.0), vec3<f32>(1.0)));

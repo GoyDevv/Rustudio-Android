@@ -804,12 +804,14 @@ impl Session {
         headers: &[(String, String)],
         body: Option<&[u8]>,
     ) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
-        let send_cookie = {
-            let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-            let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-            let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
-            let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
-            host == "roblox.com" || host.ends_with(".roblox.com")
+        let send_cookie = match url.split_once("://") {
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => {
+                let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+                let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+                let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+                host == "roblox.com" || host.ends_with(".roblox.com")
+            }
+            _ => false,
         };
         let is_read = matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE");
         for _ in 0..=CSRF_MAX_RETRIES {

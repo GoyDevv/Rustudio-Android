@@ -157,6 +157,7 @@ const PLAYABLE_DEVICES: [&str; 5] = ["Computer", "Phone", "Tablet", "Console", "
 struct ExperienceSettingsState {
     tab: SettingsTab,
     loaded_universe: Option<u64>,
+    loaded_ok: bool,
     loading: bool,
     saving: bool,
     error: Option<String>,
@@ -640,13 +641,14 @@ impl CloudUi {
             st.enabled = st.enabled.or(origin.team_create);
             origin.team_create = st.enabled;
             let _ = tx.send(Msg::Status(origin.universe_id, st.clone()));
-            if open_mode(st.enabled, as_copy) == OpenMode::JoinTeamCreate {
+            let download_copy = as_copy || version.is_some();
+            if open_mode(st.enabled, download_copy) == OpenMode::JoinTeamCreate {
                 // Live Team Create sessions count as opened too.
                 let _ = cache.remember(&origin);
                 let _ = tx.send(Msg::TeamCreateOn(Box::new(origin)));
                 return;
             }
-            origin.local_copy = as_copy && st.enabled == Some(true);
+            origin.local_copy = download_copy && st.enabled == Some(true);
             let opened = match a.download(place, version) {
                 Ok((bytes, v)) => {
                     origin.version = v;
@@ -895,6 +897,7 @@ impl Editor {
                         match r {
                             Ok(cfg) => {
                                 let s = &mut self.cloud.exp_settings;
+                                s.loaded_ok = true;
                                 s.error = None;
                                 if let Some(name) = cfg.get("name").and_then(|v| v.as_str()) {
                                     s.name = name.to_string();
@@ -921,6 +924,7 @@ impl Editor {
                                     .and_then(parse_universe_avatar_type);
                             }
                             Err(e) => {
+                                self.cloud.exp_settings.loaded_ok = false;
                                 self.cloud.exp_settings.error = Some(e);
                             }
                         }
@@ -2354,6 +2358,7 @@ impl Editor {
     fn fetch_universe_config(&mut self, universe_id: u64, fallback_name: &str) {
         let s = &mut self.cloud.exp_settings;
         s.loaded_universe = Some(universe_id);
+        s.loaded_ok = false;
         s.loading = true;
         s.saving = false;
         s.error = None;
@@ -2501,12 +2506,14 @@ impl Editor {
                         });
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            let can_save = !busy_cfg && !self.cloud.exp_settings.name.trim().is_empty();
+                            let can_save = self.cloud.exp_settings.loaded_ok
+                                && !busy_cfg
+                                && !self.cloud.exp_settings.name.trim().is_empty();
                             if ui.add_enabled(can_save, egui::Button::new("Save Basic Info")).clicked() {
                                 save_basic_info = true;
                             }
                             if ui
-                                .add_enabled(!self.cloud.exp_settings.loading, egui::Button::new("Reload"))
+                                .add_enabled(!busy_cfg, egui::Button::new("Reload"))
                                 .clicked()
                             {
                                 reload_cfg = true;
@@ -2586,7 +2593,10 @@ impl Editor {
                                     .color(theme::TEXT_DIM),
                             );
                             if ui
-                                .add_enabled(!busy_cfg, egui::Button::new("Save Security to Roblox"))
+                                .add_enabled(
+                                    self.cloud.exp_settings.loaded_ok && !busy_cfg,
+                                    egui::Button::new("Save Security to Roblox"),
+                                )
                                 .clicked()
                             {
                                 save_security_api = true;
@@ -2622,7 +2632,8 @@ impl Editor {
                                 .color(theme::TEXT_DIM),
                         );
                         ui.add_space(4.0);
-                        ui.add_enabled_ui(sp_ref.is_some() && !is_playing, |ui| {
+                        let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
+                        ui.add_enabled_ui(sp_ref.is_some() && !is_playing && !busy_cfg, |ui| {
                             ui.horizontal(|ui| {
                                 for (label, v, tip) in [
                                     ("R6", 0u32, "Characters use the classic R6 body (6 parts)."),
@@ -2768,7 +2779,7 @@ impl Editor {
                 self.fetch_universe_config(o.universe_id, &o.experience);
             }
         }
-        if save_basic_info {
+        if save_basic_info && self.cloud.exp_settings.loaded_ok {
             if let Some(o) = &origin {
                 let u = o.universe_id;
                 let name = self.cloud.exp_settings.name.trim().to_string();
@@ -2800,7 +2811,7 @@ impl Editor {
                 });
             }
         }
-        if save_security_api {
+        if save_security_api && self.cloud.exp_settings.loaded_ok {
             if let Some(o) = &origin {
                 let u = o.universe_id;
                 let allow = self.cloud.exp_settings.studio_access_to_apis;

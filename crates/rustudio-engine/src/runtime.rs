@@ -2742,6 +2742,9 @@ fn prop_get_special(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<O
                 let xf = part_xform(lua, r)?;
                 let v = if key == "Position" {
                     xf.pos
+                } else if key == "Rotation" {
+                    let (x, y, z) = xf.rot.to_euler(glam::EulerRot::XYZ);
+                    Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees())
                 } else {
                     xf.orientation_deg()
                 };
@@ -3370,11 +3373,9 @@ pub fn fire_parent_signals_opts(
         let key = ustr("Tags");
         descendants
             .iter()
-            .filter_map(|d| match w.d().dom.get_by_ref(*d)?.properties.get(&key) {
-                Some(Variant::Tags(t)) if t.iter().next().is_some() => {
-                    Some((*d, t.iter().map(|s| s.to_string()).collect()))
-                }
-                _ => None,
+            .filter_map(|d| {
+                let tags = ext::tags_in(w.d().dom.get_by_ref(*d)?.properties.get(&key));
+                (!tags.is_empty()).then_some((*d, tags))
             })
             .collect()
     } else {
@@ -4126,6 +4127,16 @@ fn newindex_routed(
                         pos: v.0,
                         rot: xf.rot,
                     }
+                } else if key == "Rotation" {
+                    Xform {
+                        pos: xf.pos,
+                        rot: glam::Mat3::from_euler(
+                            glam::EulerRot::XYZ,
+                            v.0.x.to_radians(),
+                            v.0.y.to_radians(),
+                            v.0.z.to_radians(),
+                        ),
+                    }
                 } else {
                     Xform::from_orientation_deg(xf.pos, v.0)
                 };
@@ -4135,7 +4146,8 @@ fn newindex_routed(
             "BrickColor" => {
                 let b = opt_ud::<LBrickColor>(&value)
                     .ok_or_else(|| bad_assign(key, "BrickColor", &value))?;
-                return store_prop(lua, r, "Color", Variant::Color3uint8(b.0.to_color3uint8()));
+                store_prop(lua, r, "Color", Variant::Color3uint8(b.0.to_color3uint8()))?;
+                return fire_changed(lua, r, "BrickColor");
             }
             "AssemblyLinearVelocity" | "Velocity" => {
                 let v =
@@ -4259,15 +4271,20 @@ fn newindex_routed(
         }
         return Ok(());
     }
-    let enabling = canon == "Disabled"
-        && matches!(v, Variant::Bool(false))
-        && matches!(class, "Script" | "LocalScript");
-    let disabling = canon == "Disabled"
-        && matches!(v, Variant::Bool(true))
-        && matches!(class, "Script" | "LocalScript");
+    let is_script_disabled = canon == "Disabled" && matches!(class, "Script" | "LocalScript");
+    let enabling = is_script_disabled && matches!(v, Variant::Bool(false));
+    let disabling = is_script_disabled && matches!(v, Variant::Bool(true));
     let carry = canon == "CFrame" && doc::is_a(class, "BasePart");
     let before = if carry { part_xform(lua, r).ok() } else { None };
     store_prop_key(lua, r, info.canon, v)?;
+    if is_script_disabled {
+        let mut w = world(lua)?;
+        if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
+            i.properties.remove(&ustr("Enabled"));
+        }
+        w.fire(r, "Changed", vec![Value::String(lua.create_string("Enabled")?)]);
+        w.fire(r, "Changed:Enabled", vec![]);
+    }
     if carry {
         carry_assembly(lua, r, before)?;
     }
@@ -4914,11 +4931,24 @@ fn primary_part_frame(lua: &Lua, model: Ref, method: &str) -> mlua::Result<(Ref,
     )))
 }
 
+fn part_pivot_offset(lua: &Lua, r: Ref) -> mlua::Result<Xform> {
+    let w = world(lua)?;
+    Ok(match w.d().prop(r, "PivotOffset") {
+        Some(Variant::CFrame(o)) => Xform::from_cframe(&o),
+        _ => Xform {
+            pos: Vec3::ZERO,
+            rot: glam::Mat3::IDENTITY,
+        },
+    })
+}
+
 fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
     let (class, _, _) = inst_meta(lua, r)?;
     if doc::is_a(&class, "BasePart") {
         let before = part_xform(lua, r).ok();
-        store_prop(lua, r, "CFrame", Variant::CFrame(target.to_cframe()))?;
+        let off = part_pivot_offset(lua, r)?;
+        let cf = cf_mul(&target, &cf_inv(&off));
+        store_prop(lua, r, "CFrame", Variant::CFrame(cf.to_cframe()))?;
         return carry_assembly(lua, r, before);
     }
     move_model(lua, r, target, None, doc::is_a(&class, "Model"))
@@ -5600,7 +5630,9 @@ fn call_method_routed(
         "GetPivot" => {
             let (class, _, _) = inst_meta(lua, this)?;
             let xf = if doc::is_a(&class, "BasePart") {
-                part_xform(lua, this)?
+                let base = part_xform(lua, this)?;
+                let off = part_pivot_offset(lua, this)?;
+                compose(&base, &off)
             } else {
                 model_pivot(&*world(lua)?, this)
             };
@@ -6415,10 +6447,33 @@ impl Runtime {
         task.set(
             "cancel",
             lua.create_function(|lua, th: Thread| {
-                let mut s = sched(lua)?;
-                s.timers.retain(|t| t.thread != th);
-                s.ready.retain(|t| t.thread != th);
-                s.deferred.retain(|(t, _)| *t != th);
+                {
+                    let mut s = sched(lua)?;
+                    s.timers.retain(|t| t.thread != th);
+                    s.ready.retain(|t| t.thread != th);
+                    s.deferred.retain(|(t, _)| *t != th);
+                }
+                let mut changed = Vec::new();
+                if let Some(mut sigs) = lua.app_data_mut::<Signals>() {
+                    for (key, list) in &mut sigs.waiters {
+                        let before = list.len();
+                        list.retain(|(_, w)| *w != th);
+                        if before != 0 && list.is_empty() {
+                            changed.push(key.0);
+                        }
+                    }
+                }
+                for r in changed {
+                    prune_layout_listener(lua, r);
+                }
+                if let Some(mut inv) = lua.app_data_mut::<Invokes>() {
+                    inv.waiting.retain(|_, w| *w != th);
+                }
+                if let Ok(coro) = lua.globals().get::<Table>("coroutine") {
+                    if let Ok(close) = coro.get::<Function>("close") {
+                        let _ = close.call::<Value>(th);
+                    }
+                }
                 Ok(())
             })?,
         )?;
@@ -6428,16 +6483,16 @@ impl Runtime {
             lua.create_function(|lua, f: Function| {
                 let th = domains::assets_cloud::scene::create_thread(lua, f)?;
                 let now = world(lua)?.time;
-                sched(lua)?.schedule(now, 0.0, th, Some(Vec::new()), true);
+                sched(lua)?.schedule(now, 0.0, th, None, true);
                 Ok(())
             })?,
         )?;
         g.set(
             "delay",
-            lua.create_function(|lua, (t, f): (f64, Function)| {
-                let th = domains::assets_cloud::scene::create_thread(lua,f)?;
+            lua.create_function(|lua, (t, f): (Option<f64>, Function)| {
+                let th = domains::assets_cloud::scene::create_thread(lua, f)?;
                 let now = world(lua)?.time;
-                sched(lua)?.schedule(now, t, th, Some(Vec::new()), true);
+                sched(lua)?.schedule(now, t.unwrap_or(0.0), th, None, true);
                 Ok(())
             })?,
         )?;
@@ -7455,7 +7510,12 @@ impl Runtime {
                     // (RUSTUDIO_FIXED_DT runs: game time only; the wall clock would make
                     // the result depend on the machine's load. --fixed-dt: its simulated clock.)
                     let real = if fixed_step { 0.0 } else { rustudio_core::sim_clock::since(t.wall).as_secs_f64() };
-                    vec![Value::Number((now - t.started).max(real))]
+                    let elapsed = (now - t.started).max(real);
+                    if t.legacy {
+                        vec![Value::Number(elapsed), Value::Number(now)]
+                    } else {
+                        vec![Value::Number(elapsed)]
+                    }
                 });
             crate::script_profiler::with_entry(
                 crate::script_profiler::EntryKind::Timer,

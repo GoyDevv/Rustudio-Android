@@ -282,7 +282,8 @@ pub struct Atmos {
 /// fog setup.
 pub fn atmosphere(d: &Document) -> Option<Atmos> {
     let l = d.find_child(d.dom.root_ref(), "Lighting")?;
-    let a = d.find_child(l, "Atmosphere")?;
+    let a = d.dom.get_by_ref(l)?.children().iter().copied()
+        .rfind(|r| d.class_of(*r).is_some_and(|c| c == "Atmosphere"))?;
     let num = |n: &str, dflt: f32| f32_of(d.prop(a, n)).unwrap_or(dflt);
     // Defaults: the Atmosphere constructor's: Density 0.395,
     // Color (199, 170, 107), Decay (92, 60, 13), the rest 0.
@@ -482,7 +483,7 @@ pub fn globals(
     // it lights dims with them (Haze 1.9 at 02:48: (3, 5, 5) on screen with
     // the default sky, (62, 77, 108) with a custom one); rustudio keeps the
     // day faces and dims them by sky_tint, so the haze follows sky_tint too.
-    let default_sky = sky_faces(d)[0].starts_with("rbxasset://textures/sky/sky512");
+    let default_sky = sky_faces(d).iter().all(|f| f.starts_with("rbxasset://textures/sky/sky512"));
     // AdvSky's irradiance stays in the source sky frame.
     // Re-express the ambient cube supplied by the rotated reflection sky.
     // Axis-aligned rotations are exact; general rotations use the same
@@ -526,7 +527,6 @@ pub fn globals(
         0.0
     };
     let soft = soft_style(d);
-    let quality = prioritize_lighting_quality(d);
 
     // Without a BloomEffect Studio still glows what is over-bright (Neon):
     // tools/fidelity control shots show a ~12 px halo around a 1-stud Neon bar
@@ -654,7 +654,7 @@ pub fn globals(
         // Only ShadowMap / Future part shaders reflect the sky and draw the
         // sun's highlight (Voxel / Compatibility's FS uses the scale for
         // the sun highlight only).
-        env_spec: if !soft || quality || mech::TECHNOLOGY_QUALITY.contains(&tech) {
+        env_spec: if !soft || mech::TECHNOLOGY_QUALITY.contains(&tech) {
             [env_specular, mech::ENV_SPEC_ROUGHNESS, 1.0, 0.0]
         } else {
             [0.0, mech::ENV_SPEC_ROUGHNESS, 0.0, 0.0]
@@ -1119,7 +1119,7 @@ fn prepare_light(d: &Document, l: Ref, soft: bool) -> Option<CachedLight> {
 /// Sky instances are selected by class; games commonly rename clones.
 fn sky_child(d: &Document, parent: Ref) -> Option<Ref> {
     d.dom.get_by_ref(parent)?.children().iter().copied()
-        .find(|r| d.class_of(*r).is_some_and(|c| c == "Sky"))
+        .rfind(|r| d.class_of(*r).is_some_and(|c| c == "Sky"))
 }
 
 /// Sky.SkyboxOrientation in degrees (zero without a Sky). Studio turns the
@@ -1154,6 +1154,7 @@ pub fn sky_faces(d: &Document) -> [String; 6] {
             Some(Variant::Content(c)) => {
                 c.as_uri().filter(|u| !u.is_empty()).map(|u| u.to_string())
             }
+            Some(Variant::String(s)) if !s.is_empty() => Some(s.clone()),
             _ => None,
         });
         out[i] =

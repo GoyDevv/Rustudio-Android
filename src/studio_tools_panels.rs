@@ -238,6 +238,7 @@ pub struct StudioToolsState {
     analysis_diags: Vec<AnalysisDiag>,
     analysis_checked_scripts: usize,
     analysis_has_run: bool,
+    analysis_doc_id: u64,
     analysis_include_warnings: bool,
 
     // Script Activity
@@ -332,6 +333,7 @@ impl Default for StudioToolsState {
             analysis_diags: Vec::new(),
             analysis_checked_scripts: 0,
             analysis_has_run: false,
+            analysis_doc_id: 0,
             analysis_include_warnings: true,
 
             activity_filter: String::new(),
@@ -1386,6 +1388,7 @@ impl Editor {
                         {
                             replace_hit = Some((hit.script, hit.line));
                         }
+                        let bg_idx = ui.painter().add(egui::Shape::Noop);
                         let resp = ui
                             .horizontal(|ui| {
                                 crate::icons::class_icon(ui, &hit.class, 14.0);
@@ -1395,7 +1398,7 @@ impl Editor {
                             .response
                             .interact(Sense::click());
                         if resp.hovered() {
-                            ui.painter().rect_filled(resp.rect, 2.0, theme::HOVER_BG);
+                            ui.painter().set(bg_idx, egui::Shape::rect_filled(resp.rect, 2.0, theme::HOVER_BG));
                         }
                         if resp.clicked() {
                             jump = Some((hit.script, hit.line));
@@ -1405,16 +1408,16 @@ impl Editor {
             });
 
         if let Some((r, line)) = replace_hit {
-            self.replace_find_in_place_hit(r, line);
+            self.replace_find_in_place_hit(ui.ctx(), r, line);
         } else if replace_all {
-            self.replace_all_find_in_place();
+            self.replace_all_find_in_place(ui.ctx());
         } else if let Some((r, line)) = jump {
             self.scripts.goto.insert(r, line);
             self.open_script.push(r);
         }
     }
 
-    fn replace_find_in_place_hit(&mut self, r: Ref, line_1based: usize) {
+    fn replace_find_in_place_hit(&mut self, ctx: &egui::Context, r: Ref, line_1based: usize) {
         let q = self.ui.tools.find_query.clone();
         if q.is_empty() {
             return;
@@ -1461,6 +1464,16 @@ impl Editor {
         if let Some(buf) = self.scripts.bufs.get_mut(&r) {
             buf.text = new_src.clone();
         }
+        let editor_id = egui::Id::new(("script_text", r));
+        if let Some(mut st) = egui::TextEdit::load_state(ctx, editor_id) {
+            if let Some(mut cr) = st.cursor.char_range() {
+                let max_c = new_src.chars().count();
+                cr.primary.index.0 = cr.primary.index.0.min(max_c);
+                cr.secondary.index.0 = cr.secondary.index.0.min(max_c);
+                st.cursor.set_char_range(Some(cr));
+                st.store(ctx, editor_id);
+            }
+        }
         if let Some(c) = crate::plugin_host::script_docs::diff(&src, &new_src) {
             crate::plugin_host::script_docs::changed(r, vec![c]);
         }
@@ -1471,7 +1484,7 @@ impl Editor {
         self.rescan_find_in_place();
     }
 
-    fn replace_all_find_in_place(&mut self) {
+    fn replace_all_find_in_place(&mut self, ctx: &egui::Context) {
         let q = self.ui.tools.find_query.clone();
         if q.is_empty() {
             return;
@@ -1518,6 +1531,16 @@ impl Editor {
             if let Some(buf) = self.scripts.bufs.get_mut(&r) {
                 buf.text = new_src.clone();
             }
+            let editor_id = egui::Id::new(("script_text", r));
+            if let Some(mut st) = egui::TextEdit::load_state(ctx, editor_id) {
+                if let Some(mut cr) = st.cursor.char_range() {
+                    let max_c = new_src.chars().count();
+                    cr.primary.index.0 = cr.primary.index.0.min(max_c);
+                    cr.secondary.index.0 = cr.secondary.index.0.min(max_c);
+                    st.cursor.set_char_range(Some(cr));
+                    st.store(ctx, editor_id);
+                }
+            }
             if let Some(c) = crate::plugin_host::script_docs::diff(&old_src, &new_src) {
                 crate::plugin_host::script_docs::changed(r, vec![c]);
             }
@@ -1561,9 +1584,9 @@ impl Editor {
                         line.to_lowercase().contains(&q_lower)
                     };
                     if matched {
-                        let mut preview = line.trim().to_string();
-                        if preview.len() > 140 {
-                            preview.truncate(140);
+                        let trimmed = line.trim();
+                        let mut preview: String = trimmed.chars().take(140).collect();
+                        if trimmed.chars().count() > 140 {
                             preview.push('…');
                         }
                         hits.push(FindHit {
@@ -1892,7 +1915,8 @@ impl Editor {
     // =========================================================================
 
     pub fn script_analysis_panel_ui(&mut self, ui: &mut egui::Ui) {
-        if !self.ui.tools.analysis_has_run {
+        if !self.ui.tools.analysis_has_run || self.ui.tools.analysis_doc_id != self.game.doc.id {
+            self.ui.tools.analysis_doc_id = self.game.doc.id;
             self.run_script_analysis();
         }
         let mut refresh = false;
@@ -1942,6 +1966,7 @@ impl Editor {
                         DiagSeverity::Error => ("ERR", theme::ERROR),
                         DiagSeverity::Warning => ("WARN", theme::WARN),
                     };
+                    let bg_idx = ui.painter().add(egui::Shape::Noop);
                     let resp = ui
                         .horizontal(|ui| {
                             ui.label(RichText::new(badge).small().strong().color(col));
@@ -1951,7 +1976,7 @@ impl Editor {
                         .response
                         .interact(Sense::click());
                     if resp.hovered() {
-                        ui.painter().rect_filled(resp.rect, 2.0, theme::HOVER_BG);
+                        ui.painter().set(bg_idx, egui::Shape::rect_filled(resp.rect, 2.0, theme::HOVER_BG));
                     }
                     if resp.clicked() {
                         jump = Some((diag.script, diag.line));
@@ -2063,7 +2088,8 @@ impl Editor {
             if !q.is_empty() && !path.to_lowercase().contains(&q) && !cls.to_lowercase().contains(&q) {
                 continue;
             }
-            let disabled = matches!(inst.properties.get(&ustr("Disabled")), Some(Variant::Bool(true)));
+            let disabled = matches!(inst.properties.get(&ustr("Disabled")), Some(Variant::Bool(true)))
+                || matches!(inst.properties.get(&ustr("Enabled")), Some(Variant::Bool(false)));
             let lines = match inst.properties.get(&ustr("Source")) {
                 Some(Variant::String(s)) => s.lines().count().max(1),
                 _ => 0,
@@ -2116,7 +2142,10 @@ impl Editor {
         if let Some((r, dis)) = toggle_disabled {
             self.game.doc.set_props(
                 "Toggle Script Disabled",
-                vec![(r, ustr("Disabled"), Variant::Bool(dis))],
+                vec![
+                    (r, ustr("Disabled"), Variant::Bool(dis)),
+                    (r, ustr("Enabled"), Variant::Bool(!dis)),
+                ],
                 None,
             );
         }
@@ -2436,7 +2465,8 @@ impl Editor {
             }
             if matches!(cls, "Script" | "LocalScript" | "ModuleScript") {
                 script_count += 1;
-                let disabled = matches!(inst.properties.get(&ustr("Disabled")), Some(Variant::Bool(true)));
+                let disabled = matches!(inst.properties.get(&ustr("Disabled")), Some(Variant::Bool(true)))
+                    || matches!(inst.properties.get(&ustr("Enabled")), Some(Variant::Bool(false)));
                 if !disabled && cls != "ModuleScript" {
                     active_scripts += 1;
                 }
@@ -2600,7 +2630,7 @@ impl Editor {
             let add_clicked = ui
                 .add_enabled(!playing, egui::Button::new("Add Group"))
                 .clicked()
-                || (!playing && resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                || (!playing && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if add_clicked {
                 let name = self.ui.tools.cg_new_name.trim().to_string();
                 if name.contains('^') || name.contains('\\') {
@@ -2742,9 +2772,9 @@ impl Editor {
                                         let r = ui.add(
                                             egui::TextEdit::singleline(draft).desired_width(100.0),
                                         );
-                                        let enter = r.has_focus()
+                                        let enter = r.lost_focus()
                                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                        let esc = r.has_focus()
+                                        let esc = r.lost_focus()
                                             && ui.input(|i| i.key_pressed(egui::Key::Escape));
                                         if enter || ui.small_button("✓").clicked() {
                                             commit_rename =

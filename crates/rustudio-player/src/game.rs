@@ -453,6 +453,7 @@ impl Game {
             self.meshes.retry(&done);
             self.textures.retry(&done);
             self.gui.retry(&done);
+            self.lighting.retry_sky();
             self.asset_gen += 1;
         }
         // Material texture packs load on their own threads.

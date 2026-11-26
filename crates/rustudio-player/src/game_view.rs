@@ -2627,6 +2627,15 @@ impl LightingState {
         self.sky_failed || self.sky_job.is_some()
     }
 
+    /// Retry a previously unavailable skybox when new assets finish downloading
+    /// or sign-in / content installation completes.
+    pub fn retry_sky(&mut self) {
+        if self.sky_unavailable {
+            self.sky_unavailable = false;
+            self.sky_failed = true;
+        }
+    }
+
     /// Rebuild the light grid next frame, whatever the time since the last.
     pub fn refresh_lightgrid_now(&mut self) {
         self.lightgrid_dirty = true;
@@ -2651,9 +2660,10 @@ pub struct LightingState {
     /// Skybox face ids in use ("" = none yet) and whether one failed to load.
     sky_key: String,
     sky_failed: bool,
+    sky_unavailable: bool,
     /// The sky being prepared on a worker (for that face key).
     #[allow(clippy::type_complexity)]
-    sky_job: Option<(String, std::sync::mpsc::Receiver<Option<(u32, Vec<u8>, [Vec3; 6])>>)>,
+    sky_job: Option<(String, std::sync::mpsc::Receiver<Result<(u32, Vec<u8>, [Vec3; 6]), String>>)>,
     /// Studio's studs.dds was looked for (loaded when found).
     studs_tried: bool,
     /// Light grid (lightgrid.rs): where it is (chunks, Studio's camera
@@ -2786,7 +2796,13 @@ impl Game {
                     let key = key.clone();
                     self.lighting.sky_job = None;
                     if key == self.lighting.sky_key {
-                        self.apply_sky(done);
+                        match done {
+                            Ok(sky) => self.apply_sky(Some(sky)),
+                            Err(err) => {
+                                self.warn(format!("Sky: {err}"));
+                                self.apply_sky(None);
+                            }
+                        }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -2795,9 +2811,15 @@ impl Game {
         }
         let faces = rustudio_render::lighting::sky_faces(&self.doc);
         let orient = rustudio_render::lighting::sky_orientation(&self.doc);
-        // Whether scripts run is part of the key: a local sky loaded in Edit
-        // isn't place content in Play (assets::place_content_allowed).
-        let key = format!("{}|{:?}|{}", faces.join("|"), orient.to_array(), rustudio_core::assets::scripts_running());
+        // Whether scripts run and whether Studio content is installed are part
+        // of the key so skyboxes automatically retry once content finishes installing.
+        let key = format!(
+            "{}|{:?}|{}|{}",
+            faces.join("|"),
+            orient.to_array(),
+            rustudio_core::assets::scripts_running(),
+            rustudio_core::studio_content::installed().is_some(),
+        );
         if key == self.lighting.sky_key && !self.lighting.sky_failed {
             return;
         }
@@ -2807,26 +2829,78 @@ impl Game {
             .as_ref()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf());
-        // Every face's bytes first: nothing is decoded while one downloads.
-        let mut bytes = Vec::new();
+        // Request every face before returning on Pending so all 6 download in parallel.
+        let mut bytes = Vec::with_capacity(6);
+        let mut pending = false;
+        let mut unavailable = false;
         for id in &faces {
             match self.assets.content(id, doc_dir.as_deref()) {
-                rustudio_core::assets::Fetch::Ready(b) => bytes.push(b),
-                // Still downloading: try again next frame.
-                rustudio_core::assets::Fetch::Pending => {
-                    self.lighting.sky_failed = true;
-                    return;
+                rustudio_core::assets::Fetch::Ready(mut b) => {
+                    // Unwrap Roblox Decal XML/binary payloads pointing to an inner image URI.
+                    let trimmed = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&b);
+                    let trimmed = trimmed
+                        .iter()
+                        .position(|c| !c.is_ascii_whitespace())
+                        .map_or(trimmed, |i| &trimmed[i..]);
+                    if trimmed.starts_with(b"<roblox") || trimmed.starts_with(b"<?xml") {
+                        let inner = rustudio_core::doc::Document::decode(&b).ok().and_then(|dom| {
+                            dom.descendants().find_map(|i| {
+                                for prop in ["Texture", "TextureContent"] {
+                                    match i.properties.get(&rbx_dom_weak::ustr(prop)) {
+                                        Some(Variant::ContentId(c)) if !c.as_str().is_empty() => {
+                                            return Some(c.as_str().to_string());
+                                        }
+                                        Some(Variant::Content(c)) => {
+                                            if let Some(u) = c.as_uri() {
+                                                if !u.is_empty() {
+                                                    return Some(u.to_string());
+                                                }
+                                            }
+                                        }
+                                        Some(Variant::String(s)) if !s.is_empty() => {
+                                            return Some(s.clone());
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                None
+                            })
+                        });
+                        match inner.map(|u| self.assets.content(&u, doc_dir.as_deref())) {
+                            Some(rustudio_core::assets::Fetch::Ready(inner_b)) => b = inner_b,
+                            Some(rustudio_core::assets::Fetch::Pending) => {
+                                pending = true;
+                                continue;
+                            }
+                            _ => {
+                                unavailable = true;
+                                continue;
+                            }
+                        }
+                    }
+                    bytes.push(b);
                 }
-                rustudio_core::assets::Fetch::Unavailable(_) => break,
+                rustudio_core::assets::Fetch::Pending => {
+                    pending = true;
+                }
+                rustudio_core::assets::Fetch::Unavailable(_) => {
+                    unavailable = true;
+                }
             }
+        }
+        if pending {
+            self.lighting.sky_failed = true;
+            return;
         }
         self.lighting.sky_key = key.clone();
         self.lighting.sky_failed = false;
-        if bytes.len() != 6 {
+        if unavailable || bytes.len() != 6 {
+            self.lighting.sky_unavailable = true;
             self.lighting.sky_job = None;
             self.apply_sky(None);
             return;
         }
+        self.lighting.sky_unavailable = false;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(prepare_sky(&bytes, orient));
@@ -3483,11 +3557,14 @@ impl DrawCache {
 }
 
 /// Decodes the six skybox faces (Bk, Dn, Ft, Lf, Rt, Up) into the cube
-/// rustudio draws, with its irradiance; None if any face doesn't decode.
-fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Option<(u32, Vec<u8>, [Vec3; 6])> {
+/// rustudio draws, with its irradiance; Err if any face doesn't decode.
+fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Result<(u32, Vec<u8>, [Vec3; 6]), String> {
     let mut imgs = Vec::new();
-    for b in bytes {
-        imgs.push(rustudio_core::texture::decode(b).ok()?);
+    for (idx, b) in bytes.iter().enumerate() {
+        imgs.push(
+            rustudio_core::texture::decode(b)
+                .map_err(|e| format!("failed to decode skybox face {idx}: {e}"))?,
+        );
     }
         // All faces square at the smallest face's size.
         let size = imgs
@@ -3560,7 +3637,7 @@ fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Option<(u32, 
         ];
         let cube = orient_sky(cube, size, orient);
         let irr = rustudio_render::lighting::sky_irradiance(&cube, size);
-    Some((size, rustudio_render::render::cube_mips(size, &cube), irr))
+    Ok((size, rustudio_render::render::cube_mips(size, &cube), irr))
 }
 
 /// Turns a sky cube (+X, −X, +Y, −Y, +Z, −Z faces, wgpu's layout) by

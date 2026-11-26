@@ -1241,7 +1241,8 @@ impl Default for PlaceCache {
 }
 
 fn is_xml(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"<roblox") && !bytes.starts_with(b"<roblox!")
+    let trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes).trim_ascii_start();
+    !bytes.starts_with(b"<roblox!") && !trimmed.starts_with(b"<roblox!")
 }
 
 impl PlaceCache {

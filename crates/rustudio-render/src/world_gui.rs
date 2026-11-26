@@ -117,6 +117,11 @@ pub enum FxKind {
     Sparkles,
 }
 
+/// Built-in procedural fallback texture IDs used when Studio's built-in
+/// `fire_main.dds`, `smoke_main.dds`, or `sparkles_main.dds` are unavailable.
+pub const FX_FALLBACK_PUFF: egui::TextureId = egui::TextureId::User(u64::MAX - 1);
+pub const FX_FALLBACK_SPARKLES: egui::TextureId = egui::TextureId::User(u64::MAX - 2);
+
 /// One draw of effects, far to near: a texture and a range of `FxFrame`'s
 /// strip indices or particles.
 #[derive(Clone, Copy, Debug)]
@@ -545,7 +550,8 @@ fn vs_particle(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
         // ParticleCustomVS: offset along CB0[10] (camera +Z = -view.forward).
         let q = p + tone.cam_back.xyz * v.zoffset;
         let cz = tone.vp * vec4<f32>(q, 1.0);
-        if (abs(cz.w) > 1e-6) { z = cz.z * c.w / cz.w; }
+        let z_ndc = select(select(0.0, 1.0, v.zoffset > 0.0), clamp(cz.z / max(cz.w, 1e-6), 0.0, 1.0), cz.w > 1e-6);
+        z = z_ndc * c.w;
     }
     o.pos = vec4<f32>(c.xy, z, c.w);
     o.depth = z;
@@ -589,7 +595,8 @@ fn vs_sparkles(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
     if (v.zoffset != 0.0) {
         let q = p + tone.cam_back.xyz * v.zoffset;
         let cz = tone.vp * vec4<f32>(q, 1.0);
-        if (abs(cz.w) > 1e-6) { z = cz.z * c.w / cz.w; }
+        let z_ndc = select(select(0.0, 1.0, v.zoffset > 0.0), clamp(cz.z / max(cz.w, 1e-6), 0.0, 1.0), cz.w > 1e-6);
+        z = z_ndc * c.w;
     }
     o.pos = vec4<f32>(c.xy, z, c.w);
     o.depth = z;
@@ -933,6 +940,9 @@ pub struct WorldGuiPass {
     pub(crate) font_texture_update: Option<(u64, Option<[u32; 4]>)>,
     /// Untextured effects: one white texel.
     white: wgpu::BindGroup,
+    /// Built-in procedural RGBA8 fallback textures for Fire/Smoke and Sparkles.
+    fallback_puff: wgpu::BindGroup,
+    fallback_sparkles: wgpu::BindGroup,
     fx_bgl: wgpu::BindGroupLayout,
     fx_in: wgpu::RenderPipeline,
     fx_out: wgpu::RenderPipeline,
@@ -1513,10 +1523,10 @@ impl WorldGuiPass {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let white = {
+        let make_rgba_bg = |label: &str, size: u32, pixels: &[u8]| {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("effects white"),
-                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                label: Some(label),
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -1526,13 +1536,13 @@ impl WorldGuiPass {
             });
             queue.write_texture(
                 tex.as_image_copy(),
-                &[255u8; 4],
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                pixels,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: None },
+                wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
             );
             let view = tex.create_view(&Default::default());
             device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("effects white"),
+                label: Some(label),
                 layout: &tex_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
@@ -1540,8 +1550,62 @@ impl WorldGuiPass {
                 ],
             })
         };
+        let white = make_rgba_bg("effects white", 1, &[255u8; 4]);
+        let fallback_puff = {
+            const N: u32 = 64;
+            let mut pixels = vec![0u8; (N * N * 4) as usize];
+            for y in 0..N {
+                let ny = ((y as f32 + 0.5) / N as f32) * 2.0 - 1.0;
+                for x in 0..N {
+                    let nx = ((x as f32 + 0.5) / N as f32) * 2.0 - 1.0;
+                    let r = (nx * nx + ny * ny).sqrt();
+                    let edge = (1.0 - r).clamp(0.0, 1.0);
+                    let smooth = edge * edge * (3.0 - 2.0 * edge);
+                    let a = (smooth * smooth * 0.65 + smooth * 0.35).clamp(0.0, 1.0);
+                    let idx = ((y * N + x) * 4) as usize;
+                    pixels[idx] = 255;
+                    pixels[idx + 1] = 255;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = (a * 255.0).round() as u8;
+                }
+            }
+            make_rgba_bg("effects fallback puff", N, &pixels)
+        };
+        let fallback_sparkles = {
+            const N: u32 = 64;
+            let mut pixels = vec![0u8; (N * N * 4) as usize];
+            for y in 0..N {
+                let ny = ((y as f32 + 0.5) / N as f32) * 2.0 - 1.0;
+                for x in 0..N {
+                    let nx = ((x as f32 + 0.5) / N as f32) * 2.0 - 1.0;
+                    let r = (nx * nx + ny * ny).sqrt();
+                    let glow = (1.0 - r).clamp(0.0, 1.0).powf(1.5);
+                    let ax = (1.0 - ny.abs() / (0.14 * (1.0 - nx.abs() * 0.85).max(0.05))).clamp(0.0, 1.0)
+                        * (1.0 - nx.abs()).clamp(0.0, 1.0);
+                    let ay = (1.0 - nx.abs() / (0.14 * (1.0 - ny.abs() * 0.85).max(0.05))).clamp(0.0, 1.0)
+                        * (1.0 - ny.abs()).clamp(0.0, 1.0);
+                    let d1 = (nx + ny) * std::f32::consts::FRAC_1_SQRT_2;
+                    let d2 = (nx - ny) * std::f32::consts::FRAC_1_SQRT_2;
+                    let ad1 = (1.0 - d2.abs() / (0.10 * (1.0 - d1.abs() * 1.1).max(0.05))).clamp(0.0, 1.0)
+                        * (1.0 - d1.abs() / 0.7).clamp(0.0, 1.0);
+                    let ad2 = (1.0 - d1.abs() / (0.10 * (1.0 - d2.abs() * 1.1).max(0.05))).clamp(0.0, 1.0)
+                        * (1.0 - d2.abs() / 0.7).clamp(0.0, 1.0);
+                    let core = (1.0 - r / 0.35).clamp(0.0, 1.0);
+                    let star = ax.max(ay).max(ad1 * 0.8).max(ad2 * 0.8).max(core).clamp(0.0, 1.0);
+                    let g = (glow * 255.0).round() as u8;
+                    let idx = ((y * N + x) * 4) as usize;
+                    pixels[idx] = g;
+                    pixels[idx + 1] = g;
+                    pixels[idx + 2] = g;
+                    pixels[idx + 3] = (star * 255.0).round() as u8;
+                }
+            }
+            make_rgba_bg("effects fallback sparkles", N, &pixels)
+        };
         WorldGuiPass {
             white,
+            fallback_puff,
+            fallback_sparkles,
             fx_pipeline,
             strip_pipeline,
             particle_pipeline,
@@ -1932,7 +1996,15 @@ impl WorldGuiPass {
         // reads egui's white texel: a 1×1 white texture, not the font
         // atlas, whose mips would be refilled every frame for it.)
         for d in &f.draws {
-            let bg = if d.texture == egui::TextureId::default() { Some(self.white.clone()) } else { group(self, d.texture, d.wrap) };
+            let bg = if d.texture == egui::TextureId::default() {
+                Some(self.white.clone())
+            } else if d.texture == FX_FALLBACK_PUFF {
+                Some(self.fallback_puff.clone())
+            } else if d.texture == FX_FALLBACK_SPARKLES {
+                Some(self.fallback_sparkles.clone())
+            } else {
+                group(self, d.texture, d.wrap)
+            };
             let Some(bg) = bg else { continue };
             let kind = match d.kind {
                 FxKind::Strip => Kind::Strip,

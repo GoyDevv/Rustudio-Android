@@ -1295,7 +1295,7 @@ local function drag_step(kind, x, y)
             local ps = o.Parent:IsA("GuiBase2d") and o.Parent.AbsoluteSize or Vector2.one
             local pw, ph = math.max(ps.X, 1), math.max(ps.Y, 1)
             if use_scale then
-                du = UDim2.fromScale(du.X.Offset / pw, du.Y.Offset / ph)
+                du = UDim2.fromScale(du.X.Scale + du.X.Offset / pw, du.Y.Scale + du.Y.Offset / ph)
             end
             if style ~= Enum.UIDragDetectorDragStyle.Scriptable and not is_relative then
                 du = (drag.base_du or UDim2.new()) + du
@@ -2475,9 +2475,6 @@ local function binding_value(a, b)
         -- UIButton: "a GuiButton press/release" (create.roblox.com/docs/input/
         -- input-action-system). UIModifier as a second button held with it,
         -- like PrimaryModifier for keys, is an estimate (the docs don't say).
-        if (h(b.KeyCode) and mods_ok(b)) or (h(b.UIButton) and (b.UIModifier == nil or h(b.UIModifier))) then
-            return true
-        end
         local stick = sticks[b.KeyCode]
         if stick and mods_ok(b) then
             local mag = stick.Magnitude * math.abs(s)
@@ -2494,6 +2491,17 @@ local function binding_value(a, b)
             end
             binding_pressed[b] = now or nil
             return now
+        end
+        if h(b.KeyCode) and mods_ok(b) then
+            local mag = math.abs(s)
+            local ok_pt, pt = pcall(function() return b.PressedThreshold end)
+            pt = (ok_pt and tonumber(pt)) or 0
+            if pt <= 0 or mag >= pt then
+                return true
+            end
+        end
+        if h(b.UIButton) and (b.UIModifier == nil or h(b.UIModifier)) then
+            return true
         end
         return false
     elseif t == Enum.InputActionType.Direction1D then
@@ -2661,7 +2669,9 @@ local function analog_input(kind, x, y)
                                 binding_pressed[b] = now or nil
                                 analog[a] = (analog[a] == true) or now
                                 set_state(a, keys_value(a) or touch_pressed(a) or (analog[a] == true))
-                                took = true
+                                if now or was then
+                                    took = true
+                                end
                             end
                         elseif t == Enum.InputActionType.Direction2D then
                             analog[a] = (analog[a] or Vector2.zero) + Vector2.new(x, y) * b.Vector2Scale * b.Scale / frame_dt
@@ -2819,7 +2829,7 @@ end
 touch_input = function(state, id, x, y, dx, dy, gpe, began_on)
     if state == "Begin" then
         finger_seq += 1
-        local f = { x = x, y = y, x0 = x, y0 = y, began_on = {}, gpe = gpe == true, order = finger_seq, actions = {}, page_layout = page_layout_at(x, y) }
+        local f = { x = x, y = y, x0 = x, y0 = y, began_on = {}, gpe = gpe == true, order = finger_seq, actions = {}, page_layout = (not gpe) and page_layout_at(x, y) or nil }
         for _, btn in began_on or {} do f.began_on[btn] = true end
         fingers[id] = f
         assign_finger(f)
@@ -2836,7 +2846,7 @@ touch_input = function(state, id, x, y, dx, dy, gpe, began_on)
         f.x, f.y = x, y
         for a, b in f.actions do touch_update(a, b, nil, 0, 0) end
         local pl = f.page_layout
-        if pl and pl.Parent and pl.TouchInputEnabled then
+        if state == "End" and not f.gpe and pl and pl.Parent and pl.TouchInputEnabled then
             local sx, sy = x - f.x0, y - f.y0
             if pl.FillDirection == Enum.FillDirection.Vertical then
                 if math.abs(sy) >= 24 and math.abs(sy) >= math.abs(sx) then
@@ -3015,20 +3025,27 @@ methods["HapticService.IsMotorSupported"] = function(_, t, motor)
     return supported_input and (motor == Enum.VibrationMotor.Large or motor == Enum.VibrationMotor.Small)
 end
 local motors = {}
+local motor_strengths = {}
 methods["HapticService.SetMotor"] = function(_, t, motor, ...)
     if typeof(t) ~= "EnumItem" or typeof(motor) ~= "EnumItem" then error("Unable to cast value to token", 0) end
     if select("#", ...) == 0 then
         log("error", "Error in HapticService:SetMotor no values found for vibration.")
         return
     end
-    motors[t.Name .. "/" .. motor.Name] = table.pack(...)
+    local key = t.Name .. "/" .. motor.Name
+    motors[key] = table.pack(...)
     if G.haptic_supported() and (t == Enum.UserInputType.Touch or pad_connected(t))
         and (motor == Enum.VibrationMotor.Large or motor == Enum.VibrationMotor.Small) then
         local strength = tonumber((...)) or 0
-        if strength <= 0 then
+        motor_strengths[key] = if strength > 0 then math.clamp(strength, 0, 1) else nil
+        local max_s = 0
+        for _, s in pairs(motor_strengths) do
+            if s > max_s then max_s = s end
+        end
+        if max_s <= 0 then
             G.haptic_vibrate(0, 0)
         else
-            G.haptic_vibrate(250, math.clamp(strength, 0, 1))
+            G.haptic_vibrate(250, max_s)
         end
     end
 end
@@ -3045,6 +3062,7 @@ end
 local effect_len = { UIHover = 0.035, UIClick = 0.055, UINotification = 0.4, GameplayCollision = 0.3, GameplayExplosion = 0.8, Custom = 0 }
 local effect_strength = { UIHover = 0.25, UIClick = 0.45, UINotification = 0.65, GameplayCollision = 0.8, GameplayExplosion = 1.0, Custom = 0.5 }
 local playing_fx = {}
+local loop_fx = {}
 local fx_keys = setmetatable({}, { __mode = "k" })
 methods["HapticEffect.Play"] = function(fx)
     if not fx:IsDescendantOf(game) then return end
@@ -3054,6 +3072,7 @@ methods["HapticEffect.Play"] = function(fx)
         playing_fx[fx] = math.huge
     else
         playing_fx[fx] = G.time() + dur
+        loop_fx[fx] = nil
     end
     if G.haptic_supported() then
         local strength = effect_strength[name] or 0.5
@@ -3073,13 +3092,18 @@ methods["HapticEffect.Play"] = function(fx)
         local ms = math.floor(vib_dur * 1000 + 0.5)
         if fx.Looped and ms == 0 then ms = 500 end
         if ms > 0 and strength > 0 then
-            G.haptic_vibrate(ms, math.clamp(strength, 0, 1))
+            local clamped = math.clamp(strength, 0, 1)
+            G.haptic_vibrate(ms, clamped)
+            if fx.Looped then
+                loop_fx[fx] = { next_at = G.time() + ms / 1000, ms = ms, strength = clamped }
+            end
         end
     end
 end
 methods["HapticEffect.Stop"] = function(fx)
     local was_playing = playing_fx[fx] ~= nil
     playing_fx[fx] = nil
+    loop_fx[fx] = nil
     if was_playing and G.haptic_supported() and next(playing_fx) == nil then
         G.haptic_vibrate(0, 0)
     end
@@ -3095,9 +3119,23 @@ end
 local function step_fx()
     local now = G.time()
     for fx, at in playing_fx do
-        if now >= at then
+        if not fx:IsDescendantOf(game) then
             playing_fx[fx] = nil
+            loop_fx[fx] = nil
+        elseif now >= at then
+            playing_fx[fx] = nil
+            loop_fx[fx] = nil
             if fx.Parent then fire(fx, "Ended") end
+        end
+    end
+    if G.haptic_supported() then
+        for fx, lp in loop_fx do
+            if not fx.Looped or playing_fx[fx] == nil then
+                loop_fx[fx] = nil
+            elseif now >= lp.next_at then
+                G.haptic_vibrate(lp.ms, lp.strength)
+                lp.next_at = now + lp.ms / 1000
+            end
         end
     end
 end

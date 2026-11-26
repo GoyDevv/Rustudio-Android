@@ -348,7 +348,8 @@ impl Renderer {
         let mut encoder: Option<wgpu::CommandEncoder> = None;
         for (&vf, req) in reqs {
             let gen = self.vf.gen.get(&vf).copied().unwrap_or(0);
-            let size = [req.size[0].clamp(1, 4096), req.size[1].clamp(1, 4096)];
+            let max_dim = self.caps.limits.max_texture_dimension_2d.min(4096).max(1);
+            let size = [req.size[0].clamp(1, max_dim), req.size[1].clamp(1, max_dim)];
             if self.vf.targets.get(&vf).is_none_or(|t| t.size != size) {
                 if let Some(old) = self.vf.targets.remove(&vf) {
                     rs.renderer.write().free_texture(&old.id);
@@ -394,8 +395,7 @@ impl Renderer {
         // The sample count of the pipelines it is drawn with (1 on OpenGL);
         // at one sample the scene is drawn straight into `resolve`.
         let samples = self.probe_samples;
-        let caps = crate::gpu_caps::GpuCaps::of_device(device);
-        let hdr_fmt = super::scene_hdr_alpha_format(&caps);
+        let hdr_fmt = super::scene_hdr_alpha_format(&self.caps);
         let depth = tex("viewport frame depth", DEPTH_FORMAT, samples, att).create_view(&Default::default());
         let resolve = tex("viewport frame resolve", hdr_fmt, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());
@@ -618,12 +618,16 @@ impl Renderer {
                 mesh.draw(pass, range);
             };
             let viewport = self.pipelines(self.probe_samples);
+            let (vf_opaque, vf_opaque_two_sided, vf_transparent, vf_transparent_culled) = match &viewport.vf_alpha {
+                Some(vf) => (&vf.opaque, &vf.opaque_two_sided, &vf.transparent, &vf.transparent_culled),
+                None => (&viewport.opaque, &viewport.opaque_two_sided, &viewport.transparent, &viewport.transparent_culled),
+            };
             for r in &opaque_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &viewport.opaque } else { &viewport.opaque_two_sided });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { vf_opaque } else { vf_opaque_two_sided });
                 draw(&mut pass, r.0, r.1..r.2);
             }
             for r in &see_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &viewport.transparent_culled } else { &viewport.transparent });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { vf_transparent_culled } else { vf_transparent });
                 draw(&mut pass, r.0, r.1..r.2);
             }
         }

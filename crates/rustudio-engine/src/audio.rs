@@ -148,19 +148,22 @@ impl Region {
 /// Puts `dec` at `t` seconds (exact seek, else by skipping samples); returns
 /// the interleaved sample index it now stands at.
 fn seek_to(dec: &mut Dec, t: f64) -> u64 {
-    if t <= 0.0 {
+    if !t.is_finite() || t <= 0.0 {
         return 0;
     }
     let ch = dec.channels().get() as u64;
     let frames = (t * dec.sample_rate().get() as f64) as u64;
-    if dec.try_seek(Duration::from_secs_f64(t)).is_err() {
-        for _ in 0..frames * ch {
+    let seek_ok = Duration::try_from_secs_f64(t)
+        .ok()
+        .is_some_and(|dur| dec.try_seek(dur).is_ok());
+    if !seek_ok {
+        for _ in 0..frames.saturating_mul(ch) {
             if dec.next().is_none() {
                 break;
             }
         }
     }
-    frames * ch
+    frames.saturating_mul(ch)
 }
 
 /// Loop control shared with the audio thread.
@@ -1490,6 +1493,8 @@ struct GraphDevice {
     starved: AtomicU64,
     /// The game has fed the queue since it opened (startup silence isn't a stall).
     fed: AtomicBool,
+    /// True if opening the default audio sink failed.
+    failed: AtomicBool,
     /// (last demand, recent peak frame time).
     last: Mutex<(Option<Instant>, f64)>,
 }
@@ -1520,6 +1525,7 @@ fn graph_device() -> Option<&'static Arc<GraphDevice>> {
             q: Mutex::new(std::collections::VecDeque::new()),
             starved: AtomicU64::new(0),
             fed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             last: Mutex::new((None, 0.0)),
         });
         let src = GraphSource { dev: dev.clone(), buf: Vec::new(), at: 0 };
@@ -1538,19 +1544,24 @@ fn graph_device() -> Option<&'static Arc<GraphDevice>> {
                     })
                     .is_ok()
             }
-            None => std::thread::Builder::new()
-                .name("rustudio-graph-audio".into())
-                .spawn(move || {
-                    if let Ok(mut sink) = rodio::DeviceSinkBuilder::open_default_sink() {
-                        sink.log_on_drop(false);
-                        sink.mixer().add(src);
-                        // The sink lives as long as the process.
-                        loop {
-                            std::thread::park();
+            None => {
+                let dev_flag = dev.clone();
+                std::thread::Builder::new()
+                    .name("rustudio-graph-audio".into())
+                    .spawn(move || {
+                        if let Ok(mut sink) = rodio::DeviceSinkBuilder::open_default_sink() {
+                            sink.log_on_drop(false);
+                            sink.mixer().add(src);
+                            // The sink lives as long as the process.
+                            loop {
+                                std::thread::park();
+                            }
+                        } else {
+                            dev_flag.failed.store(true, Ordering::Relaxed);
                         }
-                    }
-                })
-                .is_ok(),
+                    })
+                    .is_ok()
+            }
         };
         ok.then_some(dev)
     })
@@ -1563,6 +1574,9 @@ fn graph_device() -> Option<&'static Arc<GraphDevice>> {
 /// the rest. `None` without a device: the caller renders by game time.
 pub fn graph_demand() -> Option<(usize, usize)> {
     let dev = graph_device()?;
+    if dev.failed.load(Ordering::Relaxed) {
+        return None;
+    }
     let now = Instant::now();
     let (frame, peak) = {
         let mut last = dev.last.lock().ok()?;

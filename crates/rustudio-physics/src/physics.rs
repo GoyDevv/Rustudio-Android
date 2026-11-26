@@ -2237,6 +2237,7 @@ impl Physics {
                 let _p = rustudio_core::bench::scope("ps_reconcile");
                 self.queued.clear();
                 self.reconcile(doc);
+                self.sync_fluid_forces(doc);
                 return;
             }
             doc::Marks::Some(m) => m,
@@ -2287,6 +2288,9 @@ impl Physics {
                     | "Enabled"
                     | "CollisionGroup"
                     | "CollisionGroupId"
+                    | "Massless"
+                    | "CustomPhysicalProperties"
+                    | "Material"
             )
         };
         // Movers to re-read, attachments that moved between parts, terrain.
@@ -2393,6 +2397,7 @@ impl Physics {
             let Some(xf) = xform_of(doc, r) else { continue };
             self.teleport(r, &xf);
         }
+        self.sync_fluid_forces(doc);
     }
 
     /// Sorts an instance from a Tree mark (or a queued ref) into the mover,
@@ -2525,10 +2530,12 @@ impl Physics {
             Some(pool) => pool.install(build),
             None => build(),
         };
+        let terrain_groups = self.part_groups(doc, t);
         for (b, n) in built {
             let b = b
                 .friction(mech::TERRAIN_FRICTION)
                 .restitution(mech::TERRAIN_ELASTICITY)
+                .collision_groups(terrain_groups)
                 .active_events(rp::ActiveEvents::COLLISION_EVENTS);
             let c = self.world.insert_collider(b, None);
             self.register_collider(c, t);
@@ -3194,6 +3201,9 @@ impl Physics {
     }
 
     pub fn set_velocity(&mut self, r: Ref, v: Vec3) {
+        if !v.is_finite() {
+            return;
+        }
         // A part made this frame has no body until the next sync.
         if !self.parts.contains_key(&r) && !self.hums.of_part.contains_key(&r) {
             self.pending_vel.insert(r, (v, 30));
@@ -3319,6 +3329,9 @@ impl Physics {
 
     /// Sets the angular velocity of the body a part rides on.
     pub fn set_angular_velocity(&mut self, r: Ref, w: Vec3) {
+        if !w.is_finite() {
+            return;
+        }
         if let Some(body) = self.body_of(r) {
             if let Some(b) = self.world.bodies.get_mut(body) {
                 if b.is_dynamic() {
@@ -3622,7 +3635,7 @@ impl Physics {
         };
 
         // (hinge, p0, p1, target_omega, motor_torque, set_motor)
-        let mut updates: Vec<(Ref, Ref, Ref, f32, f32, bool)> = Vec::new();
+        let mut updates: Vec<(Ref, Ref, Ref, f32, f32)> = Vec::new();
         for &hinge in &self.joint_cons {
             if doc.class_of(hinge).as_deref() != Some("HingeConstraint")
                 || !doc.is_ancestor(ws, hinge)
@@ -3630,9 +3643,8 @@ impl Physics {
             {
                 continue;
             }
-            // Skip script-overridden Servo hinges (ActuatorType == 2); drive None (0) or Motor (1).
-            let actuator = enum_u32(doc.prop(hinge, "ActuatorType"));
-            if actuator == Some(2) {
+            // Only drive Motor hinges (ActuatorType == 1); leave None (0) and Servo (2) hinges untouched.
+            if enum_u32(doc.prop(hinge, "ActuatorType")) != Some(1) {
                 continue;
             }
             let (Some(a0), Some(a1)) = (ref_prop(doc, hinge, "Attachment0"), ref_prop(doc, hinge, "Attachment1")) else {
@@ -3708,45 +3720,45 @@ impl Physics {
                 .or_else(|| rustudio_core::attachment::world(doc, a0, false).map(|a| a.rot.x_axis))
                 .unwrap_or(seat_right);
 
+            let wheel_size = vec3_of(doc.prop(wheel_part, "Size")).unwrap_or(Vec3::splat(2.0));
+            let wheel_rot = self
+                .part_xform(doc, wheel_part)
+                .or_else(|| xform_of(doc, wheel_part))
+                .map_or(Mat3::IDENTITY, |x| x.rot);
+            let local_axis = (wheel_rot.transpose() * a0_axis).abs();
+            let wheel_radius = if local_axis.x >= local_axis.y && local_axis.x >= local_axis.z {
+                0.5 * wheel_size.y.max(wheel_size.z)
+            } else if local_axis.y >= local_axis.z {
+                0.5 * wheel_size.x.max(wheel_size.z)
+            } else {
+                0.5 * wheel_size.x.max(wheel_size.y)
+            }
+            .max(0.25);
+
             // Forward rolling (+drive_speed along -seat_z) needs wheel angular velocity along -seat_right.
             let dir_sign = if a0_axis.dot(seat_right) >= 0.0 { -1.0 } else { 1.0 };
             let order_sign = if chassis_is_a0 { 1.0 } else { -1.0 };
-            let target_omega = drive_speed * dir_sign * order_sign;
+            let target_omega = (drive_speed / wheel_radius) * dir_sign * order_sign;
 
-            let existing_torque = num(doc, hinge, "MotorMaxTorque", 0.0);
-            let motor_torque = if torque > 0.0 {
-                (torque * 1000.0).max(existing_torque)
-            } else {
-                existing_torque
-            };
-            let set_motor = actuator != Some(1);
-            updates.push((hinge, p0, p1, target_omega, motor_torque, set_motor));
+            let motor_torque = torque * 1000.0;
+            updates.push((hinge, p0, p1, target_omega, motor_torque));
         }
 
-        for (hinge, p0, p1, target_omega, motor_torque, set_motor) in updates {
+        for (hinge, p0, p1, target_omega, motor_torque) in updates {
             let prev_vel = num(doc, hinge, "AngularVelocity", 0.0);
             let prev_torque = num(doc, hinge, "MotorMaxTorque", 0.0);
             let vel_changed = (prev_vel - target_omega).abs() > 1e-4;
             let torque_changed = (prev_torque - motor_torque).abs() > 1e-4;
-            if !set_motor && !vel_changed && !torque_changed {
+            if !vel_changed && !torque_changed {
                 continue;
             }
             if let Some(inst) = doc.dom.get_by_ref_mut(hinge) {
-                if set_motor {
-                    inst.properties.insert(
-                        ustr("ActuatorType"),
-                        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
-                    );
-                }
                 if vel_changed {
                     inst.properties.insert(ustr("AngularVelocity"), Variant::Float32(target_omega));
                 }
                 if torque_changed {
                     inst.properties.insert(ustr("MotorMaxTorque"), Variant::Float32(motor_torque));
                 }
-            }
-            if set_motor {
-                doc.mark_prop(hinge, ustr("ActuatorType"));
             }
             if vel_changed {
                 doc.mark_prop(hinge, ustr("AngularVelocity"));
@@ -4240,8 +4252,18 @@ impl Physics {
             return;
         }
         self.groups_seen = v;
-        let all: Vec<(Ref, rp::ColliderHandle)> =
+        let mut all: Vec<(Ref, rp::ColliderHandle)> =
             self.parts.iter().map(|(r, p)| (*r, p.collider)).collect();
+        for h in self.hums.by_model.values() {
+            for p in &h.parts {
+                all.push((p.part, p.collider));
+            }
+        }
+        if let Some(t) = self.terrain {
+            for &c in &self.terrain_colliders {
+                all.push((t, c));
+            }
+        }
         for (r, c) in all {
             let g = self.part_groups(doc, r);
             if let Some(col) = self.world.colliders.get_mut(c) {
@@ -4327,7 +4349,12 @@ impl Physics {
         let hi = Vec3::new(centre.x + r, root.y + mech::CLIMB_QUERY_TOP, centre.z + r);
         let candidates: HashSet<rp::ColliderHandle> = {
             let not_own = |h: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !self.link.hides_from(h, by_collider, own);
-            let qp = self.world.query_pipeline_with_filter(rp::QueryFilter::default().exclude_sensors().predicate(&not_own));
+            let qp = self.world.query_pipeline_with_filter(
+                rp::QueryFilter::default()
+                    .exclude_sensors()
+                    .groups(self.interaction(&self.char_group))
+                    .predicate(&not_own),
+            );
             qp.intersect_aabb_conservative(rp::Aabb::new(rv(lo), rv(hi)))
                 .filter(|(_, co)| {
                     let b = co.compute_aabb();
@@ -4387,7 +4414,7 @@ impl Physics {
         items.extend(std::mem::take(&mut self.pending_spin).into_iter().map(|(r, (dw, n))| (r, dw, n)));
         for (r, dw, n) in items {
             // A part made this frame has no body yet: keep it a while.
-            if !self.parts.contains_key(&r) {
+            if !self.parts.contains_key(&r) && !self.hums.of_part.contains_key(&r) {
                 if n < 30 {
                     let e = self.pending_spin.entry(r).or_insert((Vec3::ZERO, n + 1));
                     e.0 += dw;
@@ -4409,7 +4436,7 @@ impl Physics {
             if !w.is_finite() {
                 continue;
             }
-            if !self.parts.contains_key(&r) {
+            if !self.parts.contains_key(&r) && !self.hums.of_part.contains_key(&r) {
                 self.pending_spin.insert(r, (w, 1));
                 continue;
             }

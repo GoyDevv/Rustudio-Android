@@ -1097,6 +1097,39 @@ local function new_input_object(fields)
 end
 __rs_new_input_object = new_input_object
 local mouse_delta = Vector2.zero
+local mouse_buttons_down = {}
+local keys_pressed = {}
+function __rs_is_mouse_button_pressed(uit)
+    return mouse_buttons_down[uit] == true
+end
+function __rs_get_keys_pressed(extra_keys)
+    local out = {}
+    local seen = {}
+    for k, io in pairs(keys_pressed) do
+        seen[k] = true
+        table.insert(out, io)
+    end
+    if type(extra_keys) == "table" then
+        for _, k in ipairs(extra_keys) do
+            if not seen[k] then
+                seen[k] = true
+                local id = "Keyboard/" .. k
+                local io = input_objects[id]
+                if not io then
+                    local ok, kc = pcall(function() return Enum.KeyCode[k] end)
+                    io = new_input_object({
+                        UserInputType = Enum.UserInputType.Keyboard,
+                        KeyCode = ok and kc or keycode_unknown,
+                        UserInputState = Enum.UserInputState.Begin,
+                    })
+                    input_objects[id] = io
+                end
+                table.insert(out, io)
+            end
+        end
+    end
+    return out
+end
 -- The kind of input the player last used (UserInputService's
 -- GetLastInputType / LastInputTypeChanged). Before any input Roblox
 -- answers with the device's own kind: Touch on a phone or tablet
@@ -1136,9 +1169,23 @@ function __rs_input_event(state, uit, key, x, y, z, dx, dy, gpe)
         mouse_delta = Vector2.new(dx, dy)
     end
     io.Delta = Vector3.new(dx, dy, 0)
+    if uit == "MouseButton1" or uit == "MouseButton2" or uit == "MouseButton3" then
+        if state == "Begin" then
+            mouse_buttons_down[uit] = true
+        elseif state == "End" or state == "Cancel" then
+            mouse_buttons_down[uit] = nil
+        end
+    elseif uit == "Keyboard" and key and key ~= "Unknown" then
+        if state == "Begin" then
+            keys_pressed[key] = io
+        elseif state == "End" or state == "Cancel" then
+            keys_pressed[key] = nil
+        end
+    end
     local uis = game:GetService("UserInputService")
     local sunk = false
     if not gpe then sunk = run_actions(io, io.UserInputState) end
+    local processed = (gpe == true) or sunk
     local ev = state == "Begin" and "InputBegan" or state == "End" and "InputEnded" or "InputChanged"
     -- UserInputService.LastInputTypeChanged: the kind of input the player
     -- last used changed (Roblox: keyboard / mouse movement / a button…).
@@ -1147,9 +1194,9 @@ function __rs_input_event(state, uit, key, x, y, z, dx, dy, gpe)
         last_input_type = uit
         fire(uis, "LastInputTypeChanged", Enum.UserInputType[uit])
     end
-    fire(uis, ev, io, gpe or false)
+    fire(uis, ev, io, processed)
     if uit == "MouseWheel" then
-        fire(uis, "PointerAction", z, Vector2.zero, 0, gpe or false)
+        fire(uis, "PointerAction", z, Vector2.zero, 0, processed)
     end
     return sunk
 end

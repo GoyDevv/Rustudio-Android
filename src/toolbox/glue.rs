@@ -119,13 +119,13 @@ impl Editor {
             let mine = ready.asset.creator.id != 0 && ready.asset.creator.id == self.toolbox.user_id && ready.asset.creator.kind != 2;
             if *scripts > 0 && !mine && std::env::var_os("RUSTUDIO_TOOLBOX_NO_SCRIPT_PROMPT").is_none() {
                 let count = *scripts;
-                self.toolbox.ask = Some(Ask::Scripts { ready, count });
+                self.toolbox.push_ask(Ask::Scripts { ready, count });
                 return;
             }
             if let Prepared::Model { dom, .. } = &ready.prepared {
                 let tool = dom.root().children().iter().any(|r| dom.get_by_ref(*r).is_some_and(|i| insert::home_of(i.class.as_str(), &ready.asset.sub_types) == Home::AskToolHome));
                 if tool && !matches!(ready.target, Target::Parent(_)) {
-                    self.toolbox.ask = Some(Ask::ToolHome { ready });
+                    self.toolbox.push_ask(Ask::ToolHome { ready });
                     return;
                 }
             }
@@ -141,6 +141,7 @@ impl Editor {
                 if !insert_it {
                     self.toolbox.inserts.retain(|j| j.job != ready.job);
                     self.toolbox.harness.insert(format!("insert_{}", ready.asset.id), serde_json::json!({"ok": false, "error": "cancelled"}));
+                    self.toolbox.pop_next_ask();
                     return;
                 }
                 let tool = matches!(&ready.prepared, Prepared::Model { dom, .. } if dom.root().children().iter().any(|r| dom.get_by_ref(*r).is_some_and(|i| matches!(i.class.as_str(), "Tool" | "HopperBin"))));
@@ -153,6 +154,7 @@ impl Editor {
             Ask::ToolHome { ready } => {
                 if !insert_it {
                     self.toolbox.inserts.retain(|j| j.job != ready.job);
+                    self.toolbox.pop_next_ask();
                     return;
                 }
                 let home = if starter_pack { self.game.doc.find_child(self.game.doc.dom.root_ref(), "StarterPack") } else { None };
@@ -173,6 +175,7 @@ impl Editor {
                 }
             }
         }
+        self.toolbox.pop_next_ask();
     }
 
     /// The UI thread part of an insert: placement and one undo step.
@@ -189,6 +192,7 @@ impl Editor {
             _ => None,
         };
         let source_id = Variant::Int64(id as i64);
+        let rev_before = self.game.doc.revision;
         let inserted: Vec<Ref> = match prepared {
             Prepared::Plugin => {
                 self.toolbox_install_plugin(asset);
@@ -243,22 +247,60 @@ impl Editor {
                             }
                         }
                     }
-                    let bytes = insert::encode(&dom, &roots);
+                    let bytes = match insert::encode(&dom, &roots) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            self.error(format!("Toolbox failed to encode asset {id}: {e}"));
+                            self.toolbox.harness.insert(format!("insert_{id}"), serde_json::json!({"ok": false, "error": e}));
+                            return;
+                        }
+                    };
                     let refs = self.game.doc.paste_groups(vec![(bytes, parent)], &label);
                     self.select(refs.clone());
                     refs
                 } else {
                     let lighting = self.game.doc.find_child(self.game.doc.dom.root_ref(), "Lighting");
+                    let terrain = self.game.doc.workspace().and_then(|w| self.game.doc.find_child(w, "Terrain"));
                     let material = self.game.doc.find_child(self.game.doc.dom.root_ref(), "MaterialService");
                     let world_parent = tool_parent.or(explicit).unwrap_or(ws);
                     let mut world = Vec::new();
                     let mut groups: Vec<(Vec<u8>, Ref)> = Vec::new();
                     let mut light = Vec::new();
+                    let mut terr = Vec::new();
                     let mut mats = Vec::new();
                     for r in &roots {
+                        let is_env_wrapper = explicit.is_none() && dom.get_by_ref(*r).is_some_and(|inst| {
+                            matches!(inst.class.as_str(), "Model" | "Folder")
+                                && !inst.children().is_empty()
+                                && inst.children().iter().all(|c| {
+                                    dom.get_by_ref(*c).is_some_and(|ci| {
+                                        matches!(insert::home_of(ci.class.as_str(), &asset.sub_types), Home::Lighting | Home::Terrain)
+                                    })
+                                })
+                                && !dom.descendants_of(*r).skip(1).any(|d| {
+                                    rustudio_core::doc::is_a(d.class.as_str(), "BasePart")
+                                        || matches!(d.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
+                                })
+                        });
+                        if is_env_wrapper {
+                            let kids = dom.get_by_ref(*r).map(|i| i.children().to_vec()).unwrap_or_default();
+                            for c in kids {
+                                if let Some(ci) = dom.get_by_ref_mut(c) {
+                                    ci.properties.insert("SourceAssetId".into(), source_id.clone());
+                                }
+                                let Some(ci) = dom.get_by_ref(c) else { continue };
+                                match insert::home_of(ci.class.as_str(), &asset.sub_types) {
+                                    Home::Lighting if lighting.is_some() => light.push(c),
+                                    Home::Terrain if terrain.is_some() => terr.push(c),
+                                    _ => world.push(c),
+                                }
+                            }
+                            continue;
+                        }
                         let Some(i) = dom.get_by_ref(*r) else { continue };
                         match insert::home_of(i.class.as_str(), &asset.sub_types) {
                             Home::Lighting if explicit.is_none() && lighting.is_some() => light.push(*r),
+                            Home::Terrain if explicit.is_none() && terrain.is_some() => terr.push(*r),
                             Home::MaterialService if explicit.is_none() && material.is_some() => mats.push(*r),
                             _ => world.push(*r),
                         }
@@ -281,22 +323,32 @@ impl Editor {
                             insert::translate(&mut dom, &world, d);
                         }
                     }
-                    if !world.is_empty() {
-                        groups.push((insert::encode(&dom, &world), world_parent));
-                    }
-                    if !light.is_empty() {
-                        groups.push((insert::encode(&dom, &light), lighting.unwrap_or(ws)));
-                    }
-                    if !mats.is_empty() {
-                        groups.push((insert::encode(&dom, &mats), material.unwrap_or(ws)));
+                    for (refs_group, target_parent) in [
+                        (&world, world_parent),
+                        (&light, lighting.unwrap_or(ws)),
+                        (&terr, terrain.unwrap_or(ws)),
+                        (&mats, material.unwrap_or(ws)),
+                    ] {
+                        if !refs_group.is_empty() {
+                            match insert::encode(&dom, refs_group) {
+                                Ok(b) => groups.push((b, target_parent)),
+                                Err(e) => {
+                                    self.error(format!("Toolbox failed to encode asset {id}: {e}"));
+                                    self.toolbox.harness.insert(format!("insert_{id}"), serde_json::json!({"ok": false, "error": e}));
+                                    return;
+                                }
+                            }
+                        }
                     }
                     let refs = self.game.doc.paste_groups(groups, &label);
-                    self.select(refs.clone());
+                    if !refs.is_empty() {
+                        self.select(refs.clone());
+                    }
                     refs
                 }
             }
         };
-        if inserted.is_empty() {
+        if inserted.is_empty() && self.game.doc.revision == rev_before {
             self.error(format!("Toolbox failed to insert asset {id}: nothing to insert"));
             self.toolbox.harness.insert(format!("insert_{id}"), serde_json::json!({"ok": false, "error": "empty"}));
             return;
@@ -353,7 +405,13 @@ impl Editor {
             let mut tmp = rbx_dom_weak::WeakDom::new(InstanceBuilder::new("DataModel"));
             let root = tmp.root_ref();
             let r = tmp.insert(root, b);
-            groups.push((insert::encode(&tmp, &[r]), parent));
+            match insert::encode(&tmp, &[r]) {
+                Ok(bytes) => groups.push((bytes, parent)),
+                Err(e) => {
+                    self.error(format!("Toolbox failed to encode built asset: {e}"));
+                    return Vec::new();
+                }
+            }
         }
         let refs = self.game.doc.paste_groups(groups, label);
         self.select(refs.clone());
@@ -368,11 +426,11 @@ impl Editor {
         }
         let owned = self.toolbox.owned.get(&asset.id).copied().unwrap_or(false);
         if !owned && !asset.price.is_free() && asset.price != super::model::Price::Unknown {
-            self.toolbox.ask = Some(Ask::Paid { asset });
+            self.toolbox.push_ask(Ask::Paid { asset });
             return;
         }
         if !owned {
-            self.toolbox.ask = Some(Ask::GetPlugin { asset });
+            self.toolbox.push_ask(Ask::GetPlugin { asset });
             return;
         }
         let client = self.game.account.shared_client();
@@ -395,7 +453,7 @@ impl Editor {
             }
             if let super::model::Price::Cents(_) = a.price {
                 if !self.toolbox.owned.get(&id).copied().unwrap_or(false) {
-                    self.toolbox.ask = Some(Ask::Paid { asset: a.clone() });
+                    self.toolbox.push_ask(Ask::Paid { asset: a.clone() });
                     return None;
                 }
             }
@@ -1026,9 +1084,7 @@ impl Editor {
             self.toolbox.cancel_insert(job);
             self.toolbox.inserts.retain(|j| j.job != job);
             // (its scripts warning or Tool dialog goes too)
-            if matches!(&self.toolbox.ask, Some(Ask::Scripts { ready, .. } | Ask::ToolHome { ready }) if ready.job == job) {
-                self.toolbox.ask = None;
-            }
+            self.toolbox.cancel_ask_job(job);
             self.toolbox.harness.insert(format!("drag_cancel_{}", d.id), serde_json::json!(job));
         }
         let made: std::collections::HashSet<Ref> = d.made.iter().copied().collect();

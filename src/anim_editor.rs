@@ -333,14 +333,16 @@ impl PoseEasingStyle {
     }
 
     fn from_variant(v: Option<Variant>) -> Self {
-        match v {
-            Some(Variant::Enum(e)) => match e.to_u32() {
-                1 => Self::Constant,
-                2 => Self::Elastic,
-                3 | 5 => Self::Cubic,
-                4 => Self::Bounce,
-                _ => Self::Linear,
-            },
+        let code = match v {
+            Some(Variant::Enum(e)) => e.to_u32(),
+            Some(Variant::EnumItem(e)) => e.value,
+            _ => return Self::Linear,
+        };
+        match code {
+            1 => Self::Constant,
+            2 => Self::Elastic,
+            3 | 5 => Self::Cubic,
+            4 => Self::Bounce,
             _ => Self::Linear,
         }
     }
@@ -376,12 +378,14 @@ impl PoseEasingDirection {
     }
 
     fn from_variant(v: Option<Variant>) -> Self {
-        match v {
-            Some(Variant::Enum(e)) => match e.to_u32() {
-                1 => Self::Out,
-                2 => Self::InOut,
-                _ => Self::In,
-            },
+        let code = match v {
+            Some(Variant::Enum(e)) => e.to_u32(),
+            Some(Variant::EnumItem(e)) => e.value,
+            _ => return Self::In,
+        };
+        match code {
+            1 => Self::Out,
+            2 => Self::InOut,
             _ => Self::In,
         }
     }
@@ -557,15 +561,33 @@ fn parse_roblox_asset_id(input: &str) -> Option<u64> {
     if let Ok(id) = s.parse::<u64>() {
         return Some(id);
     }
-    let mut digits = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-        } else if !digits.is_empty() {
-            break;
+    for marker in ["id=", "/assets/", "/asset/", "/library/", "/catalog/", "/animations/"] {
+        if let Some(pos) = s.find(marker) {
+            let tail = &s[pos + marker.len()..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(id) = digits.parse::<u64>() {
+                return Some(id);
+            }
         }
     }
-    digits.parse::<u64>().ok()
+    let mut best = "";
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let run = &s[start..i];
+            if run.len() > best.len() {
+                best = run;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best.parse::<u64>().ok()
 }
 
 fn clip_duration(kfs: &[KeyframeData]) -> f32 {
@@ -809,6 +831,21 @@ impl Editor {
                 .unwrap_or_else(|| part_cframe(&self.game.doc, rig.root));
             let solved = rig.solve(root_xf, &transforms);
             write_pose(&mut self.game.doc, &solved, None);
+        }
+    }
+
+    /// Snapshots the active rig's rest pose before a 3D gizmo or part drag mutates any limb `CFrame`.
+    pub(crate) fn snapshot_rest_pose_for_parts(&mut self, parts: &[Ref]) {
+        if !self.ui.anim.anim_open || parts.is_empty() {
+            return;
+        }
+        let Some(rig_r) = self.ui.anim.rig_ref else { return };
+        if self.ui.anim.active_pose_rig == Some(rig_r) || !self.game.doc.exists(rig_r) {
+            return;
+        }
+        let rig = Rig::read(&self.game.doc, rig_r);
+        if parts.iter().any(|p| rig.joints.iter().any(|j| j.part1 == *p)) {
+            self.ensure_pose_snapshot(rig_r);
         }
     }
 
@@ -1060,8 +1097,14 @@ impl Editor {
             .map(|i| i.referent());
         let cf = Variant::CFrame(xf.to_cframe());
         if let Some(pr) = existing_pose {
-            self.game.doc.set_prop_live(pr, ustr("CFrame"), cf);
-            self.game.doc.set_prop_live(pr, ustr("Weight"), Variant::Float32(1.0));
+            self.game.doc.set_props(
+                "Edit Pose",
+                vec![
+                    (pr, ustr("CFrame"), cf),
+                    (pr, ustr("Weight"), Variant::Float32(1.0)),
+                ],
+                Some(format!("pose:{pr:?}")),
+            );
         } else {
             let parent = self
                 .game
@@ -1216,26 +1259,52 @@ impl Editor {
         style: Option<PoseEasingStyle>,
         dir: Option<PoseEasingDirection>,
     ) {
-        let kf_r = self.ensure_keyframe_at(clip_r, time);
-        let pose_refs: Vec<Ref> = self
+        let Some(kf_r) = self
+            .game
+            .doc
+            .dom
+            .get_by_ref(clip_r)
+            .and_then(|c| {
+                c.children().iter().copied().find(|&ch| {
+                    self.game.doc.dom.get_by_ref(ch).is_some_and(|i| {
+                        i.class == "Keyframe"
+                            && matches!(i.properties.get(&ustr("Time")), Some(Variant::Float32(t)) if (*t - time).abs() < 0.005)
+                    })
+                })
+            })
+        else {
+            return;
+        };
+        let sel_joint = self.ui.anim.selected_joint.as_deref();
+        let mut pose_refs: Vec<Ref> = self
             .game
             .doc
             .dom
             .descendants_of(kf_r)
-            .filter(|i| i.class == "Pose")
+            .filter(|i| i.class == "Pose" && sel_joint.is_none_or(|j| i.name == j))
             .map(|i| i.referent())
             .collect();
+        if pose_refs.is_empty() && sel_joint.is_some() {
+            pose_refs = self
+                .game
+                .doc
+                .dom
+                .descendants_of(kf_r)
+                .filter(|i| i.class == "Pose")
+                .map(|i| i.referent())
+                .collect();
+        }
+        let mut edits = Vec::new();
         for pr in pose_refs {
             if let Some(s) = style {
-                self.game
-                    .doc
-                    .set_prop_live(pr, ustr("EasingStyle"), s.to_variant());
+                edits.push((pr, ustr("EasingStyle"), s.to_variant()));
             }
             if let Some(d) = dir {
-                self.game
-                    .doc
-                    .set_prop_live(pr, ustr("EasingDirection"), d.to_variant());
+                edits.push((pr, ustr("EasingDirection"), d.to_variant()));
             }
+        }
+        if !edits.is_empty() {
+            self.game.doc.set_props("Set Keyframe Easing", edits, None);
         }
     }
 
@@ -1723,9 +1792,11 @@ impl Editor {
                 self.stop_anim_preview();
             }
             if ui.checkbox(&mut self.ui.anim.looping, "Loop").changed() {
-                self.game
-                    .doc
-                    .set_prop_live(clip_r, ustr("Loop"), Variant::Bool(self.ui.anim.looping));
+                self.game.doc.set_props(
+                    "Toggle Animation Loop",
+                    vec![(clip_r, ustr("Loop"), Variant::Bool(self.ui.anim.looping))],
+                    None,
+                );
             }
             egui::ComboBox::from_id_salt("anim_speed_combo")
                 .selected_text(format!("{}x", self.ui.anim.speed))
@@ -2177,6 +2248,7 @@ impl Editor {
             Pos2::new(rect.min.x + pad_l, rect.min.y + pad_t),
             Pos2::new(rect.max.x - pad_r, rect.max.y - pad_b),
         );
+        self.game.touch.zones.direct_drag.push(plot.expand(6.0));
 
         let t_to_x = |t: f32| plot.min.x + (t / duration).clamp(0.0, 1.0) * plot.width().max(1.0);
         let deg_to_y = |deg: f32| {
@@ -2385,25 +2457,25 @@ impl Editor {
                 .show(ui, |ui| {
                     ui.label("WalkSpeed");
                     if ui.add(egui::DragValue::new(&mut walk_speed).speed(0.5).range(0.0..=200.0)).changed() {
-                        self.game.doc.set_prop_live(hum_r, ustr("WalkSpeed"), Variant::Float32(walk_speed));
+                        self.game.doc.set_props("Edit WalkSpeed", vec![(hum_r, ustr("WalkSpeed"), Variant::Float32(walk_speed))], Some(format!("hum_ws:{hum_r:?}")));
                     }
                     ui.end_row();
 
                     ui.label("JumpPower");
                     if ui.add(egui::DragValue::new(&mut jump_power).speed(0.5).range(0.0..=300.0)).changed() {
-                        self.game.doc.set_prop_live(hum_r, ustr("JumpPower"), Variant::Float32(jump_power));
+                        self.game.doc.set_props("Edit JumpPower", vec![(hum_r, ustr("JumpPower"), Variant::Float32(jump_power))], Some(format!("hum_jp:{hum_r:?}")));
                     }
                     ui.end_row();
 
                     ui.label("HipHeight");
                     if ui.add(egui::DragValue::new(&mut hip_height).speed(0.05).range(-5.0..=20.0)).changed() {
-                        self.game.doc.set_prop_live(hum_r, ustr("HipHeight"), Variant::Float32(hip_height));
+                        self.game.doc.set_props("Edit HipHeight", vec![(hum_r, ustr("HipHeight"), Variant::Float32(hip_height))], Some(format!("hum_hh:{hum_r:?}")));
                     }
                     ui.end_row();
 
                     ui.label("MaxHealth");
                     if ui.add(egui::DragValue::new(&mut max_health).speed(1.0).range(1.0..=10000.0)).changed() {
-                        self.game.doc.set_prop_live(hum_r, ustr("MaxHealth"), Variant::Float32(max_health));
+                        self.game.doc.set_props("Edit MaxHealth", vec![(hum_r, ustr("MaxHealth"), Variant::Float32(max_health))], Some(format!("hum_mh:{hum_r:?}")));
                     }
                     ui.end_row();
                 });
@@ -2547,9 +2619,11 @@ impl Editor {
                         pos: tp_xf.apply(-ap_xf.pos),
                         rot: tp_xf.rot * ap_xf.rot.transpose(),
                     };
-                    self.game
-                        .doc
-                        .set_prop_live(hr, ustr("CFrame"), Variant::CFrame(placed.to_cframe()));
+                    self.game.doc.set_props(
+                        "Attach Accessory",
+                        vec![(hr, ustr("CFrame"), Variant::CFrame(placed.to_cframe()))],
+                        None,
+                    );
                 }
                 self.info(format!("Attached '{acc_name}' to rig ({attach_name})."));
             }
@@ -2604,9 +2678,11 @@ impl Editor {
                 let up = back.cross(right).normalize_or(Vec3::Y);
                 ap.rot = Mat3::from_cols(right, up, back);
             }
-            self.game
-                .doc
-                .set_prop_live(acc_r, ustr("AttachmentPoint"), Variant::CFrame(ap.to_cframe()));
+            self.game.doc.set_props(
+                "Edit AttachmentPoint",
+                vec![(acc_r, ustr("AttachmentPoint"), Variant::CFrame(ap.to_cframe()))],
+                Some(format!("acc_ap:{acc_r:?}")),
+            );
         }
     }
 
@@ -2679,11 +2755,11 @@ impl Editor {
                         ui.horizontal(|ui| {
                             ui.label("Order:");
                             if ui.add(egui::DragValue::new(&mut order).range(0..=100)).changed() {
-                                self.game.doc.set_prop_live(wr, ustr("Order"), Variant::Int32(order));
+                                self.game.doc.set_props("Edit WrapLayer Order", vec![(wr, ustr("Order"), Variant::Int32(order))], Some(format!("wrap_ord:{wr:?}")));
                             }
                             ui.label("Puffiness:");
                             if ui.add(egui::Slider::new(&mut puff, 0.0..=2.0).fixed_decimals(2)).changed() {
-                                self.game.doc.set_prop_live(wr, ustr("Puffiness"), Variant::Float32(puff));
+                                self.game.doc.set_props("Edit WrapLayer Puffiness", vec![(wr, ustr("Puffiness"), Variant::Float32(puff))], Some(format!("wrap_puff:{wr:?}")));
                             }
                         });
                     } else if class == "WrapTarget" {
@@ -2694,9 +2770,7 @@ impl Editor {
                         ui.horizontal(|ui| {
                             ui.label("Stiffness:");
                             if ui.add(egui::Slider::new(&mut stiffness, 0.0..=1.0).fixed_decimals(2)).changed() {
-                                self.game
-                                    .doc
-                                    .set_prop_live(wr, ustr("Stiffness"), Variant::Float32(stiffness));
+                                self.game.doc.set_props("Edit WrapTarget Stiffness", vec![(wr, ustr("Stiffness"), Variant::Float32(stiffness))], Some(format!("wrap_stiff:{wr:?}")));
                             }
                         });
                     }

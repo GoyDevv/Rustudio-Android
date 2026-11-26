@@ -1381,26 +1381,61 @@ fn shade_transparent_low(in: PartOut, use_shadow_map: bool) -> vec4<f32> {
     let vertex_tint = sq(in.vtint.rgb);
     var base = in.color.rgb * vertex_tint;
     var alpha = in.color.a;
+    let translucent = alpha < 0.999;
+    if (translucent) {
+        alpha = alpha * in.vtint.a;
+    }
+    let decal_clamp = mode == 2u && all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+    let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), decal_clamp);
+    if (kind == 6.0) {
+        var n_ff = normalize(in.normal);
+        if (dot(n_ff, g.cam_pos.xyz - in.world) < 0.0) { n_ff = -n_ff; }
+        let view = normalize(g.cam_pos.xyz - in.world);
+        let rim = 1.0 - clamp(2.0 * abs(dot(n_ff, view)), 0.0, 1.0);
+        let phase = abs(cos(0.3 * g.cam_pos.w) * cos(g.cam_pos.w));
+        var pulse = 0.0;
+        if (mode != 0u) {
+            let sample = textureSampleGrad(tex, tex_sampler, suv, uv_dx, uv_dy);
+            let raw = select(1.055 * pow(max(sample.rgb, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+                12.92 * sample.rgb, sample.rgb <= vec3<f32>(0.0031308));
+            let red = raw.r;
+            pulse = select(0.0, (1.0 - clamp(13.0 * abs(red - phase), 0.0, 1.0)) * sample.a, red > 0.0);
+        }
+        let edge = max(rim, pulse);
+        let cover = alpha * max(mix(pulse, 1.0, edge) * edge, 0.05);
+        let fog = fog_amount(length(in.world - g.cam_pos.xyz));
+        let fc = mix(base, fog_rgb_at(in.world), fog);
+        return vec4<f32>(fc * cover, cover * (1.0 - fog));
+    }
     if (mode != 0u) {
-        let sample = textureSampleGrad(tex, tex_sampler, in.uv, uv_dx, uv_dy);
+        let sample = textureSampleGrad(tex, tex_sampler, suv, uv_dx, uv_dy);
         let raw = select(1.055 * pow(max(sample.rgb, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
             12.92 * sample.rgb, sample.rgb <= vec3<f32>(0.0031308));
         let squared = raw * raw;
-        if (mode == 2u || mode == 3u) {
+        let surface = in.tint.w > 0.5;
+        let sa_raw = raw * in.tint.rgb * sqrt(max(in.emissive_albedo, 0.0));
+        if (mode == 1u && surface) {
+            let under = sqrt(max(in.color.rgb, vec3<f32>(0.0))) * in.vtint.rgb;
+            let mixed = mix(under, sa_raw, sample.a);
+            base = mixed * mixed;
+        } else if (mode == 1u) {
+            base = mix(base, squared * in.emissive_albedo * vertex_tint, sample.a);
+        } else if (mode == 2u) {
             alpha *= sample.a;
             base = squared * base;
-        } else if (mode == 1u && in.tint.w > 0.5) {
-            alpha *= sample.a;
-            base = sq(raw * in.tint.rgb) * max(in.emissive_albedo, 0.0);
-        } else if (mode == 1u) {
-            alpha *= sample.a;
+        } else if (mode == 3u) {
+            if (translucent) { alpha *= sample.a; }
             base = squared * in.emissive_albedo * vertex_tint;
+        } else if (mode == 4u) {
+            base = select(squared * in.emissive_albedo * vertex_tint, sa_raw * sa_raw, surface);
+            alpha = in.color.a * in.vtint.a * sample.a;
         } else if (mode == 5u) {
-            alpha *= sample.a;
+            if (translucent) { alpha *= sample.a; }
             base *= squared;
         } else if (mode == 6u) {
-            alpha *= sample.a;
-            base = sq(raw * mix(vec3<f32>(1.0), in.tint.rgb, sample.a)) * max(in.emissive_albedo, 0.0);
+            let mixed = raw * mix(vec3<f32>(1.0), in.tint.rgb, sample.a) * sqrt(max(in.emissive_albedo, 0.0));
+            base = mixed * mixed;
         } else {
             alpha *= sample.a;
             base = squared * in.emissive_albedo * vertex_tint;
@@ -3446,9 +3481,9 @@ fn fs_ssao_apply(in: PostOut) -> @location(0) vec4<f32> {
 
 // Resolve the nearest covered sample, retaining reversed-Z for reconstruction.
 @fragment
-fn fs_glass_depth(in: PostOut) -> @location(0) f32 {
+fn fs_glass_depth(in: PostOut) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(in.pos.xy);
     var z = 0.0;
     for (var i = 0; i < VIEWPORT_SAMPLES; i++) { z = max(z, textureLoad(ssao_depth_ms, pixel, i)); }
-    return z;
+    return vec4<f32>(z, 0.0, 0.0, 1.0);
 }

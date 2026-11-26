@@ -1190,7 +1190,7 @@ impl Physics {
         if self.hums.fluid_forces_enabled {
             for a in self.asms.values() {
                 for &r in &a.parts {
-                    if matches!(doc.prop(r, "EnableFluidForces"), Some(Variant::Bool(true))) {
+                    if !matches!(doc.prop(r, "EnableFluidForces"), Some(Variant::Bool(false))) {
                         self.hums.fluid_parts.insert(r);
                     }
                 }
@@ -2644,6 +2644,9 @@ impl Physics {
             let com = gv(b.center_of_mass());
             let mut f_total = Vec3::ZERO;
             let mut t_total = Vec3::ZERO;
+            let mut f_drag_total = Vec3::ZERO;
+            let mut t_drag_total = Vec3::ZERO;
+            let mut max_rel_speed = 0.0_f32;
             let mut max_sub_frac = 0.0_f32;
 
             for &part_ref in &asm.parts {
@@ -2686,10 +2689,10 @@ impl Physics {
                                 let sub_area = area * sub_frac;
                                 let raw_mag = WATER_LIN_DRAG * submerged_vol * speed
                                     + 0.5 * WATER_DENSITY * WATER_QUAD_CD * sub_area * speed * speed;
-                                let max_mag = 0.5 * body_mass * speed / dt_stab;
-                                let f_drag = -dir * raw_mag.min(max_mag);
-                                f_total += f_drag;
-                                t_total += (buoyancy_pt - com).cross(f_drag);
+                                max_rel_speed = max_rel_speed.max(speed);
+                                let f_drag = -dir * raw_mag;
+                                f_drag_total += f_drag;
+                                t_drag_total += (buoyancy_pt - com).cross(f_drag);
                             }
                         }
                     }
@@ -2718,13 +2721,24 @@ impl Physics {
                         let exposed = 1.0 - sub_frac;
                         let rho = air_density * (-center.y.max(0.0) / 33381.0).exp();
                         let raw_mag = 0.5 * rho * AERO_CD * area * exposed * speed * speed;
-                        let max_mag = 0.5 * body_mass * speed / dt_stab;
-                        let f_aero = -dir * raw_mag.min(max_mag);
-                        f_total += f_aero;
-                        t_total += (center - com).cross(f_aero);
+                        max_rel_speed = max_rel_speed.max(speed);
+                        let f_aero = -dir * raw_mag;
+                        f_drag_total += f_aero;
+                        t_drag_total += (center - com).cross(f_aero);
                     }
                 }
             }
+
+            // Clamp total assembly linear drag (not per-part) so multi-part assemblies cannot oscillate/explode.
+            let drag_mag = f_drag_total.length();
+            let max_drag = 0.5 * body_mass * max_rel_speed / dt_stab;
+            if drag_mag > max_drag && drag_mag > 1.0e-6 {
+                let scale = max_drag / drag_mag;
+                f_drag_total *= scale;
+                t_drag_total *= scale;
+            }
+            f_total += f_drag_total;
+            t_total += t_drag_total;
 
             // Angular water drag damping for submerged assemblies.
             if max_sub_frac > 0.0 {

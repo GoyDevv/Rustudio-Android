@@ -126,6 +126,8 @@ struct Rotate {
 #[derive(Debug, Default)]
 pub struct Gestures {
     fingers: Vec<Finger>,
+    /// Peak simultaneous finger count during the current touch group.
+    peak_fingers: u32,
     pan: Pan,
     pinch: Pinch,
     rotate: Rotate,
@@ -207,6 +209,7 @@ impl Gestures {
                     moved: false,
                     samples: VecDeque::from([(now, (ev.x, ev.y))]),
                 });
+                self.peak_fingers = self.peak_fingers.max(self.fingers.len() as u32);
                 self.rebase_pan();
                 if self.fingers.len() == 2 {
                     let (a, b) = (self.fingers[0].pos, self.fingers[1].pos);
@@ -360,11 +363,13 @@ impl Gestures {
                             } else {
                                 Swipe::Up
                             };
-                            out.push(Gesture::Swipe { direction, touches: count, gpe });
+                            let touches = self.peak_fingers.max(count);
+                            out.push(Gesture::Swipe { direction, touches, gpe });
                         }
                         self.pan = Pan::default();
                     }
                     self.gestured = false;
+                    self.peak_fingers = 0;
                 } else {
                     self.rebase_pan();
                 }

@@ -2051,6 +2051,50 @@ pub struct TextureCache {
     loose_bytes: usize,
 }
 
+/// Returns true when `bytes` look like a Roblox XML or binary asset payload
+/// (after stripping any UTF-8 BOM and leading ASCII whitespace).
+pub fn is_roblox_asset_bytes(bytes: &[u8]) -> bool {
+    let trimmed = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let trimmed = trimmed
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(&trimmed[trimmed.len()..], |i| &trimmed[i..]);
+    trimmed.starts_with(b"<roblox")
+        || trimmed.starts_with(b"<?xml")
+        || trimmed.starts_with(b"<!--")
+}
+
+/// Extracts the inner `Texture` or `TextureContent` URI from a Roblox Decal/Texture
+/// XML or binary asset payload (handling UTF-8 BOM and leading whitespace).
+pub fn unwrap_decal_uri(bytes: &[u8]) -> Option<String> {
+    if !is_roblox_asset_bytes(bytes) {
+        return None;
+    }
+    crate::doc::Document::decode(bytes).ok().and_then(|dom| {
+        dom.descendants().find_map(|i| {
+            for prop in ["Texture", "TextureContent"] {
+                match i.properties.get(&rbx_dom_weak::ustr(prop)) {
+                    Some(rbx_dom_weak::types::Variant::ContentId(c)) if !c.as_str().is_empty() => {
+                        return Some(c.as_str().to_string());
+                    }
+                    Some(rbx_dom_weak::types::Variant::Content(c)) => {
+                        if let Some(u) = c.as_uri() {
+                            if !u.is_empty() {
+                                return Some(u.to_string());
+                            }
+                        }
+                    }
+                    Some(rbx_dom_weak::types::Variant::String(s)) if !s.is_empty() => {
+                        return Some(s.clone());
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+    })
+}
+
 impl TextureCache {
     /// Releases non-pinned loose pixel buffers and decoded staging buffers on trim/background.
     pub fn trim(&mut self) {
@@ -2125,23 +2169,8 @@ impl TextureCache {
                 // Unwrap Roblox Decal XML/binary assets pointing to an inner image URI
                 // before decoding (many Toolbox Decals/Nextbots store Decal asset IDs).
                 Fetch::Ready(mut bytes) => {
-                    let trimmed = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-                    let trimmed = trimmed.iter().position(|b| !b.is_ascii_whitespace()).map_or(trimmed, |i| &trimmed[i..]);
-                    if trimmed.starts_with(b"<roblox") || trimmed.starts_with(b"<?xml") {
-                        let inner = crate::doc::Document::decode(&bytes).ok().and_then(|dom| {
-                            dom.descendants().find_map(|i| {
-                                for prop in ["Texture", "TextureContent"] {
-                                    match i.properties.get(&rbx_dom_weak::ustr(prop)) {
-                                        Some(rbx_dom_weak::types::Variant::ContentId(c)) if !c.as_str().is_empty() => return Some(c.as_str().to_string()),
-                                        Some(rbx_dom_weak::types::Variant::Content(c)) => if let Some(u) = c.as_uri() { if !u.is_empty() { return Some(u.to_string()); } },
-                                        Some(rbx_dom_weak::types::Variant::String(s)) if !s.is_empty() => return Some(s.clone()),
-                                        _ => {}
-                                    }
-                                }
-                                None
-                            })
-                        });
-                        match inner.map(|u| store.content(&u, doc_dir)) {
+                    if is_roblox_asset_bytes(&bytes) {
+                        match unwrap_decal_uri(&bytes).map(|u| store.content(&u, doc_dir)) {
                             Some(Fetch::Ready(b)) => bytes = b,
                             Some(Fetch::Pending) => return None,
                             _ => {

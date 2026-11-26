@@ -44,6 +44,13 @@ pub fn is_open() -> bool {
     wheel().lock().map(|w| w.open).unwrap_or(false)
 }
 
+/// Closes the wheel when Play stops.
+pub fn close() {
+    if let Ok(mut w) = wheel().lock() {
+        w.open = false;
+    }
+}
+
 impl Game {
     /// Draws the wheel over the game view; number keys pick from it while
     /// it's open (they're taken out of `slots`, the hotbar's).

@@ -354,6 +354,7 @@ impl ClientJoints {
             return rustudio_core::body::joint_frames_for(cd, joint);
         }
         if !rustudio_core::body::joint_enabled(cd, j) {
+            self.welds.remove(&j);
             return None;
         }
         let (p0, p1) = rustudio_core::body::joint_parts(cd, j)?;

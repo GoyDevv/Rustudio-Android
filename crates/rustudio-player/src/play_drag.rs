@@ -23,6 +23,11 @@ thread_local! {
     static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
 }
 
+/// Clears any active drag state when Play stops.
+pub(super) fn reset() {
+    ACTIVE.with(|a| *a.borrow_mut() = None);
+}
+
 /// The face normal of `part`'s box nearest the point `p`.
 fn face_normal(d: &Document, part: Ref, p: Vec3) -> Vec3 {
     let Some(x) = rustudio_render::scene::xform_of(d, part) else { return Vec3::Y };

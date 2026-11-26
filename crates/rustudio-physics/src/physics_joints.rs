@@ -560,9 +560,11 @@ impl Physics {
                 let mut rebound = false;
                 for mark in ms {
                     let doc::Mark::Prop(r, key) = mark else { continue };
-                    if matches!(key.as_str(), "Attachment0" | "Attachment1") && c.known.contains(r) {
-                        // Rebinding changes reverse dependencies as well as the frame.
-                        rebound = true;
+                    if c.known.contains(r) {
+                        if matches!(key.as_str(), "Attachment0" | "Attachment1") {
+                            // Rebinding changes reverse dependencies as well as the frame.
+                            rebound = true;
+                        }
                         wake_joints.insert(*r);
                     }
                     if *key != "CFrame" {
@@ -734,6 +736,12 @@ impl Physics {
             "AngularVelocity" => a1.is_none(),
             _ => false,
         };
+        let uses_a1_frame = match class.as_str() {
+            "VectorForce" | "Torque" => e("RelativeTo", 0) == 1,
+            "LinearVelocity" => e("RelativeTo", 2) == 1,
+            "AlignPosition" => one && e("ForceRelativeTo", 2) == 1,
+            _ => false,
+        };
         let end = |me: &Self, a: Option<Ref>| a.and_then(|a| me.joint_end(doc, a)).map(|x| {
             let mut s = studio_end(&x);
             s.mass = a.map_or(0.0, |a| me.studio_mass(doc, a));
@@ -774,7 +782,13 @@ impl Physics {
             Some(solver_joints::End { body: Some(body), pos, rot, mass: 0.0 })
         };
         let ea = if legacy { Some(mover_end().unwrap_or(solver_joints::End::WORLD)) } else { end(self, a0) };
-        let eb = if legacy || one { Some(solver_joints::End::WORLD) } else { end(self, a1) };
+        let eb = if legacy {
+            Some(solver_joints::End::WORLD)
+        } else if one {
+            Some(if uses_a1_frame { end(self, a1).unwrap_or(solver_joints::End::WORLD) } else { solver_joints::End::WORLD })
+        } else {
+            end(self, a1)
+        };
         if ea.is_none() || eb.is_none() {
             enabled = false;
         }
@@ -896,6 +910,7 @@ impl Physics {
                 SClass::AlignOrientation {
                     one_attachment: one,
                     target,
+                    look_at_pos: v("LookAtPosition"),
                     align_type: e("AlignType", 5),
                     primary_only: on("PrimaryAxisOnly"),
                     max_ang_vel: n("MaxAngularVelocity", inf),
@@ -955,22 +970,11 @@ impl Physics {
             }
             _ => return None,
         };
-        if let SClass::AlignOrientation { align_type: 4, .. } = &class {
-            uncovered_once(&UNCOVERED_LOOKAT, "AlignOrientation with AlignType PrimaryAxisLookAt");
-        }
-        // VectorForce / Torque with RelativeTo Attachment1 read B's frame
-        let b = match &class {
-            SClass::VectorForce { relative_to: 1, .. } | SClass::Torque { relative_to: 1, .. } => end(self, a1).unwrap_or(b),
-            SClass::LineForce { .. } => end(self, a1).unwrap_or(b),
-            SClass::LinearVelocity { relative_to: 1, .. } => end(self, a1).unwrap_or(b),
-            _ => b,
-        };
         Some(solver_joints::Desc { class, a, b, in_world: enabled })
     }
 }
 
 static UNCOVERED_ROCKET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static UNCOVERED_LOOKAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What the Studio solver (the default) does not simulate yet but rapier does: said
 /// once per process, so a place that relies on it can be run with the old physics.

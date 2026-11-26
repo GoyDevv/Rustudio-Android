@@ -115,12 +115,18 @@ impl Asset {
             self.price = o.price;
         }
         self.has_scripts |= o.has_scripts;
+        if self.script_count == 0 {
+            self.script_count = o.script_count;
+        }
         if self.created.is_empty() {
             self.created = o.created.clone();
             self.updated = o.updated.clone();
         }
         if self.category_path.is_empty() {
             self.category_path = o.category_path.clone();
+        }
+        if self.sub_types.is_empty() {
+            self.sub_types = o.sub_types.clone();
         }
         if self.triangles.is_none() {
             self.triangles = o.triangles;

@@ -985,7 +985,7 @@ struct TagCache {
     of: rustc_hash::FxHashMap<Ref, Vec<String>>,
 }
 
-fn tags_in(v: Option<&Variant>) -> Vec<String> {
+pub(crate) fn tags_in(v: Option<&Variant>) -> Vec<String> {
     match v {
         Some(Variant::Tags(t)) => t.iter().map(|s| s.to_string()).collect(),
         Some(Variant::BinaryString(b)) => Tags::decode(b.as_ref())
@@ -2268,6 +2268,9 @@ fn overlap_once(
         if !filter.brute_force_all_slow && !p.query && !p.collide {
             continue;
         }
+        if filter.respect_collide && !p.collide {
+            continue;
+        }
         let (plo, phi) = part_aabb(p);
         let hit = match sphere {
             Some((c, r)) => (c.clamp(plo, phi) - c).length() <= r,
@@ -2281,6 +2284,106 @@ fn overlap_once(
         }
     }
     Ok(out)
+}
+
+fn parts_in_part(lua: &Lua, root: Ref, p: Ref, params: &Value) -> mlua::Result<Vec<Ref>> {
+    let xf = part_xform(lua, p)?;
+    let size = part_size(lua, p)?;
+    let (probe_kind, is_workspace) = {
+        let w = world(lua)?;
+        let d = w.d();
+        let class = d
+            .class_of(p)
+            .filter(|c| doc::is_a(c, "BasePart"))
+            .ok_or_else(|| rt_err("GetPartsInPart: BasePart expected"))?;
+        (
+            rustudio_physics::query_shapes::kind_of(d, p, &class),
+            d.workspace() == Some(root),
+        )
+    };
+    let tol = overlap_tolerance(params);
+    let probe_size = size + Vec3::splat(tol * 2.0);
+    let (lo, hi) = part_aabb(&QPart {
+        r: p,
+        xf,
+        size: probe_size,
+        collide: true,
+        query: true,
+        mesh: false,
+        shape: 0,
+        cvx: 0,
+        initial: Vec3::ONE,
+    });
+    let filter = match params {
+        Value::Nil => Filter::none(),
+        _ => params_filter_groups(lua, params),
+    };
+    let max = num(&ud_value(params, "MaxParts"))
+        .filter(|n| *n > 0.0)
+        .map(|n| n as usize)
+        .unwrap_or(usize::MAX);
+    let near = if is_workspace {
+        let refs = overlap(lua, lo, hi, None, &filter, usize::MAX)?;
+        let cache = lua.app_data_ref::<QueryCache>();
+        refs.into_iter()
+            .filter_map(|r| {
+                let c = cache.as_ref()?;
+                c.index.get(&r).and_then(|i| c.parts.get(*i)).copied()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let w = world(lua)?;
+        let d = w.d();
+        d.dom
+            .descendants_of(root)
+            .filter_map(|i| {
+                let r = i.referent();
+                if r == p || !doc::is_a(&i.class, "BasePart") || !filter.passes(d, r) {
+                    return None;
+                }
+                let q = world_root_part(d, r, &i.class)?;
+                let (qlo, qhi) = part_aabb(&q);
+                ((filter.brute_force_all_slow || q.query || q.collide)
+                    && qlo.cmple(hi).all()
+                    && qhi.cmpge(lo).all())
+                .then_some(q)
+            })
+            .collect()
+    };
+    let w = world(lua)?;
+    let d = w.d();
+    Ok(near
+        .into_iter()
+        .filter(|q| {
+            if q.r == p
+                || query_root(d, q.r) != Some(root)
+                || (filter.respect_collide && !q.collide)
+            {
+                return false;
+            }
+            if q.mesh {
+                let id = if d
+                    .class_of(q.r)
+                    .is_some_and(|c| doc::is_a(&c, "PartOperation"))
+                {
+                    rustudio_core::mesh::union_mesh(d, q.r).map(|m| m.id)
+                } else {
+                    rustudio_render::scene::content_string(d.prop(q.r, "MeshId"))
+                };
+                return match id.and_then(|id| rustudio_core::mesh_bvh::for_mesh(&id)) {
+                    Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(
+                        &xf, probe_size, &q.xf, q.size, &bvh,
+                    ),
+                    None => rustudio_physics::query_shapes::obb_obb(&xf, probe_size, &q.xf, q.size),
+                };
+            }
+            rustudio_physics::query_shapes::part_part(
+                &xf, probe_size, probe_kind, &q.xf, q.size, q.shape,
+            )
+        })
+        .take(max)
+        .map(|q| q.r)
+        .collect())
 }
 
 /// Workspace.Terrain with its voxels and their world bounds (studs), read
@@ -5675,7 +5778,18 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             none()
         }
         "GetScale" => one(Value::Number(1.0)),
-        "GetTouchingParts" => one(Value::Table(list(lua, Vec::new())?)),
+        "GetTouchingParts" => {
+            let root = {
+                let w = world(lua)?;
+                let d = w.d();
+                query_root(d, this).or_else(|| d.workspace())
+            };
+            let parts = match root {
+                Some(root) => parts_in_part(lua, root, this, &Value::Nil)?,
+                None => Vec::new(),
+            };
+            one(Value::Table(list(lua, parts)?))
+        }
         "GetConnectedParts" | "GetRootPart" => {
             if name == "GetRootPart" {
                 one(inst_value(lua, this)?)
@@ -6071,96 +6185,25 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 Value::Nil => Filter::none(),
                 ref p => params_filter_groups(lua, p),
             };
+            let max = num(&ud_value(&params, "MaxParts"))
+                .filter(|n| *n > 0.0)
+                .map(|n| n as usize)
+                .unwrap_or(usize::MAX);
             let parts = overlap(
                 lua,
                 c - Vec3::splat(r),
                 c + Vec3::splat(r),
                 Some((c, r)),
                 &filter,
-                usize::MAX,
+                max,
             )?;
             one(Value::Table(list(lua, parts)?))
         }
         "GetPartsInPart" => {
             let p = opt_inst(&arg(args, 1))
                 .ok_or_else(|| rt_err("GetPartsInPart: BasePart expected"))?;
-            let xf = part_xform(lua, p)?;
-            let size = part_size(lua, p)?;
-            let (probe_kind, is_workspace) = {
-                let w = world(lua)?;
-                let d = w.d();
-                let class = d.class_of(p).filter(|c| doc::is_a(c, "BasePart"))
-                    .ok_or_else(|| rt_err("GetPartsInPart: BasePart expected"))?;
-                (rustudio_physics::query_shapes::kind_of(d, p, &class), d.workspace() == Some(this))
-            };
             let params = arg(args, 2);
-            let tol = overlap_tolerance(&params);
-            let probe_size = size + Vec3::splat(tol * 2.0);
-            let (lo, hi) = part_aabb(&QPart {
-                r: p,
-                xf,
-                size: probe_size,
-                collide: true,
-                query: true,
-                mesh: false,
-                shape: 0,
-                cvx: 0,
-                initial: Vec3::ONE,
-            });
-            let filter = match params {
-                Value::Nil => Filter::none(),
-                _ => params_filter_groups(lua, &params),
-            };
-            let max = num(&ud_value(&params, "MaxParts"))
-                .filter(|n| *n > 0.0)
-                .map(|n| n as usize)
-                .unwrap_or(usize::MAX);
-            let near = if is_workspace {
-                let refs = overlap(lua, lo, hi, None, &filter, usize::MAX)?;
-                let cache = lua.app_data_ref::<QueryCache>();
-                refs.into_iter().filter_map(|r| {
-                    let c = cache.as_ref()?;
-                    c.index.get(&r).and_then(|i| c.parts.get(*i)).copied()
-                }).collect::<Vec<_>>()
-            } else {
-                let w = world(lua)?;
-                let d = w.d();
-                d.dom.descendants_of(this).filter_map(|i| {
-                    let r = i.referent();
-                    if r == p || !doc::is_a(&i.class, "BasePart") || !filter.passes(d, r) {
-                        return None;
-                    }
-                    let q = world_root_part(d, r, &i.class)?;
-                    let (qlo, qhi) = part_aabb(&q);
-                    ((filter.brute_force_all_slow || q.query || q.collide)
-                        && qlo.cmple(hi).all()
-                        && qhi.cmpge(lo).all())
-                    .then_some(q)
-                }).collect()
-            };
-            let parts = {
-                let w = world(lua)?;
-                let d = w.d();
-                near.into_iter().filter(|q| {
-                    if q.r == p || query_root(d, q.r) != Some(this)
-                        || (filter.respect_collide && !q.collide)
-                    {
-                        return false;
-                    }
-                    if q.mesh {
-                        let id = if d.class_of(q.r).is_some_and(|c| doc::is_a(&c, "PartOperation")) {
-                            rustudio_core::mesh::union_mesh(d, q.r).map(|m| m.id)
-                        } else {
-                            rustudio_render::scene::content_string(d.prop(q.r, "MeshId"))
-                        };
-                        return match id.and_then(|id| rustudio_core::mesh_bvh::for_mesh(&id)) {
-                            Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(&xf, probe_size, &q.xf, q.size, &bvh),
-                            None => rustudio_physics::query_shapes::obb_obb(&xf, probe_size, &q.xf, q.size),
-                        };
-                    }
-                    rustudio_physics::query_shapes::part_part(&xf, probe_size, probe_kind, &q.xf, q.size, q.shape)
-                }).take(max).map(|q| q.r).collect::<Vec<_>>()
-            };
+            let parts = parts_in_part(lua, this, p, &params)?;
             one(Value::Table(list(lua, parts)?))
         }
         "GetServerTimeNow" => one(Value::Number(
@@ -6444,13 +6487,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 let d = w.d();
                 d.dom
                     .descendants()
-                    .filter_map(|i| match i.properties.get(&ustr("Tags")) {
-                        Some(Variant::Tags(t)) => {
-                            Some(t.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-                        }
-                        _ => None,
-                    })
-                    .flatten()
+                    .flat_map(|i| tags_in(i.properties.get(&ustr("Tags"))))
                     .collect()
             };
             all.sort();
@@ -6581,8 +6618,31 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 lua.create_userdata(LVector2(glam::Vec2::new(xy[0], xy[1])))?,
             ))
         }
-        "IsMouseButtonPressed" => one(Value::Boolean(false)),
-        "GetKeysPressed" => one(Value::Table(lua.create_table()?)),
+        "IsMouseButtonPressed" => {
+            let btn = match arg(args, 1) {
+                Value::UserData(ref u) => u.borrow::<LEnumItem>().ok().map(|e| e.name.clone()),
+                Value::String(ref s) => s.to_str().ok().map(|t| t.to_string()),
+                _ => None,
+            };
+            let pressed = match btn {
+                Some(name) => lua
+                    .globals()
+                    .get::<Function>("__rs_is_mouse_button_pressed")
+                    .and_then(|f| f.call::<bool>(name))
+                    .unwrap_or(false),
+                None => false,
+            };
+            one(Value::Boolean(pressed))
+        }
+        "GetKeysPressed" => {
+            let keys_down: Vec<String> = world(lua)?.keys_down.iter().cloned().collect();
+            let tbl = if let Ok(f) = lua.globals().get::<Function>("__rs_get_keys_pressed") {
+                f.call::<Table>(lua.create_sequence_from(keys_down)?)?
+            } else {
+                lua.create_table()?
+            };
+            one(Value::Table(tbl))
+        }
         "GetCore" => {
             if let Value::String(k) = arg(args, 1) {
                 if let Ok(ks) = k.to_str() {
