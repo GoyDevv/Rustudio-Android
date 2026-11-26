@@ -3602,7 +3602,7 @@ impl Physics {
         // Studio's cyclic executive caps this frame and remembers less
         // than four steps for the next. The worker and inline paths use
         // the same frame budget, including the opening fractional tick.
-        let max_steps = if cfg!(target_os = "android") { self.throttle.max_world_steps().min(6) } else { self.throttle.max_world_steps() };
+        let max_steps = self.throttle.max_world_steps();
         let wanted = self.accum + dt.max(0.0);
         self.accum = wanted.min(h * (max_steps as f32 + mech::PHYSICS_CARRY_MAX_STEPS));
         let owed = ((wanted - self.accum) * 60.0) as u32;

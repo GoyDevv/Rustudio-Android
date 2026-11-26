@@ -80,7 +80,15 @@ impl Throttle {
     /// 0.4 of the frames step the environment, else 4, one 60 Hz frame's worth). Studio's
     /// rule reads the throttle factor; Always and Disabled have none here, so they keep 12.
     pub fn max_world_steps(&self) -> usize {
-        let throttled = matches!(self.mode, Mode::Default | Mode::Skip(_)) && self.fraction() <= 0.4;
+        // On Android (typically 30-60 fps), dropping max_world_steps to 4 (16.67 ms at 240 Hz)
+        // forces the player's Humanoid into 0.5x slow motion and traps the adaptive throttle at
+        // max level via owed steps. Keep the full 12-step (50 ms) budget for Mode::Default so
+        // environmental throttling only skips background parts while keeping 1.0x real-time speed.
+        let throttled = if cfg!(target_os = "android") {
+            matches!(self.mode, Mode::Skip(_)) && self.fraction() <= 0.4
+        } else {
+            matches!(self.mode, Mode::Default | Mode::Skip(_)) && self.fraction() <= 0.4
+        };
         if throttled {
             rustudio_core::mech::THROTTLED_MAX_PHYSICS_STEPS
         } else {
