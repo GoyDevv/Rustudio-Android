@@ -394,13 +394,14 @@ impl Renderer {
         // The sample count of the pipelines it is drawn with (1 on OpenGL);
         // at one sample the scene is drawn straight into `resolve`.
         let samples = self.probe_samples;
+        let hdr_fmt = super::scene_hdr_format(device);
         let depth = tex("viewport frame depth", DEPTH_FORMAT, samples, att).create_view(&Default::default());
-        let resolve = tex("viewport frame resolve", HDR_FORMAT, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
+        let resolve = tex("viewport frame resolve", hdr_fmt, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());
         let msaa = if samples == 1 {
             resolve.clone()
         } else {
-            tex("viewport frame msaa", HDR_FORMAT, samples, att).create_view(&Default::default())
+            tex("viewport frame msaa", hdr_fmt, samples, att).create_view(&Default::default())
         };
         let out = tex(
             "viewport frame",

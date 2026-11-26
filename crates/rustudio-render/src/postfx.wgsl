@@ -61,7 +61,7 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> PostOut {
         vec2<f32>(-1.0, 3.0),
     );
     var out: PostOut;
-    out.pos = vec4<f32>(p[vid], 0.0, 1.0);
+    out.pos = vec4<f32>(p[vid], 0.5, 1.0);
     out.uv = vec2<f32>(p[vid].x * 0.5 + 0.5, 0.5 - p[vid].y * 0.5);
     return out;
 }
@@ -85,7 +85,8 @@ fn sample_scene_encoded(uv: vec2<f32>) -> vec3<f32> {
 }
 
 fn scene_post_exp_linear(rgb: vec3<f32>) -> vec3<f32> {
-    let encoded = sqrt(clamp(max(rgb, vec3<f32>(0.0)) * u.p0.x * 0.25, vec3<f32>(0.0), vec3<f32>(1.0)));
+    let safe_rgb = select(vec3<f32>(0.0), rgb, rgb > vec3<f32>(0.0));
+    let encoded = sqrt(clamp(safe_rgb * u.p0.x * 0.25, vec3<f32>(0.0), vec3<f32>(1.0)));
     return 4.0 * encoded * encoded;
 }
 
@@ -546,7 +547,7 @@ fn fs_dof_tent(in: PostOut) -> @location(0) vec4<f32> {
 // tex0 = scene (post-DOF linear HDR), tex1 = bloom, tex2 = sunrays, tex3 = blur (1/4-res encoded).
 
 fn apply_tonemap(x: vec3<f32>) -> vec3<f32> {
-    let y = max(x, vec3<f32>(0.0));
+    let y = select(vec3<f32>(0.0), x, x > vec3<f32>(0.0));
     let mode = i32(u.p0.z + 0.5);
     if (mode == 2) {
         // Legacy no-tone / debug view: sqrt(clamp(y, 0, 1))

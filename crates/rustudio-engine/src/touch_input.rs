@@ -943,9 +943,10 @@ pub fn set_hardware_kbm(keyboard: bool, mouse: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let prev = HAS_HW_KB.swap(keyboard, Relaxed) || HAS_HW_MOUSE.swap(mouse, Relaxed);
     let now = keyboard || mouse;
-    if now && !prev {
-        ACTIVE_KBM.store(true, Relaxed);
-    } else if !now && prev {
+    // Do not auto-enable ACTIVE_KBM on boot (many Android phones expose phantom
+    // virtual keyboard/mouse devices like fingerprint/media sensors); only clear
+    // it when hardware KBM disconnects, and let real external KBM events turn it on.
+    if !now && prev {
         ACTIVE_KBM.store(false, Relaxed);
     }
 }
@@ -982,7 +983,7 @@ pub fn game_touch() -> bool {
     }
     match env_touch_override() {
         Some(v) => v,
-        None => cfg!(target_os = "android") && !kbm_active(),
+        None => cfg!(target_os = "android"),
     }
 }
 

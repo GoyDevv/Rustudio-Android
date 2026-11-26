@@ -1140,7 +1140,8 @@ function __rs_input_event(state, uit, key, x, y, z, dx, dy, gpe)
     local ev = state == "Begin" and "InputBegan" or state == "End" and "InputEnded" or "InputChanged"
     -- UserInputService.LastInputTypeChanged: the kind of input the player
     -- last used changed (Roblox: keyboard / mouse movement / a button…).
-    if uit ~= last_input() then
+    local soft_kb_on_touch = gpe and uit == "Keyboard" and last_input() == "Touch"
+    if not soft_kb_on_touch and uit ~= last_input() then
         last_input_type = uit
         fire(uis, "LastInputTypeChanged", Enum.UserInputType[uit])
     end

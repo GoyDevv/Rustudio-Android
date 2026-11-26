@@ -649,10 +649,15 @@ impl PostFx {
         let blur_1d = make_pipe("postfx blur 1d", "fs_blur_1d", hdr_format, None);
         let dof_cheap = make_pipe("postfx dof cheap", "fs_dof_cheap", hdr_format, None);
         let dof_down_v = make_pipe("postfx dof down v", "fs_dof_down_v", hdr_format, None);
+        let r16_fmt = if hdr_format == wgpu::TextureFormat::Rgba8Unorm {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            wgpu::TextureFormat::R16Float
+        };
         let dof_coc_filter = make_pipe(
             "postfx dof coc filter",
             "fs_dof_coc_filter",
-            wgpu::TextureFormat::R16Float,
+            r16_fmt,
             None,
         );
         let dof_edge_fatten = make_pipe("postfx dof edge fatten", "fs_dof_edge_fatten", hdr_format, None);
@@ -749,7 +754,7 @@ impl PostFx {
             })
         };
         self.depth_pipes[slot] = Some(DepthPipelines {
-            sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", wgpu::TextureFormat::R16Float),
+            sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", if self.hdr_format == wgpu::TextureFormat::Rgba8Unorm { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R16Float }),
             dof_cheap_prep: make("postfx dof cheap prep", "fs_dof_cheap_prep", self.hdr_format),
             dof_far_down_h: make("postfx dof far down h", "fs_dof_far_down_h", self.hdr_format),
             dof_near_down_h: make("postfx dof near down h", "fs_dof_near_down_h", self.hdr_format),
@@ -832,7 +837,7 @@ impl PostFx {
         let half_size = [((w + (w & 1)) / 2).max(1), ((h + (h & 1)) / 2).max(1)];
         let quarter_dof_size = [((w + (w & 1)) / 4).max(1), ((h + (h & 1)) / 4).max(1)];
         let quarter_size = [(w >> 2).max(1), (h >> 2).max(1)];
-        let r16 = wgpu::TextureFormat::R16Float;
+        let r16 = if self.hdr_format == wgpu::TextureFormat::Rgba8Unorm { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R16Float };
 
         let depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("postfx depth"),

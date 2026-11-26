@@ -27,9 +27,12 @@ const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// 32-bit HDR (Rg11b10Ufloat) on Android Vulkan when renderable: halves HDR,
 /// scene-copy, and PostFX memory bandwidth and keeps color+depth at 64 bits/px
 /// (half of Mali-G52's 128-bit tile buffer) with full HDR lighting & bloom.
-fn scene_hdr_format(device: &wgpu::Device) -> wgpu::TextureFormat {
-    if cfg!(target_os = "android")
-        && device.adapter_info().backend != wgpu::Backend::Gl
+pub(crate) fn scene_hdr_format(device: &wgpu::Device) -> wgpu::TextureFormat {
+    let info = device.adapter_info();
+    if crate::gpu_caps::is_powervr_gl(&info) {
+        wgpu::TextureFormat::Rgba8Unorm
+    } else if cfg!(target_os = "android")
+        && info.backend != wgpu::Backend::Gl
         && device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE)
     {
         wgpu::TextureFormat::Rg11b10Ufloat
@@ -78,9 +81,14 @@ impl LightShadows {
                 })
                 .create_view(&Default::default())
         };
+        let lfmt = if crate::gpu_caps::is_powervr_gl(&device.adapter_info()) {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            LSHADOW_FORMAT
+        };
         let moments_view = tex(
             "light shadow moments",
-            LSHADOW_FORMAT,
+            lfmt,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let depth_view = tex("light shadow depth", DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
@@ -2116,7 +2124,7 @@ impl SeeThrough {
             })
         };
         SeeThrough {
-            encode: pipe("see-through encode", "fs_see_encode", false, HDR_FORMAT),
+            encode: pipe("see-through encode", "fs_see_encode", false, hdr_format),
             // (in the pass that also draws the editor's lines: with depth)
             decode: pipe("see-through decode", "fs_see_decode", true, hdr_format),
             layout,
@@ -2206,7 +2214,10 @@ struct ViewportPipelines {
 // channels they write, so the half-float equivalents need no shader changes.
 fn post_float_formats(device: &wgpu::Device) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
     use wgpu::TextureFormat::*;
-    if device.adapter_info().backend == wgpu::Backend::Gl {
+    let info = device.adapter_info();
+    if crate::gpu_caps::is_powervr_gl(&info) {
+        (Rgba8Unorm, Rgba8Unorm)
+    } else if info.backend == wgpu::Backend::Gl {
         (R16Float, Rg16Float)
     } else if cfg!(target_os = "android") {
         // Keep full 32-bit float depth precision (prevents depth banding / Z-fighting)
@@ -2351,10 +2362,15 @@ impl ViewportPipelines {
                     depth_write: bool,
                     depth_compare: wgpu::CompareFunction,
                     blend: Option<wgpu::BlendState>| {
-            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[], HDR_FORMAT)
+            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[], hdr_format)
         };
         use wgpu::CompareFunction as C;
         use wgpu::PrimitiveTopology as T;
+        let sky_cmp = if device.adapter_info().backend == wgpu::Backend::Gl {
+            C::Always
+        } else {
+            C::GreaterEqual
+        };
         let sky = make(
             "sky",
             "vs_sky",
@@ -2363,7 +2379,7 @@ impl ViewportPipelines {
             T::TriangleList,
             None,
             false,
-            C::GreaterEqual,
+            sky_cmp,
             None,
         );
         let opaque = make(
@@ -5022,7 +5038,7 @@ impl Renderer {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING)
                 .create_view(&Default::default())
         };
-        let see_view = tex("viewport-see-through", HDR_FORMAT, samples,
+        let see_view = tex("viewport-see-through", hdr_format, samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
         let see_encode_bg = viewport.see.bind(device, &msaa_view);
         let see_decode_bg = viewport.see.bind(device, &see_view);
@@ -5377,7 +5393,8 @@ impl Renderer {
         self.gui_fog = Self::gui_fog(&frame.globals);
         self.gui_exposure = frame.globals.params[1];
         self.gui_lightgrid = frame.globals.lightgrid;
-        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, rustudio_core::mech::SUN_DIST, rustudio_core::mech::HYBRID_LERP_SLOPE, if frame.shadows { 1.0 } else { 0.0 }];
+        let shadows_on = frame.shadows && self.caps.hdr_float_rt;
+        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, rustudio_core::mech::SUN_DIST, rustudio_core::mech::HYBRID_LERP_SLOPE, if shadows_on { 1.0 } else { 0.0 }];
         self.gui_sun = crate::world_gui::SunCascades { local: frame.globals.sun_casc, sphere: frame.globals.sun_sphere, rect: frame.globals.sun_rect };
         let mut stats = RenderStats {
             rebuilds: self.stats.rebuilds,
@@ -5785,7 +5802,7 @@ impl Renderer {
         let scene_gen = self.caster_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
-        let sun_due = if frame.shadows {
+        let sun_due = if shadows_on {
             self.sun.upload(queue, &frame.sun_cascades);
             self.sun.plan(&frame.sun_cascades, scene_gen, self.dyn_caster_gen, !opaque_runs.is_empty() || !cutout_runs.is_empty() || !self.terrain_grass.is_empty())
         } else {
@@ -6587,6 +6604,15 @@ impl Renderer {
             };
 
             unbind();
+            let gl_sky_first = self.caps.backend == wgpu::Backend::Gl;
+            if gl_sky_first && frame.sky {
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pass.set_bind_group(1, &self.textures[0], &[]);
+                pass.set_bind_group(2, &target.glass_bg, &[]);
+                pass.set_pipeline(&viewport.sky);
+                pass.draw(0..3, 0..1);
+                unbind();
+            }
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
                 pass.set_pipeline(opaque_pipe(r.1, &self.st.raw[r.2 as usize..r.3 as usize]));
@@ -6628,11 +6654,14 @@ impl Renderer {
                 // Depth-test sky and clouds against reversed-Z clear depth (0.0)
                 // after opaque and terrain geometry so only uncovered sky samples
                 // are shaded (0a108737), while cutout edges blend over sky + clouds.
+                // On OpenGL ES, sky was already drawn first with CompareFunction::Always.
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(1, &self.textures[0], &[]);
                 pass.set_bind_group(2, &target.glass_bg, &[]);
-                pass.set_pipeline(&viewport.sky);
-                pass.draw(0..3, 0..1);
+                if !gl_sky_first {
+                    pass.set_pipeline(&viewport.sky);
+                    pass.draw(0..3, 0..1);
+                }
                 if let Some(c) = self.clouds[cloud_slot].as_ref().filter(|_| frame.clouds.is_some()) {
                     let globals_bg = self.sky_globals.as_ref().map_or(&self.globals_bg, |(_, bg)| bg);
                     c.draw_over_sky(device, &mut pass, globals_bg);

@@ -276,7 +276,7 @@ fn sky_color_lod_k(dir: vec3<f32>, lod: f32, k: vec3<f32>) -> vec3<f32> {
         c = sq(t) * k * select(vec3<f32>(1.0), g.sky_tint.rgb, g.sky_tint.w > 0.5);
     } else {
         let h = clamp(dir.y, -1.0, 1.0);
-        c = mix(g.sky_horizon.rgb, g.sky_top.rgb, pow(clamp(h, 0.0, 1.0), 0.55));
+        c = mix(g.sky_horizon.rgb, g.sky_top.rgb, pow(max(clamp(h, 0.0, 1.0), 1e-6), 0.55));
         if (h < 0.0) {
             c = mix(g.sky_horizon.rgb, g.sky_horizon.rgb * 0.55, clamp(-h * 3.0, 0.0, 1.0));
         }
@@ -287,7 +287,7 @@ fn sky_color_lod_k(dir: vec3<f32>, lod: f32, k: vec3<f32>) -> vec3<f32> {
     }
     let t = atmos_t(dir);
     // The sun's glare: Lamp0Color x clamp((0.5 + 0.5 dot(dir, toward sun))^exp x (1 - t)) x Glare.
-    let gl = clamp(pow(vec3<f32>(0.5 + 0.5 * dot(dir, normalize(g.sun_dir.xyz))), g.atmos_glare.xyz) * (1.0 - t),
+    let gl = clamp(pow(vec3<f32>(max(0.5 + 0.5 * dot(dir, normalize(g.sun_dir.xyz)), 1e-6)), g.atmos_glare.xyz) * (1.0 - t),
         vec3<f32>(0.0), vec3<f32>(1.0)) * g.atmos_sky.z;
     let haze = atmos_haze(dir) + g.sun_color.rgb * g.sun_dir.w * gl;
     return mix(haze, c, t);
@@ -307,7 +307,7 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
     var o: SkyOut;
     // Slightly above 0.0 (still < NEAR / FAR) so GLES3's 2*z - w stays strictly
     // inside (-1, 1) and never clips at z == -w; passes GreaterEqual on clear 0.0.
-    o.pos = vec4<f32>(x, y, 1e-7, 1.0);
+    o.pos = vec4<f32>(x, y, 1e-5, 1.0);
     o.ndc = vec2<f32>(x, y);
     return o;
 }
@@ -870,7 +870,9 @@ fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
         let h = vh * inverseSqrt(max(dot(vh, vh), 0.0001));
         let nh = max(dot(n, h), 0.001);
         let lh = dot(direction, h);
-        let edge = pow(1.0 - lh, 5.0);
+        let _et = clamp(1.0 - lh, 0.0, 1.0);
+        let _et2 = _et * _et;
+        let edge = _et2 * _et2 * _et;
         let fresnel = vec3<f32>(edge) + f0 * (1.0 - edge);
         let a = pow(rough, 4.0);
         let denominator = (nh * a - nh) * nh + 1.0;
@@ -1245,7 +1247,7 @@ fn shade_opaque_low(in: PartOut, use_shadow_map: bool) -> vec4<f32> {
     var base = in.color.rgb * vertex_tint;
     if (mode != 0u) {
         let sample = textureSampleGrad(tex, tex_sampler, in.uv, uv_dx, uv_dy);
-        let raw = select(1.055 * pow(sample.rgb, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+        let raw = select(1.055 * pow(max(sample.rgb, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
             12.92 * sample.rgb, sample.rgb <= vec3<f32>(0.0031308));
         let squared = raw * raw;
         if (mode == 1u && in.tint.w > 0.5) {
@@ -1329,7 +1331,7 @@ fn shade_transparent_low(in: PartOut, use_shadow_map: bool) -> vec4<f32> {
     var alpha = in.color.a;
     if (mode != 0u) {
         let sample = textureSampleGrad(tex, tex_sampler, in.uv, uv_dx, uv_dy);
-        let raw = select(1.055 * pow(sample.rgb, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+        let raw = select(1.055 * pow(max(sample.rgb, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
             12.92 * sample.rgb, sample.rgb <= vec3<f32>(0.0031308));
         let squared = raw * raw;
         if (mode == 2u || mode == 3u) {
@@ -1780,7 +1782,9 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
             let h = normalize(v + l);
             let nh = max(dot(n, h), 0.001);
             let lh = dot(l, h);
-            let e = pow(1.0 - lh, 5.0);
+            let _e1 = clamp(1.0 - lh, 0.0, 1.0);
+            let _e2 = _e1 * _e1;
+            let e = _e2 * _e2 * _e1;
             fs = vec3<f32>(e) + f0 * (1.0 - e);
             let a = pow(rough, 4.0);
             let d = (nh * a - nh) * nh + 1.0;
@@ -2089,7 +2093,9 @@ fn fs_water(in: PartOut) -> @location(0) vec4<f32> {
         let a2 = (r * r) * (r * r);
         let ndh = max(0.001, dot(nm, hv));
         let ldh = dot(l, hv);
-        let f5 = pow(1.0 - ldh, 5.0);
+        let _f1 = clamp(1.0 - ldh, 0.0, 1.0);
+        let _f2 = _f1 * _f1;
+        let f5 = _f2 * _f2 * _f1;
         let fr = f5 + 0.02 * (1.0 - f5);
         let den = (ndh * a2 - ndh) * ndh + 1.0;
         let dterm = (a2 + a2 * a2) / ((den * den) * (ldh * 3.0 + 0.5) * (ndh * 0.75 + 0.25));
@@ -2666,7 +2672,7 @@ fn vs_post(@builtin(vertex_index) i: u32) -> PostOut {
     let x = f32(i32(i & 1u) * 4 - 1);
     let y = f32(i32(i >> 1u) * 4 - 1);
     var o: PostOut;
-    o.pos = vec4<f32>(x, y, 0.0, 1.0);
+    o.pos = vec4<f32>(x, y, 0.5, 1.0);
     o.uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
     return o;
 }

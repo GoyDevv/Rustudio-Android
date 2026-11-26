@@ -834,7 +834,7 @@ struct VOut { @builtin(position) pos: vec4<f32> };
 fn vs(@builtin(vertex_index) i: u32) -> VOut {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
     var o: VOut;
-    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.5, 1.0);
     return o;
 }
 @fragment
@@ -1029,7 +1029,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 fn vs(@builtin(vertex_index) i: u32) -> VOut {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
     var o: VOut;
-    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.5, 1.0);
     o.uv = vec2<f32>(p.x, 1.0 - p.y);
     return o;
 }
@@ -1547,7 +1547,7 @@ impl WorldGuiPass {
             sun_atlas: device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("unshadowed GUI fallback"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+                format: hdr_format, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
             }).create_view(&Default::default()),
             sun_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("sun shadow cascades"),

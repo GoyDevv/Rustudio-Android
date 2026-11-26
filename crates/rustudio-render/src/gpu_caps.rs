@@ -25,6 +25,27 @@ pub struct GpuCaps {
     /// R8Unorm storage textures (HBAO's visibility output); else it writes
     /// Rgba8Unorm.
     pub r8_storage: bool,
+    /// Whether Rgba16Float is reliably color-renderable + filterable + blendable
+    /// (false on PowerVR Rogue GLES 3.0 and GLES devices lacking float RT support).
+    pub hdr_float_rt: bool,
+    /// Whether R16Float / Rg16Float are reliably color-renderable + filterable.
+    pub r16_float_rt: bool,
+}
+
+/// PowerVR Rogue Android GLES 3.0 drivers have broken Rgba16Float/R16Float FBO
+/// clears and blends (causing uncleared smearing frames and black EVSM/probes).
+pub fn is_powervr_gl(info: &wgpu::AdapterInfo) -> bool {
+    if info.backend != wgpu::Backend::Gl {
+        return false;
+    }
+    let name = info.name.to_ascii_lowercase();
+    let driver = info.driver.to_ascii_lowercase();
+    let dinfo = info.driver_info.to_ascii_lowercase();
+    name.contains("powervr")
+        || name.contains("rogue")
+        || name.contains("imagination")
+        || driver.contains("powervr")
+        || dinfo.contains("powervr")
 }
 
 impl GpuCaps {
@@ -37,6 +58,21 @@ impl GpuCaps {
                 .get_texture_format_features(wgpu::TextureFormat::R8Unorm)
                 .allowed_usages
                 .contains(wgpu::TextureUsages::STORAGE_BINDING);
+        let float_rt_ok = |fmt: wgpu::TextureFormat| {
+            let f = adapter.get_texture_format_features(fmt);
+            f.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                && f.flags.contains(
+                    wgpu::TextureFormatFeatureFlags::FILTERABLE
+                        | wgpu::TextureFormatFeatureFlags::BLENDABLE,
+                )
+        };
+        if caps.backend == wgpu::Backend::Gl {
+            let pvr = is_powervr_gl(&device.adapter_info());
+            caps.hdr_float_rt = !pvr && float_rt_ok(wgpu::TextureFormat::Rgba16Float);
+            caps.r16_float_rt = !pvr
+                && float_rt_ok(wgpu::TextureFormat::R16Float)
+                && float_rt_ok(wgpu::TextureFormat::Rg16Float);
+        }
         caps
     }
 
@@ -45,6 +81,7 @@ impl GpuCaps {
     /// adapter-specific format feature.
     pub fn of_device(device: &wgpu::Device) -> Self {
         let info = device.adapter_info();
+        let pvr = is_powervr_gl(&info);
         let limits = device.limits();
         let mut downlevel = wgpu::DownlevelFlags::compliant();
         downlevel.set(wgpu::DownlevelFlags::COMPUTE_SHADERS, limits.max_compute_workgroups_per_dimension > 0);
@@ -57,6 +94,8 @@ impl GpuCaps {
             device_type: info.device_type,
             r8_storage: info.backend != wgpu::Backend::Gl
                 && device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES),
+            hdr_float_rt: !pvr,
+            r16_float_rt: !pvr,
             limits,
             features: device.features(),
             downlevel,

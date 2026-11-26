@@ -344,6 +344,11 @@ impl SunShadows {
     /// `depth`: the square depth map the cascades are drawn into one at a
     /// time (at least the largest tile across).
     pub fn new(device: &wgpu::Device, depth: &wgpu::TextureView) -> Self {
+        let atlas_fmt = if crate::gpu_caps::is_powervr_gl(&device.adapter_info()) {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            ATLAS_FORMAT
+        };
         let tex = |label: &str, [w, h]: [u32; 2]| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -352,7 +357,7 @@ impl SunShadows {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: ATLAS_FORMAT,
+                    format: atlas_fmt,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 })

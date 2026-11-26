@@ -51,7 +51,7 @@ struct ClOut {
 fn vs_clouds(@builtin(vertex_index) i: u32) -> ClOut {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
     var o: ClOut;
-    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    o.pos = vec4<f32>(p * 2.0 - 1.0, 1e-5, 1.0);
     return o;
 }
 

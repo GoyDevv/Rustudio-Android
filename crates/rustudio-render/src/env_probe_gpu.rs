@@ -37,14 +37,14 @@ pub struct ProbeGpu {
     conv: wgpu::RenderPipeline,
 }
 
-fn cube_tex(device: &wgpu::Device, label: &str) -> wgpu::Texture {
+fn cube_tex(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 6 },
         mip_level_count: LEVELS,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::COPY_SRC
@@ -75,9 +75,10 @@ fn face_view(t: &wgpu::Texture, mip: u32, face: u32) -> wgpu::TextureView {
 
 impl ProbeGpu {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, samples: u32, face_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, globals_size: u64) -> Self {
-        let slots = [cube_tex(device, "env probe slot a"), cube_tex(device, "env probe slot b")];
+        let cube_fmt = if face_format == wgpu::TextureFormat::Rgba8Unorm { wgpu::TextureFormat::Rgba8Unorm } else { FORMAT };
+        let slots = [cube_tex(device, "env probe slot a", cube_fmt), cube_tex(device, "env probe slot b", cube_fmt)];
         let slot_views = [cube_view(&slots[0], 0, None), cube_view(&slots[1], 0, None)];
-        let src = cube_tex(device, "env probe source pyramid");
+        let src = cube_tex(device, "env probe source pyramid", cube_fmt);
         let src_view = cube_view(&src, 0, None);
         let src_level_views = (0..LEVELS).map(|m| cube_view(&src, m, Some(1))).collect();
         let size = wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 };
@@ -158,7 +159,7 @@ impl ProbeGpu {
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader, entry_point: Some(fs), compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState { format: cube_fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
