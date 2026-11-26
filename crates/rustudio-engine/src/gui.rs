@@ -355,6 +355,33 @@ struct TouchFinger {
     moved_at: std::time::Instant,
 }
 
+/// Geometry and scroll range for a ScrollingFrame's scrollbar thumb hit target.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ScrollBarHit {
+    /// True for vertical scrollbar thumb, false for horizontal.
+    pub vertical: bool,
+    /// Scrollable canvas range (`canvas_len - view`, in canvas pixels).
+    pub max_scroll: f32,
+    /// Thumb travel range along the track (`view - thumb_len`, in canvas pixels).
+    pub track_travel: f32,
+    /// Thumb length along the scroll axis (in canvas pixels).
+    pub thumb_len: f32,
+    /// Current `CanvasPosition` on this axis when drawn.
+    pub current_cp: f32,
+}
+
+/// Active pointer drag on a ScrollingFrame's scrollbar thumb.
+#[derive(Debug, Clone, Copy)]
+struct ScrollBarDrag {
+    r: Ref,
+    vertical: bool,
+    last_pos: f32,
+    canvas_per_px: f32,
+    max_scroll: f32,
+    current_cp: f32,
+    remainder: f32,
+}
+
 /// An interactive object, in screen space, in draw order.
 #[derive(Debug, Clone)]
 struct Hit {
@@ -373,6 +400,8 @@ struct Hit {
     page_layout: Option<Ref>,
     drag: bool,
     painted: bool,
+    /// Non-None when this hit represents a ScrollingFrame's scrollbar thumb.
+    scrollbar: Option<ScrollBarHit>,
 }
 
 enum Img {
@@ -522,6 +551,8 @@ pub struct Gui {
     last_wheel_sunk: bool,
     /// The object being dragged with the left button.
     dragging: Option<Ref>,
+    /// Active mouse drag on a ScrollingFrame's scrollbar thumb.
+    scrollbar_drag: Option<ScrollBarDrag>,
     /// Fingers on the GUI (`touch_input`), by the input layer's id.
     touch_fingers: HashMap<u64, TouchFinger>,
     /// ParticleEmitter2D particles (gui_fx.rs).
@@ -2444,6 +2475,9 @@ struct Run {
     size: Option<f32>,
     transparency: Option<f32>,
     stroke_transparency: Option<f32>,
+    stroke_color: Option<[f32; 3]>,
+    stroke_thickness: Option<f32>,
+    mark_color: Option<Color32>,
 }
 
 fn parse_color(s: &str) -> Option<[f32; 3]> {
@@ -2490,6 +2524,7 @@ fn unescape(s: &str) -> String {
 }
 
 /// Roblox RichText: <b> <i> <u> <s> <font color size transparency weight>
+/// <stroke color thickness transparency> <mark color transparency> <comment>
 /// <br/> <uppercase>/<uc> <smallcaps>/<sc> (as uppercase) and the XML escapes.
 fn rich_runs(src: &str) -> Vec<Run> {
     #[derive(Clone, Default)]
@@ -2503,9 +2538,14 @@ fn rich_runs(src: &str) -> Vec<Run> {
         size: Option<f32>,
         tr: Option<f32>,
         stroke_tr: Option<f32>,
+        stroke_color: Option<[f32; 3]>,
+        stroke_thickness: Option<f32>,
+        mark_color: Option<[f32; 3]>,
+        mark_tr: Option<f32>,
     }
     let mut stack: Vec<(String, St)> = Vec::new();
     let mut st = St::default();
+    let mut comment_depth: usize = 0;
     let mut out = Vec::new();
     let mut rest = src;
     let push = |out: &mut Vec<Run>, text: &str, st: &St| {
@@ -2523,17 +2563,45 @@ fn rich_runs(src: &str) -> Vec<Run> {
             size: st.size,
             transparency: st.tr,
             stroke_transparency: st.stroke_tr,
+            stroke_color: st.stroke_color,
+            stroke_thickness: st.stroke_thickness,
+            mark_color: st.mark_color.map(|c| {
+                let a = (1.0 - st.mark_tr.unwrap_or(0.0)).clamp(0.0, 1.0);
+                rgba(c, a)
+            }),
         });
     };
     while let Some(lt) = rest.find('<') {
-        push(&mut out, &rest[..lt], &st);
+        if comment_depth == 0 {
+            push(&mut out, &rest[..lt], &st);
+        }
         let Some(gt) = rest[lt..].find('>') else {
-            push(&mut out, &rest[lt..], &st);
+            if comment_depth == 0 {
+                push(&mut out, &rest[lt..], &st);
+            }
             return out;
         };
         let tag = &rest[lt + 1..lt + gt];
         rest = &rest[lt + gt + 1..];
         let lower = tag.trim().to_ascii_lowercase();
+        let self_closing = tag.trim_end().ends_with('/');
+        if comment_depth > 0 {
+            if let Some(name) = lower.strip_prefix('/') {
+                if name.trim() == "comment" {
+                    comment_depth -= 1;
+                }
+            } else {
+                let name = lower
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches('/');
+                if name == "comment" && !self_closing {
+                    comment_depth += 1;
+                }
+            }
+            continue;
+        }
         if lower == "br" || lower == "br/" || lower == "br /" {
             push(&mut out, "\n", &st);
             continue;
@@ -2551,6 +2619,12 @@ fn rich_runs(src: &str) -> Vec<Run> {
             .unwrap_or("")
             .trim_end_matches('/')
             .to_string();
+        if name == "comment" {
+            if !self_closing {
+                comment_depth += 1;
+            }
+            continue;
+        }
         let prev = st.clone();
         match name.as_str() {
             "b" => st.b = true,
@@ -2575,22 +2649,39 @@ fn rich_runs(src: &str) -> Vec<Run> {
                 }
             }
             "stroke" => {
-                if let Some(t) = attr(tag, "transparency").and_then(|s| s.parse().ok()) {
-                    st.stroke_tr = Some(t);
+                if let Some(c) = attr(tag, "color").and_then(|c| parse_color(&c)) {
+                    st.stroke_color = Some(c);
+                }
+                if let Some(th) = attr(tag, "thickness").and_then(|s| s.parse::<f32>().ok()) {
+                    st.stroke_thickness = Some(th.max(0.0));
+                }
+                if let Some(t) = attr(tag, "transparency").and_then(|s| s.parse::<f32>().ok()) {
+                    st.stroke_tr = Some(t.clamp(0.0, 1.0));
                 }
             }
-            "mark" | "comment" => {}
+            "mark" => {
+                if let Some(c) = attr(tag, "color").and_then(|c| parse_color(&c)) {
+                    st.mark_color = Some(c);
+                } else if st.mark_color.is_none() {
+                    st.mark_color = Some([1.0, 1.0, 0.0]);
+                }
+                if let Some(t) = attr(tag, "transparency").and_then(|s| s.parse::<f32>().ok()) {
+                    st.mark_tr = Some(t.clamp(0.0, 1.0));
+                }
+            }
             _ => {
                 // Not a tag Roblox knows: shown as text.
                 push(&mut out, &format!("<{tag}>"), &st);
                 continue;
             }
         }
-        if !tag.trim_end().ends_with('/') {
+        if !self_closing {
             stack.push((name, prev));
         }
     }
-    push(&mut out, rest, &st);
+    if comment_depth == 0 {
+        push(&mut out, rest, &st);
+    }
     out
 }
 

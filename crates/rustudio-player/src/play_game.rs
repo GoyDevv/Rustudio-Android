@@ -62,6 +62,17 @@ fn tool_handle(d: &Document, tool: Ref) -> Option<Ref> {
     })
 }
 
+/// Sentinel slot value pushed into `PlayInput::slots` when Backspace is pressed to drop the equipped Tool.
+const DROP_TOOL_SLOT: usize = usize::MAX;
+
+/// Whether a Tool should auto-fire `Activated`/`Deactivated` on mouse click
+/// (`Enabled` defaults to `true`, `ManualActivationOnly` defaults to `false`).
+fn tool_auto_activates(d: &Document, tool: Ref) -> bool {
+    let enabled = !matches!(d.prop(tool, "Enabled"), Some(Variant::Bool(false)));
+    let manual = matches!(d.prop(tool, "ManualActivationOnly"), Some(Variant::Bool(true)));
+    enabled && !manual
+}
+
 struct Walk {
     target: Vec3,
     since: f64,
@@ -103,6 +114,8 @@ pub struct GameState {
     walks: HashMap<Ref, Walk>,
     /// Humanoid:MoveTo target for the player's own character.
     pub move_target: Option<Vec3>,
+    /// Elapsed seconds for the active Humanoid:MoveTo target (8.0 s Roblox timeout).
+    pub move_target_elapsed: f32,
     pub jump: bool,
     /// Humanoid:ChangeState for the player's own character (state name).
     pub forced_state: Option<String>,
@@ -993,7 +1006,12 @@ impl Game {
         // DragDetector drags (play_drag.rs).
         self.drag_detectors(&input.buttons);
 
+        let mut drop_requested = false;
         for slot in input.slots {
+            if slot == DROP_TOOL_SLOT {
+                drop_requested = true;
+                continue;
+            }
             let tool = self
                 .play
                 .as_ref()
@@ -1007,6 +1025,20 @@ impl Game {
                 Some(t) => self.equip_tool(t),
                 None => {}
             }
+        }
+        // Also handle Backspace directly from hotbar_taps when running without the UI viewport.
+        if !drop_requested {
+            if let Some(s) = self.play.as_mut() {
+                if !s.game.menu_open {
+                    if let Some(pos) = s.game.hotbar_taps.iter().position(|k| *k == egui::Key::Backspace) {
+                        s.game.hotbar_taps.remove(pos);
+                        drop_requested = true;
+                    }
+                }
+            }
+        }
+        if drop_requested {
+            self.drop_equipped_tool();
         }
 
         // Mouse buttons: the equipped tool activates; the Mouse object fires.
@@ -1024,10 +1056,24 @@ impl Game {
         for (button, down) in input.buttons {
             if button == 1 {
                 if let Some(t) = equipped {
-                    self.fire_both(t, if down { "Activated" } else { "Deactivated" });
+                    let server_ok = tool_auto_activates(&self.doc, t);
+                    let client_ok = self
+                        .client_of(t)
+                        .and_then(|ct| self.play.as_ref()?.other_doc.as_ref().map(|cd| tool_auto_activates(cd, ct)))
+                        .unwrap_or(true);
+                    if server_ok && client_ok {
+                        self.fire_both(t, if down { "Activated" } else { "Deactivated" });
+                    }
                 }
                 if let Some(t) = client_tool {
-                    self.with_side(Side::Client, |rt, _, _| rt.fire(t, if down { "Activated" } else { "Deactivated" }, vec![]));
+                    let client_ok = self
+                        .play
+                        .as_ref()
+                        .and_then(|s| s.other_doc.as_ref())
+                        .is_some_and(|cd| tool_auto_activates(cd, t));
+                    if client_ok {
+                        self.with_side(Side::Client, |rt, _, _| rt.fire(t, if down { "Activated" } else { "Deactivated" }, vec![]));
+                    }
                 }
             }
             if let Some(m) = mouse {
@@ -1160,6 +1206,7 @@ impl Game {
             if mine(h, self) {
                 if let Some(s) = self.play.as_mut() {
                     s.game.move_target = Some(target);
+                    s.game.move_target_elapsed = 0.0;
                 }
             } else if side == Side::Server {
                 let now = self.play.as_ref().map(|s| s.time).unwrap_or(0.0);
@@ -1311,9 +1358,13 @@ impl Game {
         {
             return;
         }
+        let requires_handle = !matches!(self.doc.prop(tool, "RequiresHandle"), Some(Variant::Bool(false)));
+        let handle = tool_handle(&self.doc, tool);
+        if requires_handle && handle.is_none() {
+            return;
+        }
         self.unequip_tool();
         self.with_side(Side::Server, |rt, _, _| rt.apply_parent(tool, model));
-        let handle = tool_handle(&self.doc, tool);
         let parts: Vec<Ref> = self
             .doc
             .dom
@@ -1350,13 +1401,20 @@ impl Game {
     /// parts out of the client's world while they follow the hand (`client_tool_pose`).
     fn equip_client_tool(&mut self, tool: Ref) {
         let Some(model) = self.character_model().and_then(|m| self.client_of(m)) else { return };
+        let allowed = self.play.as_ref().and_then(|s| s.other_doc.as_ref()).is_some_and(|cd| {
+            if !cd.class_of(tool).is_some_and(|c| doc::is_a(&c, "BackpackItem")) {
+                return false;
+            }
+            let requires_handle = !matches!(cd.prop(tool, "RequiresHandle"), Some(Variant::Bool(false)));
+            !requires_handle || tool_handle(cd, tool).is_some()
+        });
+        if !allowed {
+            return;
+        }
         self.unequip_tool();
         self.unequip_client_tool(true);
         let Some(s) = self.play.as_mut() else { return };
         let Some(cd) = s.other_doc.as_ref() else { return };
-        if !cd.class_of(tool).is_some_and(|c| doc::is_a(&c, "BackpackItem")) {
-            return;
-        }
         let parts: Vec<Ref> = cd.dom.descendants_of(tool).filter(|i| doc::is_a(&i.class, "BasePart")).map(|i| i.referent()).collect();
         let handle = tool_handle(cd, tool);
         let base = handle.and_then(|h| rustudio_render::scene::xform_of(cd, h));
@@ -1549,6 +1607,81 @@ impl Game {
             }
         }
         self.fire_both(e.tool, "Unequipped");
+    }
+
+    /// Drops the currently equipped Tool into Workspace in front of the character
+    /// when `Tool.CanBeDropped` is `true` (default `true`), firing `Unequipped`.
+    fn drop_equipped_tool(&mut self) {
+        let drop_xf = self.character_model().and_then(|model| {
+            let root = self
+                .doc
+                .find_named(model, "HumanoidRootPart")
+                .or_else(|| self.doc.find_named(model, "Torso"))?;
+            let xf = rustudio_render::scene::xform_of(&self.doc, root)?;
+            let forward = -xf.rot.z_axis;
+            Some(Xform { pos: xf.pos + forward * 4.0 + Vec3::Y * 0.5, rot: xf.rot })
+        });
+        if let Some(tool) = self.play.as_ref().and_then(|s| s.game.equipped.as_ref().map(|e| e.tool)) {
+            let can_drop = !matches!(self.doc.prop(tool, "CanBeDropped"), Some(Variant::Bool(false)));
+            if !can_drop {
+                return;
+            }
+            let Some(e) = self.play.as_mut().and_then(|s| s.game.equipped.take()) else {
+                return;
+            };
+            let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
+            if let Some(ws) = self.doc.workspace() {
+                if self.doc.exists(e.tool) {
+                    self.with_side(Side::Server, |rt, _, _| {
+                        if let Some(base) = drop_xf {
+                            for (part, off) in &e.offsets {
+                                let part_xf = rustudio_engine::ltypes::cf_mul(&base, off);
+                                rt.apply_prop(*part, "CFrame", Variant::CFrame(part_xf.to_cframe()));
+                            }
+                        }
+                        rt.apply_parent(e.tool, ws);
+                    });
+                }
+            }
+            if let Some(s) = self.play.as_mut() {
+                s.physics.skip.retain(|r| !parts.contains(r));
+                s.physics.refresh(parts);
+            }
+            self.fire_both(e.tool, "Unequipped");
+            return;
+        }
+        if let Some(ct) = self.play.as_ref().and_then(|s| s.game.client_tool.as_ref().map(|e| e.tool)) {
+            let can_drop = self
+                .play
+                .as_ref()
+                .and_then(|s| s.other_doc.as_ref())
+                .is_some_and(|cd| !matches!(cd.prop(ct, "CanBeDropped"), Some(Variant::Bool(false))));
+            if !can_drop {
+                return;
+            }
+            let offsets = self
+                .play
+                .as_ref()
+                .and_then(|s| s.game.client_tool.as_ref().map(|e| e.offsets.clone()))
+                .unwrap_or_default();
+            let ws = self
+                .play
+                .as_ref()
+                .and_then(|s| s.other_doc.as_ref())
+                .and_then(|cd| cd.workspace());
+            self.unequip_client_tool(false);
+            if let Some(ws) = ws {
+                self.with_side(Side::Client, |rt, _, _| {
+                    if let Some(base) = drop_xf {
+                        for (part, off) in &offsets {
+                            let part_xf = rustudio_engine::ltypes::cf_mul(&base, off);
+                            rt.apply_prop(*part, "CFrame", Variant::CFrame(part_xf.to_cframe()));
+                        }
+                    }
+                    rt.apply_parent(ct, ws);
+                });
+            }
+        }
     }
 
     /// Where the equipped tool's parts go, given this frame's body pose.
@@ -2559,6 +2692,10 @@ impl Game {
                 if taps.contains(k) {
                     slots.push(n);
                 }
+            }
+            // Backspace drops the currently equipped Tool when CanBeDropped is true.
+            if taps.contains(&Backspace) {
+                slots.push(DROP_TOOL_SLOT);
             }
             // "." opens the emote wheel (Roblox's Emotes menu key).
             if taps.contains(&Period) {

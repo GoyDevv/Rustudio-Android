@@ -1597,6 +1597,9 @@ struct Filter {
     list: rustc_hash::FxHashSet<Ref>,
     include: bool,
     respect_collide: bool,
+    /// RaycastParams / OverlapParams BruteForceAllSlow: include parts with
+    /// CanQuery == false.
+    brute_force_all_slow: bool,
     /// Collision groups that don't collide with the query's CollisionGroup
     /// (PhysicsService:CollisionGroupSetCollidable): their parts are passed.
     skip_groups: HashSet<String>,
@@ -1611,6 +1614,7 @@ impl Filter {
             list: Default::default(),
             include: false,
             respect_collide: false,
+            brute_force_all_slow: false,
             skip_groups: HashSet::new(),
             ignore_water: false,
         }
@@ -1687,6 +1691,7 @@ fn params_filter_of(q: &crate::ltypes::QueryParams) -> Filter {
         list: q.filter.iter().filter_map(opt_inst).collect(),
         include: q.is_include(),
         respect_collide: q.respect_can_collide,
+        brute_force_all_slow: q.brute_force_all_slow,
         skip_groups: HashSet::new(),
         ignore_water: q.ignore_water,
     }
@@ -1699,14 +1704,33 @@ fn params_filter(v: &Value) -> Filter {
     let include = opt_ud::<LEnumItem>(&ud_value(v, "FilterType"))
         .is_some_and(|e| matches!(e.name.as_str(), "Include" | "Whitelist"));
     let respect_collide = matches!(ud_value(v, "RespectCanCollide"), Value::Boolean(true));
+    let brute_force_all_slow = matches!(ud_value(v, "BruteForceAllSlow"), Value::Boolean(true));
     let ignore_water = matches!(ud_value(v, "IgnoreWater"), Value::Boolean(true));
     Filter {
         list,
         include,
         respect_collide,
+        brute_force_all_slow,
         skip_groups: HashSet::new(),
         ignore_water,
     }
+}
+
+/// Positive margin expansion from OverlapParams.Tolerance (0.0 when omitted or <= 0).
+fn overlap_tolerance(v: &Value) -> f32 {
+    if let Value::UserData(u) = v {
+        if let Ok(p) = u.borrow::<crate::ltypes::LOverlapParams>() {
+            return if p.0.tolerance.is_finite() {
+                p.0.tolerance.max(0.0)
+            } else {
+                0.0
+            };
+        }
+    }
+    num(&ud_value(v, "Tolerance"))
+        .filter(|n| n.is_finite())
+        .map(|n| (n as f32).max(0.0))
+        .unwrap_or(0.0)
 }
 
 /// Closest hit along origin + dir (dir's length is the range): (part, point, normal, distance).
@@ -1817,7 +1841,9 @@ fn cast_swept_once(
         // CanQuery only counts once CanCollide is off: Studio still hits a
         // CanCollide part whose CanQuery is false (Laser Tag's containment
         // walls and spawn forcefields).
-        if (!p.query && !p.collide) || (filter.respect_collide && !p.collide) {
+        if (!filter.brute_force_all_slow && !p.query && !p.collide)
+            || (filter.respect_collide && !p.collide)
+        {
             return;
         }
         // Boxes: entered from outside (a ray starting inside a part doesn't
@@ -2239,7 +2265,7 @@ fn overlap_once(
     let d = w.d();
     let mut out = Vec::new();
     for p in parts.iter() {
-        if !p.query && !p.collide {
+        if !filter.brute_force_all_slow && !p.query && !p.collide {
             continue;
         }
         let (plo, phi) = part_aabb(p);
@@ -5960,6 +5986,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 list,
                 include: name == "FindPartOnRayWithWhitelist",
                 respect_collide: false,
+                brute_force_all_slow: false,
                 skip_groups: HashSet::new(),
                 ignore_water: matches!(arg(args, water_arg), Value::Boolean(true)),
             };
@@ -6007,6 +6034,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 list: listed,
                 include: name.ends_with("WhiteList"),
                 respect_collide: false,
+                brute_force_all_slow: false,
                 skip_groups: HashSet::new(),
                 ignore_water: false,
             };
@@ -6018,14 +6046,16 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             let cf = opt_ud::<LCFrame>(&arg(args, 1))
                 .ok_or_else(|| rt_err("GetPartBoundsInBox: CFrame expected"))?;
             let size = vec3_arg(args, 2, "GetPartBoundsInBox")?;
-            let h = size * 0.5;
+            let params = arg(args, 3);
+            let tol = overlap_tolerance(&params);
+            let h = size * 0.5 + Vec3::splat(tol);
             let r = cf.0.rot;
             let ext = r.x_axis.abs() * h.x + r.y_axis.abs() * h.y + r.z_axis.abs() * h.z;
-            let filter = match arg(args, 3) {
+            let filter = match params {
                 Value::Nil => Filter::none(),
-                p => params_filter_groups(lua, &p),
+                ref p => params_filter_groups(lua, p),
             };
-            let max = num(&ud_value(&arg(args, 3), "MaxParts"))
+            let max = num(&ud_value(&params, "MaxParts"))
                 .filter(|n| *n > 0.0)
                 .map(|n| n as usize)
                 .unwrap_or(usize::MAX);
@@ -6034,10 +6064,12 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         }
         "GetPartBoundsInRadius" => {
             let c = vec3_arg(args, 1, "GetPartBoundsInRadius")?;
-            let r = num(&arg(args, 2)).unwrap_or(0.0) as f32;
-            let filter = match arg(args, 3) {
+            let params = arg(args, 3);
+            let tol = overlap_tolerance(&params);
+            let r = (num(&arg(args, 2)).unwrap_or(0.0) as f32 + tol).max(0.0);
+            let filter = match params {
                 Value::Nil => Filter::none(),
-                p => params_filter_groups(lua, &p),
+                ref p => params_filter_groups(lua, p),
             };
             let parts = overlap(
                 lua,
@@ -6061,10 +6093,13 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     .ok_or_else(|| rt_err("GetPartsInPart: BasePart expected"))?;
                 (rustudio_physics::query_shapes::kind_of(d, p, &class), d.workspace() == Some(this))
             };
+            let params = arg(args, 2);
+            let tol = overlap_tolerance(&params);
+            let probe_size = size + Vec3::splat(tol * 2.0);
             let (lo, hi) = part_aabb(&QPart {
                 r: p,
                 xf,
-                size,
+                size: probe_size,
                 collide: true,
                 query: true,
                 mesh: false,
@@ -6072,7 +6107,6 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 cvx: 0,
                 initial: Vec3::ONE,
             });
-            let params = arg(args, 2);
             let filter = match params {
                 Value::Nil => Filter::none(),
                 _ => params_filter_groups(lua, &params),
@@ -6098,7 +6132,10 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     }
                     let q = world_root_part(d, r, &i.class)?;
                     let (qlo, qhi) = part_aabb(&q);
-                    ((q.query || q.collide) && qlo.cmple(hi).all() && qhi.cmpge(lo).all()).then_some(q)
+                    ((filter.brute_force_all_slow || q.query || q.collide)
+                        && qlo.cmple(hi).all()
+                        && qhi.cmpge(lo).all())
+                    .then_some(q)
                 }).collect()
             };
             let parts = {
@@ -6117,11 +6154,11 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                             rustudio_render::scene::content_string(d.prop(q.r, "MeshId"))
                         };
                         return match id.and_then(|id| rustudio_core::mesh_bvh::for_mesh(&id)) {
-                            Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(&xf, size, &q.xf, q.size, &bvh),
-                            None => rustudio_physics::query_shapes::obb_obb(&xf, size, &q.xf, q.size),
+                            Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(&xf, probe_size, &q.xf, q.size, &bvh),
+                            None => rustudio_physics::query_shapes::obb_obb(&xf, probe_size, &q.xf, q.size),
                         };
                     }
-                    rustudio_physics::query_shapes::part_part(&xf, size, probe_kind, &q.xf, q.size, q.shape)
+                    rustudio_physics::query_shapes::part_part(&xf, probe_size, probe_kind, &q.xf, q.size, q.shape)
                 }).take(max).map(|q| q.r).collect::<Vec<_>>()
             };
             one(Value::Table(list(lua, parts)?))
@@ -6132,6 +6169,27 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         "GetRealPhysicsFPS" => one(Value::Number(rustudio_physics::physics::step_rate().0 as f64)),
         "MoveTo" => {
             let target = vec3_arg(args, 1, "MoveTo")?;
+            let part_ref = match arg(args, 2) {
+                Value::Nil => Ref::none(),
+                v => {
+                    let r = opt_inst(&v).ok_or_else(|| rt_err("MoveTo: BasePart expected"))?;
+                    let is_part = world(lua)?
+                        .d()
+                        .class_of(r)
+                        .is_some_and(|c| doc::is_a(&c, "BasePart"));
+                    if !is_part {
+                        return Err(rt_err("MoveTo: BasePart expected"));
+                    }
+                    r
+                }
+            };
+            store_prop(
+                lua,
+                this,
+                "WalkToPoint",
+                Variant::Vector3(Vector3::new(target.x, target.y, target.z)),
+            )?;
+            store_prop(lua, this, "WalkToPart", Variant::Ref(part_ref))?;
             world(lua)?.requests.move_to.push((this, target));
             none()
         }

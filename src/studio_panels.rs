@@ -151,16 +151,38 @@ impl Editor {
     /// the component at) returns at once when the value
     /// is unchanged: no change is recorded, so no undo step either.
     pub fn set_avatar_type(&mut self, v: u32) {
-        if v > 2 || self.avatar_type() == v {
+        if v > 2 {
             return;
         }
-        if let Some(sp) = self.starter_player() {
-            let mut edit = vec![(sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v)))];
-            if let Some(rules) = self.avatar_body_rules() {
-                edit.push((rules, rbx_dom_weak::ustr("AvatarType"), Variant::Enum(Enum::from_u32(v))));
-            }
-            self.game.doc.set_props("Avatar Type", edit, None);
+        let sp = self.starter_player();
+        let sp_matches = sp.is_none_or(|sp| {
+            rustudio_render::scene::enum_u32(self.game.doc.prop(sp, "GameSettingsAvatar")) == Some(v)
+        });
+        let rules_matches = self.avatar_body_rules().is_some_and(|b| {
+            rustudio_render::scene::enum_u32(self.game.doc.prop(b, "AvatarType")) == Some(v)
+        });
+        if sp_matches && rules_matches {
+            return;
         }
+        let root = self.game.doc.dom.root_ref();
+        let settings = self.game.doc.find_child(root, "AvatarSettings").unwrap_or_else(|| {
+            self.game.doc.insert(
+                root,
+                rbx_dom_weak::InstanceBuilder::new("AvatarSettings").with_name("AvatarSettings"),
+            )
+        });
+        let rules = self.game.doc.find_child(settings, "AvatarBodyRules").unwrap_or_else(|| {
+            self.game.doc.insert(
+                settings,
+                rbx_dom_weak::InstanceBuilder::new("AvatarBodyRules").with_name("AvatarBodyRules"),
+            )
+        });
+        let mut edit = Vec::with_capacity(2);
+        if let Some(sp) = sp {
+            edit.push((sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v))));
+        }
+        edit.push((rules, rbx_dom_weak::ustr("AvatarType"), Variant::Enum(Enum::from_u32(v))));
+        self.game.doc.set_props("Avatar Type", edit, None);
     }
 
     /// The Avatar Settings panel (Studio: File > Avatar Settings).
@@ -181,7 +203,7 @@ impl Editor {
                 for (label, v, tip) in AVATAR_TYPES {
                     let r = ui.radio(cur == v, label).on_hover_text(tip);
                     self.ui_rects.insert(avatar_type_key(v), r.rect);
-                    if r.clicked() && cur != v {
+                    if r.clicked() {
                         self.set_avatar_type(v);
                     }
                 }

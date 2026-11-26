@@ -339,7 +339,7 @@ impl World {
                     !template
                 };
                 server_anywhere
-                    || ctx != 2
+                    || (ctx == 0 || ctx == 1)
                     && (under("Workspace")
                         || under("ServerScriptService")
                         || d.find_child(root, "Players").is_some_and(|ps| {
@@ -738,6 +738,7 @@ fn signals(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, Signals>> {
 
 impl World {
     pub fn new(doc: Document, mode: RunMode) -> Self {
+        let groups = rustudio_core::collision_groups::shared_from_doc(&doc);
         World {
             signal_mode: signal_timing::SignalMode::of(&doc),
             doc: Some(doc),
@@ -770,7 +771,7 @@ impl World {
             topbar_inset: None,
             humanoid_states: HashMap::new(),
             states_disabled: HashMap::new(),
-            groups: rustudio_core::collision_groups::shared(),
+            groups,
             avatar: None,
             avatar_descs: HashSet::new(),
             listening: Default::default(),

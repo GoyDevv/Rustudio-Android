@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use glam::Vec3;
-use rbx_dom_weak::types::{BrickColor, Color3, Color3uint8, CustomPhysicalProperties, Enum, PhysicalProperties, Ref, Tags, Variant, Vector2, Vector3};
+use rbx_dom_weak::types::{Attributes, BrickColor, Color3, Color3uint8, CustomPhysicalProperties, Enum, PhysicalProperties, Ref, Tags, Variant, Vector2, Vector3};
 use rbx_dom_weak::ustr;
 
 use crate::app::Editor;
@@ -28,6 +28,8 @@ pub const TEXT: Color32 = Color32::from_rgb(188, 190, 200);
 pub const READ_ONLY: Color32 = Color32::from_rgb(73, 77, 90);
 pub const BAND: Color32 = Color32::from_rgb(32, 34, 39);
 const BOX_OFF: Color32 = Color32::from_rgb(40, 41, 49);
+const MIXED_LABEL: &str = "<mixed>";
+const MIXED_COLOR: Color32 = Color32::from_rgb(130, 134, 150);
 pub(crate) const FONT: f32 = 12.5;
 
 #[derive(Default)]
@@ -70,6 +72,53 @@ pub struct PropertiesState {
     active_for: Option<Ref>,
     /// Each drawn row's rect, by property name (the self-test reads them).
     pub row_rects: HashMap<String, Rect>,
+    /// Inline "Add Attribute" editor state when the Attributes `+` button is active.
+    adding_attr: Option<AddingAttr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttrKind {
+    String,
+    Number,
+    Boolean,
+    Vector3,
+    Color3,
+}
+
+impl AttrKind {
+    const ALL: [AttrKind; 5] = [
+        AttrKind::String,
+        AttrKind::Number,
+        AttrKind::Boolean,
+        AttrKind::Vector3,
+        AttrKind::Color3,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            AttrKind::String => "String",
+            AttrKind::Number => "Number",
+            AttrKind::Boolean => "Boolean",
+            AttrKind::Vector3 => "Vector3",
+            AttrKind::Color3 => "Color3",
+        }
+    }
+
+    fn default_variant(self) -> Variant {
+        match self {
+            AttrKind::String => Variant::String(String::new()),
+            AttrKind::Number => Variant::Float64(0.0),
+            AttrKind::Boolean => Variant::Bool(false),
+            AttrKind::Vector3 => Variant::Vector3(Vector3::new(0.0, 0.0, 0.0)),
+            AttrKind::Color3 => Variant::Color3(Color3::new(1.0, 1.0, 1.0)),
+        }
+    }
+}
+
+struct AddingAttr {
+    name: String,
+    kind: AttrKind,
+    focus_name: bool,
 }
 
 pub struct SliderDrag {
@@ -235,12 +284,35 @@ fn value_text(doc: &doc::Document, v: &Variant) -> String {
     }
 }
 
+/// Compares two resolved property/attribute variants for multi-selection agreement.
+fn variants_equal(a: &Variant, b: &Variant) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (Variant::Enum(x), Variant::EnumItem(y)) | (Variant::EnumItem(y), Variant::Enum(x)) => x.to_u32() == y.value,
+        (Variant::Color3(c), Variant::Color3uint8(u)) | (Variant::Color3uint8(u), Variant::Color3(c)) => {
+            [(c.r * 255.0).round() as u8, (c.g * 255.0).round() as u8, (c.b * 255.0).round() as u8] == [u.r, u.g, u.b]
+        }
+        (Variant::Float32(x), Variant::Float32(y)) => (x - y).abs() <= 1e-5,
+        (Variant::Float64(x), Variant::Float64(y)) => (x - y).abs() <= 1e-5,
+        (Variant::Vector3(x), Variant::Vector3(y)) => {
+            (x.x - y.x).abs() <= 1e-4 && (x.y - y.y).abs() <= 1e-4 && (x.z - y.z).abs() <= 1e-4
+        }
+        (Variant::Vector2(x), Variant::Vector2(y)) => (x.x - y.x).abs() <= 1e-4 && (x.y - y.y).abs() <= 1e-4,
+        _ => false,
+    }
+}
+
 /// What the panel did this frame.
 enum Edit {
     Prop(String, Variant),
+    PropAxis(String, usize, f32),
     Frame(Frame, Option<Vec3>, Option<Vec3>),
     AddTag(String),
     RemoveTag(String),
+    SetAttr(String, Variant),
+    RemoveAttr(String),
 }
 
 struct Painter<'a> {
@@ -259,8 +331,11 @@ impl Painter<'_> {
 
 impl Editor {
     pub(crate) fn properties_interacting(&self) -> bool {
-        self.props.editing.is_some() || self.props.slider_drag.is_some()
-            || self.props.brick_popup.is_some() || self.props.color_dialog.is_some()
+        self.props.editing.is_some()
+            || self.props.slider_drag.is_some()
+            || self.props.brick_popup.is_some()
+            || self.props.color_dialog.is_some()
+            || self.props.adding_attr.is_some()
     }
 
     pub fn properties_ui(&mut self, ui: &mut egui::Ui) {
@@ -287,14 +362,65 @@ impl Editor {
         if self.props.active_for != Some(first) {
             self.props.active_for = Some(first);
             self.props.active_row = None;
+            self.props.adding_attr = None;
         }
-        let can_collide = !matches!(self.game.doc.prop(first, "CanCollide"), Some(Variant::Bool(false)));
-        let cats = self
+        let can_collide = sel
+            .iter()
+            .all(|r| !matches!(self.game.doc.prop(*r, "CanCollide"), Some(Variant::Bool(false))));
+        let mut cats = self
             .props
             .cache
             .entry((class.clone(), can_collide))
             .or_insert_with(|| crate::props_layout::rows(&class, can_collide))
             .clone();
+        if sel.len() > 1 {
+            let mut seen_classes: HashSet<String> = HashSet::new();
+            seen_classes.insert(class.clone());
+            for &r in &sel[1..] {
+                let Some(other_class) = self.game.doc.class_of(r).map(|c| c.to_string()) else {
+                    continue;
+                };
+                if !seen_classes.insert(other_class.clone()) {
+                    continue;
+                }
+                let other_cats = self
+                    .props
+                    .cache
+                    .entry((other_class.clone(), can_collide))
+                    .or_insert_with(|| crate::props_layout::rows(&other_class, can_collide))
+                    .clone();
+                let mut other_props: HashMap<String, bool> = HashMap::new();
+                let mut other_frames: Vec<(&'static str, Frame)> = Vec::new();
+                for oc in &other_cats {
+                    for row in &oc.rows {
+                        match row {
+                            Row::Prop(n, ro) => {
+                                other_props.insert(n.clone(), *ro);
+                            }
+                            Row::Frame(l, f) => {
+                                if !other_frames.contains(&(*l, *f)) {
+                                    other_frames.push((*l, *f));
+                                }
+                            }
+                        }
+                    }
+                }
+                for cat in &mut cats {
+                    cat.rows.retain_mut(|row| match row {
+                        Row::Prop(n, ro) => {
+                            if let Some(&other_ro) = other_props.get(n.as_str()) {
+                                *ro = *ro || other_ro;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Row::Frame(l, f) => other_frames.contains(&(*l, *f)),
+                    });
+                }
+                cats.retain(|cat| !cat.rows.is_empty());
+            }
+        }
         let filter = self.props.filter.trim().to_lowercase();
         let mut edits: Vec<Edit> = Vec::new();
         egui::ScrollArea::vertical()
@@ -334,13 +460,13 @@ impl Editor {
                     }
                     for r in rows {
                         match r {
-                            Row::Prop(name, ro) => self.prop_row(&mut p, first, &class, name, *ro, &mut edits),
-                            Row::Frame(label, f) => self.frame_rows(&mut p, first, label, *f, &mut edits),
+                            Row::Prop(name, ro) => self.prop_row(&mut p, &sel, first, &class, name, *ro, &mut edits),
+                            Row::Frame(label, f) => self.frame_rows(&mut p, &sel, first, label, *f, &mut edits),
                         }
                     }
                 }
-                self.tags_section(&mut p, first, &mut edits);
-                self.attributes_section(&mut p, first);
+                self.tags_section(&mut p, &sel, first, &mut edits);
+                self.attributes_section(&mut p, &sel, first, &mut edits);
             });
         self.hud.property_rows = self.props.drawn.len();
         let ctx = ui.ctx().clone();
@@ -429,6 +555,21 @@ impl Editor {
     /// second click picks the number under the pointer, a third the whole
     /// text, and dragging after a double-click extends word by word.
     fn text_cell(&mut self, p: &mut Painter, key: &str, v: Rect, shown: &str, ro: bool, clicked: bool) -> Option<String> {
+        self.text_cell_ex(p, key, v, shown, shown, if ro { READ_ONLY } else { TEXT }, ro, clicked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn text_cell_ex(
+        &mut self,
+        p: &mut Painter,
+        key: &str,
+        v: Rect,
+        shown: &str,
+        edit_init: &str,
+        color: Color32,
+        ro: bool,
+        clicked: bool,
+    ) -> Option<String> {
         use egui::text::{CCursor, CCursorRange};
         let eid = egui::Id::new(("prop_edit", key));
         let ctx = p.ui.ctx().clone();
@@ -444,11 +585,11 @@ impl Editor {
         }
         let editing = self.props.editing.as_ref().is_some_and(|(k, _)| k == key);
         if !editing {
-            Self::value_label(p, v, shown, if ro { READ_ONLY } else { TEXT });
+            Self::value_label(p, v, shown, color);
             if clicked && !ro {
-                self.props.editing = Some((key.to_string(), shown.to_string()));
+                self.props.editing = Some((key.to_string(), edit_init.to_string()));
                 let mut st = egui::text_edit::TextEditState::default();
-                st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(shown.chars().count()))));
+                st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(edit_init.chars().count()))));
                 st.store(&ctx, eid);
                 self.props.drag = None;
                 self.props.edit_layout = None;
@@ -536,23 +677,22 @@ impl Editor {
         None
     }
 
-    fn prop_row(&mut self, p: &mut Painter, first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
-        // ClassName / Parent aren't stored properties.
-        let parent_is_root = self.game.doc.dom.get_by_ref(first).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref());
-        let value = match name {
+    fn read_prop_value(&self, r: Ref, class: &str, name: &str) -> Option<Variant> {
+        let parent_is_root = self.game.doc.dom.get_by_ref(r).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref());
+        match name {
             "ClassName" => Some(Variant::String(class.to_string())),
-            "Name" => self.game.doc.dom.get_by_ref(first).map(|i| Variant::String(i.name.clone())),
+            "Name" => self.game.doc.dom.get_by_ref(r).map(|i| Variant::String(i.name.clone())),
             "Parent" if parent_is_root => Some(Variant::String(self.game.doc.title.clone())),
-            "Parent" => self.game.doc.dom.get_by_ref(first).map(|i| Variant::Ref(i.parent())),
+            "Parent" => self.game.doc.dom.get_by_ref(r).map(|i| Variant::Ref(i.parent())),
             // A Part resizes on every face by whole studs (Studio: "Right, Top,
             // Back, Left, Bottom, Front", 1).
-            "ResizeableFaces" if self.game.doc.prop(first, name).is_none() => {
+            "ResizeableFaces" if self.game.doc.prop(r, name).is_none() => {
                 Some(Variant::String("Right, Top, Back, Left, Bottom, Front".into()))
             }
-            "ResizeIncrement" if self.game.doc.prop(first, name).is_none() => Some(Variant::Int32(1)),
+            "ResizeIncrement" if self.game.doc.prop(r, name).is_none() => Some(Variant::Int32(1)),
             // A part keeps only Color; its BrickColor is the nearest palette
             // colour (Studio shows both).
-            "BrickColor" => self.game.doc.prop(first, name).or_else(|| match self.game.doc.prop(first, "Color") {
+            "BrickColor" => self.game.doc.prop(r, name).or_else(|| match self.game.doc.prop(r, "Color") {
                 Some(Variant::Color3uint8(c)) => Some(Variant::BrickColor(nearest_brick([c.r, c.g, c.b]))),
                 _ => None,
             }),
@@ -560,22 +700,22 @@ impl Editor {
             // them (captured RefPart 4×1.2×2 Plastic: Mass 6.72, AssemblyMass
             // inf when anchored, root itself, centre at its position).
             "Mass" | "AssemblyMass" | "AssemblyRootPart" | "AssemblyCenterOfMass" if doc::is_a(class, "BasePart") => {
-                let size = match self.game.doc.prop(first, "Size") {
+                let size = match self.game.doc.prop(r, "Size") {
                     Some(Variant::Vector3(s)) => s,
                     _ => Vector3::new(4.0, 1.2, 2.0),
                 };
-                let density = match self.game.doc.prop(first, "CustomPhysicalProperties") {
+                let density = match self.game.doc.prop(r, "CustomPhysicalProperties") {
                     Some(Variant::PhysicalProperties(PhysicalProperties::Custom(c))) => c.density(),
                     _ => rustudio_core::mech::PART_DENSITY,
                 };
                 let mass = size.x * size.y * size.z * density;
-                let anchored = matches!(self.game.doc.prop(first, "Anchored"), Some(Variant::Bool(true)));
+                let anchored = matches!(self.game.doc.prop(r, "Anchored"), Some(Variant::Bool(true)));
                 Some(match name {
                     "Mass" => Variant::Float32(mass),
                     "AssemblyMass" if anchored => Variant::String("inf".into()),
                     "AssemblyMass" => Variant::Float32(mass),
-                    "AssemblyRootPart" => Variant::Ref(first),
-                    _ => Variant::Vector3(rustudio_core::math::rv3(rustudio_render::scene::xform_of(&self.game.doc, first).map(|x| x.pos).unwrap_or_default())),
+                    "AssemblyRootPart" => Variant::Ref(r),
+                    _ => Variant::Vector3(rustudio_core::math::rv3(rustudio_render::scene::xform_of(&self.game.doc, r).map(|x| x.pos).unwrap_or_default())),
                 })
             }
             // Studio shows PhysicalProperties as a checkbox: Current is always
@@ -583,8 +723,8 @@ impl Editor {
             "CurrentPhysicalProperties" => Some(Variant::Bool(true)),
             // A script runs unless Disabled or Enabled = false (as Play reads it).
             "Enabled" if doc::is_a(class, "BaseScript") => Some(Variant::Bool(
-                !matches!(self.game.doc.prop(first, "Disabled"), Some(Variant::Bool(true)))
-                    && !matches!(self.game.doc.prop(first, "Enabled"), Some(Variant::Bool(false))),
+                !matches!(self.game.doc.prop(r, "Disabled"), Some(Variant::Bool(true)))
+                    && !matches!(self.game.doc.prop(r, "Enabled"), Some(Variant::Bool(false))),
             )),
             // A ScreenGui's AbsoluteSize is the view's size (Studio: 863, 675
             // for its 863×675 viewport).
@@ -595,19 +735,19 @@ impl Editor {
             // Every instance has a UniqueId in Studio; one not saved yet shows
             // its session id.
             "UniqueId"
-                if match self.game.doc.prop(first, name) {
+                if match self.game.doc.prop(r, name) {
                     Some(Variant::UniqueId(u)) => u.to_string().bytes().all(|c| c == b'0'),
                     other => other.is_none(),
                 } =>
             {
-                Some(Variant::String(format!("{first}")))
+                Some(Variant::String(format!("{r}")))
             }
             "CustomPhysicalProperties" => Some(Variant::Bool(matches!(
-                self.game.doc.prop(first, name),
+                self.game.doc.prop(r, name),
                 Some(Variant::PhysicalProperties(PhysicalProperties::Custom(_)))
             ))),
             "AudioContent" if matches!(class, "Sound" | "AudioPlayer") => {
-                let read = |prop: &str| match self.game.doc.prop(first, prop) {
+                let read = |prop: &str| match self.game.doc.prop(r, prop) {
                     Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
                     Some(Variant::ContentId(c)) => c.as_str().to_string(),
                     Some(Variant::String(s)) => s,
@@ -621,14 +761,36 @@ impl Editor {
                 };
                 Some(Variant::Content(rbx_dom_weak::types::Content::from(uri)))
             }
-            _ if matches!(class, "Sound" | "AudioPlayer") && self.live_sound_prop(first, name).is_some() => {
-                self.live_sound_prop(first, name)
+            _ if matches!(class, "Sound" | "AudioPlayer") && self.live_sound_prop(r, name).is_some() => {
+                self.live_sound_prop(r, name)
             }
-            _ => self.game.doc.prop(first, name).or_else(|| typed_empty(class, name)),
-        };
+            _ => self.game.doc.prop(r, name).or_else(|| typed_empty(class, name)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prop_row(&mut self, p: &mut Painter, sel: &[Ref], first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
+        // ClassName / Parent aren't stored properties.
+        let value = self.read_prop_value(first, class, name);
+        let mixed = sel.len() > 1
+            && value.is_some()
+            && sel[1..].iter().any(|&r| {
+                let Some(c) = self.game.doc.class_of(r) else {
+                    return false;
+                };
+                let other = self.read_prop_value(r, c.as_str(), name);
+                match (&value, &other) {
+                    (Some(a), Some(b)) => !variants_equal(a, b),
+                    (None, None) => false,
+                    _ => true,
+                }
+            });
+        let any_parent_is_root = sel
+            .iter()
+            .any(|&r| self.game.doc.dom.get_by_ref(r).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref()));
         let ro = ro_api
             || matches!(name, "ClassName" | "UniqueId" | "IsInSandbox")
-            || (name == "Parent" && parent_is_root);
+            || (name == "Parent" && any_parent_is_root);
         let color = if ro { READ_ONLY } else { TEXT };
         let vec_like = matches!(value, Some(Variant::Vector3(_)) | Some(Variant::Vector2(_)));
         let audio_content_row = name == "AudioContent" && matches!(class, "Sound" | "AudioPlayer");
@@ -671,14 +833,18 @@ impl Editor {
             Variant::Bool(b) => {
                 let br = Rect::from_min_size(Pos2::new(v.min.x + 2.0, v.center().y - 7.0), Vec2::splat(14.0));
                 let painter = p.ui.painter();
-                if *b {
+                if mixed {
+                    painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(170, 172, 182) });
+                    let bar = Rect::from_center_size(br.center(), Vec2::new(8.0, 2.0));
+                    painter.rect_filled(bar, 0.5, Color32::from_rgb(25, 26, 31));
+                } else if *b {
                     painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(230, 231, 233) });
                     rustudio_engine::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
                 } else {
                     painter.rect_filled(br, 2.0, BOX_OFF);
                 }
                 if clicked_value && !ro {
-                    edits.push(Edit::Prop(name.to_string(), Variant::Bool(!b)));
+                    edits.push(Edit::Prop(name.to_string(), Variant::Bool(if mixed { true } else { !b })));
                 }
             }
             Variant::Color3(_) | Variant::Color3uint8(_) | Variant::BrickColor(_) => {
@@ -692,26 +858,32 @@ impl Editor {
                     _ => unreachable!(),
                 };
                 let sw = Rect::from_min_size(Pos2::new(v.min.x + 2.0, v.center().y - 6.0), Vec2::splat(12.0));
-                p.ui.painter().rect_filled(sw, 1.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                let sw_fill = if mixed { BOX_OFF } else { Color32::from_rgb(rgb[0], rgb[1], rgb[2]) };
+                p.ui.painter().rect_filled(sw, 1.0, sw_fill);
                 p.ui.painter().rect_stroke(sw, 1.0, Stroke::new(1.0, BAND), egui::StrokeKind::Inside);
-                let text = match label {
-                    Some(n) => n,
-                    None => {
-                        let base = format!("[{}, {}, {}]", rgb[0], rgb[1], rgb[2]);
-                        // A part's Color names its BrickColor when it is one (captured).
-                        match brick_name(rgb).filter(|_| name == "Color") {
-                            Some(n) => format!("{base} ({n})"),
-                            None => base,
+                let text = if mixed {
+                    MIXED_LABEL.to_string()
+                } else {
+                    match label {
+                        Some(n) => n,
+                        None => {
+                            let base = format!("[{}, {}, {}]", rgb[0], rgb[1], rgb[2]);
+                            // A part's Color names its BrickColor when it is one (captured).
+                            match brick_name(rgb).filter(|_| name == "Color") {
+                                Some(n) => format!("{base} ({n})"),
+                                None => base,
+                            }
                         }
                     }
                 };
+                let label_color = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { color };
                 let tv = Rect::from_min_max(Pos2::new(sw.max.x + 6.0, v.min.y), v.max);
                 self.ui_rects.insert(if matches!(value, Variant::BrickColor(_)) { "props.brickcolor" } else { "props.color" }, v);
                 if ro {
-                    Self::value_label(p, tv, &text, color);
+                    Self::value_label(p, tv, &text, label_color);
                 } else if matches!(value, Variant::BrickColor(_)) {
                     // Studio's palette popup (crate::color_editors).
-                    Self::value_label(p, tv, &text, color);
+                    Self::value_label(p, tv, &text, label_color);
                     if clicked_value {
                         self.props.brick_popup = Some(crate::color_editors::BrickPopup {
                             prop: name.to_string(),
@@ -727,12 +899,21 @@ impl Editor {
                     if clicked_value && on_swatch {
                         self.open_color_dialog(name, rgb);
                     }
-                    let plain = format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]);
+                    let plain = if mixed { String::new() } else { format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]) };
                     let editing = self.props.editing.as_ref().is_some_and(|(k, _)| k == name);
                     if !editing {
-                        Self::value_label(p, tv, &text, color);
+                        Self::value_label(p, tv, &text, label_color);
                     }
-                    if let Some(t) = self.text_cell(p, name, if editing { tv } else { Rect::NOTHING }, &plain, false, clicked_value && !on_swatch) {
+                    if let Some(t) = self.text_cell_ex(
+                        p,
+                        name,
+                        if editing { tv } else { Rect::NOTHING },
+                        &text,
+                        &plain,
+                        label_color,
+                        false,
+                        clicked_value && !on_swatch,
+                    ) {
                         if let Some(n) = parse_nums(&t, 3) {
                             let c = [n[0].clamp(0.0, 255.0) as u8, n[1].clamp(0.0, 255.0) as u8, n[2].clamp(0.0, 255.0) as u8];
                             edits.push(Edit::Prop(name.to_string(), color_variant(&value, c)));
@@ -755,8 +936,12 @@ impl Editor {
                         v
                     })
                     .unwrap_or_default();
-                let cur_name = items.iter().find(|(_, n)| *n == cur).map(|(k, _)| k.clone()).unwrap_or_else(|| cur.to_string());
-                Self::value_label(p, v, &cur_name, color);
+                let cur_name = if mixed {
+                    MIXED_LABEL.to_string()
+                } else {
+                    items.iter().find(|(_, n)| *n == cur).map(|(k, _)| k.clone()).unwrap_or_else(|| cur.to_string())
+                };
+                Self::value_label(p, v, &cur_name, if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { color });
                 if !ro {
                     let id = egui::Id::new(("enum_popup", name));
                     if clicked_value {
@@ -783,13 +968,13 @@ impl Editor {
                                 .show(ui, |ui| {
                                     for (k, n) in &items {
                                         let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ITEM_H), Sense::click());
-                                        let sel = *n == cur;
-                                        if sel || resp.hovered() {
-                                            let bg = if sel { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                        let sel_item = !mixed && *n == cur;
+                                        if sel_item || resp.hovered() {
+                                            let bg = if sel_item { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
                                             ui.painter().rect_filled(r, 0.0, bg);
                                         }
                                         ui.painter().text(Pos2::new(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, k, FontId::proportional(FONT), TEXT);
-                                        if sel && just_opened {
+                                        if sel_item && just_opened {
                                             resp.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         if resp.clicked() {
@@ -798,14 +983,17 @@ impl Editor {
                                     }
                                 });
                         });
-                    if let Some(n) = picked.filter(|n| *n != cur) {
+                    if let Some(n) = picked.filter(|n| mixed || *n != cur) {
                         edits.push(Edit::Prop(name.to_string(), Variant::Enum(Enum::from_u32(n))));
                     }
                 }
             }
             Variant::Vector3(v3) => {
                 let g = rustudio_core::math::v3(*v3);
-                if let Some(t) = self.text_cell(p, name, v, &fmt_v3(g), ro, clicked_value) {
+                let shown = if mixed { MIXED_LABEL.to_string() } else { fmt_v3(g) };
+                let init = if mixed { "" } else { shown.as_str() };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                if let Some(t) = self.text_cell_ex(p, name, v, &shown, init, col, ro, clicked_value) {
                     if let Some(n) = parse_v3(&t) {
                         edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
                     }
@@ -815,11 +1003,28 @@ impl Editor {
                         let key = format!("{name}.{axis}");
                         let (r, vv, resp) = Self::cells(p, &key);
                         Self::name_text(p, r, 1.0, axis, color, None);
-                        if let Some(t) = self.text_cell(p, &key, vv, &fmt_num(g[i] as f64), ro, resp.clicked()) {
+                        let axis_mixed = mixed
+                            && sel[1..].iter().any(|&sr| {
+                                let Some(c) = self.game.doc.class_of(sr) else {
+                                    return false;
+                                };
+                                match self.read_prop_value(sr, c.as_str(), name) {
+                                    Some(Variant::Vector3(ov)) => (rustudio_core::math::v3(ov)[i] - g[i]).abs() > 1e-4,
+                                    _ => true,
+                                }
+                            });
+                        let ax_shown = if axis_mixed { MIXED_LABEL.to_string() } else { fmt_num(g[i] as f64) };
+                        let ax_init = if axis_mixed { "" } else { ax_shown.as_str() };
+                        let ax_col = if ro { READ_ONLY } else if axis_mixed { MIXED_COLOR } else { TEXT };
+                        if let Some(t) = self.text_cell_ex(p, &key, vv, &ax_shown, ax_init, ax_col, ro, resp.clicked()) {
                             if let Ok(x) = t.trim().parse::<f32>() {
-                                let mut n = g;
-                                n[i] = x;
-                                edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
+                                if sel.len() > 1 {
+                                    edits.push(Edit::PropAxis(name.to_string(), i, x));
+                                } else {
+                                    let mut n = g;
+                                    n[i] = x;
+                                    edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
+                                }
                             }
                         }
                     }
@@ -828,13 +1033,15 @@ impl Editor {
             Variant::Tags(_) | Variant::Attributes(_) => {}
             other if !ro && number_of(other).is_some() && crate::prop_slider::spec_for(class, name).is_some() => {
                 let spec = crate::prop_slider::spec_for(class, name).unwrap_or(crate::prop_slider::SliderSpec { min: 0.0, max: 1.0, ticks: 20.0, square: false });
-                self.slider_cell(p, name, other, spec, v, &resp, clicked_value, edits);
+                self.slider_cell(p, name, other, mixed, spec, v, &resp, clicked_value, edits);
             }
             other => {
-                let shown = value_text(&self.game.doc, other);
+                let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, other) };
+                let init = if mixed { "" } else { shown.as_str() };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
                 let editable = !ro
                     && matches!(other, Variant::String(_) | Variant::Int32(_) | Variant::Int64(_) | Variant::Float32(_) | Variant::Float64(_) | Variant::Vector2(_) | Variant::ContentId(_) | Variant::Content(_));
-                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && editable) {
+                if let Some(t) = self.text_cell_ex(p, name, v, &shown, init, col, ro, clicked_value && editable) {
                     if let Some(nv) = parse_like(other, &t) {
                         if name == "Name" {
                             edits.push(Edit::Prop("Name".into(), nv));
@@ -937,6 +1144,7 @@ impl Editor {
         p: &mut Painter,
         name: &str,
         value: &Variant,
+        mixed: bool,
         spec: crate::prop_slider::SliderSpec,
         v: Rect,
         resp: &egui::Response,
@@ -956,7 +1164,11 @@ impl Editor {
         let held = p.ui.ctx().is_being_dragged(p.ui.id().with(("slider", name)));
         let shown = over || held || dragging || editing || self.props.active_row.as_deref() == Some(name);
         if !shown {
-            Self::value_label(p, v, &fmt_num(cur), TEXT);
+            if mixed {
+                Self::value_label(p, v, MIXED_LABEL, MIXED_COLOR);
+            } else {
+                Self::value_label(p, v, &fmt_num(cur), TEXT);
+            }
             return;
         }
         // Studio's editor fills the value cell from the divider.
@@ -974,7 +1186,11 @@ impl Editor {
         rustudio_engine::ti::paint(&painter, Rect::from_center_size(down.center() - Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-down", TEXT);
         let text_rect = Rect::from_min_max(spin.min + Vec2::new(4.0, 0.0), Pos2::new(arrows.min.x - 2.0, spin.max.y));
         let on_text = resp.interact_pointer_pos().is_some_and(|q| text_rect.contains(q));
-        if let Some(t) = self.text_cell(p, name, text_rect, &fmt_num(cur), false, clicked_value && on_text) {
+        let num_str = fmt_num(cur);
+        let shown_txt = if mixed { MIXED_LABEL } else { num_str.as_str() };
+        let init_txt = if mixed { "" } else { num_str.as_str() };
+        let txt_col = if mixed { MIXED_COLOR } else { TEXT };
+        if let Some(t) = self.text_cell_ex(p, name, text_rect, shown_txt, init_txt, txt_col, false, clicked_value && on_text) {
             if let Some(nv) = parse_like(value, &t) {
                 edits.push(Edit::Prop(name.to_string(), nv));
             }
@@ -1000,7 +1216,7 @@ impl Editor {
         }
         if let Some(q) = sresp.interact_pointer_pos().filter(|_| sresp.dragged() || sresp.drag_started()) {
             let nv = spec.value_at(ps::fraction_at(slider, q.x));
-            if (nv - cur).abs() > 1e-9 {
+            if mixed || (nv - cur).abs() > 1e-9 {
                 let refs: Vec<Ref> = self.props.slider_drag.as_ref().map(|d| d.originals.iter().map(|(r, _)| *r).collect()).unwrap_or_default();
                 for r in refs {
                     self.game.doc.set_prop_live(r, ustr(name), number_like(value, nv));
@@ -1039,12 +1255,15 @@ impl Editor {
         use crate::color_editors::{brick_popup_ui, color_dialog_ui, BrickPick, DialogOut};
         if let Some(mut pop) = self.props.brick_popup.take() {
             let first = self.game.doc.selection.first().copied();
-            let current = first.and_then(|r| match self.game.doc.prop(r, &pop.prop) {
+            let brick_of = |r: Ref| match self.game.doc.prop(r, &pop.prop) {
                 Some(Variant::BrickColor(b)) => Some(b),
                 _ => match self.game.doc.prop(r, "Color") {
                     Some(Variant::Color3uint8(c)) => Some(nearest_brick([c.r, c.g, c.b])),
                     _ => None,
                 },
+            };
+            let current = first.and_then(|r| brick_of(r)).filter(|&b| {
+                self.game.doc.selection.iter().skip(1).all(|&r| brick_of(r) == Some(b))
             });
             self.ui_rects.insert("brick.popup", Rect::from_min_size(crate::color_editors::popup_origin(ctx, &pop), crate::color_editors::POPUP_SIZE));
             match brick_popup_ui(ctx, &mut pop, current, self.game.frame_no) {
@@ -1096,8 +1315,25 @@ impl Editor {
     }
 
     /// A CFrame row with Position and Orientation under it (Studio's Transform / Pivot rows).
-    fn frame_rows(&mut self, p: &mut Painter, first: Ref, label: &str, f: Frame, edits: &mut Vec<Edit>) {
+    fn frame_rows(&mut self, p: &mut Painter, sel: &[Ref], first: Ref, label: &str, f: Frame, edits: &mut Vec<Edit>) {
         let xf = self.frame_value(first, f).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+        let first_ori = xf.orientation_deg();
+        let mut pos_mixed = false;
+        let mut ori_mixed = false;
+        if sel.len() > 1 {
+            for &sr in &sel[1..] {
+                let oxf = self.frame_value(sr, f).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+                if (oxf.pos - xf.pos).abs().max_element() > 1e-3 {
+                    pos_mixed = true;
+                }
+                if (oxf.orientation_deg() - first_ori).abs().max_element() > 1e-2 {
+                    ori_mixed = true;
+                }
+                if pos_mixed && ori_mixed {
+                    break;
+                }
+            }
+        }
         let (r, _, resp) = Self::cells(p, label);
         let folded = self.props.open_rows.contains(&format!("fold:{label}"));
         Self::name_text(p, r, 0.0, label, TEXT, Some(!folded));
@@ -1111,12 +1347,15 @@ impl Editor {
         if folded {
             return;
         }
-        for (part, value) in [("Position", xf.pos), ("Orientation", xf.orientation_deg())] {
+        for (part, value, is_mixed) in [("Position", xf.pos, pos_mixed), ("Orientation", first_ori, ori_mixed)] {
             let key = format!("{label}.{part}");
             let (r, v, resp) = Self::cells(p, &key);
             Self::name_text(p, r, 1.0, part, TEXT, Some(false));
             let on_value = resp.interact_pointer_pos().is_some_and(|q| q.x >= v.min.x);
-            if let Some(t) = self.text_cell(p, &key, v, &fmt_v3(value), false, resp.clicked() && on_value) {
+            let shown = if is_mixed { MIXED_LABEL.to_string() } else { fmt_v3(value) };
+            let init = if is_mixed { "" } else { shown.as_str() };
+            let col = if is_mixed { MIXED_COLOR } else { TEXT };
+            if let Some(t) = self.text_cell_ex(p, &key, v, &shown, init, col, false, resp.clicked() && on_value) {
                 if let Some(n) = parse_v3(&t) {
                     let (pos, ori) = if part == "Position" { (Some(n), None) } else { (None, Some(n)) };
                     edits.push(Edit::Frame(f, pos, ori));
@@ -1134,20 +1373,36 @@ impl Editor {
             Frame::ModelOrigin | Frame::WorldPivot => cf_of(self.game.doc.prop(r, "WorldPivotData")).or_else(|| {
                 let pp = match self.game.doc.prop(r, "PrimaryPart") {
                     Some(Variant::Ref(p)) if p.is_some() => p,
-                    _ => self.selected_parts().first().copied()?,
+                    _ => self
+                        .game
+                        .doc
+                        .dom
+                        .descendants_of(r)
+                        .find(|i| doc::is_a(i.class.as_str(), "BasePart"))
+                        .map(|i| i.referent())
+                        .or_else(|| self.selected_parts().first().copied())?,
                 };
                 cf_of(self.game.doc.prop(pp, "CFrame"))
             }),
         }
     }
 
-    fn tags_section(&mut self, p: &mut Painter, first: Ref, edits: &mut Vec<Edit>) {
+    fn tags_section(&mut self, p: &mut Painter, sel: &[Ref], first: Ref, edits: &mut Vec<Edit>) {
         let mut plus = false;
         self.band(p, "Tags", false, Some(&mut plus));
-        let tags: Vec<String> = match self.game.doc.prop(first, "Tags") {
+        let mut tags: Vec<String> = match self.game.doc.prop(first, "Tags") {
             Some(Variant::Tags(t)) => t.iter().map(|s| s.to_string()).collect(),
             _ => Vec::new(),
         };
+        if sel.len() > 1 && !tags.is_empty() {
+            for &sr in &sel[1..] {
+                let other: HashSet<String> = match self.game.doc.prop(sr, "Tags") {
+                    Some(Variant::Tags(t)) => t.iter().map(|s| s.to_string()).collect(),
+                    _ => HashSet::new(),
+                };
+                tags.retain(|t| other.contains(t));
+            }
+        }
         if plus {
             self.props.editing = Some(("tag:new".into(), String::new()));
         }
@@ -1174,29 +1429,274 @@ impl Editor {
         }
     }
 
-    fn attributes_section(&mut self, p: &mut Painter, first: Ref) {
+    fn attributes_section(&mut self, p: &mut Painter, sel: &[Ref], first: Ref, edits: &mut Vec<Edit>) {
         let mut plus = false;
-        self.band(p, "Attributes", false, Some(&mut plus));
-        let attrs: Vec<(String, String)> = match self.game.doc.prop(first, "Attributes") {
-            Some(Variant::Attributes(a)) => {
-                let mut v: Vec<(String, String)> = a
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with("RBX_"))
-                    .map(|(k, v)| (k.clone(), value_text(&self.game.doc, v)))
-                    .collect();
-                v.sort();
-                v
+        let folded = self.props.folded.contains("Attributes");
+        if self.band(p, "Attributes", folded, Some(&mut plus)) {
+            if !self.props.folded.remove("Attributes") {
+                self.props.folded.insert("Attributes".into());
             }
+        }
+        if plus {
+            self.props.folded.remove("Attributes");
+            self.props.adding_attr = Some(AddingAttr {
+                name: String::new(),
+                kind: AttrKind::String,
+                focus_name: true,
+            });
+        }
+        if self.props.folded.contains("Attributes") {
+            return;
+        }
+        if let Some(mut adding) = self.props.adding_attr.take() {
+            // Inline row 1: attribute name
+            let (r, v, _) = Self::cells(p, "attr:add:name");
+            Self::name_text(p, r, 0.0, "Name", TEXT, None);
+            let name_id = egui::Id::new("attr_add_name");
+            let te = p
+                .ui
+                .scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(v)
+                        .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut adding.name)
+                                .id(name_id)
+                                .hint_text("Attribute name")
+                                .frame(egui::Frame::NONE)
+                                .font(FontId::proportional(FONT)),
+                        )
+                    },
+                )
+                .inner;
+            if adding.focus_name {
+                te.request_focus();
+                adding.focus_name = false;
+            }
+            // Inline row 2: type selector + Add / Cancel buttons
+            let (r, v, _) = Self::cells(p, "attr:add:type");
+            Self::name_text(p, r, 0.0, "Type", TEXT, None);
+            let btn_w = 34.0;
+            let cancel_w = 18.0;
+            let cancel_rect = Rect::from_min_max(
+                Pos2::new((v.max.x - cancel_w).max(v.min.x), v.min.y + 1.0),
+                Pos2::new(v.max.x, v.max.y - 1.0),
+            );
+            let add_rect = Rect::from_min_max(
+                Pos2::new((cancel_rect.min.x - btn_w - 3.0).max(v.min.x), v.min.y + 1.0),
+                Pos2::new((cancel_rect.min.x - 3.0).max(v.min.x), v.max.y - 1.0),
+            );
+            let type_rect = Rect::from_min_max(v.min, Pos2::new((add_rect.min.x - 4.0).max(v.min.x), v.max.y));
+
+            let type_resp = p.ui.interact(type_rect, egui::Id::new("attr_add_type_btn"), Sense::click());
+            if type_resp.hovered() {
+                p.ui.painter().rect_filled(type_rect, 2.0, Color32::from_rgb(45, 48, 58));
+            }
+            Self::value_label(p, type_rect, adding.kind.label(), TEXT);
+            let popup_id = egui::Id::new("attr_add_type_popup");
+            if type_resp.clicked() {
+                egui::Popup::open_id(p.ui.ctx(), popup_id);
+            }
+            let pop_w = type_rect.width().max(96.0);
+            egui::Popup::new(popup_id, p.ui.ctx().clone(), egui::PopupAnchor::Position(type_rect.left_bottom()), p.ui.layer_id())
+                .kind(egui::PopupKind::Menu)
+                .open_memory(None)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .width(pop_w)
+                .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                .show(|ui| {
+                    ui.set_width(pop_w - 4.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    for k in AttrKind::ALL {
+                        let (ir, iresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), Sense::click());
+                        let is_cur = k == adding.kind;
+                        if is_cur || iresp.hovered() {
+                            let bg = if is_cur { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                            ui.painter().rect_filled(ir, 0.0, bg);
+                        }
+                        ui.painter().text(
+                            Pos2::new(ir.min.x + 6.0, ir.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            k.label(),
+                            FontId::proportional(FONT),
+                            TEXT,
+                        );
+                        if iresp.clicked() {
+                            adding.kind = k;
+                        }
+                    }
+                });
+
+            let trimmed = adding.name.trim().to_string();
+            let valid_name = !trimmed.is_empty() && !trimmed.starts_with("RBX_");
+            let add_resp = p.ui.interact(
+                add_rect,
+                egui::Id::new("attr_add_confirm"),
+                if valid_name { Sense::click() } else { Sense::hover() },
+            );
+            let add_bg = if !valid_name {
+                BOX_OFF
+            } else if add_resp.hovered() {
+                Color32::from_rgb(35, 65, 160)
+            } else {
+                Color32::from_rgb(19, 35, 93)
+            };
+            p.ui.painter().rect_filled(add_rect, 2.0, add_bg);
+            p.ui.painter().text(
+                add_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Add",
+                FontId::proportional(FONT - 1.0),
+                if valid_name { Color32::WHITE } else { READ_ONLY },
+            );
+
+            let cancel_resp = p.ui.interact(cancel_rect, egui::Id::new("attr_add_cancel"), Sense::click());
+            if cancel_resp.hovered() {
+                p.ui.painter().rect_filled(cancel_rect, 2.0, Color32::from_rgb(45, 48, 58));
+            }
+            rustudio_engine::ti::paint(p.ui.painter(), Rect::from_center_size(cancel_rect.center(), Vec2::splat(11.0)), "x", TEXT);
+
+            let (enter, esc) = p.ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if esc || cancel_resp.clicked() {
+                // Cancelled: drop adding_attr.
+            } else if valid_name && (add_resp.clicked() || (enter && te.has_focus())) {
+                edits.push(Edit::SetAttr(trimmed, adding.kind.default_variant()));
+            } else {
+                self.props.adding_attr = Some(adding);
+            }
+        }
+
+        // Collect attributes common to all selected instances and detect mixed values.
+        let mut attrs: Vec<(String, Variant, bool)> = match self.game.doc.prop(first, "Attributes") {
+            Some(Variant::Attributes(a)) => a
+                .iter()
+                .filter(|(k, _)| !k.starts_with("RBX_"))
+                .map(|(k, v)| (k.clone(), v.clone(), false))
+                .collect(),
             _ => Vec::new(),
         };
-        if attrs.is_empty() {
+        if sel.len() > 1 && !attrs.is_empty() {
+            for &sr in &sel[1..] {
+                let other = match self.game.doc.prop(sr, "Attributes") {
+                    Some(Variant::Attributes(a)) => a,
+                    _ => Attributes::new(),
+                };
+                attrs.retain_mut(|(k, v, mixed)| {
+                    let Some(ov) = other.get(k.as_str()) else {
+                        return false;
+                    };
+                    if !variants_equal(v, ov) {
+                        *mixed = true;
+                    }
+                    true
+                });
+            }
+        }
+        attrs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if attrs.is_empty() && self.props.adding_attr.is_none() {
             let (r, _, _) = Self::cells(p, "attrs:none");
             Self::name_text(p, r, -0.5, "No Attribute has been added yet", READ_ONLY.gamma_multiply(1.6), None);
         }
-        for (k, v) in attrs {
-            let (r, vr, _) = Self::cells(p, &format!("attr:{k}"));
+        for (k, val, mixed) in attrs {
+            let row_key = format!("attr:{k}");
+            let (r, vr, resp) = Self::cells(p, &row_key);
             Self::name_text(p, r, 0.0, &k, TEXT, None);
-            Self::value_label(p, vr, &v, TEXT);
+            let x_rect = Rect::from_center_size(Pos2::new(vr.max.x - 8.0, vr.center().y), Vec2::splat(12.0));
+            let val_rect = Rect::from_min_max(vr.min, Pos2::new((x_rect.min.x - 4.0).max(vr.min.x), vr.max.y));
+            let x_hover = p.ui.ctx().pointer_latest_pos().is_some_and(|q| x_rect.expand(3.0).contains(q));
+            rustudio_engine::ti::paint(p.ui.painter(), x_rect, "x", if x_hover { Color32::WHITE } else { TEXT });
+            if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| x_rect.expand(3.0).contains(q)) {
+                edits.push(Edit::RemoveAttr(k));
+                continue;
+            }
+            let clicked_val = resp.clicked()
+                && resp.interact_pointer_pos().is_some_and(|q| q.x >= val_rect.min.x && q.x <= val_rect.max.x);
+            match &val {
+                Variant::Bool(b) => {
+                    let br = Rect::from_min_size(Pos2::new(val_rect.min.x + 2.0, val_rect.center().y - 7.0), Vec2::splat(14.0));
+                    let painter = p.ui.painter();
+                    if mixed {
+                        painter.rect_filled(br, 2.0, Color32::from_rgb(170, 172, 182));
+                        painter.rect_filled(Rect::from_center_size(br.center(), Vec2::new(8.0, 2.0)), 0.5, Color32::from_rgb(25, 26, 31));
+                    } else if *b {
+                        painter.rect_filled(br, 2.0, Color32::from_rgb(230, 231, 233));
+                        rustudio_engine::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
+                    } else {
+                        painter.rect_filled(br, 2.0, BOX_OFF);
+                    }
+                    if clicked_val {
+                        edits.push(Edit::SetAttr(k, Variant::Bool(if mixed { true } else { !b })));
+                    }
+                }
+                Variant::Color3(c) => {
+                    let rgb = [(c.r * 255.0).round() as u8, (c.g * 255.0).round() as u8, (c.b * 255.0).round() as u8];
+                    let sw = Rect::from_min_size(Pos2::new(val_rect.min.x + 2.0, val_rect.center().y - 6.0), Vec2::splat(12.0));
+                    p.ui.painter().rect_filled(sw, 1.0, if mixed { BOX_OFF } else { Color32::from_rgb(rgb[0], rgb[1], rgb[2]) });
+                    p.ui.painter().rect_stroke(sw, 1.0, Stroke::new(1.0, BAND), egui::StrokeKind::Inside);
+                    let tv = Rect::from_min_max(Pos2::new(sw.max.x + 6.0, val_rect.min.y), val_rect.max);
+                    let shown = if mixed { MIXED_LABEL.to_string() } else { format!("[{}, {}, {}]", rgb[0], rgb[1], rgb[2]) };
+                    let plain = if mixed { String::new() } else { format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]) };
+                    let col = if mixed { MIXED_COLOR } else { TEXT };
+                    let editing = self.props.editing.as_ref().is_some_and(|(ek, _)| ek == &row_key);
+                    if !editing {
+                        Self::value_label(p, tv, &shown, col);
+                    }
+                    if let Some(t) = self.text_cell_ex(
+                        p,
+                        &row_key,
+                        if editing { tv } else { Rect::NOTHING },
+                        &shown,
+                        &plain,
+                        col,
+                        false,
+                        clicked_val,
+                    ) {
+                        if let Some(n) = parse_nums(&t, 3) {
+                            let nc = Color3::new(
+                                n[0].clamp(0.0, 255.0) / 255.0,
+                                n[1].clamp(0.0, 255.0) / 255.0,
+                                n[2].clamp(0.0, 255.0) / 255.0,
+                            );
+                            edits.push(Edit::SetAttr(k, Variant::Color3(nc)));
+                        }
+                    }
+                }
+                Variant::Vector3(v3) => {
+                    let g = rustudio_core::math::v3(*v3);
+                    let shown = if mixed { MIXED_LABEL.to_string() } else { fmt_v3(g) };
+                    let init = if mixed { "" } else { shown.as_str() };
+                    let col = if mixed { MIXED_COLOR } else { TEXT };
+                    if let Some(t) = self.text_cell_ex(p, &row_key, val_rect, &shown, init, col, false, clicked_val) {
+                        if let Some(n) = parse_v3(&t) {
+                            edits.push(Edit::SetAttr(k, Variant::Vector3(rustudio_core::math::rv3(n))));
+                        }
+                    }
+                }
+                Variant::String(s) => {
+                    let shown = if mixed { MIXED_LABEL } else { s.lines().next().unwrap_or("") };
+                    let init = if mixed { "" } else { s.as_str() };
+                    let col = if mixed { MIXED_COLOR } else { TEXT };
+                    if let Some(t) = self.text_cell_ex(p, &row_key, val_rect, shown, init, col, false, clicked_val) {
+                        edits.push(Edit::SetAttr(k, Variant::String(t)));
+                    }
+                }
+                Variant::Float64(_) | Variant::Float32(_) | Variant::Int32(_) | Variant::Int64(_) | Variant::Vector2(_) => {
+                    let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, &val) };
+                    let init = if mixed { "" } else { shown.as_str() };
+                    let col = if mixed { MIXED_COLOR } else { TEXT };
+                    if let Some(t) = self.text_cell_ex(p, &row_key, val_rect, &shown, init, col, false, clicked_val) {
+                        if let Some(nv) = parse_like(&val, &t) {
+                            edits.push(Edit::SetAttr(k, nv));
+                        }
+                    }
+                }
+                _ => {
+                    let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, &val) };
+                    Self::value_label(p, val_rect, &shown, if mixed { MIXED_COLOR } else { READ_ONLY });
+                }
+            }
         }
     }
 
@@ -1282,14 +1782,63 @@ impl Editor {
                     let changes = targets.iter().map(|r| (*r, ustr(&name), v.clone())).collect();
                     self.game.doc.set_props(&format!("Set {name}"), changes, Some(format!("prop:{name}:{targets:?}")));
                 }
-                Edit::Frame(f, pos, ori) => self.set_frame(first, f, pos, ori),
+                Edit::PropAxis(name, axis, val) => {
+                    let mut changes = Vec::new();
+                    for &r in sel {
+                        let Some(c) = self.game.doc.class_of(r) else {
+                            continue;
+                        };
+                        if !has_prop(c.as_str(), &name) {
+                            continue;
+                        }
+                        let mut g = match self.game.doc.prop(r, &name) {
+                            Some(Variant::Vector3(v3)) => rustudio_core::math::v3(v3),
+                            _ => Vec3::ZERO,
+                        };
+                        g[axis] = val;
+                        changes.push((r, ustr(&name), Variant::Vector3(rustudio_core::math::rv3(g))));
+                    }
+                    if !changes.is_empty() {
+                        self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                    }
+                }
+                Edit::Frame(f, pos, ori) => self.set_frame(sel, f, pos, ori),
                 Edit::AddTag(t) => self.edit_tags(sel, |tags| {
                     if !tags.contains(&t) {
                         tags.push(t.clone());
                     }
                 }),
                 Edit::RemoveTag(t) => self.edit_tags(sel, |tags| tags.retain(|x| *x != t)),
+                Edit::SetAttr(k, v) => self.edit_attrs(sel, &format!("Set Attribute {k}"), |attrs| {
+                    attrs.insert(k.clone(), v.clone());
+                }),
+                Edit::RemoveAttr(k) => self.edit_attrs(sel, &format!("Remove Attribute {k}"), |attrs| {
+                    let mut rebuilt = Attributes::new();
+                    for (ek, ev) in attrs.iter() {
+                        if ek.as_str() != k.as_str() {
+                            rebuilt.insert(ek.clone(), ev.clone());
+                        }
+                    }
+                    *attrs = rebuilt;
+                }),
             }
+        }
+    }
+
+    fn edit_attrs(&mut self, sel: &[Ref], label: &str, f: impl Fn(&mut Attributes)) {
+        let changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = sel
+            .iter()
+            .map(|&r| {
+                let mut attrs = match self.game.doc.prop(r, "Attributes") {
+                    Some(Variant::Attributes(a)) => a,
+                    _ => Attributes::new(),
+                };
+                f(&mut attrs);
+                (r, ustr("Attributes"), Variant::Attributes(attrs))
+            })
+            .collect();
+        if !changes.is_empty() {
+            self.game.doc.set_props(label, changes, None);
         }
     }
 
@@ -1308,41 +1857,55 @@ impl Editor {
         self.game.doc.set_props("Set Tags", changes, None);
     }
 
-    /// Writes a Transform / Pivot row: CFrame directly; Origin by moving
-    /// the part (or model) so its pivot lands there; the pivot offsets alone.
-    fn set_frame(&mut self, r: Ref, f: Frame, pos: Option<Vec3>, ori: Option<Vec3>) {
-        let Some(cur) = self.frame_value(r, f) else {
-            return;
-        };
-        let new = Xform::from_orientation_deg(pos.unwrap_or(cur.pos), ori.unwrap_or_else(|| cur.orientation_deg()));
+    /// Writes a Transform / Pivot row across all selected instances as one undo step:
+    /// CFrame directly; Origin by moving each part (or model) so its pivot lands there;
+    /// the pivot offsets alone.
+    fn set_frame(&mut self, sel: &[Ref], f: Frame, pos: Option<Vec3>, ori: Option<Vec3>) {
         let cf = |x: &Xform| Variant::CFrame(x.to_cframe());
-        match f {
-            Frame::PartCFrame => self.game.doc.set_props("Set CFrame", vec![(r, ustr("CFrame"), cf(&new))], None),
-            Frame::PivotOffset => self.game.doc.set_props("Set PivotOffset", vec![(r, ustr("PivotOffset"), cf(&new))], None),
-            Frame::PartOrigin => {
-                let offset = cf_of(self.game.doc.prop(r, "PivotOffset")).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
-                let part = mul(&new, &offset.inverse());
-                self.game.doc.set_props("Set Origin", vec![(r, ustr("CFrame"), cf(&part))], None);
-            }
-            Frame::WorldPivot => self.game.doc.set_props(
-                "Set WorldPivot",
-                vec![(r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe())))],
-                None,
-            ),
-            Frame::ModelOrigin => {
-                // Move every part of the model by new × old⁻¹.
-                let delta = mul(&new, &cur.inverse());
-                let mut changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = self.game
-                    .doc
-                    .dom
-                    .descendants_of(r)
-                    .map(|i| i.referent())
-                    .filter_map(|p| cf_of(self.game.doc.prop(p, "CFrame")).filter(|_| self.game.scene.get(p).is_some()).map(|c| (p, ustr("CFrame"), cf(&mul(&delta, &c)))))
-                    .collect();
-                changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe()))));
-                self.game.doc.set_props("Set Origin", changes, None);
+        let mut changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = Vec::new();
+        for &r in sel {
+            let Some(cur) = self.frame_value(r, f) else {
+                continue;
+            };
+            let new = Xform::from_orientation_deg(pos.unwrap_or(cur.pos), ori.unwrap_or_else(|| cur.orientation_deg()));
+            match f {
+                Frame::PartCFrame => changes.push((r, ustr("CFrame"), cf(&new))),
+                Frame::PivotOffset => changes.push((r, ustr("PivotOffset"), cf(&new))),
+                Frame::PartOrigin => {
+                    let offset = cf_of(self.game.doc.prop(r, "PivotOffset")).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+                    let part = mul(&new, &offset.inverse());
+                    changes.push((r, ustr("CFrame"), cf(&part)));
+                }
+                Frame::WorldPivot => changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe())))),
+                Frame::ModelOrigin => {
+                    // Move every part of the model by new × old⁻¹.
+                    let delta = mul(&new, &cur.inverse());
+                    changes.extend(
+                        self.game
+                            .doc
+                            .dom
+                            .descendants_of(r)
+                            .map(|i| i.referent())
+                            .filter_map(|p| {
+                                cf_of(self.game.doc.prop(p, "CFrame"))
+                                    .filter(|_| self.game.scene.get(p).is_some())
+                                    .map(|c| (p, ustr("CFrame"), cf(&mul(&delta, &c))))
+                            }),
+                    );
+                    changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe()))));
+                }
             }
         }
+        if changes.is_empty() {
+            return;
+        }
+        let label = match f {
+            Frame::PartCFrame => "Set CFrame",
+            Frame::PivotOffset => "Set PivotOffset",
+            Frame::PartOrigin | Frame::ModelOrigin => "Set Origin",
+            Frame::WorldPivot => "Set WorldPivot",
+        };
+        self.game.doc.set_props(label, changes, None);
     }
 }
 
@@ -1419,5 +1982,21 @@ mod tests {
         assert_eq!(super::fmt_num(100000.0), "100000");
         assert_eq!(super::fmt_num(-0.0001), "0");
         assert_eq!(super::fmt_v3(glam::Vec3::new(4.0, 1.2, 2.0)), "4, 1.2, 2");
+    }
+
+    #[test]
+    fn variants_equal_handles_floats_and_colors() {
+        use rbx_dom_weak::types::{Color3, Color3uint8, Variant, Vector3};
+        assert!(super::variants_equal(&Variant::Float32(1.0), &Variant::Float32(1.000001)));
+        assert!(!super::variants_equal(&Variant::Float32(1.0), &Variant::Float32(1.5)));
+        assert!(super::variants_equal(
+            &Variant::Color3(Color3::new(1.0, 0.0, 0.0)),
+            &Variant::Color3uint8(Color3uint8::new(255, 0, 0)),
+        ));
+        assert!(super::variants_equal(
+            &Variant::Vector3(Vector3::new(1.0, 2.0, 3.0)),
+            &Variant::Vector3(Vector3::new(1.0, 2.0, 3.00001)),
+        ));
+        assert!(!super::variants_equal(&Variant::Bool(true), &Variant::Bool(false)));
     }
 }

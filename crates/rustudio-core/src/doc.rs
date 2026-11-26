@@ -1868,14 +1868,57 @@ impl Document {
             self.default_parent()
         };
         let roots = tmp.root().children().to_vec();
+        let has_service = roots.iter().any(|r| {
+            tmp.get_by_ref(*r).is_some_and(|i| is_service(i.class.as_str()))
+        });
+        let mut inserted = Vec::new();
         let mut changes = Vec::new();
-        for r in &roots {
-            tmp.transfer(*r, &mut self.dom, parent);
-            changes.push(Change::Create { r: *r, parent });
+        if has_service {
+            let doc_root = self.dom.root_ref();
+            for r in roots {
+                let Some(cls) = tmp.get_by_ref(r).map(|i| i.class.as_str().to_owned()) else {
+                    continue;
+                };
+                if UNSAVED_SERVICES.contains(&cls.as_str()) {
+                    continue;
+                }
+                if is_service(&cls) {
+                    let children = tmp.get_by_ref(r).map(|i| i.children().to_vec()).unwrap_or_default();
+                    if children.is_empty() {
+                        continue;
+                    }
+                    let target_svc = self.find_child(doc_root, &cls).unwrap_or_else(|| {
+                        let new_svc = self.dom.insert(doc_root, InstanceBuilder::new(&cls).with_name(&cls));
+                        changes.push(Change::Create { r: new_svc, parent: doc_root });
+                        new_svc
+                    });
+                    for ch in children {
+                        // Do not duplicate default Workspace Camera or Terrain when importing a .rbxl into an existing place.
+                        if cls == "Workspace"
+                            && tmp.get_by_ref(ch).is_some_and(|c| c.class == "Camera" || c.class == "Terrain")
+                        {
+                            continue;
+                        }
+                        tmp.transfer(ch, &mut self.dom, target_svc);
+                        changes.push(Change::Create { r: ch, parent: target_svc });
+                        inserted.push(ch);
+                    }
+                } else {
+                    tmp.transfer(r, &mut self.dom, parent);
+                    changes.push(Change::Create { r, parent });
+                    inserted.push(r);
+                }
+            }
+        } else {
+            for r in roots {
+                tmp.transfer(r, &mut self.dom, parent);
+                changes.push(Change::Create { r, parent });
+                inserted.push(r);
+            }
         }
-        self.renew_script_guids(&roots);
+        self.renew_script_guids(&inserted);
         self.push(label, changes, None);
-        roots
+        inserted
     }
 
     /// Inserts several groups of model bytes, each under its own parent,

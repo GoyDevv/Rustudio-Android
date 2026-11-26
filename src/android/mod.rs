@@ -163,6 +163,18 @@ pub fn run(app: AndroidApp) {
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());
     rustudio_engine::mouse_lock::install_capture(jni::set_pointer_capture);
+    if jni::vibrator_info().present {
+        rustudio_engine::runtime::domains::gui_input::set_haptic_handler(|ms, strength| {
+            let res = if ms == 0 || strength <= 0.0 {
+                jni::cancel_vibration()
+            } else {
+                jni::vibrate(ms, strength)
+            };
+            if let Err(e) = res {
+                log::warn!("haptics: {e}");
+            }
+        });
+    }
     if let Ok(hw) = jni::hardware_input_devices() {
         rustudio_engine::touch_input::set_hardware_kbm(hw.keyboard, hw.mouse);
     }

@@ -950,12 +950,249 @@ fn line_range(src: &str, line: usize) -> Option<std::ops::Range<usize>> {
     None
 }
 
+/// Finds all non-overlapping occurrences of `query` in `text`, returning
+/// `(byte_range, char_range)` pairs. Safe for arbitrary UTF-8.
+pub(crate) fn find_matches_in_text(
+    text: &str,
+    query: &str,
+    match_case: bool,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    if match_case {
+        let mut out = Vec::new();
+        let mut cur_byte = 0usize;
+        let mut cur_char = 0usize;
+        let q_chars = query.chars().count();
+        for (b_start, m) in text.match_indices(query) {
+            cur_char += text[cur_byte..b_start].chars().count();
+            cur_byte = b_start;
+            let b_end = b_start + m.len();
+            out.push((b_start..b_end, cur_char..cur_char + q_chars));
+        }
+        return out;
+    }
+    if query.is_ascii() {
+        let mut out = Vec::new();
+        let tb = text.as_bytes();
+        let qb = query.as_bytes();
+        let qlen = qb.len();
+        if qlen > tb.len() {
+            return out;
+        }
+        let mut i = 0usize;
+        let mut cur_byte = 0usize;
+        let mut cur_char = 0usize;
+        while i + qlen <= tb.len() {
+            if tb[i..i + qlen].eq_ignore_ascii_case(qb) {
+                cur_char += text[cur_byte..i].chars().count();
+                cur_byte = i;
+                out.push((i..i + qlen, cur_char..cur_char + qlen));
+                i += qlen;
+            } else {
+                i += 1;
+            }
+        }
+        return out;
+    }
+    let q_lower: Vec<char> = query.to_lowercase().chars().collect();
+    if q_lower.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let text_len = text.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let mut qi = 0usize;
+        let mut j = i;
+        while j < chars.len() && qi < q_lower.len() {
+            let mut ok = true;
+            for lc in chars[j].1.to_lowercase() {
+                if qi < q_lower.len() && lc == q_lower[qi] {
+                    qi += 1;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+            j += 1;
+        }
+        if qi == q_lower.len() && j > i {
+            let b_start = chars[i].0;
+            let b_end = if j < chars.len() { chars[j].0 } else { text_len };
+            out.push((b_start..b_end, i..j));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Replaces all non-overlapping occurrences of `query` with `replacement` in `text`.
+/// Returns `(updated_text, replacement_count)`.
+pub(crate) fn replace_all_in_text(
+    text: &str,
+    query: &str,
+    replacement: &str,
+    match_case: bool,
+) -> (String, usize) {
+    let matches = find_matches_in_text(text, query, match_case);
+    if matches.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let count = matches.len();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (b_range, _) in matches {
+        out.push_str(&text[last..b_range.start]);
+        out.push_str(replacement);
+        last = b_range.end;
+    }
+    out.push_str(&text[last..]);
+    (out, count)
+}
+
+/// Toggles `-- ` Luau line comments on the current line or all lines spanned by
+/// `sel_start..=sel_end` (character indices). Returns `(new_text, new_lo, new_hi)`.
+fn toggle_comment_lines(text: &str, sel_start: usize, sel_end: usize) -> (String, usize, usize) {
+    let total_chars = text.chars().count();
+    let lo = sel_start.min(sel_end).min(total_chars);
+    let hi = sel_start.max(sel_end).min(total_chars);
+
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut line_starts: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut acc = 0usize;
+    for l in &lines {
+        line_starts.push(acc);
+        acc += l.chars().count() + 1;
+    }
+
+    let find_line = |ci: usize| -> usize {
+        match line_starts.binary_search(&ci) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        }
+    };
+
+    let start_line = find_line(lo);
+    let mut end_line = find_line(hi);
+    if hi > lo && end_line > start_line && hi == line_starts[end_line] {
+        end_line -= 1;
+    }
+
+    let single_line = start_line == end_line;
+    let has_non_empty = (start_line..=end_line).any(|i| !lines[i].trim().is_empty());
+
+    let all_commented = (start_line..=end_line)
+        .filter(|&i| !has_non_empty || !lines[i].trim().is_empty())
+        .all(|i| lines[i].trim_start().starts_with("--"));
+
+    let min_indent: usize = if !all_commented && has_non_empty {
+        (start_line..=end_line)
+            .filter(|&i| !lines[i].trim().is_empty())
+            .map(|i| lines[i].bytes().take_while(|&b| b == b' ' || b == b'\t').count())
+            .min()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut edits: Vec<(usize, isize)> = Vec::with_capacity(lines.len());
+
+    for (i, &line) in lines.iter().enumerate() {
+        if i < start_line || i > end_line {
+            new_lines.push(line.to_string());
+            edits.push((0, 0));
+            continue;
+        }
+        if all_commented {
+            let indent = line.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+            let rest = &line[indent..];
+            if let Some(after) = rest.strip_prefix("-- ") {
+                new_lines.push(format!("{}{}", &line[..indent], after));
+                edits.push((indent, -3));
+            } else if let Some(after) = rest.strip_prefix("--") {
+                new_lines.push(format!("{}{}", &line[..indent], after));
+                edits.push((indent, -2));
+            } else {
+                new_lines.push(line.to_string());
+                edits.push((0, 0));
+            }
+        } else if single_line || !line.trim().is_empty() {
+            let col = min_indent.min(line.len());
+            let mut s = String::with_capacity(line.len() + 3);
+            s.push_str(&line[..col]);
+            s.push_str("-- ");
+            s.push_str(&line[col..]);
+            new_lines.push(s);
+            edits.push((col, 3));
+        } else {
+            new_lines.push(line.to_string());
+            edits.push((0, 0));
+        }
+    }
+
+    let new_text = new_lines.join("\n");
+    let new_total = new_text.chars().count();
+
+    let map_pos = |pos: usize| -> usize {
+        let ln = find_line(pos);
+        let delta_before: isize = edits[..ln].iter().map(|&(_, d)| d).sum();
+        let (edit_col, line_delta) = edits[ln];
+        let col = pos.saturating_sub(line_starts[ln]);
+        let line_adj = if line_delta > 0 {
+            if col >= edit_col { line_delta } else { 0 }
+        } else if line_delta < 0 {
+            let removed = (-line_delta) as usize;
+            if col >= edit_col + removed {
+                line_delta
+            } else if col > edit_col {
+                -((col - edit_col) as isize)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let mapped = (pos as isize + delta_before + line_adj).max(0) as usize;
+        mapped.min(new_total)
+    };
+
+    let new_lo = map_pos(lo);
+    let new_hi = map_pos(hi);
+    (new_text, new_lo, new_hi)
+}
+
+/// 1-based line number of `byte_idx` in `text`.
+fn line_of_byte(text: &str, byte_idx: usize) -> usize {
+    let end = byte_idx.min(text.len());
+    text[..end].bytes().filter(|&b| b == b'\n').count() + 1
+}
+
 /// A highlighted layout job; the error line gets a red wavy-looking underline.
 pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJob {
+    highlight_with_matches(src, error_line, font, &[], None)
+}
+
+fn highlight_with_matches(
+    src: &str,
+    error_line: Option<usize>,
+    font: FontId,
+    matches: &[std::ops::Range<usize>],
+    active_match: Option<usize>,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     let err = error_line.and_then(|l| line_range(src, l));
     // Studio Settings > Script Editor > Theme.
     let sc = crate::studio_settings::script_colors();
+    let mut m_cursor = 0usize;
     for (range, tok) in tokenize(src) {
         let color = match tok {
             Tok::Plain => sc.text,
@@ -966,7 +1203,10 @@ pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJo
             Tok::Comment => sc.comment,
             Tok::Op => sc.operator,
         };
-        // Split the token where it crosses into / out of the error line.
+        while m_cursor < matches.len() && matches[m_cursor].end <= range.start {
+            m_cursor += 1;
+        }
+        // Split the token where it crosses into / out of the error line or find matches.
         let mut cuts = vec![range.start, range.end];
         if let Some(e) = &err {
             for p in [e.start, e.end] {
@@ -975,7 +1215,18 @@ pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJo
                 }
             }
         }
+        let mut mi = m_cursor;
+        while mi < matches.len() && matches[mi].start < range.end {
+            let m = &matches[mi];
+            for p in [m.start, m.end] {
+                if p > range.start && p < range.end {
+                    cuts.push(p);
+                }
+            }
+            mi += 1;
+        }
         cuts.sort_unstable();
+        cuts.dedup();
         for w in cuts.windows(2) {
             let (a, z) = (w[0], w[1]);
             if a == z {
@@ -984,6 +1235,27 @@ pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJo
             let on_err = err
                 .as_ref()
                 .is_some_and(|e| a >= e.start && z <= e.end && e.start != e.end);
+            let mut match_bg: Option<Color32> = None;
+            let mut mj = m_cursor;
+            while mj < matches.len() && matches[mj].start < z {
+                let m = &matches[mj];
+                if a >= m.start && z <= m.end && m.start != m.end {
+                    match_bg = Some(if active_match == Some(mj) {
+                        Color32::from_rgba_unmultiplied(235, 165, 50, 120)
+                    } else {
+                        Color32::from_rgba_unmultiplied(220, 190, 70, 55)
+                    });
+                    break;
+                }
+                mj += 1;
+            }
+            let background = match_bg.unwrap_or_else(|| {
+                if on_err {
+                    Color32::from_rgba_unmultiplied(240, 96, 86, 28)
+                } else {
+                    Color32::TRANSPARENT
+                }
+            });
             let fmt = TextFormat {
                 font_id: font.clone(),
                 color,
@@ -993,11 +1265,7 @@ pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJo
                 } else {
                     Stroke::NONE
                 },
-                background: if on_err {
-                    Color32::from_rgba_unmultiplied(240, 96, 86, 28)
-                } else {
-                    Color32::TRANSPARENT
-                },
+                background,
                 ..Default::default()
             };
             job.append(&src[a..z], 0.0, fmt);
@@ -1021,6 +1289,25 @@ struct AutocompleteState {
     caret_top: Option<egui::Pos2>,
 }
 
+#[derive(Default, Clone)]
+struct FindReplaceState {
+    open: bool,
+    show_replace: bool,
+    query: String,
+    replace: String,
+    match_case: bool,
+    active_match: usize,
+    focus_find: bool,
+    focus_replace: bool,
+}
+
+#[derive(Default, Clone)]
+struct GotoLineState {
+    open: bool,
+    input: String,
+    focus_input: bool,
+}
+
 pub struct ScriptBuf {
     pub text: String,
     pub error: Option<(usize, String)>,
@@ -1033,6 +1320,12 @@ pub struct ScriptBuf {
     completions: Vec<(String, String)>,
     /// Built-in + merged Luau autocomplete popup state.
     ac: AutocompleteState,
+    /// In-editor Find & Replace bar state.
+    find: FindReplaceState,
+    /// In-editor Go to Line bar state.
+    goto_bar: GotoLineState,
+    /// Pending toggle-comment action triggered externally (e.g. from menu bar).
+    pending_toggle_comment: bool,
 }
 
 #[derive(Default)]
@@ -1063,6 +1356,48 @@ pub struct ScriptTabs {
     pub portrait_bar_keep_kb: bool,
     /// Multi-frame hold counter keeping Gboard & editor focus alive across tap-release frames.
     pub portrait_bar_keep_kb_frames: u8,
+}
+
+impl ScriptTabs {
+    /// Opens the in-editor Find bar for script `r`.
+    pub fn open_find(&mut self, r: Ref) {
+        if let Some(buf) = self.bufs.get_mut(&r) {
+            buf.find.open = true;
+            buf.find.show_replace = false;
+            buf.find.focus_find = true;
+            buf.goto_bar.open = false;
+        }
+    }
+
+    /// Opens the in-editor Find & Replace bar for script `r`.
+    pub fn open_replace(&mut self, r: Ref) {
+        if let Some(buf) = self.bufs.get_mut(&r) {
+            buf.find.open = true;
+            buf.find.show_replace = true;
+            if buf.find.query.is_empty() {
+                buf.find.focus_find = true;
+            } else {
+                buf.find.focus_replace = true;
+            }
+            buf.goto_bar.open = false;
+        }
+    }
+
+    /// Opens the in-editor Go to Line bar for script `r`.
+    pub fn open_goto_line(&mut self, r: Ref) {
+        if let Some(buf) = self.bufs.get_mut(&r) {
+            buf.goto_bar.open = true;
+            buf.goto_bar.input.clear();
+            buf.goto_bar.focus_input = true;
+        }
+    }
+
+    /// Queues a Toggle Comment action on the current line / selection for script `r`.
+    pub fn toggle_comment(&mut self, r: Ref) {
+        if let Some(buf) = self.bufs.get_mut(&r) {
+            buf.pending_toggle_comment = true;
+        }
+    }
 }
 
 fn apply_android_orientation(portrait: bool) {
@@ -1133,6 +1468,73 @@ impl Editor {
         }
     }
 
+    /// Returns the currently active script tab's `Ref` if one is open and
+    /// present in the current DataModel.
+    pub fn active_script_tab(&self) -> Option<Ref> {
+        self.maximized_script()
+            .or_else(crate::plugin_host::script_docs::active)
+            .filter(|&r| self.game.doc.dom.get_by_ref(r).is_some())
+    }
+
+    fn ensure_script_buf(&mut self, r: Ref) {
+        if self.scripts.bufs.contains_key(&r) {
+            return;
+        }
+        let source = match self.game.doc.prop(r, "Source") {
+            Some(Variant::String(s)) => s,
+            _ => String::new(),
+        };
+        self.scripts.bufs.insert(
+            r,
+            ScriptBuf {
+                text: source,
+                error: None,
+                checked: None,
+                edited: Instant::now(),
+                plugin_diags: Vec::new(),
+                plugin_checked: None,
+                completions: Vec::new(),
+                ac: AutocompleteState::default(),
+                find: FindReplaceState::default(),
+                goto_bar: GotoLineState::default(),
+                pending_toggle_comment: false,
+            },
+        );
+    }
+
+    /// Opens the in-editor Find bar for the active script tab.
+    pub fn open_find(&mut self) {
+        if let Some(r) = self.active_script_tab() {
+            self.ensure_script_buf(r);
+            self.scripts.open_find(r);
+        }
+    }
+
+    /// Opens the in-editor Find & Replace bar for the active script tab.
+    pub fn open_replace(&mut self) {
+        if let Some(r) = self.active_script_tab() {
+            self.ensure_script_buf(r);
+            self.scripts.open_replace(r);
+        }
+    }
+
+    /// Opens the in-editor Go to Line bar for the active script tab.
+    pub fn open_goto_line(&mut self) {
+        if let Some(r) = self.active_script_tab() {
+            self.ensure_script_buf(r);
+            self.scripts.open_goto_line(r);
+        }
+    }
+
+    /// Toggles `-- ` comments on the active script tab's current line or selection.
+    pub fn toggle_comment(&mut self, ctx: &egui::Context) {
+        if let Some(r) = self.active_script_tab() {
+            self.ensure_script_buf(r);
+            self.scripts.toggle_comment(r);
+            ctx.request_repaint();
+        }
+    }
+
     pub fn script_title(&self, r: Ref) -> String {
         match self.game.doc.dom.get_by_ref(r) {
             Some(i) => i.name.clone(),
@@ -1167,10 +1569,23 @@ impl Editor {
             plugin_checked: None,
             completions: Vec::new(),
             ac: AutocompleteState::default(),
+            find: FindReplaceState::default(),
+            goto_bar: GotoLineState::default(),
+            pending_toggle_comment: false,
         });
         let editor_id = egui::Id::new(("script_text", r));
         let goto = self.scripts.goto.get(&r).copied();
+        let find_id = egui::Id::new(("script_find_input", r));
+        let replace_id = egui::Id::new(("script_replace_input", r));
+        let goto_id = egui::Id::new(("script_goto_input", r));
         let focused = ui.ctx().memory(|m| m.has_focus(editor_id));
+        let any_script_focus = focused
+            || ui.ctx().memory(|m| {
+                m.has_focus(find_id) || m.has_focus(replace_id) || m.has_focus(goto_id)
+            });
+        if any_script_focus {
+            crate::plugin_host::script_docs::set_active(Some(r));
+        }
         // Undo/redo or a script change elsewhere: follow the document.
         if (!focused || follow_live_source) && buf.text != source {
             buf.text = source.clone();
@@ -1281,6 +1696,392 @@ impl Editor {
         }
         ui.separator();
 
+        let mut changed = false;
+        let mut doc_undo_label: Option<&'static str> = None;
+        let mut goto = goto;
+        let mut scroll_to_line: Option<usize> = goto;
+        let mut select_char_range: Option<(usize, usize)> = None;
+        let mut do_toggle_comment = std::mem::take(&mut buf.pending_toggle_comment);
+
+        // In-editor keyboard shortcuts (Ctrl+F, Ctrl+H, Ctrl+G, Ctrl+/, Esc).
+        if any_script_focus || is_maximized {
+            let sc_find = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
+            let sc_replace = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::H);
+            let sc_goto = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::G);
+            let sc_comment = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Slash);
+
+            let prefill_selection = |ctx: &egui::Context, buf: &mut ScriptBuf| {
+                if let Some(st) = egui::TextEdit::load_state(ctx, editor_id) {
+                    if let Some(cr) = st.cursor.char_range() {
+                        if !cr.is_empty() {
+                            let [lo, hi] = cr.sorted_cursors();
+                            let chars: Vec<char> = buf.text.chars().collect();
+                            let a = lo.index.0.min(chars.len());
+                            let b = hi.index.0.min(chars.len());
+                            let sel: String = chars[a..b].iter().collect();
+                            if !sel.is_empty() && !sel.contains('\n') {
+                                buf.find.query = sel;
+                                buf.find.active_match = 0;
+                            }
+                        }
+                    }
+                }
+            };
+
+            if ui.input_mut(|i| i.consume_shortcut(&sc_find)) {
+                prefill_selection(ui.ctx(), buf);
+                buf.find.open = true;
+                buf.find.show_replace = false;
+                buf.find.focus_find = true;
+                buf.goto_bar.open = false;
+                buf.ac.open = false;
+            } else if ui.input_mut(|i| i.consume_shortcut(&sc_replace)) {
+                prefill_selection(ui.ctx(), buf);
+                buf.find.open = true;
+                buf.find.show_replace = true;
+                if buf.find.query.is_empty() {
+                    buf.find.focus_find = true;
+                } else {
+                    buf.find.focus_replace = true;
+                }
+                buf.goto_bar.open = false;
+                buf.ac.open = false;
+            } else if ui.input_mut(|i| i.consume_shortcut(&sc_goto)) {
+                buf.goto_bar.open = true;
+                buf.goto_bar.input.clear();
+                buf.goto_bar.focus_input = true;
+                buf.ac.open = false;
+            } else if ui.input_mut(|i| i.consume_shortcut(&sc_comment)) {
+                do_toggle_comment = true;
+            } else if !buf.ac.open
+                && (buf.find.open || buf.goto_bar.open)
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                buf.find.open = false;
+                buf.goto_bar.open = false;
+                ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            }
+        }
+
+        // Apply Toggle Comment (`Ctrl+/` or View > Toggle Comment).
+        if do_toggle_comment {
+            let mut te_state = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            let total_chars = buf.text.chars().count();
+            let cur_range = te_state
+                .cursor
+                .char_range()
+                .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+            let [lo, hi] = cur_range.sorted_cursors();
+            let a = lo.index.0.min(total_chars);
+            let b = hi.index.0.min(total_chars);
+            let (new_text, new_lo, new_hi) = toggle_comment_lines(&buf.text, a, b);
+            if new_text != buf.text {
+                let mut u = te_state.undoer();
+                u.add_undo(&(cur_range, buf.text.clone()));
+                te_state.set_undoer(u);
+                buf.text = new_text;
+                buf.edited = Instant::now();
+                buf.ac.open = false;
+                changed = true;
+                doc_undo_label = Some("Toggle Comment");
+                let new_range = if new_lo == new_hi {
+                    egui::text::CCursorRange::one(egui::text::CCursor::new(new_lo))
+                } else {
+                    egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(new_lo),
+                        egui::text::CCursor::new(new_hi),
+                    )
+                };
+                te_state.cursor.set_char_range(Some(new_range));
+                te_state.store(ui.ctx(), editor_id);
+                ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            }
+        }
+
+        // Inline Find & Replace bar.
+        if buf.find.open {
+            let mut matches = find_matches_in_text(&buf.text, &buf.find.query, buf.find.match_case);
+            if matches.is_empty() {
+                buf.find.active_match = 0;
+            } else if buf.find.active_match >= matches.len() {
+                buf.find.active_match = 0;
+            }
+
+            let mut jump_delta: Option<isize> = None;
+            let mut do_replace_one = false;
+            let mut do_replace_all = false;
+            let mut close_find = false;
+            let mut query_changed = false;
+
+            egui::Frame::new()
+                .fill(theme::PANEL_DARK)
+                .stroke(Stroke::new(1.0, theme::DIVIDER))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let arrow = if buf.find.show_replace { "▾" } else { "▸" };
+                        if ui
+                            .small_button(arrow)
+                            .on_hover_text("Toggle Replace (Ctrl+H)")
+                            .clicked()
+                        {
+                            buf.find.show_replace = !buf.find.show_replace;
+                            if buf.find.show_replace {
+                                buf.find.focus_replace = true;
+                            }
+                        }
+
+                        let find_resp = ui.add(
+                            egui::TextEdit::singleline(&mut buf.find.query)
+                                .id(find_id)
+                                .hint_text("Find…")
+                                .desired_width(180.0),
+                        );
+                        if buf.find.focus_find {
+                            ui.ctx().memory_mut(|m| m.request_focus(find_id));
+                            buf.find.focus_find = false;
+                        }
+                        if find_resp.changed() {
+                            query_changed = true;
+                        }
+                        if find_resp.has_focus() {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
+                                jump_delta = Some(-1);
+                            } else if !shift
+                                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                            {
+                                jump_delta = Some(1);
+                            }
+                        }
+
+                        let mc_btn = if buf.find.match_case {
+                            egui::Button::new(RichText::new("Aa").small().strong().color(Color32::WHITE))
+                                .fill(theme::ACCENT)
+                        } else {
+                            egui::Button::new(RichText::new("Aa").small())
+                        };
+                        if ui.add(mc_btn).on_hover_text("Match Case").clicked() {
+                            buf.find.match_case = !buf.find.match_case;
+                            query_changed = true;
+                        }
+
+                        let count_text = if buf.find.query.is_empty() {
+                            String::new()
+                        } else if matches.is_empty() {
+                            "0 of 0".to_string()
+                        } else {
+                            format!("{} of {}", buf.find.active_match + 1, matches.len())
+                        };
+                        if !count_text.is_empty() {
+                            let color = if matches.is_empty() {
+                                theme::ERROR
+                            } else {
+                                theme::TEXT_DIM
+                            };
+                            ui.label(RichText::new(count_text).small().color(color));
+                        }
+
+                        if ui
+                            .add_enabled(!matches.is_empty(), egui::Button::new("◀").small())
+                            .on_hover_text("Previous Match (Shift+Enter)")
+                            .clicked()
+                        {
+                            jump_delta = Some(-1);
+                        }
+                        if ui
+                            .add_enabled(!matches.is_empty(), egui::Button::new("▶").small())
+                            .on_hover_text("Next Match (Enter)")
+                            .clicked()
+                        {
+                            jump_delta = Some(1);
+                        }
+                        if ui.small_button("✕").on_hover_text("Close (Esc)").clicked() {
+                            close_find = true;
+                        }
+                    });
+
+                    if buf.find.show_replace {
+                        ui.horizontal(|ui| {
+                            ui.add_space(22.0);
+                            let repl_resp = ui.add(
+                                egui::TextEdit::singleline(&mut buf.find.replace)
+                                    .id(replace_id)
+                                    .hint_text("Replace with…")
+                                    .desired_width(180.0),
+                            );
+                            if buf.find.focus_replace {
+                                ui.ctx().memory_mut(|m| m.request_focus(replace_id));
+                                buf.find.focus_replace = false;
+                            }
+                            if repl_resp.has_focus()
+                                && !matches.is_empty()
+                                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                            {
+                                do_replace_one = true;
+                            }
+                            if ui
+                                .add_enabled(!matches.is_empty(), egui::Button::new("Replace").small())
+                                .on_hover_text("Replace current match")
+                                .clicked()
+                            {
+                                do_replace_one = true;
+                            }
+                            if ui
+                                .add_enabled(!matches.is_empty(), egui::Button::new("Replace All").small())
+                                .on_hover_text("Replace all matches in this script")
+                                .clicked()
+                            {
+                                do_replace_all = true;
+                            }
+                        });
+                    }
+                });
+
+            if query_changed {
+                matches = find_matches_in_text(&buf.text, &buf.find.query, buf.find.match_case);
+                buf.find.active_match = 0;
+                if let Some((b_range, c_range)) = matches.first() {
+                    scroll_to_line = Some(line_of_byte(&buf.text, b_range.start));
+                    select_char_range = Some((c_range.start, c_range.end));
+                }
+            } else if let Some(delta) = jump_delta {
+                if !matches.is_empty() {
+                    let len = matches.len() as isize;
+                    buf.find.active_match =
+                        ((buf.find.active_match as isize + delta).rem_euclid(len)) as usize;
+                    if let Some((b_range, c_range)) = matches.get(buf.find.active_match) {
+                        scroll_to_line = Some(line_of_byte(&buf.text, b_range.start));
+                        select_char_range = Some((c_range.start, c_range.end));
+                    }
+                }
+            }
+
+            if do_replace_one {
+                if let Some((b_range, _)) = matches.get(buf.find.active_match).cloned() {
+                    let mut te_state = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                    let cur_range = te_state
+                        .cursor
+                        .char_range()
+                        .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                    let mut u = te_state.undoer();
+                    u.add_undo(&(cur_range, buf.text.clone()));
+                    te_state.set_undoer(u);
+                    te_state.store(ui.ctx(), editor_id);
+
+                    let mut updated = String::with_capacity(buf.text.len() + buf.find.replace.len());
+                    updated.push_str(&buf.text[..b_range.start]);
+                    updated.push_str(&buf.find.replace);
+                    updated.push_str(&buf.text[b_range.end..]);
+                    buf.text = updated;
+                    buf.edited = Instant::now();
+                    buf.ac.open = false;
+                    changed = true;
+                    doc_undo_label = Some("Replace in script");
+
+                    let next_matches = find_matches_in_text(&buf.text, &buf.find.query, buf.find.match_case);
+                    if next_matches.is_empty() {
+                        buf.find.active_match = 0;
+                    } else {
+                        buf.find.active_match %= next_matches.len();
+                        let (nb, nc) = &next_matches[buf.find.active_match];
+                        scroll_to_line = Some(line_of_byte(&buf.text, nb.start));
+                        select_char_range = Some((nc.start, nc.end));
+                    }
+                }
+            } else if do_replace_all {
+                let (updated, count) = replace_all_in_text(
+                    &buf.text,
+                    &buf.find.query,
+                    &buf.find.replace,
+                    buf.find.match_case,
+                );
+                if count > 0 && updated != buf.text {
+                    let mut te_state = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                    let cur_range = te_state
+                        .cursor
+                        .char_range()
+                        .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                    let mut u = te_state.undoer();
+                    u.add_undo(&(cur_range, buf.text.clone()));
+                    te_state.set_undoer(u);
+                    te_state.store(ui.ctx(), editor_id);
+
+                    buf.text = updated;
+                    buf.edited = Instant::now();
+                    buf.ac.open = false;
+                    buf.find.active_match = 0;
+                    changed = true;
+                    doc_undo_label = Some("Replace All in script");
+                }
+            }
+
+            if close_find {
+                buf.find.open = false;
+                ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            }
+        }
+
+        // Inline Go to Line bar (`Ctrl+G` or Script > Go to Line).
+        if buf.goto_bar.open {
+            let total_lines = buf.text.split('\n').count().max(1);
+            let mut commit_goto = false;
+            let mut close_goto = false;
+
+            egui::Frame::new()
+                .fill(theme::PANEL_DARK)
+                .stroke(Stroke::new(1.0, theme::DIVIDER))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Go to Line:").small().color(theme::TEXT_DIM));
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut buf.goto_bar.input)
+                                .id(goto_id)
+                                .hint_text(format!("1–{total_lines}"))
+                                .desired_width(110.0),
+                        );
+                        if buf.goto_bar.focus_input {
+                            ui.ctx().memory_mut(|m| m.request_focus(goto_id));
+                            buf.goto_bar.focus_input = false;
+                        }
+                        if resp.has_focus()
+                            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                        {
+                            commit_goto = true;
+                        }
+                        if ui.small_button("Go").clicked() {
+                            commit_goto = true;
+                        }
+                        if ui.small_button("✕").on_hover_text("Close (Esc)").clicked() {
+                            close_goto = true;
+                        }
+                    });
+                });
+
+            if commit_goto {
+                if let Ok(line_num) = buf.goto_bar.input.trim().parse::<usize>() {
+                    let target = line_num.clamp(1, total_lines);
+                    goto = Some(target);
+                    scroll_to_line = Some(target);
+                    buf.goto_bar.open = false;
+                }
+            } else if close_goto {
+                buf.goto_bar.open = false;
+                ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            }
+        }
+
+        // Compute find match byte ranges for syntax highlight background markers.
+        let (highlight_matches, highlight_active_match): (Vec<std::ops::Range<usize>>, Option<usize>) =
+            if buf.find.open && !buf.find.query.is_empty() {
+                let m = find_matches_in_text(&buf.text, &buf.find.query, buf.find.match_case);
+                let active = (!m.is_empty()).then_some(buf.find.active_match.min(m.len().saturating_sub(1)));
+                (m.into_iter().map(|(br, _)| br).collect(), active)
+            } else {
+                (Vec::new(), None)
+            };
+
         // Intercept keyboard navigation for the autocomplete popup BEFORE
         // TextEdit consumes Enter/Tab/Arrows/Escape.
         let mut accept_ac_idx: Option<usize> = None;
@@ -1318,7 +2119,6 @@ impl Editor {
         let bg = crate::studio_settings::script_colors().background;
         ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
         let error_line = buf.error.as_ref().map(|e| e.0);
-        let mut changed = false;
         let mut caret_pos: Option<(egui::Pos2, egui::Pos2)> = None;
         let mut post_edit_cursor: Option<usize> = None;
 
@@ -1882,7 +2682,13 @@ impl Editor {
                                         text: &dyn egui::TextBuffer,
                                         wrap_w: f32|
                      -> Arc<egui::Galley> {
-                        let mut job = highlight(text.as_str(), error_line, font.clone());
+                        let mut job = highlight_with_matches(
+                            text.as_str(),
+                            error_line,
+                            font.clone(),
+                            &highlight_matches,
+                            highlight_active_match,
+                        );
                         if wrap {
                             job.wrap.max_width = wrap_w;
                         }
@@ -1936,7 +2742,7 @@ impl Editor {
                         changed = true;
                         buf.edited = Instant::now();
                     }
-                    if let Some(line) = goto {
+                    if let Some(line) = scroll_to_line {
                         let y = resp.rect.top() + line.saturating_sub(1) as f32 * row_h;
                         ui.scroll_to_rect(
                             egui::Rect::from_min_size(
@@ -1957,7 +2763,7 @@ impl Editor {
         // Apply auto-closing brackets/quotes, smart skip-over, smart backspace,
         // and smart Luau block auto-close on Enter.
         let mut cursor_override: Option<usize> = None;
-        if changed && !bar_acted {
+        if changed && !bar_acted && doc_undo_label.is_none() {
             if let (Some(pc), Some(nc)) = (prev_cursor, post_edit_cursor) {
                 if let Some((updated, new_cur)) = apply_auto_edit(&prev_text, pc, &buf.text, nc) {
                     buf.text = updated;
@@ -2118,8 +2924,17 @@ impl Editor {
             }
         }
 
+        // Apply Find match selection range to TextEdit without stealing focus from Find bar.
+        if let (Some((sel_a, sel_b)), Some(st)) = (select_char_range, state.as_mut()) {
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(sel_a),
+                egui::text::CCursor::new(sel_b),
+            )));
+            st.clone().store(ui.ctx(), editor_id);
+        }
+
         // Update built-in autocomplete candidates whenever text changes.
-        if changed && accept_ac_idx.is_none() {
+        if changed && accept_ac_idx.is_none() && doc_undo_label.is_none() {
             if let Some(cur) = word_end {
                 if let Some((ac_ctx, items)) = build_completions(&buf.text, cur, &buf.completions) {
                     buf.ac.open = true;
@@ -2172,10 +2987,14 @@ impl Editor {
             }
             // Plugins' autocomplete for the word being typed.
             let pos = word_end.map(|i| crate::plugin_host::script_docs::pos_of(&text, i));
+            let (undo_label, merge_key) = match doc_undo_label {
+                Some(label) => (label, None),
+                None => ("Edit script", Some(format!("source:{r:?}"))),
+            };
             self.game.doc.set_props(
-                "Edit script",
+                undo_label,
                 vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text.clone()))],
-                Some(format!("source:{r:?}")),
+                merge_key,
             );
             let typing_word = word_end.is_some_and(|i| {
                 let c: Vec<char> = text.chars().collect();
@@ -2424,5 +3243,39 @@ mod tests {
         let balanced = "if x then\nend";
         let res = apply_auto_edit("if x then\nend", 9, "if x then\n\nend", 10);
         assert!(res.is_none(), "expected no duplicate end for balanced block: {balanced}");
+    }
+
+    #[test]
+    fn find_and_replace_matches() {
+        let src = "local foo = Foo + foo\nprint(FOO)";
+        let m_ci = find_matches_in_text(src, "foo", false);
+        assert_eq!(m_ci.len(), 4);
+        let m_cs = find_matches_in_text(src, "foo", true);
+        assert_eq!(m_cs.len(), 2);
+
+        let (replaced, count) = replace_all_in_text(src, "foo", "bar", false);
+        assert_eq!(count, 4);
+        assert_eq!(replaced, "local bar = bar + bar\nprint(bar)");
+
+        let (replaced_cs, count_cs) = replace_all_in_text(src, "foo", "bar", true);
+        assert_eq!(count_cs, 2);
+        assert_eq!(replaced_cs, "local bar = Foo + bar\nprint(FOO)");
+    }
+
+    #[test]
+    fn toggle_comment_single_and_multi_line() {
+        let (t, lo, hi) = toggle_comment_lines("    local x = 1", 8, 8);
+        assert_eq!(t, "    -- local x = 1");
+        assert_eq!((lo, hi), (11, 11));
+
+        let (t2, lo2, hi2) = toggle_comment_lines(&t, lo, hi);
+        assert_eq!(t2, "    local x = 1");
+        assert_eq!((lo2, hi2), (8, 8));
+
+        let multi = "  local a = 1\n  local b = 2\n  local c = 3";
+        let (tm, mlo, mhi) = toggle_comment_lines(multi, 2, 26);
+        assert_eq!(tm, "  -- local a = 1\n  -- local b = 2\n  local c = 3");
+        let (tm2, _, _) = toggle_comment_lines(&tm, mlo, mhi);
+        assert_eq!(tm2, multi);
     }
 }

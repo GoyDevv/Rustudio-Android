@@ -401,6 +401,10 @@ pub struct RustudioApp {
     /// (src/android/text_bar.rs).
     #[cfg(target_os = "android")]
     text_bar: crate::android::text_bar::TextBar,
+    /// Cached Android window insets (`[left, top, right, bottom]` in logical
+    /// egui points), last poll timestamp, and last viewport size.
+    #[cfg(target_os = "android")]
+    android_insets: ([f32; 4], Option<Instant>, egui::Vec2),
     /// The display's refresh rate in Hz (0 unknown): the frame budget the
     /// CPU governor is told (src/android/perf_hint.rs).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -740,8 +744,36 @@ impl RustudioApp {
             text_menu: Default::default(),
             #[cfg(target_os = "android")]
             text_bar: Default::default(),
+            #[cfg(target_os = "android")]
+            android_insets: ([0.0; 4], None, egui::Vec2::ZERO),
             refresh_hz: display_refresh_hz(),
             cpu_usage: None,
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl RustudioApp {
+    /// Polls Android window insets (system bars + display cutout) via JNI,
+    /// converting physical pixels to logical egui points and publishing them
+    /// to the engine's GUI safe-area insets.
+    fn poll_android_insets(&mut self, ctx: &egui::Context) {
+        let size = ctx.viewport_rect().size();
+        let due = self.android_insets.1.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(250))
+            || self.android_insets.2 != size;
+        if !due {
+            return;
+        }
+        self.android_insets.1 = Some(Instant::now());
+        self.android_insets.2 = size;
+        if let Ok(ins) = crate::android::jni::window_insets() {
+            let ppp = ctx.pixels_per_point().max(0.5);
+            let left = (ins.left.max(0) as f32) / ppp;
+            let top = (ins.top.max(0) as f32) / ppp;
+            let right = (ins.right.max(0) as f32) / ppp;
+            let bottom = (ins.bottom.max(0) as f32) / ppp;
+            self.android_insets.0 = [left, top, right, bottom];
+            rustudio_engine::runtime::domains::gui_input::set_device_safe_insets(left, top, right, bottom);
         }
     }
 }
@@ -1223,7 +1255,7 @@ impl Editor {
         use crate::file_dialog::{Kind, Purpose};
         let d = crate::file_dialog::Request::new()
             .set_title("Insert from File")
-            .add_filter("Roblox model", &["rbxm", "rbxmx"]);
+            .add_filter("Roblox model or place", &["rbxm", "rbxmx", "rbxl", "rbxlx"]);
         self.dialogs.start(Purpose::InsertModel(parent), d, Kind::PickFile);
     }
 
@@ -2707,6 +2739,7 @@ impl RustudioApp {
         // `over`, decided in raw_input_hook with the safe-area inset.
         #[cfg(target_os = "android")]
         {
+            self.poll_android_insets(&ctx);
             self.ed.keyboard_cover = self.keyboard.cover(&ctx);
             self.keyboard.shrink(ui);
         }
@@ -2937,12 +2970,17 @@ impl RustudioApp {
             || matches!(self.dock.find_active_focused(), Some((_, Tab::Script(_))));
         self.ed.sync_orientation(script_active);
         if self.ed.is_script_maximized() {
-            let screen = ctx.viewport_rect();
-            let top_notch = if cfg!(target_os = "android") && screen.height() > screen.width() {
-                34
-            } else {
-                0
+            #[cfg(target_os = "android")]
+            let top_notch: i8 = {
+                let screen = ctx.viewport_rect();
+                if screen.height() > screen.width() {
+                    self.android_insets.0[1].max(24.0).round().clamp(0.0, i8::MAX as f32) as i8
+                } else {
+                    0
+                }
             };
+            #[cfg(not(target_os = "android"))]
+            let top_notch: i8 = 0;
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::new()

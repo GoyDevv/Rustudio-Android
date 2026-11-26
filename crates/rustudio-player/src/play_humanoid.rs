@@ -73,6 +73,8 @@ pub(crate) struct HumDyn {
     /// A server CFrame / PivotTo of the root waiting for the next frame's
     /// Humanoid step (`hum_server_root`): the server copy holds it meanwhile.
     deferred_server_root: Option<Xform>,
+    /// Last WalkToPart ref observed so changing it resets the MoveTo timeout.
+    last_walk_to_part: Option<Ref>,
 }
 
 /// Frames from a character part entering a Seat to the Humanoid being
@@ -87,7 +89,7 @@ impl Default for HumDyn {
     /// A new character is in the air (it spawns above its SpawnLocation).
     fn default() -> Self {
         let hum = Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() };
-        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None, deferred_server_root: None }
+        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None, deferred_server_root: None, last_walk_to_part: None }
     }
 }
 
@@ -476,27 +478,107 @@ impl Game {
                 )
             })
             .unwrap_or((None, false, Vec3::ZERO));
-        // MoveDirection (H), else Humanoid:MoveTo's (H).
+        // Support WalkToPart: when the Humanoid has a valid WalkToPart ref on doc,
+        // compute its world-space target from WalkToPart's current world CFrame * WalkToPoint
+        // so MoveTo(pos, part) tracks moving parts.
+        let walk_to_part: Option<Ref> = match self.doc.prop(humanoid, "WalkToPart") {
+            Some(Variant::Ref(r)) if r.is_some() && self.doc.exists(r) => Some(r),
+            _ => self.play.as_ref().and_then(|s| {
+                let ch = s.map.s2c.get(&humanoid).copied()?;
+                let cd = s.other_doc.as_ref()?;
+                match cd.prop(ch, "WalkToPart") {
+                    Some(Variant::Ref(cr)) if cr.is_some() => {
+                        let sr = s.map.c2s.get(&cr).copied()?;
+                        self.doc.exists(sr).then_some(sr)
+                    }
+                    _ => None,
+                }
+            }),
+        };
+        if let Some(s) = self.play.as_mut() {
+            if let Some(ch) = s.character.as_mut() {
+                if walk_to_part.is_some() && walk_to_part != ch.dynamic.last_walk_to_part {
+                    s.game.move_target_elapsed = 0.0;
+                }
+                ch.dynamic.last_walk_to_part = walk_to_part;
+            }
+        }
+        let effective_target: Option<Vec3> = if let Some(part) = walk_to_part {
+            if let Some(part_xf) = rustudio_render::scene::xform_of(&self.doc, part) {
+                let local = rustudio_render::scene::vec3_of(
+                    self.owned_humanoid_prop(humanoid, "WalkToPoint")
+                        .or_else(|| self.doc.prop(humanoid, "WalkToPoint")),
+                )
+                .or(target)
+                .unwrap_or(Vec3::ZERO);
+                Some(part_xf.pos + part_xf.rot * local)
+            } else {
+                target
+            }
+        } else {
+            target
+        };
+        // MoveDirection (H), else Humanoid:MoveTo's (H) with 8-second timeout.
         let mut dir = move_dir;
         let mut mag = move_dir.length().min(1.0);
         if Vec3::new(dir.x, 0.0, dir.z) != Vec3::ZERO {
             if let Some(s) = self.play.as_mut() {
                 s.game.move_target = None;
+                s.game.move_target_elapsed = 0.0;
+                if let Some(ch) = s.character.as_mut() {
+                    ch.dynamic.last_walk_to_part = None;
+                }
             }
-        } else if let Some(t) = target {
+            if walk_to_part.is_some() {
+                self.clear_walk_to_part(humanoid);
+            }
+        } else if let Some(t) = effective_target {
             let mut to = t - at;
             to.y = 0.0;
             if to.length() < mech::MOVE_TO_REACHED {
                 if let Some(s) = self.play.as_mut() {
                     s.game.move_target = None;
+                    s.game.move_target_elapsed = 0.0;
+                    if let Some(ch) = s.character.as_mut() {
+                        ch.dynamic.last_walk_to_part = None;
+                    }
+                }
+                if walk_to_part.is_some() {
+                    self.clear_walk_to_part(humanoid);
                 }
                 self.with_side(Side::Server, |rt, _, _| rt.fire(humanoid, "MoveToFinished", vec![Value::Boolean(true)]));
                 dir = Vec3::ZERO;
                 mag = 0.0;
             } else {
-                dir = to.normalize();
-                mag = 1.0;
+                let timed_out = self
+                    .play
+                    .as_mut()
+                    .map(|s| {
+                        s.game.move_target_elapsed += dt;
+                        s.game.move_target_elapsed >= mech::MOVE_TO_TIMEOUT_S
+                    })
+                    .unwrap_or(false);
+                if timed_out {
+                    if let Some(s) = self.play.as_mut() {
+                        s.game.move_target = None;
+                        s.game.move_target_elapsed = 0.0;
+                        if let Some(ch) = s.character.as_mut() {
+                            ch.dynamic.last_walk_to_part = None;
+                        }
+                    }
+                    if walk_to_part.is_some() {
+                        self.clear_walk_to_part(humanoid);
+                    }
+                    self.with_side(Side::Server, |rt, _, _| rt.fire(humanoid, "MoveToFinished", vec![Value::Boolean(false)]));
+                    dir = Vec3::ZERO;
+                    mag = 0.0;
+                } else {
+                    dir = to.normalize();
+                    mag = 1.0;
+                }
             }
+        } else if let Some(s) = self.play.as_mut() {
+            s.game.move_target_elapsed = 0.0;
         }
         // ChangeState from scripts.
         let (forced_req, states_off) = {
@@ -518,6 +600,11 @@ impl Game {
         }
         let sit = matches!(self.owned_humanoid_prop(humanoid, "Sit"), Some(Variant::Bool(true)));
         let platform = matches!(self.owned_humanoid_prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)));
+        let evaluate_state_machine = !matches!(
+            self.owned_humanoid_prop(humanoid, "EvaluateStateMachine")
+                .or_else(|| self.doc.prop(humanoid, "EvaluateStateMachine")),
+            Some(Variant::Bool(false))
+        );
         // The owner's Health (a LocalScript setting Health = 0 kills its
         // character, as in Studio's T14 probe).
         let health = self.owned_humanoid_f32(humanoid, "Health", 100.0).min(self.humanoid_f32(humanoid, "Health", 100.0));
@@ -652,31 +739,41 @@ impl Game {
         out.active_input = !anchored && health > 0.0 && (mag > 0.0 || jump_req);
         let controller = rustudio_core::bench::scope("hum_controller");
         // A forced state (ChangeState) replaces this frame's transition.
+        // When EvaluateStateMachine is explicitly false, skip automatic state
+        // machine transitions/stepping (explicit ChangeState still updates state).
         let forced = forced_req.filter(|n| !states_off.contains(n)).and_then(|n| State::from_name(&n));
-        let change = match forced {
-            Some(State::Dead) => None,
-            Some(st) => {
-                // ChangeState swaps the state when it is called; the frame's
-                // step then runs on the new state (its update, Studio).
-                let forced = hd.hum.force_state(st, &inp);
-                let o = hd.hum.frame(&inp);
-                match (forced, o.changed) {
-                    (Some((from, _)), Some((_, to))) => Some((from, to)),
-                    (f, c) => f.or(c),
-                }
+        let change = if !evaluate_state_machine {
+            match forced {
+                Some(State::Dead) => None,
+                Some(st) => hd.hum.force_state(st, &inp),
+                None => None,
             }
-            None => {
-                // A state a script disabled (SetStateEnabled false) is never entered.
-                let before = hd.hum.clone();
-                let o = hd.hum.frame(&inp);
-                match o.changed {
-                    Some((_, to)) if states_off.contains(to.enum_name()) => {
-                        hd.hum = before;
-                        hd.hum.timer -= dt;
-                        hd.hum.air += dt;
-                        None
+        } else {
+            match forced {
+                Some(State::Dead) => None,
+                Some(st) => {
+                    // ChangeState swaps the state when it is called; the frame's
+                    // step then runs on the new state (its update, Studio).
+                    let forced = hd.hum.force_state(st, &inp);
+                    let o = hd.hum.frame(&inp);
+                    match (forced, o.changed) {
+                        (Some((from, _)), Some((_, to))) => Some((from, to)),
+                        (f, c) => f.or(c),
                     }
-                    c => c,
+                }
+                None => {
+                    // A state a script disabled (SetStateEnabled false) is never entered.
+                    let before = hd.hum.clone();
+                    let o = hd.hum.frame(&inp);
+                    match o.changed {
+                        Some((_, to)) if states_off.contains(to.enum_name()) => {
+                            hd.hum = before;
+                            hd.hum.timer -= dt;
+                            hd.hum.air += dt;
+                            None
+                        }
+                        c => c,
+                    }
                 }
             }
         };
@@ -794,8 +891,12 @@ impl Game {
         if swim.is_none() {
             hd.swim_vy = None;
         }
-        let ctl = HumCtl { hum: hd.hum.clone(), step, floor_part: hd.floor_part, hrp: root, last: Default::default(), level, swim };
-        s.physics.set_humanoid_ctl(model, Some(ctl));
+        if evaluate_state_machine {
+            let ctl = HumCtl { hum: hd.hum.clone(), step, floor_part: hd.floor_part, hrp: root, last: Default::default(), level, swim };
+            s.physics.set_humanoid_ctl(model, Some(ctl));
+        } else {
+            s.physics.set_humanoid_ctl(model, None);
+        }
         // Freefall's contact friction rule: Head and RootPart.
         let air_parts: Vec<Ref> = [doc.find_named(model, "Head"), Some(root)].into_iter().flatten().collect();
         s.physics.humanoid_air_friction(model, &air_parts, hd.hum.state == State::Freefall);
@@ -830,6 +931,26 @@ impl Game {
         }
         self.hum_sync_collide(model);
         out
+    }
+
+    /// Clears Humanoid.WalkToPart on server and client docs when MoveTo ends or is overridden.
+    fn clear_walk_to_part(&mut self, humanoid: Ref) {
+        if matches!(self.doc.prop(humanoid, "WalkToPart"), Some(Variant::Ref(r)) if r.is_some()) {
+            if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
+                inst.properties.insert(ustr("WalkToPart"), Variant::Ref(Ref::none()));
+            }
+            self.doc.mark_prop(humanoid, ustr("WalkToPart"));
+        }
+        if let Some(s) = self.play.as_mut() {
+            if let (Some(c), Some(cd)) = (s.map.s2c.get(&humanoid).copied(), s.other_doc.as_mut()) {
+                if matches!(cd.prop(c, "WalkToPart"), Some(Variant::Ref(r)) if r.is_some()) {
+                    if let Some(inst) = cd.dom.get_by_ref_mut(c) {
+                        inst.properties.insert(ustr("WalkToPart"), Variant::Ref(Ref::none()));
+                    }
+                    cd.mark_prop(c, ustr("WalkToPart"));
+                }
+            }
+        }
     }
 
     /// On a state change the Humanoid sets its limbs CanCollide false (Studio

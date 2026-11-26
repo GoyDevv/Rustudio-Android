@@ -133,6 +133,7 @@ impl Gui {
         self.tb_sel = -1;
         self.tb_selecting = None;
         self.tb_held_key = None;
+        self.scrollbar_drag = None;
         let mut sh = super::share();
         sh.focus = None;
         sh.focus_req.clear();
@@ -450,8 +451,8 @@ impl Gui {
             (Shape::Mesh(a), Shape::Mesh(b)) => same_mesh(a, b),
             _ => false,
         };
-        let same_hit = |a: &Hit, b: &Hit| a.r == b.r && a.quad == b.quad && a.clip == b.clip && a.sink == b.sink;
-        let same_lhit = |a: &walk::LocalHit, b: &walk::LocalHit| a.r == b.r && a.rect == b.rect && a.clip == b.clip && a.sink == b.sink;
+        let same_hit = |a: &Hit, b: &Hit| a.r == b.r && a.quad == b.quad && a.clip == b.clip && a.sink == b.sink && a.scrollbar == b.scrollbar;
+        let same_lhit = |a: &walk::LocalHit, b: &walk::LocalHit| a.r == b.r && a.rect == b.rect && a.clip == b.clip && a.sink == b.sink && a.scrollbar == b.scrollbar;
         let (n_shape, n_hit) = if screen {
             (
                 (k.shapes.len() != shapes.len()).then_some(usize::MAX).or_else(|| k.shapes.iter().zip(shapes).position(|(a, b)| !same_shape(a, b))),
@@ -1479,7 +1480,7 @@ impl Gui {
                                 }
                             }
                         }
-                        let same_hit = |a: &walk::LocalHit, b: &walk::LocalHit| a.r == b.r && a.rect == b.rect && a.clip == b.clip && a.sink == b.sink && a.button == b.button && a.painted == b.painted && a.aff.same(&b.aff);
+                        let same_hit = |a: &walk::LocalHit, b: &walk::LocalHit| a.r == b.r && a.rect == b.rect && a.clip == b.clip && a.sink == b.sink && a.button == b.button && a.painted == b.painted && a.aff.same(&b.aff) && a.scrollbar == b.scrollbar;
                         if bad.is_none() && (hits.len() != hits2.len() || !hits.iter().zip(&hits2).all(|(a, b)| same_hit(a, b))) {
                             bad = Some(format!("hits {} / {}", hits.len(), hits2.len()));
                         }
@@ -1676,6 +1677,7 @@ impl Gui {
                     page_layout: h.page_layout,
                     drag: h.drag,
                     painted: h.painted,
+                    scrollbar: h.scrollbar,
                 });
             }
             drop(hit_scope);
@@ -1890,7 +1892,7 @@ impl Gui {
             let all_under: Vec<Hit> = self
                 .hits
                 .iter()
-                .filter(|h| point_in_quad(&h.quad, t.pos) && h.clip.is_none_or(|c| point_in_quad(&c, t.pos)))
+                .filter(|h| h.scrollbar.is_none() && point_in_quad(&h.quad, t.pos) && h.clip.is_none_or(|c| point_in_quad(&c, t.pos)))
                 .cloned()
                 .collect();
             // Occlusion barrier: a non-scrolling modal Active Frame or TextBox (such as
@@ -2077,7 +2079,7 @@ impl Gui {
             None => Vec::new(),
         };
         let top = under.iter().rev().find(|h| h.sink).cloned();
-        self.last_over_sink = top.is_some();
+        self.last_over_sink = top.is_some() || self.scrollbar_drag.is_some();
         self.last_wheel_sunk = false;
         // GUI coordinates: from the view's top-left, below the top bar inset (as InputObject.Position).
         let inset = self.input_inset.unwrap_or(mech::GUI_TOP_INSET);
@@ -2093,6 +2095,9 @@ impl Gui {
         if let Some(p) = pointer {
             let (x, y) = gui_xy(p);
             for h in &under {
+                if h.scrollbar.is_some() {
+                    continue;
+                }
                 if !self.hovered.contains(&h.r) {
                     self.events.push(GuiEvent::Fire(
                         h.r,
@@ -2186,6 +2191,33 @@ impl Gui {
         }
 
         let mut took = top.is_some() && (resp.clicked() || resp.secondary_clicked());
+        if let Some(mut drag) = self.scrollbar_drag {
+            if ctx.input(|i| i.pointer.primary_down()) {
+                took = true;
+                let drag_pos = pointer.or_else(|| {
+                    ctx.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                });
+                if let Some(dp) = drag_pos {
+                    let axis_pos = if drag.vertical { dp.y } else { dp.x };
+                    let delta_px = axis_pos - drag.last_pos;
+                    if delta_px.abs() > 0.0 {
+                        drag.last_pos = axis_pos;
+                        let raw_delta = delta_px * drag.canvas_per_px;
+                        let target_cp = (drag.current_cp + raw_delta).clamp(0.0, drag.max_scroll);
+                        let applied = target_cp - drag.current_cp;
+                        drag.current_cp = target_cp;
+                        let total = applied + drag.remainder;
+                        let step = total.round();
+                        drag.remainder = total - step;
+                        if step != 0.0 {
+                            let delta = if drag.vertical { [0.0, step] } else { [step, 0.0] };
+                            self.events.push(GuiEvent::ScrollDrag(drag.r, delta));
+                        }
+                    }
+                }
+                self.scrollbar_drag = Some(drag);
+            }
+        }
         let presses: Vec<(egui::PointerButton, bool)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -2245,8 +2277,40 @@ impl Gui {
                     self.tb_selecting = None;
                     self.tb_held_key = None;
                 }
+                // Clicking a ScrollingFrame scrollbar thumb begins thumb dragging and consumes
+                // the click so it does not leak to underlying GUI buttons.
+                if b == 1 {
+                    if let Some((t, sb)) = top.as_ref().and_then(|t| t.scrollbar.map(|sb| (t, sb))) {
+                        let thumb_screen_len = if sb.vertical {
+                            (t.quad[3] - t.quad[0]).length()
+                        } else {
+                            (t.quad[1] - t.quad[0]).length()
+                        };
+                        let scale = if sb.thumb_len > 0.0 && thumb_screen_len > 0.0 {
+                            thumb_screen_len / sb.thumb_len
+                        } else {
+                            1.0
+                        };
+                        let screen_travel = (sb.track_travel * scale).max(1e-3);
+                        self.scrollbar_drag = Some(ScrollBarDrag {
+                            r: t.r,
+                            vertical: sb.vertical,
+                            last_pos: if sb.vertical { p.y } else { p.x },
+                            canvas_per_px: sb.max_scroll / screen_travel,
+                            max_scroll: sb.max_scroll,
+                            current_cp: sb.current_cp.clamp(0.0, sb.max_scroll),
+                            remainder: 0.0,
+                        });
+                        self.events.push(GuiEvent::ScrollDrag(t.r, [0.0, 0.0]));
+                        took = true;
+                        continue;
+                    }
+                }
                 let began_at = self.events.len();
                 for h in &under {
+                    if h.scrollbar.is_some() {
+                        continue;
+                    }
                     self.events
                         .push(GuiEvent::Fire(h.r, "InputBegan", vec![input.clone()]));
                 }
@@ -2346,11 +2410,18 @@ impl Gui {
             } else {
                 if b == 1 {
                     self.tb_selecting = None;
+                    if self.scrollbar_drag.take().is_some() {
+                        took = true;
+                        continue;
+                    }
                     if let Some(d) = self.dragging.take() {
                         super::share().drags.push((d, 2, x, y));
                     }
                 }
                 for h in &under {
+                    if h.scrollbar.is_some() {
+                        continue;
+                    }
                     self.events
                         .push(GuiEvent::Fire(h.r, "InputEnded", vec![input.clone()]));
                 }
@@ -2404,6 +2475,9 @@ impl Gui {
                 }
             }
         }
+        if self.scrollbar_drag.is_some() && !ctx.input(|i| i.pointer.primary_down()) {
+            self.scrollbar_drag = None;
+        }
         // The wheel over a ScrollingFrame scrolls it: ScrollWheelDeltaAmount
         // (100) pixels per notch.
         let wheel: f32 = ctx.input(|i| {
@@ -2436,6 +2510,9 @@ impl Gui {
                 let (x, y) = gui_xy(p);
                 let fwd = wheel > 0.0;
                 for h in &under {
+                    if h.scrollbar.is_some() {
+                        continue;
+                    }
                     self.events.push(GuiEvent::Fire(
                         h.r,
                         if fwd { "MouseWheelForward" } else { "MouseWheelBackward" },
@@ -2901,7 +2978,7 @@ impl Gui {
 
     /// Screen centre of a drawn GuiObject (the self-test clicks there).
     pub fn screen_center(&self, r: Ref) -> Option<Pos2> {
-        let h = self.hits.iter().find(|h| h.r == r)?;
+        let h = self.hits.iter().find(|h| h.r == r && h.scrollbar.is_none())?;
         Some((h.quad.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / 4.0).to_pos2())
     }
 }
@@ -3778,6 +3855,7 @@ mod touch_scroll_tests {
             page_layout: None,
             drag: false,
             painted: true,
+            scrollbar: None,
         }
     }
 

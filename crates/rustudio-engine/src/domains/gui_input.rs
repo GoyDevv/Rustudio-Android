@@ -25,6 +25,35 @@ use crate::runtime::*;
 #[path = "gui_input_path2d.rs"]
 mod path2d;
 
+static HAPTIC_FN: std::sync::OnceLock<fn(u32, f32)> = std::sync::OnceLock::new();
+
+/// Installs the platform haptic vibration callback `(millis, strength)` where
+/// `strength` is `0.0..=1.0` and `millis == 0 || strength <= 0.0` cancels vibration.
+pub fn set_haptic_handler(f: fn(u32, f32)) {
+    let _ = HAPTIC_FN.set(f);
+}
+
+/// Returns whether a platform haptic handler has been installed.
+pub fn has_haptic_handler() -> bool {
+    HAPTIC_FN.get().is_some()
+}
+
+/// Device safe-area insets in logical GUI points: `[left, top, right, bottom]`.
+static DEVICE_SAFE_INSETS: std::sync::Mutex<[f32; 4]> = std::sync::Mutex::new([0.0; 4]);
+
+/// Updates the platform device safe-area insets (display cutout / system bars)
+/// in logical GUI points (`left, top, right, bottom`).
+pub fn set_device_safe_insets(left: f32, top: f32, right: f32, bottom: f32) {
+    let mut g = DEVICE_SAFE_INSETS.lock().unwrap_or_else(|e| e.into_inner());
+    *g = [left.max(0.0), top.max(0.0), right.max(0.0), bottom.max(0.0)];
+}
+
+/// Returns the current platform device safe-area insets `[left, top, right, bottom]`
+/// in logical GUI points.
+pub fn device_safe_insets() -> [f32; 4] {
+    *DEVICE_SAFE_INSETS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 
 /// (method, base class), each one a function in gui_input.luau keyed
 /// "Base.Method" (Path2D's are Rust, in gui_input_path2d.rs).
@@ -801,6 +830,26 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "gamepads",
         lua.create_function(|lua, ()| Ok(world(lua).map(|w| w.input.gamepads).unwrap_or(0)))?,
+    )?;
+    g.set(
+        "haptic_supported",
+        lua.create_function(|_, ()| Ok(has_haptic_handler()))?,
+    )?;
+    g.set(
+        "haptic_vibrate",
+        lua.create_function(|_, (ms, strength): (u32, f32)| {
+            if let Some(f) = HAPTIC_FN.get() {
+                f(ms, strength);
+            }
+            Ok(())
+        })?,
+    )?;
+    g.set(
+        "device_safe_insets",
+        lua.create_function(|_, ()| {
+            let [l, t, r, b] = device_safe_insets();
+            Ok((l, t, r, b))
+        })?,
     )?;
     g.set(
         "mouse",

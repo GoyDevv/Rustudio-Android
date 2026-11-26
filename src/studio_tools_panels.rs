@@ -188,6 +188,7 @@ pub struct StudioToolsState {
 
     // Find in Place
     find_query: String,
+    find_replace: String,
     find_case_sensitive: bool,
     find_class_filter: u8, // 0=All, 1=Script, 2=LocalScript, 3=ModuleScript
     find_hits: Vec<FindHit>,
@@ -195,6 +196,7 @@ pub struct StudioToolsState {
     find_last_case: bool,
     find_last_filter: u8,
     find_last_rev: u64,
+    find_status: Option<String>,
 
     // Object Browser
     browser_query: String,
@@ -263,6 +265,7 @@ impl Default for StudioToolsState {
             hist_redo_stack: Vec::new(),
 
             find_query: String::new(),
+            find_replace: String::new(),
             find_case_sensitive: false,
             find_class_filter: 0,
             find_hits: Vec::new(),
@@ -270,6 +273,7 @@ impl Default for StudioToolsState {
             find_last_case: false,
             find_last_filter: 0,
             find_last_rev: u64::MAX,
+            find_status: None,
 
             browser_query: String::new(),
             browser_selected: "Part".to_string(),
@@ -1240,6 +1244,26 @@ impl Editor {
             ui.checkbox(&mut self.ui.tools.find_case_sensitive, "Match case");
         });
 
+        let mut replace_all = false;
+        let can_edit = self.game.play.is_none();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ui.tools.find_replace)
+                    .hint_text("Replace with…")
+                    .desired_width((ui.available_width() - 120.0).max(120.0)),
+            );
+            let can_replace_all = can_edit
+                && !self.ui.tools.find_query.is_empty()
+                && !self.ui.tools.find_hits.is_empty();
+            if ui
+                .add_enabled(can_replace_all, egui::Button::new("Replace All"))
+                .on_hover_text("Replace all matches across matching scripts")
+                .clicked()
+            {
+                replace_all = true;
+            }
+        });
+
         ui.horizontal(|ui| {
             ui.label(RichText::new("Scope:").small().color(theme::TEXT_DIM));
             for (idx, label) in [(0u8, "All Scripts"), (1, "Script"), (2, "LocalScript"), (3, "ModuleScript")] {
@@ -1249,54 +1273,192 @@ impl Editor {
             }
         });
 
-        let needs_rescan = self.ui.tools.find_query != self.ui.tools.find_last_query
+        let query_params_changed = self.ui.tools.find_query != self.ui.tools.find_last_query
             || self.ui.tools.find_case_sensitive != self.ui.tools.find_last_case
-            || self.ui.tools.find_class_filter != self.ui.tools.find_last_filter
-            || self.game.doc.revision != self.ui.tools.find_last_rev;
+            || self.ui.tools.find_class_filter != self.ui.tools.find_last_filter;
+        let needs_rescan = query_params_changed || self.game.doc.revision != self.ui.tools.find_last_rev;
 
+        if query_params_changed {
+            self.ui.tools.find_status = None;
+        }
         if needs_rescan {
             self.rescan_find_in_place();
         }
 
         let count = self.ui.tools.find_hits.len();
-        ui.label(
-            RichText::new(if self.ui.tools.find_query.is_empty() {
-                "Type a search term to scan all Script, LocalScript, and ModuleScript sources.".to_string()
-            } else {
-                format!("{count} match{}", if count == 1 { "" } else { "es" })
-            })
-            .small()
-            .color(theme::TEXT_DIM),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if self.ui.tools.find_query.is_empty() {
+                    "Type a search term to scan all Script, LocalScript, and ModuleScript sources.".to_string()
+                } else {
+                    format!("{count} match{}", if count == 1 { "" } else { "es" })
+                })
+                .small()
+                .color(theme::TEXT_DIM),
+            );
+            if let Some(status) = &self.ui.tools.find_status {
+                ui.label(RichText::new(format!("· {status}")).small().color(Color32::from_rgb(130, 200, 120)));
+            }
+        });
         ui.separator();
 
         let mut jump: Option<(Ref, usize)> = None;
+        let mut replace_hit: Option<(Ref, usize)> = None;
         egui::ScrollArea::vertical()
             .id_salt("find_in_place_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for hit in &self.ui.tools.find_hits {
-                    let resp = ui
-                        .horizontal(|ui| {
-                            crate::icons::class_icon(ui, &hit.class, 14.0);
-                            ui.label(RichText::new(format!("{}:{}", hit.path, hit.line)).strong().small());
-                            ui.label(RichText::new(&hit.preview).font(FontId::monospace(12.0)).color(theme::TEXT_DIM));
-                        })
-                        .response
-                        .interact(Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(resp.rect, 2.0, theme::HOVER_BG);
-                    }
-                    if resp.clicked() {
-                        jump = Some((hit.script, hit.line));
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_edit, egui::Button::new("Replace").small())
+                            .on_hover_text("Replace matches on this line")
+                            .clicked()
+                        {
+                            replace_hit = Some((hit.script, hit.line));
+                        }
+                        let resp = ui
+                            .horizontal(|ui| {
+                                crate::icons::class_icon(ui, &hit.class, 14.0);
+                                ui.label(RichText::new(format!("{}:{}", hit.path, hit.line)).strong().small());
+                                ui.label(RichText::new(&hit.preview).font(FontId::monospace(12.0)).color(theme::TEXT_DIM));
+                            })
+                            .response
+                            .interact(Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(resp.rect, 2.0, theme::HOVER_BG);
+                        }
+                        if resp.clicked() {
+                            jump = Some((hit.script, hit.line));
+                        }
+                    });
                 }
             });
 
-        if let Some((r, line)) = jump {
+        if let Some((r, line)) = replace_hit {
+            self.replace_find_in_place_hit(r, line);
+        } else if replace_all {
+            self.replace_all_find_in_place();
+        } else if let Some((r, line)) = jump {
             self.scripts.goto.insert(r, line);
             self.open_script.push(r);
         }
+    }
+
+    fn replace_find_in_place_hit(&mut self, r: Ref, line_1based: usize) {
+        let q = self.ui.tools.find_query.clone();
+        if q.is_empty() {
+            return;
+        }
+        let repl = self.ui.tools.find_replace.clone();
+        let case_sensitive = self.ui.tools.find_case_sensitive;
+        let Some(Variant::String(src)) = self.game.doc.prop(r, "Source") else {
+            return;
+        };
+        let mut start = 0usize;
+        let mut line_range = None;
+        for (idx, line) in src.split('\n').enumerate() {
+            if idx + 1 == line_1based {
+                line_range = Some(start..start + line.len());
+                break;
+            }
+            start += line.len() + 1;
+        }
+        let Some(range) = line_range else {
+            return;
+        };
+        let (new_line, count) = crate::script_editor::replace_all_in_text(
+            &src[range.clone()],
+            &q,
+            &repl,
+            case_sensitive,
+        );
+        if count == 0 {
+            return;
+        }
+        let mut new_src = String::with_capacity(src.len() + new_line.len());
+        new_src.push_str(&src[..range.start]);
+        new_src.push_str(&new_line);
+        new_src.push_str(&src[range.end..]);
+        if new_src == src {
+            return;
+        }
+
+        self.game.doc.set_props(
+            "Replace in Place",
+            vec![(r, ustr("Source"), Variant::String(new_src.clone()))],
+            None,
+        );
+        if let Some(buf) = self.scripts.bufs.get_mut(&r) {
+            buf.text = new_src.clone();
+        }
+        if let Some(c) = crate::plugin_host::script_docs::diff(&src, &new_src) {
+            crate::plugin_host::script_docs::changed(r, vec![c]);
+        }
+        self.ui.tools.find_status = Some(format!(
+            "Replaced {count} occurrence{} on line {line_1based}",
+            if count == 1 { "" } else { "s" }
+        ));
+        self.rescan_find_in_place();
+    }
+
+    fn replace_all_find_in_place(&mut self) {
+        let q = self.ui.tools.find_query.clone();
+        if q.is_empty() {
+            return;
+        }
+        let repl = self.ui.tools.find_replace.clone();
+        let case_sensitive = self.ui.tools.find_case_sensitive;
+        let filter = self.ui.tools.find_class_filter;
+
+        let mut edits: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = Vec::new();
+        let mut synced: Vec<(Ref, String, String)> = Vec::new();
+        let mut total_replaced = 0usize;
+
+        for inst in self.game.doc.dom.descendants() {
+            let cls = inst.class.as_str();
+            if !matches!(cls, "Script" | "LocalScript" | "ModuleScript") {
+                continue;
+            }
+            match filter {
+                1 if cls != "Script" => continue,
+                2 if cls != "LocalScript" => continue,
+                3 if cls != "ModuleScript" => continue,
+                _ => {}
+            }
+            let Some(Variant::String(src)) = inst.properties.get(&ustr("Source")) else {
+                continue;
+            };
+            let (new_src, count) =
+                crate::script_editor::replace_all_in_text(src, &q, &repl, case_sensitive);
+            if count > 0 && new_src != *src {
+                let r = inst.referent();
+                edits.push((r, ustr("Source"), Variant::String(new_src.clone())));
+                synced.push((r, src.clone(), new_src));
+                total_replaced += count;
+            }
+        }
+
+        if edits.is_empty() {
+            return;
+        }
+
+        let scripts_updated = edits.len();
+        self.game.doc.set_props("Replace All in Place", edits, None);
+        for (r, old_src, new_src) in synced {
+            if let Some(buf) = self.scripts.bufs.get_mut(&r) {
+                buf.text = new_src.clone();
+            }
+            if let Some(c) = crate::plugin_host::script_docs::diff(&old_src, &new_src) {
+                crate::plugin_host::script_docs::changed(r, vec![c]);
+            }
+        }
+        self.ui.tools.find_status = Some(format!(
+            "Replaced {total_replaced} occurrence{} across {scripts_updated} script{}",
+            if total_replaced == 1 { "" } else { "s" },
+            if scripts_updated == 1 { "" } else { "s" },
+        ));
+        self.rescan_find_in_place();
     }
 
     fn rescan_find_in_place(&mut self) {

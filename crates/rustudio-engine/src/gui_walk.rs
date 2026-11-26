@@ -537,6 +537,8 @@ pub(super) struct LocalHit {
     /// Drew something of its own (background, image, text, stroke…); an
     /// empty transparent container isn't picked by edit-mode clicks.
     pub painted: bool,
+    /// Non-None when this hit represents a ScrollingFrame's scrollbar thumb.
+    pub scrollbar: Option<ScrollBarHit>,
 }
 
 /// A drawn GuiObject's output from its last walk, in order: runs of its own
@@ -2155,24 +2157,18 @@ impl Walk<'_, '_> {
                 }
             };
             self.push(Shape::Mesh(mesh.into()), &me);
-            // BorderSizePixel draws outside the box (BorderMode Outline), not with a UICorner.
+            // BorderSizePixel with BorderMode (Outline = 0, Middle = 1, Inset = 2), not with a UICorner.
             let border = num(d, r, "BorderSizePixel", 0.0) * me.scale;
             if border > 0.0 && corner.is_none() && !styled && !chat_style {
                 let bc = rgba(color(d, r, "BorderColor3", [0.0, 0.0, 0.0]), a);
-                let o = rect.expand(border);
-                for s in [
-                    Rect::from_min_max(o.min, Pos2::new(o.max.x, rect.min.y)),
-                    Rect::from_min_max(Pos2::new(o.min.x, rect.max.y), o.max),
-                    Rect::from_min_max(
-                        Pos2::new(o.min.x, rect.min.y),
-                        Pos2::new(rect.min.x, rect.max.y),
-                    ),
-                    Rect::from_min_max(
-                        Pos2::new(rect.max.x, rect.min.y),
-                        Pos2::new(o.max.x, rect.max.y),
-                    ),
-                ] {
-                    self.push(
+                let border_mode = enum_u32(d.prop(r, "BorderMode")).unwrap_or(0);
+                let (o, inner) = match border_mode {
+                    1 => (rect.expand(border * 0.5), rect.shrink(border * 0.5)),
+                    2 => (rect, rect.shrink(border)),
+                    _ => (rect.expand(border), rect),
+                };
+                let push_strip = |walk: &mut Self, s: Rect| {
+                    walk.push(
                         Shape::Mesh(
                             fill_mesh(
                                 &[
@@ -2187,6 +2183,24 @@ impl Walk<'_, '_> {
                         ),
                         &me,
                     );
+                };
+                if inner.min.x >= inner.max.x || inner.min.y >= inner.max.y {
+                    push_strip(self, o);
+                } else {
+                    for s in [
+                        Rect::from_min_max(o.min, Pos2::new(o.max.x, inner.min.y)),
+                        Rect::from_min_max(Pos2::new(o.min.x, inner.max.y), o.max),
+                        Rect::from_min_max(
+                            Pos2::new(o.min.x, inner.min.y),
+                            Pos2::new(inner.min.x, inner.max.y),
+                        ),
+                        Rect::from_min_max(
+                            Pos2::new(inner.max.x, inner.min.y),
+                            Pos2::new(o.max.x, inner.max.y),
+                        ),
+                    ] {
+                        push_strip(self, s);
+                    }
                 }
             }
         }
@@ -2261,6 +2275,7 @@ impl Walk<'_, '_> {
                         || child_of_class(d, r, "UIDragDetector")
                             .is_some_and(|dd| boolp(d, dd, "Enabled", true))),
                 painted: self.items.len() > items_before,
+                scrollbar: None,
             });
         }
         if textbox {
@@ -2387,12 +2402,12 @@ impl Walk<'_, '_> {
                 if show_v {
                     let bar_x = if vpos == 1 { rect.left() } else { rect.right() - th };
                     let track = Rect::from_min_size(Pos2::new(bar_x, rect.top()), egui::vec2(th, window.y));
-                    self.scroll_bar(r, track, canvas.y, cp[1], th, st, &me, true);
+                    self.scroll_bar(r, track, canvas.y, cp[1], th, st, &me, true, scrolling_enabled);
                 }
                 if show_h {
                     let bar_x = rect.left() + if vpos == 1 && show_v { gutter } else { 0.0 };
                     let track = Rect::from_min_size(Pos2::new(bar_x, rect.bottom() - th), egui::vec2(window.x, th));
-                    self.scroll_bar(r, track, canvas.x, cp[0], th, st, &me, false);
+                    self.scroll_bar(r, track, canvas.x, cp[0], th, st, &me, false, scrolling_enabled);
                 }
             }
         } else {
@@ -2402,7 +2417,7 @@ impl Walk<'_, '_> {
 
     /// A ScrollingFrame's vertical or horizontal thumb as Studio draws it.
     #[allow(clippy::too_many_arguments)]
-    fn scroll_bar(&mut self, r: Ref, track: Rect, canvas_len: f32, cp: f32, th: f32, st: f32, me: &Down, vertical: bool) {
+    fn scroll_bar(&mut self, r: Ref, track: Rect, canvas_len: f32, cp: f32, th: f32, st: f32, me: &Down, vertical: bool, scrolling_enabled: bool) {
         let d = self.input.doc;
         let view = if vertical { track.height() } else { track.width() };
         if view <= 0.0 || canvas_len <= view {
@@ -2467,6 +2482,32 @@ impl Walk<'_, '_> {
             // No content folder: a plain bar.
             let pts = [bar.left_top(), bar.right_top(), bar.right_bottom(), bar.left_bottom()];
             self.push(Shape::Mesh(fill_mesh(&pts, &|_| c).into()), me);
+        }
+        if scrolling_enabled {
+            let track_travel = (view - len).max(0.0);
+            if track_travel > 0.0 {
+                self.hits.push(LocalHit {
+                    r,
+                    rect: bar,
+                    aff: me.aff,
+                    clip: (me.clip != Rect::EVERYTHING).then_some(me.clip),
+                    button: false,
+                    textbox: false,
+                    sink: true,
+                    active: true,
+                    scrolling: true,
+                    page_layout: None,
+                    drag: false,
+                    painted: true,
+                    scrollbar: Some(ScrollBarHit {
+                        vertical,
+                        max_scroll: (canvas_len - view).max(0.0),
+                        track_travel,
+                        thumb_len: len,
+                        current_cp: cp,
+                    }),
+                });
+            }
         }
     }
 
@@ -2568,13 +2609,34 @@ impl Walk<'_, '_> {
     /// ImageLabel / ImageButton with ImageRect*, ScaleType and UIGradient.
     fn image(&mut self, r: Ref, rect: Rect, me: &Down, gradient: Option<Ref>, corner: Option<f32>) {
         let d = self.input.doc;
-        let video = matches!(d.class_of(r).as_deref(), Some("VideoFrame" | "VideoDisplay"));
+        let cls = d.class_of(r);
+        let video = matches!(cls.as_deref(), Some("VideoFrame" | "VideoDisplay"));
         let id = if video {
             self.gui.no_cache = Some("video");
             crate::runtime::domains::media::video::surface_uri(r).unwrap_or_default()
         } else {
-            let direct = text_prop(d, r, "Image");
-            if direct.is_empty() { text_prop(d, r, "ImageContent") } else { direct }
+            let mut chosen = String::new();
+            if cls.as_deref() == Some("ImageButton") {
+                if self.gui.pressed.is_some_and(|(p, _)| p == r) {
+                    chosen = text_prop(d, r, "PressedImage");
+                    if chosen.is_empty() {
+                        chosen = text_prop(d, r, "PressedImageContent");
+                    }
+                }
+                if chosen.is_empty() && self.gui.hovered.contains(&r) {
+                    chosen = text_prop(d, r, "HoverImage");
+                    if chosen.is_empty() {
+                        chosen = text_prop(d, r, "HoverImageContent");
+                    }
+                }
+            }
+            if chosen.is_empty() {
+                chosen = text_prop(d, r, "Image");
+                if chosen.is_empty() {
+                    chosen = text_prop(d, r, "ImageContent");
+                }
+            }
+            chosen
         };
         let it = num(d, r, if video { "VideoTransparency" } else { "ImageTransparency" }, 0.0);
         if id.is_empty() || it >= 1.0 {
@@ -2819,6 +2881,9 @@ impl Walk<'_, '_> {
                 size: None,
                 transparency: None,
                 stroke_transparency: None,
+                stroke_color: None,
+                stroke_thickness: None,
+                mark_color: None,
             }]
         };
         if rich {
@@ -3100,14 +3165,66 @@ impl Walk<'_, '_> {
                 }
             }
         }
+        // RichText <mark color="..." transparency="..."> highlight rectangles (drawn BEHIND text & stroke).
+        if rich && !galley.rows.is_empty() && runs.iter().any(|run| run.mark_color.is_some()) {
+            let mut char_pos = 0usize;
+            let max_row = galley.rows.len().saturating_sub(1);
+            for run in &runs {
+                let len = run.text.chars().count();
+                let next_pos = char_pos + len;
+                if let Some(mc) = run.mark_color {
+                    if len > 0 {
+                        let mut mark_col = mc.gamma_multiply(me.alpha);
+                        if tint != [1.0, 1.0, 1.0] {
+                            let m = |b: u8, k: f32| (b as f32 * k).round().clamp(0.0, 255.0) as u8;
+                            mark_col = Color32::from_rgba_premultiplied(
+                                m(mark_col.r(), tint[0]),
+                                m(mark_col.g(), tint[1]),
+                                m(mark_col.b(), tint[2]),
+                                mark_col.a(),
+                            );
+                        }
+                        if mark_col.a() > 0 {
+                            let lc_lo = galley.layout_from_cursor(egui::text::CCursor::new(char_pos));
+                            let lc_hi = galley.layout_from_cursor(egui::text::CCursor::new(next_pos));
+                            for row_idx in lc_lo.row..=lc_hi.row.min(max_row) {
+                                let row = &galley.rows[row_idx];
+                                let x0 = if row_idx == lc_lo.row {
+                                    row.pos.x + row.x_offset(lc_lo.column)
+                                } else {
+                                    row.rect().left()
+                                };
+                                let x1 = if row_idx == lc_hi.row {
+                                    row.pos.x + row.x_offset(lc_hi.column)
+                                } else {
+                                    row.rect().right()
+                                };
+                                if x1 > x0 {
+                                    let mrect = Rect::from_min_max(
+                                        Pos2::new(pos.x + x0, pos.y + row.min_y()),
+                                        Pos2::new(pos.x + x1, pos.y + row.max_y()),
+                                    );
+                                    self.push(Shape::rect_filled(mrect, 0.0, mark_col), &text_down);
+                                }
+                            }
+                        }
+                    }
+                }
+                char_pos = next_pos;
+            }
+        }
         let mut outline: Option<(f32, Color32)> = None;
+        let mut base_stroke_rgb = [0.0f32, 0.0, 0.0];
+        let mut base_stroke_st = 1.0f32;
         let mut outline_grad: Option<GradLut> = None;
         let stroke_t = num(d, r, "TextStrokeTransparency", 1.0);
         if stroke_t < 1.0 {
+            base_stroke_rgb = color(d, r, "TextStrokeColor3", [0.0, 0.0, 0.0]);
+            base_stroke_st = stroke_t;
             outline = Some((
                 me.scale.max(1.0),
                 rgba(
-                    color(d, r, "TextStrokeColor3", [0.0, 0.0, 0.0]),
+                    base_stroke_rgb,
                     (1.0 - stroke_t) * (1.0 - tt) * me.alpha,
                 ),
             ));
@@ -3116,17 +3233,134 @@ impl Walk<'_, '_> {
             let th = num(d, s, "Thickness", 1.0) * me.scale;
             let st = num(d, s, "Transparency", 0.0);
             if th > 0.0 && st < 1.0 {
+                base_stroke_rgb = color(d, s, "Color", [0.0, 0.0, 0.0]);
+                base_stroke_st = st;
                 outline = Some((
                     th,
                     rgba(
-                        color(d, s, "Color", [0.0, 0.0, 0.0]),
+                        base_stroke_rgb,
                         (1.0 - st) * (1.0 - tt) * me.alpha,
                     ),
                 ));
                 outline_grad = child_of_class(d, s, "UIGradient").map(|g| GradLut::new(d, g, box_rect));
             }
         }
-        if let Some((th, c)) = outline {
+        let has_run_stroke = rich
+            && runs.iter().any(|run| {
+                run.stroke_color.is_some()
+                    || run.stroke_thickness.is_some()
+                    || run.stroke_transparency.is_some()
+            });
+        if has_run_stroke {
+            let mut run_strokes: Vec<((usize, usize), (usize, usize), Option<(f32, Color32, bool)>)> =
+                Vec::with_capacity(runs.len());
+            let mut char_pos = 0usize;
+            for run in &runs {
+                let len = run.text.chars().count();
+                let next_pos = char_pos + len;
+                let run_tt = run.transparency.unwrap_or(tt);
+                let has_tag = run.stroke_color.is_some()
+                    || run.stroke_thickness.is_some()
+                    || run.stroke_transparency.is_some();
+                let eff = if run_tt >= 1.0 {
+                    None
+                } else if has_tag {
+                    let r_st = run
+                        .stroke_transparency
+                        .unwrap_or(if outline.is_some() { base_stroke_st } else { 0.0 });
+                    let r_th = run
+                        .stroke_thickness
+                        .map(|t| t * me.scale)
+                        .unwrap_or_else(|| outline.map(|(th, _)| th).unwrap_or(me.scale.max(1.0)));
+                    let r_rgb = run.stroke_color.unwrap_or(base_stroke_rgb);
+                    let r_alpha = (1.0 - r_st) * (1.0 - run_tt) * me.alpha;
+                    if r_th > 0.0 && r_alpha > 0.0 {
+                        Some((
+                            r_th,
+                            rgba([r_rgb[0] * tint[0], r_rgb[1] * tint[1], r_rgb[2] * tint[2]], r_alpha),
+                            run.stroke_color.is_none() && outline_grad.is_some(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    outline.map(|(th, c)| (th, c, outline_grad.is_some()))
+                };
+                if len > 0 {
+                    let lc0 = galley.layout_from_cursor(egui::text::CCursor::new(char_pos));
+                    let lc1 = galley.layout_from_cursor(egui::text::CCursor::new(next_pos));
+                    run_strokes.push(((lc0.row, lc0.column.into()), (lc1.row, lc1.column.into()), eff));
+                }
+                char_pos = next_pos;
+            }
+            let mut thicknesses: Vec<f32> = Vec::new();
+            for (_, _, eff) in &run_strokes {
+                if let Some((th, _, _)) = eff {
+                    if !thicknesses.iter().any(|t| t.to_bits() == th.to_bits()) {
+                        thicknesses.push(*th);
+                    }
+                }
+            }
+            for th in thicknesses {
+                let th_bits = th.to_bits();
+                let mut g = (*galley).clone();
+                for (row_idx, pr) in g.rows.iter_mut().enumerate() {
+                    let off = pos.to_vec2() + pr.pos.to_vec2();
+                    let row = Arc::make_mut(&mut pr.row);
+                    let color_starts = row.visuals.color_glyph_vertex_starts.clone();
+                    for v in &mut row.visuals.mesh.vertices {
+                        v.color = Color32::TRANSPARENT;
+                    }
+                    let verts_len = row.visuals.mesh.vertices.len();
+                    let glyph_end = row.visuals.glyph_vertex_range.end.min(verts_len);
+                    for (col_idx, glyph) in row.glyphs.iter().enumerate() {
+                        let key = (row_idx, col_idx);
+                        let matched = run_strokes
+                            .iter()
+                            .find(|(lo, hi, _)| key >= *lo && key < *hi)
+                            .and_then(|(_, _, eff)| *eff);
+                        let Some((r_th, r_col, use_grad)) = matched else {
+                            continue;
+                        };
+                        if r_th.to_bits() != th_bits {
+                            continue;
+                        }
+                        let v_start = glyph.first_vertex as usize;
+                        let v_end = row
+                            .glyphs
+                            .get(col_idx + 1)
+                            .map(|ng| ng.first_vertex as usize)
+                            .unwrap_or(glyph_end)
+                            .min(verts_len);
+                        if v_start < v_end {
+                            for (vi, v) in row.visuals.mesh.vertices[v_start..v_end].iter_mut().enumerate() {
+                                let abs_vi = v_start + vi;
+                                let is_color = !color_starts.is_empty()
+                                    && color_starts
+                                        .iter()
+                                        .any(|&s| abs_vi >= s as usize && abs_vi < s as usize + 4);
+                                if !is_color {
+                                    v.color = if use_grad {
+                                        outline_grad
+                                            .as_ref()
+                                            .map(|gl| gl.tint(v.pos + off, r_col))
+                                            .unwrap_or(r_col)
+                                    } else {
+                                        r_col
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                let g = Arc::new(g);
+                for k in 0..8 {
+                    let a = std::f32::consts::TAU * k as f32 / 8.0;
+                    let at = pos + egui::vec2(a.cos(), a.sin()) * th;
+                    self.push(Shape::Text(TextShape::new(at, g.clone(), Color32::WHITE)), &text_down);
+                }
+            }
+        } else if let Some((th, c)) = outline {
             let skip_transparent = rich
                 && runs
                     .iter()

@@ -2997,6 +2997,8 @@ pub struct QueryParams {
     pub brute_force_all_slow: bool,
     /// OverlapParams only; 0 = unlimited.
     pub max_parts: i32,
+    /// OverlapParams only; margin expansion in studs (default 0.0).
+    pub tolerance: f32,
 }
 
 impl Default for QueryParams {
@@ -3009,6 +3011,7 @@ impl Default for QueryParams {
             respect_can_collide: false,
             brute_force_all_slow: false,
             max_parts: 0,
+            tolerance: 0.0,
         }
     }
 }
@@ -3133,6 +3136,11 @@ fn query_fields<T: HasQuery, F: UserDataFields<T>>(f: &mut F) {
             this.q_mut().max_parts = v.max(0.0) as i32;
             Ok(())
         });
+        f.add_field_method_get("Tolerance", |_, this| Ok(this.q().tolerance as f64));
+        f.add_field_method_set("Tolerance", |_, this, v: f64| {
+            this.q_mut().tolerance = if v.is_finite() { v as f32 } else { 0.0 };
+            Ok(())
+        });
     }
 }
 
@@ -3161,8 +3169,8 @@ fn query_methods<T: HasQuery, M: UserDataMethods<T>>(m: &mut M) {
         let group = if q.collision_group.is_empty() { "Default" } else { q.collision_group.as_str() };
         Ok(if T::OVERLAP {
             format!(
-                "OverlapParams{{MaxParts={}, Tolerance=0, BruteForceAllSlow={}, RespectCanCollide={}, CollisionGroup={group}, FilterDescendantsInstances={{{filter}}}}}",
-                q.max_parts, q.brute_force_all_slow, q.respect_can_collide
+                "OverlapParams{{MaxParts={}, Tolerance={}, BruteForceAllSlow={}, RespectCanCollide={}, CollisionGroup={group}, FilterDescendantsInstances={{{filter}}}}}",
+                q.max_parts, q.tolerance, q.brute_force_all_slow, q.respect_can_collide
             )
         } else {
             format!(
@@ -3181,7 +3189,8 @@ fn query_methods<T: HasQuery, M: UserDataMethods<T>>(m: &mut M) {
             && a.collision_group == b.collision_group
             && a.respect_can_collide == b.respect_can_collide
             && a.brute_force_all_slow == b.brute_force_all_slow
-            && a.max_parts == b.max_parts)
+            && a.max_parts == b.max_parts
+            && a.tolerance == b.tolerance)
     });
 }
 

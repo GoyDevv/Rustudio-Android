@@ -176,10 +176,18 @@ set["GuiService.SelectedCoreObject"] = function(gs, _, v)
 end
 
 methods["GuiService.GetResolutionScale"] = function() return 1 end
-methods["GuiService.GetSafeZoneOffsets"] = function() return { top = 0, bottom = 0, left = 0, right = 0 } end
+methods["GuiService.GetSafeZoneOffsets"] = function()
+    local w, h = G.view()
+    local sl, st, sr, sb = G.device_safe_insets()
+    if w <= 0 or h <= 0 then
+        return { top = 0, bottom = 0, left = 0, right = 0 }
+    end
+    return { top = st / h, bottom = sb / h, left = sl / w, right = sr / w }
+end
 methods["GuiService.GetHardwareSafeViewport"] = function()
     local w, h = G.view()
-    return Vector2.new(w, h)
+    local sl, st, sr, sb = G.device_safe_insets()
+    return Vector2.new(math.max(0, w - sl - sr), math.max(0, h - st - sb))
 end
 local topbar_seen
 methods["GuiService.SetTopbarInset"] = function(gs, rect)
@@ -194,7 +202,7 @@ methods["GuiService.SetGlobalGuiInset"] = function(_, x1, y1, x2, y2)
 end
 local UNSUPPORTED_SETTINGS_ROWS = {
     ["Output DeviceFrame"] = true,
-    ["HapticsFrame"] = true,
+    ["HapticsFrame"] = not G.haptic_supported(),
     ["In-game friends chat notificationsFrame"] = true,
 }
 local disabled_settings_rows = setmetatable({}, { __mode = "k" })
@@ -480,13 +488,21 @@ methods["GuiService.GetInsetArea"] = function(_, insets)
     end
     local w, h = G.view()
     local inset = (G.is_client() and not G.is_edit()) and 58 or 0
+    local sl, st, sr, sb = G.device_safe_insets()
     if insets == Enum.ScreenInsets.CoreUISafeInsets then
-        return Rect.new(0, 0, w, h - inset)
+        local top = math.max(0, st - inset)
+        return Rect.new(sl, top, math.max(sl, w - sr), math.max(top, h - inset - sb))
     end
     -- TopbarSafeInsets: the bar's free area (TopbarInset), above y = 0.
     if insets == Enum.ScreenInsets.TopbarSafeInsets and inset > 0 then
         local bar = G.topbar_inset()
-        return Rect.new(bar.Min.X, bar.Min.Y - inset, bar.Max.X, bar.Max.Y - inset)
+        local min_x = math.max(bar.Min.X, sl)
+        local max_x = math.max(min_x, math.min(bar.Max.X, w - sr))
+        return Rect.new(min_x, bar.Min.Y - inset, max_x, bar.Max.Y - inset)
+    end
+    if insets == Enum.ScreenInsets.DeviceSafeInsets then
+        local top = st - inset
+        return Rect.new(sl, top, math.max(sl, w - sr), math.max(top, h - inset - sb))
     end
     return Rect.new(0, -inset, w, h - inset)
 end
@@ -2811,11 +2827,13 @@ local function pad_connected(t)
 end
 methods["HapticService.IsVibrationSupported"] = function(_, t)
     if typeof(t) ~= "EnumItem" then error("Unable to cast value to token", 0) end
+    if t == Enum.UserInputType.Touch and G.haptic_supported() then return true end
     return pad_connected(t)
 end
 methods["HapticService.IsMotorSupported"] = function(_, t, motor)
     if typeof(t) ~= "EnumItem" or typeof(motor) ~= "EnumItem" then error("Unable to cast value to token", 0) end
-    return pad_connected(t) and (motor == Enum.VibrationMotor.Large or motor == Enum.VibrationMotor.Small)
+    local supported_input = pad_connected(t) or (t == Enum.UserInputType.Touch and G.haptic_supported())
+    return supported_input and (motor == Enum.VibrationMotor.Large or motor == Enum.VibrationMotor.Small)
 end
 local motors = {}
 methods["HapticService.SetMotor"] = function(_, t, motor, ...)
@@ -2825,6 +2843,15 @@ methods["HapticService.SetMotor"] = function(_, t, motor, ...)
         return
     end
     motors[t.Name .. "/" .. motor.Name] = table.pack(...)
+    if G.haptic_supported() and (t == Enum.UserInputType.Touch or pad_connected(t))
+        and (motor == Enum.VibrationMotor.Large or motor == Enum.VibrationMotor.Small) then
+        local strength = tonumber((...)) or 0
+        if strength <= 0 then
+            G.haptic_vibrate(0, 0)
+        else
+            G.haptic_vibrate(250, math.clamp(strength, 0, 1))
+        end
+    end
 end
 methods["HapticService.GetMotor"] = function(_, t, motor)
     if typeof(t) ~= "EnumItem" or typeof(motor) ~= "EnumItem" then error("Unable to cast value to token", 0) end
@@ -2837,14 +2864,47 @@ end
 -- (Studio: UIHover 35 ms, UIClick 55, UINotification 0.4 s, collision 0.3,
 -- explosion 0.8, Custom at once); Looped plays until Stop.
 local effect_len = { UIHover = 0.035, UIClick = 0.055, UINotification = 0.4, GameplayCollision = 0.3, GameplayExplosion = 0.8, Custom = 0 }
+local effect_strength = { UIHover = 0.25, UIClick = 0.45, UINotification = 0.65, GameplayCollision = 0.8, GameplayExplosion = 1.0, Custom = 0.5 }
 local playing_fx = {}
 local fx_keys = setmetatable({}, { __mode = "k" })
 methods["HapticEffect.Play"] = function(fx)
     if not fx:IsDescendantOf(game) then return end
-    if fx.Looped then playing_fx[fx] = math.huge return end
-    playing_fx[fx] = G.time() + (effect_len[fx.Type.Name] or 0)
+    local name = fx.Type.Name
+    local dur = effect_len[name] or 0
+    if fx.Looped then
+        playing_fx[fx] = math.huge
+    else
+        playing_fx[fx] = G.time() + dur
+    end
+    if G.haptic_supported() then
+        local strength = effect_strength[name] or 0.5
+        local vib_dur = dur
+        if fx.Type == Enum.HapticEffectType.Custom then
+            local keys = fx_keys[fx]
+            if keys and #keys > 0 then
+                local max_t, max_v = 0, 0
+                for _, k in keys do
+                    if k.Time > max_t then max_t = k.Time end
+                    if k.Value > max_v then max_v = k.Value end
+                end
+                vib_dur = max_t
+                strength = max_v
+            end
+        end
+        local ms = math.floor(vib_dur * 1000 + 0.5)
+        if fx.Looped and ms == 0 then ms = 500 end
+        if ms > 0 and strength > 0 then
+            G.haptic_vibrate(ms, math.clamp(strength, 0, 1))
+        end
+    end
 end
-methods["HapticEffect.Stop"] = function(fx) playing_fx[fx] = nil end
+methods["HapticEffect.Stop"] = function(fx)
+    local was_playing = playing_fx[fx] ~= nil
+    playing_fx[fx] = nil
+    if was_playing and G.haptic_supported() and next(playing_fx) == nil then
+        G.haptic_vibrate(0, 0)
+    end
+end
 methods["HapticEffect.SetWaveformKeys"] = function(fx, keys)
     if fx.Type ~= Enum.HapticEffectType.Custom then error("Cannot modify non-custom haptic effect!", 0) end
     if type(keys) ~= "table" then error("Variant cast failed", 0) end

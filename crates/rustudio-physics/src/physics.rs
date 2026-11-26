@@ -3574,6 +3574,198 @@ impl Physics {
         rustudio_core::bench::take_sections()
     }
 
+    /// Drives `HingeConstraint` wheels connected to a `VehicleSeat`'s assembly
+    /// using the seat's `ThrottleFloat`, `SteerFloat`, `MaxSpeed`, `Torque`, and `TurnSpeed`.
+    fn apply_vehicle_seats(&mut self, doc: &mut Document) {
+        if self.joint_cons.is_empty() {
+            return;
+        }
+        let Some(ws) = doc.workspace() else { return };
+        let mut asm_seat: HashMap<u32, Option<Ref>> = HashMap::default();
+        let find_seat = |part: Ref, asm_seat: &mut HashMap<u32, Option<Ref>>, doc: &Document| -> Option<Ref> {
+            if let Some(asm_id) = self.parts.get(&part).and_then(|pb| pb.asm) {
+                if let Some(&cached) = asm_seat.get(&asm_id) {
+                    return cached;
+                }
+                let found = self.asms.get(&asm_id).and_then(|a| {
+                    a.parts
+                        .iter()
+                        .copied()
+                        .find(|&r| doc.class_of(r).as_deref() == Some("VehicleSeat"))
+                });
+                asm_seat.insert(asm_id, found);
+                return found;
+            }
+            if doc.class_of(part).as_deref() == Some("VehicleSeat") {
+                return Some(part);
+            }
+            let mut visited: HashSet<Ref> = HashSet::default();
+            let mut stack = vec![part];
+            visited.insert(part);
+            while let Some(cur) = stack.pop() {
+                if visited.len() > 64 {
+                    break;
+                }
+                if let Some(neighbors) = self.adj.get(&cur) {
+                    for &n in neighbors {
+                        if !visited.insert(n) {
+                            continue;
+                        }
+                        if doc.class_of(n).as_deref() == Some("VehicleSeat") {
+                            return Some(n);
+                        }
+                        stack.push(n);
+                    }
+                }
+            }
+            None
+        };
+
+        // (hinge, p0, p1, target_omega, motor_torque, set_motor)
+        let mut updates: Vec<(Ref, Ref, Ref, f32, f32, bool)> = Vec::new();
+        for &hinge in &self.joint_cons {
+            if doc.class_of(hinge).as_deref() != Some("HingeConstraint")
+                || !doc.is_ancestor(ws, hinge)
+                || !bool_prop(doc, hinge, "Enabled", true)
+            {
+                continue;
+            }
+            // Skip script-overridden Servo hinges (ActuatorType == 2); drive None (0) or Motor (1).
+            let actuator = enum_u32(doc.prop(hinge, "ActuatorType"));
+            if actuator == Some(2) {
+                continue;
+            }
+            let (Some(a0), Some(a1)) = (ref_prop(doc, hinge, "Attachment0"), ref_prop(doc, hinge, "Attachment1")) else {
+                continue;
+            };
+            let (Some(p0), Some(p1)) = (attachment_part(doc, a0), attachment_part(doc, a1)) else {
+                continue;
+            };
+            let asm0 = self.parts.get(&p0).and_then(|pb| pb.asm);
+            let asm1 = self.parts.get(&p1).and_then(|pb| pb.asm);
+            if asm0 == asm1 {
+                continue;
+            }
+            let seat0 = find_seat(p0, &mut asm_seat, doc);
+            let seat1 = find_seat(p1, &mut asm_seat, doc);
+            let (seat, chassis_is_a0, wheel_att, wheel_part) = match (seat0, seat1) {
+                (Some(s), None) => (s, true, a1, p1),
+                (None, Some(s)) => (s, false, a0, p0),
+                _ => continue,
+            };
+            if bool_prop(doc, seat, "Disabled", false) {
+                continue;
+            }
+            let throttle = {
+                let tf = num(doc, seat, "ThrottleFloat", 0.0);
+                if tf.abs() > 1e-4 { tf } else { num(doc, seat, "Throttle", 0.0) }
+            };
+            let steer = {
+                let sf = num(doc, seat, "SteerFloat", 0.0);
+                if sf.abs() > 1e-4 { sf } else { num(doc, seat, "Steer", 0.0) }
+            };
+            let torque = num(doc, seat, "Torque", 10.0).max(0.0);
+            if throttle.abs() <= 1e-4 && steer.abs() <= 1e-4 && torque <= 0.0 {
+                continue;
+            }
+            let max_speed = num(doc, seat, "MaxSpeed", 25.0).max(0.0);
+            let turn_speed = num(doc, seat, "TurnSpeed", 1.0).max(0.0);
+            let Some(seat_xf) = self.part_xform(doc, seat).or_else(|| xform_of(doc, seat)) else {
+                continue;
+            };
+            let seat_right = seat_xf.rot.x_axis;
+
+            let wheel_pos = self
+                .part_xform(doc, wheel_part)
+                .and_then(|wp| {
+                    let wp_doc = xform_of(doc, wheel_part)?;
+                    let wa_doc = rustudio_core::attachment::world(doc, wheel_att, false)?;
+                    let local_pos = wp_doc.rot.transpose() * (wa_doc.pos - wp_doc.pos);
+                    Some(wp.pos + wp.rot * local_pos)
+                })
+                .or_else(|| self.part_xform(doc, wheel_part).map(|x| x.pos))
+                .or_else(|| xform_of(doc, wheel_part).map(|x| x.pos));
+            let Some(wheel_pos) = wheel_pos else { continue };
+            let side = (wheel_pos - seat_xf.pos).dot(seat_right);
+
+            let steer_term = if side > 1e-4 {
+                -steer * turn_speed
+            } else if side < -1e-4 {
+                steer * turn_speed
+            } else {
+                0.0
+            };
+            let drive_speed = (throttle + steer_term).clamp(-1.0, 1.0) * max_speed;
+
+            let a0_axis = self
+                .part_xform(doc, p0)
+                .and_then(|p0_now| {
+                    let p0_doc = xform_of(doc, p0)?;
+                    let a0_doc = rustudio_core::attachment::world(doc, a0, false)?;
+                    let local_rot = p0_doc.rot.transpose() * a0_doc.rot;
+                    Some(p0_now.rot * local_rot.x_axis)
+                })
+                .or_else(|| rustudio_core::attachment::world(doc, a0, false).map(|a| a.rot.x_axis))
+                .unwrap_or(seat_right);
+
+            // Forward rolling (+drive_speed along -seat_z) needs wheel angular velocity along -seat_right.
+            let dir_sign = if a0_axis.dot(seat_right) >= 0.0 { -1.0 } else { 1.0 };
+            let order_sign = if chassis_is_a0 { 1.0 } else { -1.0 };
+            let target_omega = drive_speed * dir_sign * order_sign;
+
+            let existing_torque = num(doc, hinge, "MotorMaxTorque", 0.0);
+            let motor_torque = if torque > 0.0 {
+                (torque * 1000.0).max(existing_torque)
+            } else {
+                existing_torque
+            };
+            let set_motor = actuator != Some(1);
+            updates.push((hinge, p0, p1, target_omega, motor_torque, set_motor));
+        }
+
+        for (hinge, p0, p1, target_omega, motor_torque, set_motor) in updates {
+            let prev_vel = num(doc, hinge, "AngularVelocity", 0.0);
+            let prev_torque = num(doc, hinge, "MotorMaxTorque", 0.0);
+            let vel_changed = (prev_vel - target_omega).abs() > 1e-4;
+            let torque_changed = (prev_torque - motor_torque).abs() > 1e-4;
+            if !set_motor && !vel_changed && !torque_changed {
+                continue;
+            }
+            if let Some(inst) = doc.dom.get_by_ref_mut(hinge) {
+                if set_motor {
+                    inst.properties.insert(
+                        ustr("ActuatorType"),
+                        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
+                    );
+                }
+                if vel_changed {
+                    inst.properties.insert(ustr("AngularVelocity"), Variant::Float32(target_omega));
+                }
+                if torque_changed {
+                    inst.properties.insert(ustr("MotorMaxTorque"), Variant::Float32(motor_torque));
+                }
+            }
+            if set_motor {
+                doc.mark_prop(hinge, ustr("ActuatorType"));
+            }
+            if vel_changed {
+                doc.mark_prop(hinge, ustr("AngularVelocity"));
+            }
+            if torque_changed {
+                doc.mark_prop(hinge, ustr("MotorMaxTorque"));
+            }
+            if target_omega.abs() > 1e-4 || vel_changed {
+                for p in [p0, p1] {
+                    if let Some(bh) = self.body_of(p) {
+                        if let Some(b) = self.world.bodies.get_mut(bh) {
+                            b.wake_up(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn prepare_frame(&mut self, doc: &mut Document, dt: f32) -> PhysicsFrame {
         self.apply_touch_quiet();
         self.sync_gravity(doc);
@@ -3607,6 +3799,10 @@ impl Physics {
         self.accum = wanted.min(h * (max_steps as f32 + mech::PHYSICS_CARRY_MAX_STEPS));
         let owed = ((wanted - self.accum) * 60.0) as u32;
         let jsc = rustudio_core::bench::scope("ph_joints");
+        {
+            let _v = rustudio_core::bench::scope("pj_vehicle_seats");
+            self.apply_vehicle_seats(doc);
+        }
         {
             let _a = rustudio_core::bench::scope("pj_apply_joints");
             self.apply_joints(doc);

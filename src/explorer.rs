@@ -140,23 +140,130 @@ fn flatten_open(doc: &Document, st: &ExplorerState, r: Ref, depth: usize, rows: 
     }
 }
 
+/// A single parsed token from Studio's Explorer filter query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilterTerm {
+    /// `classname:<text>` or `c:<text>`: case-insensitive substring match on class name.
+    ClassName(String),
+    /// `is:<class>`: Roblox `IsA` inheritance match (resolved canonical class name).
+    IsA(String),
+    /// `tag:<tag>`: case-insensitive match on CollectionService tags.
+    Tag(String),
+    /// `attribute:<name>` or `attr:<name>`: case-insensitive match on attribute names.
+    Attribute(String),
+    /// Plain term: case-insensitive substring match on instance name or class name.
+    Plain(String),
+}
+
+/// Resolves a class name case-insensitively against the reflection database / API dump
+/// so `is:basepart` works just like `is:BasePart`.
+fn resolve_class_name(query: &str) -> String {
+    let db = rustudio_core::doc::db();
+    if db.classes.contains_key(query) {
+        return query.to_string();
+    }
+    if let Some(name) = db.classes.keys().find(|k| k.eq_ignore_ascii_case(query)) {
+        return name.to_string();
+    }
+    if let Some(api) = rustudio_core::api::get() {
+        if let Some(name) = api.classes.keys().find(|k| k.eq_ignore_ascii_case(query)) {
+            return name.clone();
+        }
+    }
+    query.to_string()
+}
+
+/// Splits a filter query on whitespace while respecting double-quoted values
+/// (e.g. `tag:"Spawn Point" c:Part`).
+fn split_query_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in input.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+fn parse_filter_query(raw: &str) -> Vec<FilterTerm> {
+    split_query_tokens(raw.trim())
+        .into_iter()
+        .map(|tok| {
+            if let Some((prefix, val)) = tok.split_once(':') {
+                let p = prefix.to_ascii_lowercase();
+                match p.as_str() {
+                    "classname" | "c" => return FilterTerm::ClassName(val.to_lowercase()),
+                    "is" => {
+                        let resolved = if val.is_empty() { String::new() } else { resolve_class_name(val) };
+                        return FilterTerm::IsA(resolved);
+                    }
+                    "tag" => return FilterTerm::Tag(val.to_lowercase()),
+                    "attribute" | "attr" => return FilterTerm::Attribute(val.to_lowercase()),
+                    _ => {}
+                }
+            }
+            FilterTerm::Plain(tok.to_lowercase())
+        })
+        .collect()
+}
+
+fn matches_filter_term(inst: &rbx_dom_weak::Instance, term: &FilterTerm) -> bool {
+    match term {
+        FilterTerm::ClassName(q) => q.is_empty() || inst.class.to_lowercase().contains(q.as_str()),
+        FilterTerm::IsA(base) => base.is_empty() || rustudio_core::doc::is_a(inst.class.as_str(), base.as_str()),
+        FilterTerm::Tag(q) => match inst.properties.get(&rbx_dom_weak::ustr("Tags")) {
+            Some(rbx_types::Variant::Tags(tags)) => {
+                if q.is_empty() {
+                    tags.iter().next().is_some()
+                } else {
+                    tags.iter().any(|t| t.to_lowercase().contains(q.as_str()))
+                }
+            }
+            _ => false,
+        },
+        FilterTerm::Attribute(q) => match inst.properties.get(&rbx_dom_weak::ustr("Attributes")) {
+            Some(rbx_types::Variant::Attributes(attrs)) => {
+                let include_internal = q.starts_with("rbx_");
+                if q.is_empty() {
+                    attrs.iter().any(|(k, _)| !k.starts_with("RBX_"))
+                } else {
+                    attrs
+                        .iter()
+                        .any(|(k, _)| (include_internal || !k.starts_with("RBX_")) && k.to_lowercase().contains(q.as_str()))
+                }
+            }
+            _ => false,
+        },
+        FilterTerm::Plain(q) => inst.name.to_lowercase().contains(q.as_str()) || inst.class.to_lowercase().contains(q.as_str()),
+    }
+}
+
 /// The rows to draw, and (while searching) the ancestors drawn open.
 /// Searching keeps the tree: every match shows under its whole parent
 /// chain, like Studio's filtered Explorer.
 fn flatten(doc: &Document, st: &ExplorerState) -> (Vec<(Ref, usize)>, HashSet<Ref>) {
     let mut rows = Vec::new();
     let root = doc.dom.root_ref();
-    let filter = st.filter.trim().to_lowercase();
-    if filter.is_empty() {
+    let terms = parse_filter_query(&st.filter);
+    if terms.is_empty() {
         flatten_open(doc, st, root, 0, &mut rows);
         return (rows, HashSet::new());
     }
     let mut show: HashSet<Ref> = HashSet::new();
     let mut ancestors: HashSet<Ref> = HashSet::new();
     for inst in doc.dom.descendants() {
-        if inst.referent() == root
-            || !(inst.name.to_lowercase().contains(&filter) || inst.class.to_lowercase().contains(&filter))
-        {
+        if inst.referent() == root || !terms.iter().all(|t| matches_filter_term(inst, t)) {
             continue;
         }
         show.insert(inst.referent());
@@ -843,5 +950,55 @@ mod tests {
         st.filter.clear();
         st.expand_ancestors(&doc, hit);
         assert!(flatten(&doc, &st).0.iter().any(|r| r.0 == hit));
+    }
+
+    #[test]
+    fn studio_query_tokens_and_multi_term() {
+        let mut doc = Document::new_place();
+        let ws = doc.default_parent();
+        let mut attrs = rbx_dom_weak::types::Attributes::new();
+        attrs.insert("Health".into(), rbx_types::Variant::Float64(100.0));
+        let enemy = doc.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_name("BossPart")
+                .with_property("Tags", rbx_types::Variant::Tags(rbx_types::Tags::from(vec!["Enemy".to_string()])))
+                .with_property("Attributes", rbx_types::Variant::Attributes(attrs)),
+        );
+        let wedge = doc.insert(ws, InstanceBuilder::new("WedgePart").with_name("Ramp"));
+        let folder = doc.insert(ws, InstanceBuilder::new("Folder").with_name("EnemyFolder"));
+
+        let run = |q: &str| -> Vec<Ref> {
+            let mut st = ExplorerState::default();
+            st.filter = q.into();
+            flatten(&doc, &st).0.into_iter().map(|(r, _)| r).collect()
+        };
+
+        assert!(run("classname:wedge").contains(&wedge));
+        assert!(!run("classname:wedge").contains(&enemy));
+        assert!(run("c:part").contains(&enemy));
+        assert!(run("c:part").contains(&wedge));
+        assert!(!run("c:part").contains(&folder));
+
+        let base_parts = run("is:BasePart");
+        assert!(base_parts.contains(&enemy));
+        assert!(base_parts.contains(&wedge));
+        assert!(!base_parts.contains(&folder));
+
+        let base_parts_ci = run("is:basepart");
+        assert!(base_parts_ci.contains(&enemy));
+        assert!(base_parts_ci.contains(&wedge));
+
+        assert!(run("tag:enemy").contains(&enemy));
+        assert!(!run("tag:enemy").contains(&folder));
+
+        assert!(run("attribute:health").contains(&enemy));
+        assert!(run("attr:Health").contains(&enemy));
+        assert!(!run("attr:Health").contains(&wedge));
+
+        let combined = run("is:BasePart tag:enemy attr:health boss");
+        assert!(combined.contains(&enemy));
+        assert!(!combined.contains(&wedge));
+        assert!(!combined.contains(&folder));
     }
 }

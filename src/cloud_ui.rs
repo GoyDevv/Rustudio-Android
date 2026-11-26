@@ -137,6 +137,7 @@ enum Msg {
     TeamCreateOn(Box<CloudOrigin>),
     Status(u64, TeamCreateStatus),
     SaveFinished(SaveJob, Result<SaveOutcome, String>),
+    AvatarSync(u64, Result<u32, String>),
     Done,
 }
 
@@ -157,6 +158,7 @@ struct SaveJob {
     from_dialog: bool,
     relink: bool,
     origin: Option<CloudOrigin>,
+    avatar_sync: Option<Result<u32, String>>,
 }
 
 struct LiveSave {
@@ -653,9 +655,11 @@ impl CloudUi {
                     origin.version = version;
                     if job.vt == VersionType::Published {
                         if let Some(av) = avatar_type {
-                            if let Err(err) = api.set_universe_avatar_type(origin.universe_id, av) {
-                                log::warn!("cloud publish: could not sync universe avatar type: {}", err.0);
-                            }
+                            job.avatar_sync = Some(
+                                api.set_universe_avatar_type(origin.universe_id, av)
+                                    .map(|()| av)
+                                    .map_err(|err| err.0),
+                            );
                         }
                     }
                     let _ = cache.store(&origin, &bytes);
@@ -675,13 +679,22 @@ impl CloudUi {
 
 fn doc_avatar_type(doc: &Document) -> Option<u32> {
     let root = doc.dom.root_ref();
-    let sp = doc.find_child(root, "StarterPlayer")?;
-    if let Some(v) = rustudio_render::scene::enum_u32(doc.prop(sp, "GameSettingsAvatar")) {
-        return Some(v);
+    doc.find_child(root, "StarterPlayer")
+        .and_then(|sp| rustudio_render::scene::enum_u32(doc.prop(sp, "GameSettingsAvatar")))
+        .or_else(|| {
+            doc.find_child(root, "AvatarSettings")
+                .and_then(|s| doc.find_child(s, "AvatarBodyRules"))
+                .and_then(|b| rustudio_render::scene::enum_u32(doc.prop(b, "AvatarType")))
+        })
+}
+
+fn avatar_type_label(v: u32) -> &'static str {
+    match v {
+        0 => "R6",
+        1 => "R15",
+        2 => "Player Choice",
+        _ => "Unknown",
     }
-    doc.find_child(root, "AvatarSettings")
-        .and_then(|s| doc.find_child(s, "AvatarBodyRules"))
-        .and_then(|b| rustudio_render::scene::enum_u32(doc.prop(b, "AvatarType")))
 }
 
 impl Editor {
@@ -768,6 +781,10 @@ impl Editor {
                 }
                 Msg::SaveFinished(job, result) => {
                     self.finish_cloud_save(job, result);
+                    ctx.request_repaint();
+                }
+                Msg::AvatarSync(universe_id, result) => {
+                    self.log_avatar_sync(universe_id, result);
                     ctx.request_repaint();
                 }
                 Msg::Done => self.cloud.jobs = self.cloud.jobs.saturating_sub(1),
@@ -1299,20 +1316,27 @@ impl Editor {
                                     self.game.doc.mark_saved_at(save.revision);
                                     if save.vt == VersionType::Published {
                                         if let (Some(universe_id), Some(av)) = (
-                                            self.game.doc.cloud.as_ref().map(|o| o.universe_id),
+                                            self.game
+                                                .doc
+                                                .cloud
+                                                .as_ref()
+                                                .map(|o| o.universe_id)
+                                                .or_else(|| (live.universe != 0).then_some(live.universe)),
                                             doc_avatar_type(&self.game.doc),
                                         ) {
                                             let factory = self.cloud.factory(self.game.account.shared_client());
-                                            std::thread::Builder::new()
-                                                .name("rustudio-avatar-sync".into())
-                                                .spawn(move || {
-                                                    if let Some(api) = factory() {
-                                                        if let Err(err) = api.set_universe_avatar_type(universe_id, av) {
-                                                            log::warn!("Team Create publish: could not sync universe avatar type: {}", err.0);
-                                                        }
+                                            self.cloud.spawn(factory, move |api, tx| {
+                                                let result = match api {
+                                                    Some(mut api) => {
+                                                        api.session = api.session.with_timeout(std::time::Duration::from_secs(20));
+                                                        api.set_universe_avatar_type(universe_id, av)
+                                                            .map(|()| av)
+                                                            .map_err(|err| err.0)
                                                     }
-                                                })
-                                                .ok();
+                                                    None => Err("Not signed in to Roblox".into()),
+                                                };
+                                                let _ = tx.send(Msg::AvatarSync(universe_id, result));
+                                            });
                                         }
                                     }
                                     self.info(if save.vt == VersionType::Published { "Team Create server confirmed publication" } else { "Team Create server confirmed the save" });
@@ -1847,11 +1871,24 @@ impl Editor {
             from_dialog,
             relink,
             origin,
+            avatar_sync: None,
         };
         if from_dialog {
             self.cloud.upload_result = None;
         }
         self.cloud.start_save(self.game.account.shared_client(), &self.game.doc, job, overwrite);
+    }
+
+    fn log_avatar_sync(&mut self, universe_id: u64, result: Result<u32, String>) {
+        match result {
+            Ok(av) => self.info(format!(
+                "Synced experience {universe_id} avatar type to {}",
+                avatar_type_label(av),
+            )),
+            Err(err) => self.warn(format!(
+                "Published place, but could not sync experience {universe_id} avatar type: {err}",
+            )),
+        }
     }
 
     fn finish_cloud_save(&mut self, job: SaveJob, result: Result<SaveOutcome, String>) {
@@ -1862,6 +1899,9 @@ impl Editor {
             Ok(SaveOutcome::Saved { version }) => {
                 self.cloud.last_saved = Some((version, job.vt));
                 self.info(format!("{action} to Roblox: version {version} of place {}", job.place));
+                if let Some(sync) = job.avatar_sync {
+                    self.log_avatar_sync(job.universe, sync);
+                }
                 if current {
                     if job.relink && self.live_team_create_ids().is_none() {
                         if let Some(origin) = job.origin {

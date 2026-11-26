@@ -873,6 +873,10 @@ impl CloudApi {
     /// Updates the experience's live avatar rig setting (`MorphToR6`, `MorphToR15`, or `PlayerChoice`)
     /// via `PATCH /v2/universes/{universe_id}/configuration` so published places match
     /// `StarterPlayer.GameSettingsAvatar` on Roblox.
+    ///
+    /// Reads the existing configuration via `GET /v1/universes/{universe_id}/configuration`
+    /// first and merges `"universeAvatarType"` into it (falling back to a minimal body if the
+    /// GET fails), because Roblox's v2 PATCH endpoint can reject partial configuration payloads.
     pub fn set_universe_avatar_type(&self, universe_id: u64, game_avatar_type: u32) -> Result<()> {
         let avatar_type = match game_avatar_type {
             0 => "MorphToR6",
@@ -880,12 +884,20 @@ impl CloudApi {
             2 => "PlayerChoice",
             _ => return Ok(()),
         };
+        let get_url = format!("{}/v1/universes/{universe_id}/configuration", self.ep.develop);
+        let payload = match self.get_json(&get_url, "universe configuration") {
+            Ok(Value::Object(mut obj)) => {
+                obj.insert("universeAvatarType".into(), Value::String(avatar_type.into()));
+                Value::Object(obj)
+            }
+            _ => json!({ "universeAvatarType": avatar_type }),
+        };
         write_json(
             &self.session,
             "PATCH",
             &format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop),
             &format!("Sync universe {universe_id} avatar type ({avatar_type})"),
-            json!({ "universeAvatarType": avatar_type }),
+            payload,
         )?;
         Ok(())
     }
