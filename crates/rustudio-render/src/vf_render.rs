@@ -394,7 +394,8 @@ impl Renderer {
         // The sample count of the pipelines it is drawn with (1 on OpenGL);
         // at one sample the scene is drawn straight into `resolve`.
         let samples = self.probe_samples;
-        let hdr_fmt = super::scene_hdr_format(device);
+        let caps = crate::gpu_caps::GpuCaps::of_device(device);
+        let hdr_fmt = super::scene_hdr_format(&caps);
         let depth = tex("viewport frame depth", DEPTH_FORMAT, samples, att).create_view(&Default::default());
         let resolve = tex("viewport frame resolve", hdr_fmt, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());

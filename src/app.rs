@@ -2445,8 +2445,12 @@ impl eframe::App for RustudioApp {
             self.keyboard.before_frame(ctx, raw, textbox, game_box);
             let playing = self.ed.game.play_game_input();
             crate::android::lifecycle::back_pressed(ctx, raw, playing);
-            // The window back in focus: the system bars hidden again.
+            // The window back in focus: the system bars hidden again, and kick repaint
+            // for 1 second so resumed surfaces never sit idle waiting for a touch.
             crate::android::system_bars::before_frame(raw);
+            if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true))) {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("android_focus_kick_until"), Instant::now() + std::time::Duration::from_secs(1)));
+            }
         }
         // A scripted run's window on Windows sits on the real desktop: the
         // person's (or an idle session's) mouse pointer over it would hover
@@ -2704,7 +2708,9 @@ impl RustudioApp {
         // missing, leaving the window black until the next resume.
         #[cfg(target_os = "android")]
         {
-            if ed.harness.run.started.elapsed() < std::time::Duration::from_secs(3) {
+            let focus_kick = ctx.data(|d| d.get_temp::<Instant>(egui::Id::new("android_focus_kick_until")))
+                .is_some_and(|until| Instant::now() < until);
+            if ed.harness.run.started.elapsed() < std::time::Duration::from_secs(3) || focus_kick {
                 ctx.request_repaint();
             }
             crate::android::touch::auto_zoom(ed, &ctx);
@@ -2887,6 +2893,12 @@ impl RustudioApp {
             }
             if ed.game.account.busy() || ed.game.assets.busy() {
                 ctx.request_repaint();
+            }
+            #[cfg(target_os = "android")]
+            {
+                crate::android::clipboard::after_frame(&ctx);
+                self.text_menu.end_frame(&ctx);
+                self.keyboard.end_frame(&ctx, false, false);
             }
             self.watchdog.complete();
             return;
@@ -3196,7 +3208,11 @@ impl RustudioApp {
             end_drag_rects.push(tr);
         }
         self.ed.mobile_drag_rects = end_drag_rects.clone();
-        self.ed.game.touch.zones.direct_drag = end_drag_rects;
+        self.ed.game.touch.zones.direct_drag = if self.ed.game.play_game_input() {
+            Vec::new()
+        } else {
+            end_drag_rects
+        };
         self.reset_document_tabs();
         // Window > Explorer / Properties / Output / Avatar Settings toggles
         // (in a panel window too), new panels where Studio docks them
@@ -3669,7 +3685,7 @@ impl Editor {
         if !self.game.is_playing() {
             return false;
         }
-        let rect = self.game.viewport_rect;
+        let rect = self.game.viewport_rect.intersect(ui.clip_rect());
         if !rect.is_positive() || rect.width() < 160.0 {
             return false;
         }

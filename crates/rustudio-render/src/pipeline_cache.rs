@@ -66,8 +66,13 @@ fn now_ms() -> u64 {
 /// The blob's file for this adapter under `dir` (None: a backend without a
 /// pipeline cache, OpenGL and the rest).
 fn file_for(dir: &std::path::Path, info: &wgpu::AdapterInfo) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
     let key = wgpu::util::pipeline_cache_key(info)?;
-    Some(dir.join("pipelines").join(format!("{key}.bin")))
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    info.driver_info.hash(&mut h);
+    let tag = h.finish();
+    Some(dir.join("pipelines").join(format!("{key}_{tag:016x}.bin")))
 }
 
 /// Makes the process's cache for `device`, primed with the blob a previous
@@ -124,7 +129,7 @@ pub fn current() -> Option<&'static wgpu::PipelineCache> {
 /// for the last two seconds (a set is built in a burst; one write covers
 /// it), or at once with `force`. Cheap otherwise: called once a frame.
 pub fn save(force: bool) {
-    if !force && ACTIVE_BUILDS.load(Ordering::Acquire) > 0 {
+    if ACTIVE_BUILDS.load(Ordering::Acquire) > 0 {
         return;
     }
     let Some(c) = CACHE.get().and_then(|c| c.as_ref()) else { return };

@@ -621,6 +621,7 @@ impl CloudUi {
         self.save_error = None;
         self.conflict = None;
         self.save_pending = true;
+        let avatar_type = doc_avatar_type(doc);
         let (dom, roots) = doc.save_snapshot();
         let cache = self.cache.clone();
         self.spawn(self.factory(client), move |api, tx| {
@@ -650,6 +651,13 @@ impl CloudUi {
                 };
                 if let SaveOutcome::Saved { version } = outcome {
                     origin.version = version;
+                    if job.vt == VersionType::Published {
+                        if let Some(av) = avatar_type {
+                            if let Err(err) = api.set_universe_avatar_type(origin.universe_id, av) {
+                                log::warn!("cloud publish: could not sync universe avatar type: {}", err.0);
+                            }
+                        }
+                    }
                     let _ = cache.store(&origin, &bytes);
                     let _ = cache.remember(&origin);
                     job.origin = Some(origin);
@@ -663,6 +671,17 @@ impl CloudUi {
     pub fn take_opened(&mut self) -> Option<Opened> {
         self.opened.take()
     }
+}
+
+fn doc_avatar_type(doc: &Document) -> Option<u32> {
+    let root = doc.dom.root_ref();
+    let sp = doc.find_child(root, "StarterPlayer")?;
+    if let Some(v) = rustudio_render::scene::enum_u32(doc.prop(sp, "GameSettingsAvatar")) {
+        return Some(v);
+    }
+    doc.find_child(root, "AvatarSettings")
+        .and_then(|s| doc.find_child(s, "AvatarBodyRules"))
+        .and_then(|b| rustudio_render::scene::enum_u32(doc.prop(b, "AvatarType")))
 }
 
 impl Editor {
@@ -1278,6 +1297,24 @@ impl Editor {
                                         self.cloud.last_saved = Some((version, save.vt));
                                     }
                                     self.game.doc.mark_saved_at(save.revision);
+                                    if save.vt == VersionType::Published {
+                                        if let (Some(universe_id), Some(av)) = (
+                                            self.game.doc.cloud.as_ref().map(|o| o.universe_id),
+                                            doc_avatar_type(&self.game.doc),
+                                        ) {
+                                            let factory = self.cloud.factory(self.game.account.shared_client());
+                                            std::thread::Builder::new()
+                                                .name("rustudio-avatar-sync".into())
+                                                .spawn(move || {
+                                                    if let Some(api) = factory() {
+                                                        if let Err(err) = api.set_universe_avatar_type(universe_id, av) {
+                                                            log::warn!("Team Create publish: could not sync universe avatar type: {}", err.0);
+                                                        }
+                                                    }
+                                                })
+                                                .ok();
+                                        }
+                                    }
                                     self.info(if save.vt == VersionType::Published { "Team Create server confirmed publication" } else { "Team Create server confirmed the save" });
                                     if save.from_dialog && self.cloud_upload_mode().is_some() {
                                         self.cloud.upload_result = Some(Ok(version));

@@ -1026,3 +1026,27 @@ pub fn set_pointer_capture(capture: bool) {
         std::time::Duration::from_millis(200),
     );
 }
+
+/// Requests Android's "Install unknown apps" permission if needed and launches
+/// the native PackageInstaller session for `apk_path`.
+/// Returns `"installing"` or `"permission_requested"` on success.
+pub fn install_apk(apk_path: &std::path::Path) -> Result<String> {
+    let path_str = apk_path.to_str().ok_or("APK path is not valid UTF-8")?;
+    with_activity(|env, activity| {
+        let jpath = env.new_string(path_str)?;
+        let res = env
+            .call_method(
+                activity,
+                jni_str!("installApk"),
+                jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Object(&jpath)],
+            )?
+            .l()?;
+        if res.is_null() {
+            return Ok("error:null response".to_string());
+        }
+        let jstr = env.as_cast::<jni::objects::JString>(&res)?;
+        let s = jstr.to_string();
+        Ok(s)
+    })
+}

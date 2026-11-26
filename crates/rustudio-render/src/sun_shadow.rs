@@ -343,8 +343,8 @@ pub struct SunShadows {
 impl SunShadows {
     /// `depth`: the square depth map the cascades are drawn into one at a
     /// time (at least the largest tile across).
-    pub fn new(device: &wgpu::Device, depth: &wgpu::TextureView) -> Self {
-        let atlas_fmt = if crate::gpu_caps::is_powervr_gl(&device.adapter_info()) {
+    pub fn new(device: &wgpu::Device, depth: &wgpu::TextureView, hdr_float_rt: bool) -> Self {
+        let atlas_fmt = if !hdr_float_rt {
             wgpu::TextureFormat::Rgba8Unorm
         } else {
             ATLAS_FORMAT
@@ -488,7 +488,7 @@ impl SunShadows {
                     module: &module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    targets: &[Some(ATLAS_FORMAT.into())],
+                    targets: &[Some(atlas_fmt.into())],
                 }),
                 multiview_mask: None,
                 cache: crate::pipeline_cache::current(),

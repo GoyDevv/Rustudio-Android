@@ -1183,7 +1183,16 @@ fn mip_dirty_rect(rect: [u32; 4], source: [u32; 2], target: [u32; 2]) -> [u32; 4
 
 impl WorldGuiPass {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, hdr_format: wgpu::TextureFormat, samples: u32) -> Self {
-        let source = if samples == 1 { SHADER.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { SHADER.to_owned() };
+        let has_vertex_ssbo = device.limits().max_storage_buffers_per_shader_stage >= 3;
+        let mut source = if samples == 1 { SHADER.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { SHADER.to_owned() };
+        if !has_vertex_ssbo {
+            source = source
+                .replace("@group(0) @binding(5) var<storage, read> lights: array<Light>;", "")
+                .replace("@group(0) @binding(6) var<storage, read> glass: array<Glass>;", "")
+                .replace("@group(0) @binding(7) var<storage, read> glass_idx: array<u32>;", "")
+                .replace("c += fx_local(lights[i], p);", "let _skip_i = i;")
+                .replace("let g = glass[glass_idx[list.x + i]];\n        if (fx_hit(g, tone.cam.xyz, d, len)) { t *= 1.0 - g.pos.w; }", "let _skip_g = i;");
+        }
         let source = crate::gpu_caps::shader_for(device, &source);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world gui"),
@@ -1199,9 +1208,7 @@ impl WorldGuiPass {
                 .into(),
             ),
         });
-        let depth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("world gui depth"),
-            entries: &[
+        let mut depth_bgl_entries = vec![
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1234,12 +1241,13 @@ impl WorldGuiPass {
                     binding: 3, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None,
                 },
-                // The frame's local lights (render.rs lights_buf).
+        ];
+        if has_vertex_ssbo {
+            depth_bgl_entries.extend([
                 wgpu::BindGroupLayoutEntry {
                     binding: 5, visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
-                // Effects: the glass in view, and each effect's list of it.
                 wgpu::BindGroupLayoutEntry {
                     binding: 6, visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
@@ -1248,7 +1256,11 @@ impl WorldGuiPass {
                     binding: 7, visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
-            ],
+            ]);
+        }
+        let depth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("world gui depth"),
+            entries: &depth_bgl_entries,
         });
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("world gui texture"),
@@ -1956,20 +1968,27 @@ impl WorldGuiPass {
                 self.depth_binding = Some(DepthBinding {
                     views: views.map(Clone::clone),
                     buffers: buffers.map(Clone::clone),
-                    group: device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("world gui depth"),
-                        layout: &self.depth_bgl,
-                        entries: &[
+                    group: {
+                        let mut entries = vec![
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
                             wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.sun_atlas) },
                             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sun_sampler) },
                             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sun_grid) },
-                            wgpu::BindGroupEntry { binding: 5, resource: self.lights.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 6, resource: g0.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 7, resource: g1.as_entire_binding() },
-                        ],
-                    }),
+                        ];
+                        if device.limits().max_storage_buffers_per_shader_stage >= 3 {
+                            entries.extend([
+                                wgpu::BindGroupEntry { binding: 5, resource: self.lights.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 6, resource: g0.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 7, resource: g1.as_entire_binding() },
+                            ]);
+                        }
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("world gui depth"),
+                            layout: &self.depth_bgl,
+                            entries: &entries,
+                        })
+                    },
                 });
             }
             self.depth_binding.as_ref().expect("depth bindings initialized").group.clone()

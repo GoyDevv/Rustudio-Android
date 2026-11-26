@@ -1,8 +1,18 @@
 package com.logosforgestudios.rustudio;
 
 import android.app.NativeActivity;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageInstaller;
 import android.content.res.Configuration;
+import android.net.Uri;
+import android.provider.Settings;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.OutputStream;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.os.Bundle;
@@ -31,7 +41,11 @@ import android.widget.FrameLayout;
  * Rustudio's real editor buffer.
  */
 public class RustudioActivity extends NativeActivity {
+    private static final int REQ_UNKNOWN_SOURCES = 4107;
+    private static final String ACTION_INSTALL_COMMIT = "com.logosforgestudios.rustudio.ACTION_INSTALL_COMMIT";
     private ImeProxyView imeView;
+    private String pendingInstallApkPath = null;
+    private BroadcastReceiver installReceiver = null;
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -56,8 +70,11 @@ public class RustudioActivity extends NativeActivity {
         w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
                 | WindowManager.LayoutParams.FLAG_FULLSCREEN);
         // Prevent Android from panning the NativeActivity window upward off-screen
-        // when Gboard opens (Rust already shrinks safe_area_insets.bottom cleanly).
-        w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
+        // on API 30+ where WindowInsets.Type.ime reports keyboard height accurately.
+        // On API 26-29, leave default resize behavior so system window insets report IME height.
+        if (Build.VERSION.SDK_INT >= 30) {
+            w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
+        }
         w.setBackgroundDrawable(new ColorDrawable(darkBg));
         w.setStatusBarColor(darkBg);
         w.setNavigationBarColor(darkBg);
@@ -120,6 +137,146 @@ public class RustudioActivity extends NativeActivity {
     protected void onResume() {
         super.onResume();
         applyDarkFullscreenWindow();
+        maybeResumePendingInstall();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_UNKNOWN_SOURCES) {
+            maybeResumePendingInstall();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (installReceiver != null) {
+            try {
+                unregisterReceiver(installReceiver);
+            } catch (Throwable ignored) {
+            }
+            installReceiver = null;
+        }
+        super.onDestroy();
+    }
+
+    private void ensureInstallReceiver() {
+        if (installReceiver != null) {
+            return;
+        }
+        installReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent == null) {
+                    return;
+                }
+                int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+                if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                    Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                    if (confirm != null) {
+                        confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        try {
+                            startActivity(confirm);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(ACTION_INSTALL_COMMIT);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(installReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(installReceiver, filter);
+        }
+    }
+
+    private void maybeResumePendingInstall() {
+        final String path = pendingInstallApkPath;
+        if (path == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls()) {
+            pendingInstallApkPath = null;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    installApk(path);
+                }
+            }, "rustudio-apk-install").start();
+        }
+    }
+
+    /**
+     * Installs an APK from app-private cache using Android's PackageInstaller session API.
+     * Requests "Install unknown apps" permission first if not yet granted, and automatically
+     * resumes installation when the user returns from Settings.
+     */
+    public String installApk(String apkPath) {
+        if (apkPath == null || apkPath.isEmpty()) {
+            return "error:Empty APK path";
+        }
+        File apk = new File(apkPath);
+        if (!apk.exists() || !apk.isFile() || apk.length() <= 0) {
+            return "error:APK file not found";
+        }
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            pendingInstallApkPath = apkPath;
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Intent intent = new Intent(
+                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:" + getPackageName())
+                        );
+                        startActivityForResult(intent, REQ_UNKNOWN_SOURCES);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            return "permission_requested";
+        }
+        ensureInstallReceiver();
+        PackageInstaller.Session session = null;
+        try {
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params =
+                    new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            params.setAppPackageName(getPackageName());
+            params.setSize(apk.length());
+            int sessionId = installer.createSession(params);
+            session = installer.openSession(sessionId);
+            try (FileInputStream in = new FileInputStream(apk);
+                 OutputStream out = session.openWrite("rustudio_update.apk", 0, apk.length())) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                session.fsync(out);
+            }
+            Intent commitIntent = new Intent(ACTION_INSTALL_COMMIT);
+            commitIntent.setPackage(getPackageName());
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= 31) {
+                flags |= PendingIntent.FLAG_MUTABLE;
+            }
+            PendingIntent pi = PendingIntent.getBroadcast(this, sessionId, commitIntent, flags);
+            session.commit(pi.getIntentSender());
+            session.close();
+            session = null;
+            return "installing";
+        } catch (Throwable t) {
+            if (session != null) {
+                try {
+                    session.abandon();
+                } catch (Throwable ignored) {
+                }
+            }
+            String msg = t.getMessage();
+            return "error:" + t.getClass().getSimpleName() + (msg != null ? (": " + msg) : "");
+        }
     }
 
     @Override

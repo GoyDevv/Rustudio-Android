@@ -870,6 +870,26 @@ impl CloudApi {
         Ok(SaveOutcome::Saved { version })
     }
 
+    /// Updates the experience's live avatar rig setting (`MorphToR6`, `MorphToR15`, or `PlayerChoice`)
+    /// via `PATCH /v2/universes/{universe_id}/configuration` so published places match
+    /// `StarterPlayer.GameSettingsAvatar` on Roblox.
+    pub fn set_universe_avatar_type(&self, universe_id: u64, game_avatar_type: u32) -> Result<()> {
+        let avatar_type = match game_avatar_type {
+            0 => "MorphToR6",
+            1 => "MorphToR15",
+            2 => "PlayerChoice",
+            _ => return Ok(()),
+        };
+        write_json(
+            &self.session,
+            "PATCH",
+            &format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop),
+            &format!("Sync universe {universe_id} avatar type ({avatar_type})"),
+            json!({ "universeAvatarType": avatar_type }),
+        )?;
+        Ok(())
+    }
+
     /// Uploads to an explicitly selected destination, with the requested
     /// version type. The destination has no opened version to compare.
     pub fn upload_place(

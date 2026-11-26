@@ -436,7 +436,7 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     }
     // (the report and the save are on disk; the relaunch intent is queued)
     std::thread::sleep(std::time::Duration::from_millis(300));
-    std::process::exit(0);
+    unsafe { libc::_exit(0) };
 }
 
 /// Touch-first settings for the egui chrome: bigger hit targets, a wider

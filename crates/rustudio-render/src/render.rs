@@ -24,18 +24,12 @@ use rustudio_core::math::Xform;
 /// The scene is lit in linear light into this target...
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// 32-bit HDR (Rg11b10Ufloat) on Android Vulkan when renderable: halves HDR,
-/// scene-copy, and PostFX memory bandwidth and keeps color+depth at 64 bits/px
-/// (half of Mali-G52's 128-bit tile buffer) with full HDR lighting & bloom.
-pub(crate) fn scene_hdr_format(device: &wgpu::Device) -> wgpu::TextureFormat {
-    let info = device.adapter_info();
-    if crate::gpu_caps::is_powervr_gl(&info) {
+/// HDR scene render-target format: Rgba16Float whenever the adapter supports
+/// filterable/blendable float render targets (preserving alpha for SeeThrough,
+/// DoF CoC, and ViewportFrame), else Rgba8Unorm on GLES devices without float RTs.
+pub(crate) fn scene_hdr_format(caps: &crate::gpu_caps::GpuCaps) -> wgpu::TextureFormat {
+    if !caps.hdr_float_rt {
         wgpu::TextureFormat::Rgba8Unorm
-    } else if cfg!(target_os = "android")
-        && info.backend != wgpu::Backend::Gl
-        && device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE)
-    {
-        wgpu::TextureFormat::Rg11b10Ufloat
     } else {
         HDR_FORMAT
     }
@@ -51,6 +45,7 @@ const LSHADOW_FACE_STRIDE: u64 = 256;
 
 /// The local light shadow atlas for Realistic lighting.
 pub struct LightShadows {
+    format: wgpu::TextureFormat,
     moments_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -65,7 +60,7 @@ pub struct LightShadows {
 }
 
 impl LightShadows {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, caps: &crate::gpu_caps::GpuCaps) -> Self {
         let side = rustudio_core::mech::LSHADOW_ATLAS;
         let tex = |label: &str, format, usage| {
             device
@@ -81,7 +76,7 @@ impl LightShadows {
                 })
                 .create_view(&Default::default())
         };
-        let lfmt = if crate::gpu_caps::is_powervr_gl(&device.adapter_info()) {
+        let lfmt = if !caps.hdr_float_rt {
             wgpu::TextureFormat::Rgba8Unorm
         } else {
             LSHADOW_FORMAT
@@ -136,7 +131,7 @@ impl LightShadows {
                 }),
             }],
         });
-        Self { moments_view, depth_view, sampler, slots_buf, face_buf, face_layout, face_bg, key: None }
+        Self { format: lfmt, moments_view, depth_view, sampler, slots_buf, face_buf, face_layout, face_bg, key: None }
     }
 
     /// The six face view-projections of a light: 93° frusta (Studio's
@@ -586,7 +581,7 @@ pub mod gpu_check {
         // (a device that cannot sample multisampled textures never builds 4x)
         let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
         for &samples in sample_counts {
-            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, scene_hdr_format(&device), samples));
+            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, scene_hdr_format(&caps), samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -2188,7 +2183,7 @@ struct ViewportPipelines {
     /// SPEC_GLOBALS, render.rs spec_mask), made on a worker the first time a
     /// mask is seen (None while it compiles: opaque_plain draws meanwhile).
     plain_spec: std::sync::Arc<std::sync::Mutex<HashMap<u32, Option<[wgpu::RenderPipeline; 2]>>>>,
-    plain_src: (std::sync::Arc<String>, wgpu::PipelineLayout, wgpu::MultisampleState),
+    plain_src: (std::sync::Arc<String>, wgpu::PipelineLayout, wgpu::MultisampleState, wgpu::TextureFormat),
     transparent_culled: wgpu::RenderPipeline,
     glass: wgpu::RenderPipeline,
     glass_culled: wgpu::RenderPipeline,
@@ -2212,16 +2207,15 @@ struct ViewportPipelines {
 // Some OpenGL drivers lack the color-buffer-float extension that wgpu
 // requires for 32-bit float render targets. These passes only read the
 // channels they write, so the half-float equivalents need no shader changes.
-fn post_float_formats(device: &wgpu::Device) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
+fn post_float_formats(caps: &crate::gpu_caps::GpuCaps) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
     use wgpu::TextureFormat::*;
-    let info = device.adapter_info();
-    if crate::gpu_caps::is_powervr_gl(&info) {
+    if !caps.r16_float_rt {
         (Rgba8Unorm, Rgba8Unorm)
-    } else if info.backend == wgpu::Backend::Gl {
+    } else if caps.backend == wgpu::Backend::Gl {
         (R16Float, Rg16Float)
     } else if cfg!(target_os = "android") {
         // Keep full 32-bit float depth precision (prevents depth banding / Z-fighting)
-        // while using 16-bit float for AO color/visibility buffers on Mali-G52.
+        // while using 16-bit float for AO color/visibility buffers on mobile GPUs.
         (R32Float, Rg16Float)
     } else {
         (R32Float, Rg32Float)
@@ -2238,8 +2232,9 @@ impl ViewportPipelines {
         terrain_bgl: &wgpu::BindGroupLayout,
         samples: u32,
         reduced: bool,
+        caps: &crate::gpu_caps::GpuCaps,
     ) -> Self {
-        let mut source = shader_source(reduced).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
+        let mut source = shader_source(reduced, caps.storage_lights()).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
         if cfg!(target_os = "android") {
             source = source
                 .replace("const SSAO_STEPS: u32 = 7u;", "const SSAO_STEPS: u32 = 3u;")
@@ -2282,7 +2277,7 @@ impl ViewportPipelines {
             mask: !0,
             alpha_to_coverage_enabled: false,
         };
-        let hdr_format = scene_hdr_format(device);
+        let hdr_format = scene_hdr_format(caps);
         let make_fmt = |label: &str,
                     vs: &str,
                     fs: &str,
@@ -2460,7 +2455,7 @@ impl ViewportPipelines {
         // specialised program rounds one test-place pixel's green differently
         // (27,75,20 vs 27,74,20), so it is not yet the same image.
         let opaque_plain = spec_pipelines_on().then(|| {
-            let src = (std::sync::Arc::new(spec_source(&spec_base, plain[0].1 > 0.5, plain[1].1 > 0.5, None)), part_layout.clone(), ms);
+            let src = (std::sync::Arc::new(spec_source(&spec_base, plain[0].1 > 0.5, plain[1].1 > 0.5, None)), part_layout.clone(), ms, hdr_format);
             [Some(wgpu::Face::Back), None].map(|cull| opaque_part_pipeline(device, &src, cull))
         });
         let opaque_low = (samples == 1).then(|| {
@@ -2665,7 +2660,7 @@ impl ViewportPipelines {
                 cache: crate::pipeline_cache::current(),
             })
         };
-        let (depth_format, ao_format) = post_float_formats(device);
+        let (depth_format, ao_format) = post_float_formats(caps);
         let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", depth_format, None);
         let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", depth_format, None);
         let ssao_main = ssao_pipe("ssao", "fs_ssao", ao_format, None);
@@ -2710,7 +2705,7 @@ impl ViewportPipelines {
             transparent_low,
             opaque_plain,
             plain_spec: Default::default(),
-            plain_src: (spec_base.clone(), part_layout.clone(), ms),
+            plain_src: (spec_base.clone(), part_layout.clone(), ms, hdr_format),
             transparent_culled,
             glass,
             glass_culled,
@@ -2770,7 +2765,7 @@ fn spec_source(base: &str, textured: bool, special_kinds: bool, mask: Option<u32
 /// depth write, Greater, no blend) over a module made from `source`.
 fn opaque_part_pipeline(
     device: &wgpu::Device,
-    (source, layout, ms): &(std::sync::Arc<String>, wgpu::PipelineLayout, wgpu::MultisampleState),
+    (source, layout, ms, hdr_format): &(std::sync::Arc<String>, wgpu::PipelineLayout, wgpu::MultisampleState, wgpu::TextureFormat),
     cull: Option<wgpu::Face>,
 ) -> wgpu::RenderPipeline {
     let constants: &[(&str, f64)] = &[];
@@ -2811,7 +2806,7 @@ fn opaque_part_pipeline(
             module: shader,
             entry_point: Some("fs_part"),
             compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
-            targets: &[Some(wgpu::ColorTargetState { format: scene_hdr_format(device), blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            targets: &[Some(wgpu::ColorTargetState { format: *hdr_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
         }),
         multiview_mask: None,
         cache: crate::pipeline_cache::current(),
@@ -2835,7 +2830,8 @@ impl ViewportPipelines {
                 std::thread::Builder::new()
                     .name("rustudio-pipeline".into())
                     .spawn(move || {
-                        let src = (std::sync::Arc::new(spec_source(&src.0, false, false, Some(mask))), src.1, src.2);
+                        let _build_guard = crate::pipeline_cache::BuildGuard::enter();
+                        let src = (std::sync::Arc::new(spec_source(&src.0, false, false, Some(mask))), src.1, src.2, src.3);
                         let pipes = [Some(wgpu::Face::Back), None].map(|cull| opaque_part_pipeline(&device, &src, cull));
                         cache.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, Some(pipes));
                     })
@@ -2859,12 +2855,12 @@ fn sample_slot(samples: u32) -> usize {
     if samples == SAMPLES { 2 } else { samples as usize - 1 }
 }
 
-fn supports_two_samples(rs: &egui_wgpu::RenderState) -> bool {
+fn supports_two_samples(rs: &egui_wgpu::RenderState, caps: &crate::gpu_caps::GpuCaps) -> bool {
     use wgpu::TextureFormatFeatureFlags as Flags;
     if !rs.device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
         return false;
     }
-    [scene_hdr_format(&rs.device), DEPTH_FORMAT, crate::highlight::MASK_FORMAT].into_iter().all(|format| {
+    [scene_hdr_format(caps), DEPTH_FORMAT, crate::highlight::MASK_FORMAT].into_iter().all(|format| {
         let flags = rs.adapter.get_texture_format_features(format).flags;
         flags.sample_count_supported(2)
             && (format == DEPTH_FORMAT || flags.contains(Flags::MULTISAMPLE_RESOLVE))
@@ -3069,7 +3065,7 @@ impl Renderer {
         let caps = caps.clone();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rustudio viewport"),
-            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &shader_source(reduced)).into()),
+            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &shader_source(reduced, caps.storage_lights())).into()),
         });
         let uniform_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -3094,7 +3090,11 @@ impl Renderer {
                 frag(
                     1,
                     wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: if caps.storage_lights() {
+                            wgpu::BufferBindingType::Storage { read_only: true }
+                        } else {
+                            wgpu::BufferBindingType::Uniform
+                        },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -3247,10 +3247,19 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let max_lights_buf = if caps.storage_lights() {
+            rustudio_core::mech::MAX_LIGHTS.max(1)
+        } else {
+            64
+        };
         let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lights"),
-            size: (rustudio_core::mech::MAX_LIGHTS.max(1) * std::mem::size_of::<LightRaw>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            size: (max_lights_buf * std::mem::size_of::<LightRaw>()) as u64,
+            usage: if caps.storage_lights() {
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+            } else {
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST
+            },
             mapped_at_creation: false,
         });
         let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -3361,11 +3370,11 @@ impl Renderer {
             anisotropy_clamp: 2,
             ..Default::default()
         });
-        let lshadow = LightShadows::new(device);
-        let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
+        let lshadow = LightShadows::new(device, &caps);
+        let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view, caps.hdr_float_rt);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
         // current slot, 21 the slot it blends to.
-        let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), scene_hdr_format(device), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), scene_hdr_format(&caps), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
         let probe_globals_bg = Self::globals_group(
             device,
             &bgl,
@@ -3540,7 +3549,7 @@ impl Renderer {
                 entry_point: Some("fs_light_shadow"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: LSHADOW_FORMAT,
+                    format: lshadow.format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -3580,7 +3589,7 @@ impl Renderer {
                 entry_point: Some("fs_light_shadow_cutout"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: LSHADOW_FORMAT,
+                    format: lshadow.format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -3775,7 +3784,7 @@ impl Renderer {
             gui_lightgrid: [0.0; 4],
             gui_sun_params: [0.0, 580.0, 0.05, 0.0],
             gui_n_lights: 0,
-            postfx: crate::postfx::PostFx::new(device, queue, scene_hdr_format(device), DISPLAY_FORMAT),
+            postfx: crate::postfx::PostFx::new(device, queue, scene_hdr_format(&caps), DISPLAY_FORMAT, caps.r16_float_rt),
             last_postfx: crate::postfx::PostFxParams::default(),
             defer_postfx: false,
             world_gui: [None, None, None],
@@ -3884,11 +3893,11 @@ impl Renderer {
             && ((r.probe_samples != 1 && one_sample_likely) || cfg!(target_os = "android"));
         if prebuild_1x && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
             let (device, queue) = (device.clone(), queue.clone());
-            let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
+            let (g, t, gl, tr, reduced, caps) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced, r.caps.clone());
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
                 let _guard = crate::pipeline_cache::BuildGuard::enter();
-                let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced));
+                let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced, &caps));
             });
             if spawned.is_ok() {
                 r.lower_pending = Some(rx);
@@ -4961,19 +4970,20 @@ impl Renderer {
                 }
             } else if cfg!(target_os = "android") && self.caps.backend != wgpu::Backend::Gl {
                 let (device, queue) = (rs.device.clone(), rs.queue.clone());
-                let (g, t, gl, tr, reduced) = (
+                let (g, t, gl, tr, reduced, caps) = (
                     self.globals_layout.clone(),
                     self.tex_layout.clone(),
                     self.glass_layout.clone(),
                     self.terrain_layout.clone(),
                     self.reduced,
+                    self.caps.clone(),
                 );
                 let (tx, rx) = std::sync::mpsc::channel();
                 if std::thread::Builder::new()
                     .name("rustudio-pipelines".into())
                     .spawn(move || {
                         let _guard = crate::pipeline_cache::BuildGuard::enter();
-                        let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced));
+                        let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced, &caps));
                     })
                     .is_ok()
                 {
@@ -4986,7 +4996,7 @@ impl Renderer {
             let t0 = Instant::now();
             let made = ViewportPipelines::new(
                 &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
-                &self.terrain_layout, samples, self.reduced,
+                &self.terrain_layout, samples, self.reduced, &self.caps,
             );
             if rustudio_core::load_trace::startup_trace() {
                 eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
@@ -5022,7 +5032,7 @@ impl Renderer {
                     view_formats: &[],
                 })
             };
-        let hdr_format = scene_hdr_format(device);
+        let hdr_format = scene_hdr_format(&self.caps);
         let hdr = tex(
             "viewport-hdr",
             hdr_format,
@@ -5060,7 +5070,7 @@ impl Renderer {
         let water_depth = tex("water surface depth", DEPTH_FORMAT, samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let water_bg = viewport.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
-        let (depth_format, ao_format) = post_float_formats(device);
+        let (depth_format, ao_format) = post_float_formats(&self.caps);
         let glass_depth = tex("glass depth snapshot", depth_format, 1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
         let glass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5182,7 +5192,7 @@ impl Renderer {
         }
         let Some(t) = self.target.as_ref() else { return };
         let pass = self.world_gui[sample_slot(t.samples)]
-            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_hdr_format(&rs.device), t.samples));
+            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_hdr_format(&self.caps), t.samples));
         pass.font_texture_update = Some(font_texture_update);
         pass.sun_atlas = self.sun.atlas_view.clone();
         pass.sun_grid = self.lightgrid_view.clone();
@@ -5331,7 +5341,7 @@ impl Renderer {
                 }
             }),
         };
-        if samples == 2 && !supports_two_samples(rs) {
+        if samples == 2 && !supports_two_samples(rs, &self.caps) {
             samples = 1;
         }
         // (no multisampled textures to sample on OpenGL: gpu_caps.rs)
@@ -5339,10 +5349,12 @@ impl Renderer {
             samples = 1;
         }
         if !self.ensure_target(rs, size, samples) {
+            self.defer_postfx = false;
             return None;
         }
         if frame.probe.as_ref().is_some_and(|pf| pf.tasks.iter().any(|t| matches!(t, env_probe_gpu::Task::Face(_)))) {
             if !self.ensure_pipelines(rs, self.probe_samples) {
+                self.defer_postfx = false;
                 return None;
             }
         }
@@ -5785,7 +5797,8 @@ impl Renderer {
         }
 
         drop(r_scope);
-        let n_lights = frame.lights.len().min(rustudio_core::mech::MAX_LIGHTS);
+        let max_lights = if self.caps.storage_lights() { rustudio_core::mech::MAX_LIGHTS } else { 64 };
+        let n_lights = frame.lights.len().min(max_lights);
         self.gui_n_lights = n_lights as u32;
         if n_lights > 0 {
             queue.write_buffer(
@@ -5830,7 +5843,7 @@ impl Renderer {
                     None => (&self.globals_layout, &self.globals_bg),
                 };
                 let clouds = self.clouds[cloud_slot].get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced), scene_hdr_format(device), DEPTH_FORMAT, samples)
+                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced, self.caps.storage_lights()), scene_hdr_format(&self.caps), DEPTH_FORMAT, samples)
                 });
                 clouds.encode(device, queue, &mut encoder, globals_bg, look, -frame.globals.sun_dir[1], target.size);
             }
@@ -7678,6 +7691,10 @@ impl Renderer {
 
     /// Whether any sun shadow cascade is still behind the latest dynamic-caster
     /// move (used by the 3D editor to request a catch-up repaint before going idle).
+    pub fn caps(&self) -> &crate::gpu_caps::GpuCaps {
+        &self.caps
+    }
+
     pub fn has_stale_shadows(&self) -> bool {
         self.sun.has_stale_dyn(self.dyn_caster_gen)
     }
@@ -8188,7 +8205,7 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 /// atlas (15), the BRDF table (14) and the scene probe's blend target (21).
 /// With them the part pass binds 10 + 3 + 2 textures, post 10 + 3 + 3:
 /// OpenGL's 16 texture units per pipeline.
-pub const REDUCED_BINDINGS: [u32; 3] = [14, 15, 21];
+pub const REDUCED_BINDINGS: [u32; 4] = [14, 15, 17, 21];
 
 fn reduce_bindings<T>(reduced: bool, mut entries: Vec<T>, binding: impl Fn(&T) -> u32) -> Vec<T> {
     if reduced {
@@ -8200,26 +8217,27 @@ fn reduce_bindings<T>(reduced: bool, mut entries: Vec<T>, binding: impl Fn(&T) -
 /// shader.wgsl's `//#if FULL_BINDINGS` / `//#else` / `//#endif` blocks:
 /// the first branch for the full binding set, the second for the reduced
 /// one. The full source is shader.wgsl's code unchanged.
-fn select_bindings(src: &str, reduced: bool) -> String {
+fn select_bindings(src: &str, reduced: bool, storage_lights: bool) -> String {
     let mut out = String::with_capacity(src.len());
-    let mut branch: Option<bool> = None;
+    let mut active: Option<bool> = None;
     for line in src.split_inclusive('\n') {
         match line.trim() {
-            "//#if FULL_BINDINGS" => { assert!(branch.is_none(), "nested //#if FULL_BINDINGS"); branch = Some(true); continue; }
-            "//#else" => { branch = Some(false); continue; }
-            "//#endif" => { branch = None; continue; }
+            "//#if FULL_BINDINGS" => { assert!(active.is_none(), "nested //#if"); active = Some(!reduced); continue; }
+            "//#if STORAGE_LIGHTS" => { assert!(active.is_none(), "nested //#if"); active = Some(storage_lights); continue; }
+            "//#else" => { active = active.map(|a| !a); continue; }
+            "//#endif" => { active = None; continue; }
             _ => {}
         }
-        if branch.is_none_or(|full| full != reduced) {
+        if active.unwrap_or(true) {
             out.push_str(line);
         }
     }
-    assert!(branch.is_none(), "unterminated //#if FULL_BINDINGS");
+    assert!(active.is_none(), "unterminated //#if");
     out
 }
 
-fn shader_source(reduced: bool) -> String {
-    select_bindings(&shader_source_all(), reduced)
+fn shader_source(reduced: bool, storage_lights: bool) -> String {
+    select_bindings(&shader_source_all(), reduced, storage_lights)
 }
 
 fn shader_source_all() -> String {

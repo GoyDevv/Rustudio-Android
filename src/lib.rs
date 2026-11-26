@@ -465,13 +465,15 @@ mod android_gpu_guard {
     static BOOT_VERIFIED: AtomicBool = AtomicBool::new(false);
 
     fn getprop(key: &str) -> String {
-        std::process::Command::new("getprop")
-            .arg(key)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
+        crate::android::system_property(key)
+    }
+
+    pub(crate) fn clear_failed_state() {
+        let dir = crate::crash::dir();
+        let _ = std::fs::remove_file(failed_path());
+        let _ = std::fs::remove_file(probe_path());
+        let _ = std::fs::remove_file(dir.join(".vulkan_3d_probe"));
+        let _ = std::fs::remove_file(dir.join(".vulkan_probe_fails"));
     }
 
     fn probe_path() -> PathBuf {
@@ -560,30 +562,43 @@ mod android_gpu_guard {
         let _ = std::fs::create_dir_all(&dir);
         let failed = failed_path();
         let probe = probe_path();
+        let fails_path = dir.join(".vulkan_probe_fails");
         let fingerprint = getprop("ro.build.fingerprint");
+        let marker = format!("{}|{}", env!("CARGO_PKG_VERSION"), fingerprint);
 
         if let Ok(saved) = std::fs::read_to_string(&failed) {
-            let saved_fp = saved.trim();
-            if saved_fp.is_empty() || fingerprint.is_empty() || saved_fp == fingerprint {
+            if saved.trim() == marker {
                 log::warn!(
-                    "rustudio: previous Vulkan startup crash recorded; booting on native OpenGL ES 3"
+                    "rustudio: repeated Vulkan startup crashes recorded for {marker}; booting on native OpenGL ES 3"
                 );
                 return true;
             }
-            // OS firmware changed since the crash — clear marker and re-probe Vulkan.
+            // App version or OS firmware changed — clear stale marker and re-probe Vulkan.
             let _ = std::fs::remove_file(&failed);
+            let _ = std::fs::remove_file(&fails_path);
         }
 
         let render3d_probe = dir.join(".vulkan_3d_probe");
         if probe.exists() || render3d_probe.exists() {
-            log::warn!(
-                "rustudio: Vulkan crashed/stalled before completing {} on the previous launch; switching to native OpenGL ES 3",
-                if render3d_probe.exists() { "3D viewport frames" } else { "startup frames" }
-            );
-            let _ = std::fs::write(&failed, &fingerprint);
+            let prev_fails: u32 = std::fs::read_to_string(&fails_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            let next_fails = prev_fails + 1;
             let _ = std::fs::remove_file(&probe);
             let _ = std::fs::remove_file(&render3d_probe);
-            return true;
+            if next_fails >= 2 {
+                log::warn!(
+                    "rustudio: Vulkan failed {next_fails} consecutive launches; switching to native OpenGL ES 3"
+                );
+                let _ = std::fs::write(&failed, &marker);
+                let _ = std::fs::remove_file(&fails_path);
+                return true;
+            }
+            log::warn!(
+                "rustudio: previous Vulkan launch ended before probe finished (strike {next_fails}/2); retrying Vulkan once"
+            );
+            let _ = std::fs::write(&fails_path, next_fails.to_string());
         }
 
         // Arm the boot probe; cleared after the first 4 frames submit & present cleanly.
@@ -618,6 +633,7 @@ mod android_gpu_guard {
             let p = render3d_probe_path();
             if p.exists() {
                 let _ = std::fs::remove_file(&p);
+                let _ = std::fs::remove_file(crate::crash::dir().join(".vulkan_probe_fails"));
                 log::info!("rustudio: 3D viewport verified (4 frames); cleared Vulkan 3D probe");
             }
         }
@@ -665,6 +681,7 @@ pub(crate) fn wgpu_setup(mut setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu:
             }
             "vulkan" => {
                 log::info!("rustudio: user selected Vulkan in Studio Settings");
+                android_gpu_guard::clear_failed_state();
                 setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::VULKAN;
             }
             _ => {

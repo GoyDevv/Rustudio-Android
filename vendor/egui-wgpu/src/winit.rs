@@ -133,6 +133,9 @@ impl Painter {
 
         let width = surface_state.width;
         let height = surface_state.height;
+        if width == 0 || height == 0 {
+            return;
+        }
         // rustudio: Mailbox where the surface offers it, otherwise Fifo.
         let present_mode = if present_mode == wgpu::PresentMode::Mailbox
             && !surface_state.present_modes.contains(&wgpu::PresentMode::Mailbox)
@@ -192,7 +195,16 @@ impl Painter {
             return Ok(());
         };
 
-        let surface = self.instance.create_surface(Arc::clone(window))?;
+        let surface = match self.instance.create_surface(Arc::clone(window)) {
+            Ok(surface) => surface,
+            Err(err) => {
+                let mut old_state = old_state;
+                old_state.needs_recreate = true;
+                self.surfaces.insert(viewport_id, old_state);
+                self.context.request_repaint_of(viewport_id);
+                return Err(err.into());
+            }
+        };
         self.install_surface(
             surface,
             viewport_id,
@@ -597,6 +609,9 @@ impl Painter {
         let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
             return vsync_sec;
         };
+        if surface_state.width == 0 || surface_state.height == 0 {
+            return vsync_sec;
+        }
 
         let mut encoder =
             render_state

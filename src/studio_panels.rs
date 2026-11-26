@@ -129,9 +129,19 @@ impl Editor {
     }
 
     /// The place's avatar type (StarterPlayer.GameSettingsAvatar), Studio's default R15.
+    fn avatar_body_rules(&self) -> Option<Ref> {
+        let root = self.game.doc.dom.root_ref();
+        let settings = self.game.doc.find_child(root, "AvatarSettings")?;
+        self.game.doc.find_child(settings, "AvatarBodyRules")
+    }
+
     pub fn avatar_type(&self) -> u32 {
         self.starter_player()
             .and_then(|sp| rustudio_render::scene::enum_u32(self.game.doc.prop(sp, "GameSettingsAvatar")))
+            .or_else(|| {
+                self.avatar_body_rules()
+                    .and_then(|b| rustudio_render::scene::enum_u32(self.game.doc.prop(b, "AvatarType")))
+            })
             .unwrap_or(1)
     }
 
@@ -145,7 +155,10 @@ impl Editor {
             return;
         }
         if let Some(sp) = self.starter_player() {
-            let edit = vec![(sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v)))];
+            let mut edit = vec![(sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v)))];
+            if let Some(rules) = self.avatar_body_rules() {
+                edit.push((rules, rbx_dom_weak::ustr("AvatarType"), Variant::Enum(Enum::from_u32(v))));
+            }
             self.game.doc.set_props("Avatar Type", edit, None);
         }
     }

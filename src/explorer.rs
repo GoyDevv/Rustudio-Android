@@ -457,7 +457,8 @@ impl Editor {
         } else if resp.hovered() || drop.is_some() {
             painter.rect_filled(rect, 0.0, theme::HOVER_BG);
         }
-        let x0 = rect.min.x + 4.0 + depth as f32 * INDENT;
+        let left_pad = if cfg!(target_os = "android") { 8.0 } else { 4.0 };
+        let x0 = rect.min.x + left_pad + depth as f32 * INDENT;
         match drop {
             Some(Drop::Into) => {
                 painter.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Inside);
@@ -543,7 +544,8 @@ impl Editor {
             return;
         }
         if resp.clicked() {
-            let on_tri = has_children && resp.interact_pointer_pos().is_some_and(|p| tri_rect.expand(3.0).contains(p));
+            let tri_pad = if cfg!(target_os = "android") { 6.0 } else { 3.0 };
+            let on_tri = has_children && resp.interact_pointer_pos().is_some_and(|p| tri_rect.expand(tri_pad).contains(p));
             if on_tri {
                 actions.push(RowAction::Toggle(r));
             } else {

@@ -228,6 +228,12 @@ impl Keyboard {
     /// into, the view slid up by the keyboard's height behind it.
     pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, textbox: bool, game_box: bool) {
         CHANGED.store(false, Ordering::Relaxed);
+        if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false))) {
+            self.shown = false;
+            self.unwanted_since = None;
+            self.up_for = None;
+            self.zero_since = None;
+        }
         let want = wanted(ctx, textbox);
         if let Some(w) = want {
             // (a focused egui field comes first in `wanted`: the game's
@@ -337,6 +343,7 @@ impl Keyboard {
             Want::Field(id) => ctx.memory_mut(|m| m.surrender_focus(id)),
             Want::TextBox => release_textbox(),
         }
+        self.shown = false;
         self.up_for = None;
         self.zero_since = None;
         self.set_height(0);

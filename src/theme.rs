@@ -78,8 +78,8 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     s.tab.hovered.bg_fill = HOVER_BG;
     s.tab.tab_body.bg_fill = PANEL;
     s.tab.tab_body.inner_margin = egui::Margin::same(4);
-    s.separator.width = if cfg!(target_os = "android") { 6.0 } else { 2.0 };
-    s.separator.extra_interact_width = if cfg!(target_os = "android") { 16.0 } else { 8.0 };
+    s.separator.width = if cfg!(target_os = "android") { 8.0 } else { 2.0 };
+    s.separator.extra_interact_width = if cfg!(target_os = "android") { 6.0 } else { 8.0 };
     s.separator.color_idle = DIVIDER;
     s.separator.color_hovered = ACCENT;
     s.separator.color_dragged = SELECT;

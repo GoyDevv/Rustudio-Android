@@ -9,6 +9,8 @@ icon: ../../assets/icons/rustudio-512.png
 android:
   manifest:
     package: com.logosforgestudios.rustudio
+    version_name: "v1.0.4r1"
+    version_code: 16842757
     sdk:
       # API 26: VibrationEffect (HapticService); 28: DisplayCutout
       # (ScreenGui.ScreenInsets); 30: WindowInsets.Type.ime (the keyboard's
@@ -26,6 +28,8 @@ android:
       # while the editor runs brings the editor's task to the front
       # (src/android/intent.rs). A normal permission, granted at install.
       - name: android.permission.REORDER_TASKS
+      # In-app APK updater (PackageInstaller session + unknown-sources prompt).
+      - name: android.permission.REQUEST_INSTALL_PACKAGES
       # The in-app file picker (src/android/storage.rs) listing shared
       # storage (Download, Documents, …) for places and models. NativeActivity
       # gets no onActivityResult, so the system document picker (Storage

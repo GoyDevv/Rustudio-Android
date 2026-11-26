@@ -211,8 +211,11 @@ impl Updater {
                                     }
                                     Stage::Installed(r) => {
                                         if cfg!(target_os = "android") {
-                                            if ui.add(primary("Open Release")).clicked() {
-                                                ctx.open_url(egui::OpenUrl::new_tab(&r.page));
+                                            if ui.add(primary("Install again")).clicked() {
+                                                #[cfg(target_os = "android")]
+                                                if let Some(apk) = INSTALLED_EXE.lock().unwrap().clone() {
+                                                    let _ = crate::android::jni::install_apk(&apk);
+                                                }
                                             }
                                             if ui.add(secondary("Close")).clicked() {
                                                 close = true;
@@ -327,7 +330,19 @@ fn version_of(tag: &str) -> Option<Version> {
     let tag = tag.split('+').next()?;
     let (core, pre) = match tag.split_once('-') {
         Some((core, pre)) => (core, Some(pre)),
-        None => (tag, None),
+        None => {
+            // Also support compact revision tags like `v1.0.4r1` without a hyphen.
+            if let Some(pos) = tag.rfind(|c: char| c == 'r' || c == 'R') {
+                let (head, tail) = tag.split_at(pos);
+                if tail.len() > 1 && tail[1..].chars().all(|c| c.is_ascii_digit()) {
+                    (head, Some(tail))
+                } else {
+                    (tag, None)
+                }
+            } else {
+                (tag, None)
+            }
+        }
     };
     let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
     let core = [it.next()??, it.next()??, it.next()??];
@@ -343,6 +358,7 @@ fn version_of(tag: &str) -> Option<Version> {
             let stage = match name {
                 "beta" => 1,
                 "rc" => 2,
+                "r" | "rev" => 4,
                 _ => 0,
             };
             (stage, number)
@@ -372,7 +388,7 @@ fn check() -> Result<Option<Release>, String> {
     };
     // A feed that does list a pre-release (RUSTUDIO_UPDATE_URL) offers it
     // only to someone already on a pre-release.
-    let stable = ours.pre == (3, 0);
+    let stable = ours.pre.0 >= 3;
     if latest <= ours || (stable && feed["prerelease"].as_bool() == Some(true)) {
         return Ok(None);
     }
@@ -388,7 +404,6 @@ fn check() -> Result<Option<Release>, String> {
         assets
             .iter()
             .find(|(n, _)| n.to_ascii_lowercase().ends_with(".apk"))
-            .or_else(|| assets.iter().find(|(n, _)| n.to_ascii_lowercase().contains("bundle") && n.to_ascii_lowercase().ends_with(".zip")))
             .cloned()
     } else {
         asset_suffix().and_then(|suf| assets.iter().find(|(n, _)| n.ends_with(suf)).cloned())
@@ -465,11 +480,18 @@ fn remove_leftovers() {
 
 #[cfg(target_os = "android")]
 fn install(r: &Release, progress: &Progress) -> Result<PathBuf, String> {
-    let (name, url) = r.asset.as_ref().ok_or("No Android APK asset found in this release")?;
+    let (_name, url) = r.asset.as_ref().ok_or("No Android APK asset found in this release")?;
     let bytes = download(url, progress)?;
-    let saved = crate::android::crash_export::save_to_downloads_android(name, &bytes)
-        .map_err(|e| format!("Failed to save update to Downloads: {e}"))?;
-    Ok(PathBuf::from(saved))
+    let cache = crate::android::cache_dir();
+    let _ = std::fs::create_dir_all(&cache);
+    let apk_path = cache.join("rustudio-update.apk");
+    std::fs::write(&apk_path, &bytes).map_err(|e| format!("Failed to write update APK: {e}"))?;
+    let status = crate::android::jni::install_apk(&apk_path)
+        .map_err(|e| format!("Failed to launch Android installer: {e}"))?;
+    if let Some(err) = status.strip_prefix("error:") {
+        return Err(format!("Installer failed: {err}"));
+    }
+    Ok(apk_path)
 }
 
 #[cfg(not(target_os = "android"))]

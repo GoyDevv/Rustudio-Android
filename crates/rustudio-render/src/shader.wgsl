@@ -58,7 +58,11 @@ struct Light {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+//#if STORAGE_LIGHTS
 @group(0) @binding(1) var<storage, read> lights: array<Light>;
+//#else
+@group(0) @binding(1) var<uniform> lights: array<Light, 64>;
+//#endif
 @group(0) @binding(2) var sky_tex: texture_cube<f32>;
 @group(0) @binding(3) var sky_sampler: sampler;
 // The sun's shadow cascades (sun_shadow.rs): EVSM moments, four tiles.
@@ -76,7 +80,9 @@ struct ShadowSlot {
 @group(0) @binding(15) var lshadow_tex: texture_2d<f32>;
 //#endif
 @group(0) @binding(16) var lshadow_sampler: sampler;
+//#if FULL_BINDINGS
 @group(0) @binding(17) var<storage, read> lshadow_slots: array<ShadowSlot>;
+//#endif
 @group(0) @binding(20) var localgrid_tex: texture_3d<f32>;
 @group(0) @binding(12) var lightocc_tex: texture_3d<f32>;
 // The scene environment probe (env_probe.rs): PrefilteredEnvIndoorTexture

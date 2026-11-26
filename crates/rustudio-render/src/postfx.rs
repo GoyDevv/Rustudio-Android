@@ -329,6 +329,7 @@ struct PostFxTargets {
 
 pub struct PostFx {
     hdr_format: wgpu::TextureFormat,
+    r16_format: wgpu::TextureFormat,
     ubo_stride: u32,
     ubo_capacity_slots: usize,
     ubo: wgpu::Buffer,
@@ -373,6 +374,7 @@ impl PostFx {
         queue: &wgpu::Queue,
         hdr_format: wgpu::TextureFormat,
         display_format: wgpu::TextureFormat,
+        r16_float_rt: bool,
     ) -> Self {
         let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
         let ubo_stride = ((std::mem::size_of::<PostFxUniform>() as u32).div_ceil(align)) * align;
@@ -649,7 +651,7 @@ impl PostFx {
         let blur_1d = make_pipe("postfx blur 1d", "fs_blur_1d", hdr_format, None);
         let dof_cheap = make_pipe("postfx dof cheap", "fs_dof_cheap", hdr_format, None);
         let dof_down_v = make_pipe("postfx dof down v", "fs_dof_down_v", hdr_format, None);
-        let r16_fmt = if hdr_format == wgpu::TextureFormat::Rgba8Unorm {
+        let r16_fmt = if !r16_float_rt || hdr_format == wgpu::TextureFormat::Rgba8Unorm {
             wgpu::TextureFormat::Rgba8Unorm
         } else {
             wgpu::TextureFormat::R16Float
@@ -670,6 +672,7 @@ impl PostFx {
 
         Self {
             hdr_format,
+            r16_format: r16_fmt,
             ubo_stride,
             ubo_capacity_slots: INITIAL_UBO_SLOTS,
             ubo,
@@ -754,7 +757,7 @@ impl PostFx {
             })
         };
         self.depth_pipes[slot] = Some(DepthPipelines {
-            sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", if self.hdr_format == wgpu::TextureFormat::Rgba8Unorm { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R16Float }),
+            sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", self.r16_format),
             dof_cheap_prep: make("postfx dof cheap prep", "fs_dof_cheap_prep", self.hdr_format),
             dof_far_down_h: make("postfx dof far down h", "fs_dof_far_down_h", self.hdr_format),
             dof_near_down_h: make("postfx dof near down h", "fs_dof_near_down_h", self.hdr_format),
@@ -837,7 +840,7 @@ impl PostFx {
         let half_size = [((w + (w & 1)) / 2).max(1), ((h + (h & 1)) / 2).max(1)];
         let quarter_dof_size = [((w + (w & 1)) / 4).max(1), ((h + (h & 1)) / 4).max(1)];
         let quarter_size = [(w >> 2).max(1), (h >> 2).max(1)];
-        let r16 = if self.hdr_format == wgpu::TextureFormat::Rgba8Unorm { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R16Float };
+        let r16 = self.r16_format;
 
         let depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("postfx depth"),

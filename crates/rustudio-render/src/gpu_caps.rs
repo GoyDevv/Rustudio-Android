@@ -66,13 +66,11 @@ impl GpuCaps {
                         | wgpu::TextureFormatFeatureFlags::BLENDABLE,
                 )
         };
-        if caps.backend == wgpu::Backend::Gl {
-            let pvr = is_powervr_gl(&device.adapter_info());
-            caps.hdr_float_rt = !pvr && float_rt_ok(wgpu::TextureFormat::Rgba16Float);
-            caps.r16_float_rt = !pvr
-                && float_rt_ok(wgpu::TextureFormat::R16Float)
-                && float_rt_ok(wgpu::TextureFormat::Rg16Float);
-        }
+        let pvr = is_powervr_gl(&device.adapter_info());
+        caps.hdr_float_rt = !pvr && float_rt_ok(wgpu::TextureFormat::Rgba16Float);
+        caps.r16_float_rt = !pvr
+            && float_rt_ok(wgpu::TextureFormat::R16Float)
+            && float_rt_ok(wgpu::TextureFormat::Rg16Float);
         caps
     }
 
@@ -120,6 +118,12 @@ impl GpuCaps {
     /// 4x-only HBAO.
     pub fn sampled_msaa(&self) -> bool {
         self.backend != wgpu::Backend::Gl
+    }
+
+    /// True when fragment/vertex stages support read-only storage buffers
+    /// (GLES 3.0 and some ES 3.1/3.2 drivers report 0).
+    pub fn storage_lights(&self) -> bool {
+        self.limits.max_storage_buffers_per_shader_stage > 0
     }
 
     /// Compute shaders (skinning, HBAO, light grid builds).

@@ -937,7 +937,9 @@ impl Editor {
         }
         drop(vp_prepare);
         let painter = ui.painter_at(rect);
-        crate::arm_3d_renderer_probe();
+        if self.game.renderer.as_ref().is_none_or(|r| r.caps().backend == egui_wgpu::wgpu::Backend::Vulkan) {
+            crate::arm_3d_renderer_probe();
+        }
         self.game.draw_world(&ctx, &painter, rect, lines, &overlay, self.harness.run.started);
         if self.game.viewport_drawn {
             crate::note_3d_renderer_frame_ok();

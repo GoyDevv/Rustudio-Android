@@ -305,6 +305,7 @@ pub struct CloudsGpu {
     started: Instant,
     last: Instant,
     offset: Vec3,
+    f16: wgpu::TextureFormat,
     /// The sun cover read back: 0 idle, 1 copy recorded (map after submit), 2 mapping.
     readback: u8,
     mapped: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -473,6 +474,7 @@ impl CloudsGpu {
             started: rustudio_core::sim_clock::now(),
             last: rustudio_core::sim_clock::now(),
             offset: Vec3::ZERO,
+            f16,
             readback: 0,
             mapped: Default::default(),
             target: 1.0,
@@ -522,7 +524,7 @@ impl CloudsGpu {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: if crate::gpu_caps::is_powervr_gl(&device.adapter_info()) { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::Rgba16Float },
+                    format: self.f16,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 })

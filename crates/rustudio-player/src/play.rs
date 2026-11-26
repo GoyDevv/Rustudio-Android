@@ -2725,6 +2725,12 @@ impl Game {
         self.doc
             .find_child(root, "StarterPlayer")
             .and_then(|sp| rustudio_render::scene::enum_u32(self.doc.prop(sp, "GameSettingsAvatar")))
+            .or_else(|| {
+                self.doc
+                    .find_child(root, "AvatarSettings")
+                    .and_then(|s| self.doc.find_child(s, "AvatarBodyRules"))
+                    .and_then(|b| rustudio_render::scene::enum_u32(self.doc.prop(b, "AvatarType")))
+            })
             .and_then(|v| match v {
                 0 => Some(RigType::R6),
                 1 => Some(RigType::R15),
