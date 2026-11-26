@@ -75,7 +75,7 @@ end
 -------------------------------------------------------- descendant tracking
 -- Instances this domain keeps up with (StyleLinks, input contexts, prompts,
 -- haptic effects), found once and then through DescendantAdded.
-local tracked = { StyleLink = {}, InputContext = {}, ProximityPrompt = {}, HapticEffect = {}, Adorn = {} }
+local tracked = { StyleLink = {}, InputContext = {}, ProximityPrompt = {}, HapticEffect = {}, UIPageLayout = {}, Adorn = {} }
 local tracking = false
 local styles_dirty = true
 local style_recheck_frames = 0
@@ -102,7 +102,7 @@ local function start_tracking()
     tracking = true
     local classes = G.is_edit()
         and { "StyleLink", "HandleAdornment", "HandlesBase" }
-        or { "StyleLink", "InputContext", "ProximityPrompt", "HapticEffect", "HandleAdornment", "HandlesBase" }
+        or { "StyleLink", "InputContext", "ProximityPrompt", "HapticEffect", "UIPageLayout", "HandleAdornment", "HandlesBase" }
     for _, d in G.find_classes(classes) do track(d) end
     -- Natively filtered DescendantAdded / Removing: no Lua call per instance.
     local added, removing = G.class_signals(classes)
@@ -1243,6 +1243,10 @@ local function drag_step(kind, x, y)
         local dd = detector_of(o)
         drag.dd = dd
         if dd then
+            local ok_du, bdu = pcall(function() return dd.DragUDim2 end)
+            local ok_dr, bdr = pcall(function() return dd.DragRotation end)
+            drag.base_du = (ok_du and typeof(bdu) == "UDim2") and bdu or UDim2.new()
+            drag.base_rot = (ok_dr and type(bdr) == "number") and bdr or 0
             fire(dd, "DragStart", Vector2.new(x, y))
         elseif o.Draggable then
             fire(o, "DragBegin", o.Position)
@@ -1254,6 +1258,9 @@ local function drag_step(kind, x, y)
     local dx, dy = x - drag.x0, y - drag.y0
     if dd then
         local style = dd.DragStyle
+        local rs = dd.ResponseStyle
+        local ok_rel, rel = pcall(function() return dd.DragRelativity end)
+        local is_relative = ok_rel and rel == Enum.UIDragDetectorDragRelativity.Relative
         local du, rot = UDim2.fromOffset(dx, dy), 0
         if style == Enum.UIDragDetectorDragStyle.TranslateLine then
             local axis = dd.DragAxis
@@ -1273,22 +1280,53 @@ local function drag_step(kind, x, y)
             elseif ok and type(r) == "number" then rot = r - drag.start_rot du = UDim2.new() end
         end
         if style == Enum.UIDragDetectorDragStyle.Rotate or (style == Enum.UIDragDetectorDragStyle.Scriptable and rot ~= 0) then
+            if style ~= Enum.UIDragDetectorDragStyle.Scriptable and not is_relative then
+                rot = (drag.base_rot or 0) + rot
+            end
             rot = run_constraints(dd, rot)
+            local ok_min_a, min_a = pcall(function() return dd.MinDragAngle end)
+            local ok_max_a, max_a = pcall(function() return dd.MaxDragAngle end)
+            if ok_min_a and ok_max_a and type(min_a) == "number" and type(max_a) == "number" and min_a < max_a then
+                rot = math.clamp(rot, min_a, max_a)
+            end
             pcall(function() dd.DragRotation = rot end)
         else
-            if dd.ResponseStyle == Enum.UIDragDetectorResponseStyle.Scale or dd.ResponseStyle == Enum.UIDragDetectorResponseStyle.CustomScale then
-                local ps = o.Parent:IsA("GuiBase2d") and o.Parent.AbsoluteSize or Vector2.one
-                du = UDim2.fromScale(du.X.Offset / math.max(ps.X, 1), du.Y.Offset / math.max(ps.Y, 1))
+            local use_scale = rs == Enum.UIDragDetectorResponseStyle.Scale or rs == Enum.UIDragDetectorResponseStyle.CustomScale
+            local ps = o.Parent:IsA("GuiBase2d") and o.Parent.AbsoluteSize or Vector2.one
+            local pw, ph = math.max(ps.X, 1), math.max(ps.Y, 1)
+            if use_scale then
+                du = UDim2.fromScale(du.X.Offset / pw, du.Y.Offset / ph)
+            end
+            if style ~= Enum.UIDragDetectorDragStyle.Scriptable and not is_relative then
+                du = (drag.base_du or UDim2.new()) + du
             end
             du = run_constraints(dd, du)
+            local ok_min_t, min_t = pcall(function() return dd.MinDragTranslation end)
+            local ok_max_t, max_t = pcall(function() return dd.MaxDragTranslation end)
+            if ok_min_t and ok_max_t and typeof(min_t) == "UDim2" and typeof(max_t) == "UDim2" then
+                local min_x = min_t.X.Scale * pw + min_t.X.Offset
+                local max_x = max_t.X.Scale * pw + max_t.X.Offset
+                local min_y = min_t.Y.Scale * ph + min_t.Y.Offset
+                local max_y = max_t.Y.Scale * ph + max_t.Y.Offset
+                local cur_x = du.X.Scale * pw + du.X.Offset
+                local cur_y = du.Y.Scale * ph + du.Y.Offset
+                local cx = if min_x < max_x then math.clamp(cur_x, min_x, max_x) else cur_x
+                local cy = if min_y < max_y then math.clamp(cur_y, min_y, max_y) else cur_y
+                if cx ~= cur_x or cy ~= cur_y then
+                    local ux = if cx ~= cur_x then (if use_scale then UDim.new(cx / pw, 0) else UDim.new(0, cx)) else du.X
+                    local uy = if cy ~= cur_y then (if use_scale then UDim.new(cy / ph, 0) else UDim.new(0, cy)) else du.Y
+                    du = UDim2.new(ux, uy)
+                end
+            end
             pcall(function() dd.DragUDim2 = du end)
         end
-        local rs = dd.ResponseStyle
         if rs == Enum.UIDragDetectorResponseStyle.Offset or rs == Enum.UIDragDetectorResponseStyle.Scale then
             if style == Enum.UIDragDetectorDragStyle.Rotate then
-                o.Rotation = drag.start_rot + rot
+                local delta_rot = if is_relative or style == Enum.UIDragDetectorDragStyle.Scriptable then rot else rot - (drag.base_rot or 0)
+                o.Rotation = drag.start_rot + delta_rot
             else
-                local np = drag.start_pos + du
+                local delta_u = if is_relative or style == Enum.UIDragDetectorDragStyle.Scriptable then du else du - (drag.base_du or UDim2.new())
+                local np = drag.start_pos + delta_u
                 local b = dd.BoundingUI
                 if b and b:IsA("GuiObject") then
                     -- Keep the object inside the bounding object.
@@ -1824,24 +1862,45 @@ local style_targets = {} -- inst → { prop → value } last applied
 local style_overridden = setmetatable({}, { __mode = "k" }) -- inst → { prop → last script override }
 local step_styles_defaults = {} -- ClassName → { _inst, prop → { default } }
 local function resolve_token(v, sheets)
-    if type(v) == "string" and v:sub(1, 1) == "$" then
-        local name = v:sub(2)
-        for _, s in sheets do
-            local a = s:GetAttribute(name)
-            if a ~= nil then return a end
+    local cur = v
+    for _ = 1, 8 do
+        if type(cur) ~= "string" or cur:sub(1, 1) ~= "$" then
+            return cur
         end
+        local name = cur:sub(2)
+        local found = nil
+        for i = #sheets, 1, -1 do
+            local a = sheets[i]:GetAttribute(name)
+            if a ~= nil then
+                found = a
+                break
+            end
+        end
+        if found == nil then return nil end
+        cur = found
+    end
+    if type(cur) == "string" and cur:sub(1, 1) == "$" then
         return nil
     end
-    return v
+    return cur
 end
 local function collect_rules(sheet, out, sheets_out, seen)
     if seen[sheet] then return end
     seen[sheet] = true
-    table.insert(sheets_out, sheet)
     for _, d in sheet_derives[sheet] or {} do collect_rules(d, out, sheets_out, seen) end
-    for _, d in sheet:GetChildren() do
-        if d:IsA("StyleDerive") and d.StyleSheet then collect_rules(d.StyleSheet, out, sheets_out, seen) end
+    local derives = {}
+    for i, d in sheet:GetChildren() do
+        if d:IsA("StyleDerive") and d.StyleSheet then
+            local ok_p, prio = pcall(function() return d.Priority end)
+            table.insert(derives, { sheet = d.StyleSheet, prio = (ok_p and tonumber(prio)) or 0, idx = i })
+        end
     end
+    table.sort(derives, function(a, b)
+        if a.prio ~= b.prio then return a.prio < b.prio end
+        return a.idx < b.idx
+    end)
+    for _, d in derives do collect_rules(d.sheet, out, sheets_out, seen) end
+    table.insert(sheets_out, sheet)
     local function add(base, parent_rule, depth)
         for _, r in rules_of(base) do
             table.insert(out, { rule = r, parent = parent_rule, depth = depth })
@@ -2294,7 +2353,7 @@ methods["ParticleEmitter2D.Clear"] = function(self) G.p2d(self, 0) end
 -- starts at its type's zero; Bool actions fire Pressed / Released, every
 -- change fires StateChanged(state).
 local action_state = setmetatable({}, { __mode = "k" })
-local action_type = setmetatable({}, { __mode = "k" })
+local binding_pressed = setmetatable({}, { __mode = "k" })
 local function zero_of(t)
     if t == Enum.InputActionType.Bool then return false end
     if t == Enum.InputActionType.Direction1D then return 0 end
@@ -2416,7 +2475,27 @@ local function binding_value(a, b)
         -- UIButton: "a GuiButton press/release" (create.roblox.com/docs/input/
         -- input-action-system). UIModifier as a second button held with it,
         -- like PrimaryModifier for keys, is an estimate (the docs don't say).
-        return (h(b.KeyCode) and mods_ok(b)) or (h(b.UIButton) and (b.UIModifier == nil or h(b.UIModifier)))
+        if (h(b.KeyCode) and mods_ok(b)) or (h(b.UIButton) and (b.UIModifier == nil or h(b.UIModifier))) then
+            return true
+        end
+        local stick = sticks[b.KeyCode]
+        if stick and mods_ok(b) then
+            local mag = stick.Magnitude * math.abs(s)
+            local ok_pt, pt = pcall(function() return b.PressedThreshold end)
+            local ok_rt, rt = pcall(function() return b.ReleasedThreshold end)
+            pt = (ok_pt and tonumber(pt)) or 0
+            rt = (ok_rt and tonumber(rt)) or 0
+            local was = binding_pressed[b] == true
+            local now
+            if was then
+                now = if rt > 0 then mag > rt else (if pt > 0 then mag >= pt else mag > 0)
+            else
+                now = if pt > 0 then mag >= pt else mag > 0
+            end
+            binding_pressed[b] = now or nil
+            return now
+        end
+        return false
     elseif t == Enum.InputActionType.Direction1D then
         local v = 0
         if h(b.KeyCode) then v = 1 end
@@ -2485,7 +2564,7 @@ local function actions_input(key, down)
                     if b:IsA("InputBinding") and binding_uses(b, key) then
                         local value = keys_value(a)
                         if a.Type == Enum.InputActionType.Bool then
-                            value = value or touch_pressed(a)
+                            value = value or touch_pressed(a) or (analog[a] == true)
                         elseif analog[a] ~= nil then
                             value += analog[a]
                         end
@@ -2509,12 +2588,12 @@ local function gamepad_input(state, pad, key, x, y)
         values = {}
         pad_values[pad] = values
     end
-    if key == "Thumbstick1" or key == "Thumbstick2" then
+    if key == "Thumbstick1" or key == "Thumbstick2" or ((key == "ButtonL2" or key == "ButtonR2") and state == "Change") then
         local stick = Vector2.new(x, y)
         values[kc] = if stick == Vector2.zero then nil else stick
         local strongest = Vector2.zero
         for _, other in pad_values do
-            if other[kc] and other[kc].Magnitude > strongest.Magnitude then strongest = other[kc] end
+            if typeof(other[kc]) == "Vector2" and other[kc].Magnitude > strongest.Magnitude then strongest = other[kc] end
         end
         sticks[kc] = strongest
         actions_input(kc, false)
@@ -2524,6 +2603,7 @@ local function gamepad_input(state, pad, key, x, y)
         for _, other in pad_values do
             if other[kc] then down = true; break end
         end
+        if not down then sticks[kc] = nil end
         actions_input(kc, down)
     end
 end
@@ -2547,35 +2627,76 @@ local function viewport_pos(x, y)
 end
 local function analog_input(kind, x, y)
     local key = Enum.KeyCode[kind]
+    local ctxs = {}
     for c in tracked.InputContext do
-        if c.Enabled and c:IsDescendantOf(game) then
-            for _, a in c:GetChildren() do
-                if a:IsA("InputAction") and a.Enabled then
-                    for _, b in a:GetChildren() do
-                        if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable and b.KeyCode == key then
-                            local t = a.Type
-                            if kind == "MousePosition" then
-                                if t == Enum.InputActionType.ViewportPosition then set_state(a, viewport_pos(x, y)) end
-                            elseif t == Enum.InputActionType.Direction2D then
-                                analog[a] = (analog[a] or Vector2.zero) + Vector2.new(x, y) * b.Vector2Scale * b.Scale / frame_dt
-                                set_state(a, keys_value(a) + analog[a])
-                            elseif t == Enum.InputActionType.Direction1D then
-                                analog[a] = (analog[a] or 0) + x * b.Scale / frame_dt
-                                set_state(a, keys_value(a) + analog[a])
+        if c.Enabled and c:IsDescendantOf(game) then table.insert(ctxs, c) end
+    end
+    table.sort(ctxs, function(a, b) return a.Priority > b.Priority end)
+    for _, c in ctxs do
+        local took = false
+        for _, a in c:GetChildren() do
+            if a:IsA("InputAction") and a.Enabled then
+                for _, b in a:GetChildren() do
+                    if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable and b.KeyCode == key then
+                        local t = a.Type
+                        if kind == "MousePosition" then
+                            if t == Enum.InputActionType.ViewportPosition then
+                                set_state(a, viewport_pos(x, y))
+                                took = true
                             end
+                        elseif t == Enum.InputActionType.Bool then
+                            if mods_ok(b) then
+                                local mag = Vector2.new(x, y).Magnitude * math.abs(b.Scale)
+                                local ok_pt, pt = pcall(function() return b.PressedThreshold end)
+                                local ok_rt, rt = pcall(function() return b.ReleasedThreshold end)
+                                pt = (ok_pt and tonumber(pt)) or 0
+                                rt = (ok_rt and tonumber(rt)) or 0
+                                local was = binding_pressed[b] == true
+                                local now
+                                if was then
+                                    now = if rt > 0 then mag > rt else (if pt > 0 then mag >= pt else mag > 0)
+                                else
+                                    now = if pt > 0 then mag >= pt else mag > 0
+                                end
+                                binding_pressed[b] = now or nil
+                                analog[a] = (analog[a] == true) or now
+                                set_state(a, keys_value(a) or touch_pressed(a) or (analog[a] == true))
+                                took = true
+                            end
+                        elseif t == Enum.InputActionType.Direction2D then
+                            analog[a] = (analog[a] or Vector2.zero) + Vector2.new(x, y) * b.Vector2Scale * b.Scale / frame_dt
+                            set_state(a, keys_value(a) + analog[a])
+                            took = true
+                        elseif t == Enum.InputActionType.Direction1D then
+                            analog[a] = (analog[a] or 0) + x * b.Scale / frame_dt
+                            set_state(a, keys_value(a) + analog[a])
+                            took = true
                         end
                     end
                 end
             end
         end
+        if took and c.Sink then return true end
     end
+    return false
 end
 -- A new frame of input: last frame's analog input is over.
 local function analog_frame(dt)
     if type(dt) == "number" and dt > 0 then frame_dt = dt end
     for a in analog do
         analog[a] = nil
-        if a.Parent ~= nil then set_state(a, keys_value(a)) end
+        if a.Parent ~= nil then
+            if a.Type == Enum.InputActionType.Bool then
+                for _, b in a:GetChildren() do
+                    if b:IsA("InputBinding") and (b.KeyCode == Enum.KeyCode.MouseDelta or b.KeyCode == Enum.KeyCode.MouseWheel) then
+                        binding_pressed[b] = nil
+                    end
+                end
+                set_state(a, keys_value(a) or touch_pressed(a))
+            else
+                set_state(a, keys_value(a))
+            end
+        end
     end
 end
 -- Fingers (touch screens: the engine's touch events, after the GUI had
@@ -2679,10 +2800,26 @@ local function touch_update(a, b, moved, dx, dy)
         end
     end
 end
+local function page_layout_at(x, y)
+    local best, best_z = nil, -math.huge
+    for pl in tracked.UIPageLayout do
+        local p = pl.Parent
+        if p and p:IsA("GuiObject") and shown(p) and pl.TouchInputEnabled then
+            local ap, as = p.AbsolutePosition, p.AbsoluteSize
+            if x >= ap.X and x <= ap.X + as.X and y >= ap.Y and y <= ap.Y + as.Y then
+                local z = p.ZIndex or 0
+                if best == nil or z >= best_z then
+                    best, best_z = pl, z
+                end
+            end
+        end
+    end
+    return best
+end
 touch_input = function(state, id, x, y, dx, dy, gpe, began_on)
     if state == "Begin" then
         finger_seq += 1
-        local f = { x = x, y = y, began_on = {}, gpe = gpe == true, order = finger_seq, actions = {} }
+        local f = { x = x, y = y, x0 = x, y0 = y, began_on = {}, gpe = gpe == true, order = finger_seq, actions = {}, page_layout = page_layout_at(x, y) }
         for _, btn in began_on or {} do f.began_on[btn] = true end
         fingers[id] = f
         assign_finger(f)
@@ -2698,6 +2835,27 @@ touch_input = function(state, id, x, y, dx, dy, gpe, began_on)
         fingers[id] = nil
         f.x, f.y = x, y
         for a, b in f.actions do touch_update(a, b, nil, 0, 0) end
+        local pl = f.page_layout
+        if pl and pl.Parent and pl.TouchInputEnabled then
+            local sx, sy = x - f.x0, y - f.y0
+            if pl.FillDirection == Enum.FillDirection.Vertical then
+                if math.abs(sy) >= 24 and math.abs(sy) >= math.abs(sx) then
+                    if sy < 0 then
+                        methods["UIPageLayout.Next"](pl)
+                    else
+                        methods["UIPageLayout.Previous"](pl)
+                    end
+                end
+            else
+                if math.abs(sx) >= 24 and math.abs(sx) >= math.abs(sy) then
+                    if sx < 0 then
+                        methods["UIPageLayout.Next"](pl)
+                    else
+                        methods["UIPageLayout.Previous"](pl)
+                    end
+                end
+            end
+        end
     end
 end
 end
@@ -2768,6 +2926,27 @@ local function on_input(state, uit, key, x, y, z, gpe, dx, dy)
         -- (z is already the engine's 0.5 a notch: mech WHEEL_INPUT_PER_NOTCH.)
         if not gpe and (z or 0) ~= 0 then analog_input("MouseWheel", z, 0) end
     elseif uit:find("^Gamepad") then
+        if state == "Begin" and not gpe and (key == "ButtonL1" or key == "ButtonR1") then
+            local target, fallback = nil, {}
+            for pl in tracked.UIPageLayout do
+                local p = pl.Parent
+                if p and p:IsA("GuiObject") and shown(p) and pl.GamepadInputEnabled then
+                    if selected and (selected == p or selected:IsDescendantOf(p)) then
+                        target = pl
+                        break
+                    end
+                    table.insert(fallback, pl)
+                end
+            end
+            local list = if target then { target } else fallback
+            for _, pl in list do
+                if key == "ButtonR1" then
+                    methods["UIPageLayout.Next"](pl)
+                else
+                    methods["UIPageLayout.Previous"](pl)
+                end
+            end
+        end
         if not gpe then gamepad_input(state, uit, key, x, y) end
         last_device = "Gamepad"
     end

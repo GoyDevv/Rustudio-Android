@@ -185,10 +185,16 @@ impl State {
                 x = x.map(|s| (s * k).tanh() / k.tanh());
             }
             "TremoloSoundEffect" => {
-                self.phase = (self.phase + v(0, 5.) / RATE as f32).fract();
-                let g = 1.
-                    - v(1, 1.).clamp(0., 1.)
-                        * (0.5 + 0.5 * (self.phase * std::f32::consts::TAU).sin());
+                self.phase = (self.phase + v(0, 5.).max(0.) / RATE as f32).fract();
+                let depth = v(1, 1.).clamp(0., 1.);
+                let duty = v(2, 0.5).clamp(0.05, 0.95);
+                let warped = if self.phase < duty {
+                    0.5 * (self.phase / duty)
+                } else {
+                    0.5 + 0.5 * ((self.phase - duty) / (1. - duty))
+                };
+                let lfo = 0.5 - 0.5 * (warped * std::f32::consts::TAU).sin();
+                let g = 1. - depth * lfo;
                 x = x.map(|s| s * g);
             }
             _ => {}
@@ -380,5 +386,24 @@ mod tests {
             energy += y[0] * y[0];
         }
         assert!(energy > 0.01);
+    }
+    #[test]
+    fn audio_tremolo_duty_shapes_lfo() {
+        let mut low_duty = State::new(Effect {
+            id: 1,
+            kind: "TremoloSoundEffect".into(),
+            p: vec![5., 1., 0.1],
+        });
+        let mut high_duty = State::new(Effect {
+            id: 2,
+            kind: "TremoloSoundEffect".into(),
+            p: vec![5., 1., 0.9],
+        });
+        let (mut sum_low, mut sum_high) = (0.0f64, 0.0f64);
+        for _ in 0..RATE {
+            sum_low += low_duty.process([1.; 2])[0] as f64;
+            sum_high += high_duty.process([1.; 2])[0] as f64;
+        }
+        assert!(sum_high > sum_low * 1.4, "high duty ({sum_high}) should exceed low duty ({sum_low})");
     }
 }

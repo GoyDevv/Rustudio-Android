@@ -28,6 +28,8 @@ pub const ERROR: Color32 = Color32::from_rgb(231, 87, 80);
 pub const INFO: Color32 = Color32::from_rgb(143, 180, 255);
 pub const SERVER_BAR: Color32 = Color32::from_rgb(0, 204, 103);
 pub const CLIENT_BAR: Color32 = Color32::from_rgb(52, 154, 213);
+const LINK_COLOR: Color32 = Color32::from_rgb(130, 185, 255);
+const DUP_BADGE_BG: Color32 = Color32::from_rgb(72, 92, 128);
 const LINE_H: f32 = 15.0;
 
 /// Studio Settings > Output > Output Font: its size (10 pt = 13 px, with
@@ -66,6 +68,27 @@ pub struct Shown<'a> {
     pub message: &'a str,
     /// "Script:line" (the last part of the source path), when there is one.
     pub source: Option<String>,
+    /// Full `(script_path, line)` when known, used for click-to-jump.
+    pub source_full: Option<(String, u32)>,
+}
+
+/// A clickable script reference span in a rendered output line (char offsets).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptLink {
+    pub start_char: usize,
+    pub end_char: usize,
+    pub script: String,
+    pub line: u32,
+}
+
+fn parse_path_line(loc: &str) -> Option<(String, u32)> {
+    let (path, line_str) = loc.rsplit_once(':')?;
+    let path = path.trim();
+    if path.is_empty() || !line_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let line: u32 = line_str.parse().ok()?;
+    (line >= 1).then(|| (path.to_string(), line))
 }
 
 fn short_loc(loc: &str) -> String {
@@ -79,6 +102,102 @@ fn short_loc(loc: &str) -> String {
         Some(n) => format!("{short}:{n}"),
         None => short.to_string(),
     }
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_valid_script_path(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.split('.').all(|seg| {
+        let b = seg.as_bytes();
+        !b.is_empty() && is_ident_start(b[0]) && b.iter().all(|&c| is_ident_char(c))
+    })
+}
+
+/// Scans `text` for clickable `ScriptName:Line`, `Path.To.Script:Line`, and
+/// `Script 'Path.To.Script', Line N` references, returning spans as
+/// `(byte_start, byte_end, script_path, line)`.
+fn scan_script_refs_bytes(text: &str) -> Vec<(usize, usize, String, u32)> {
+    let mut out: Vec<(usize, usize, String, u32)> = Vec::new();
+    let bytes = text.as_bytes();
+
+    // Pattern 1: `'Path.To.Script', Line 123` (Roblox stack frames)
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if let Some(rel_end) = text[i + 1..].find('\'') {
+                let q_end = i + 1 + rel_end;
+                let path = &text[i + 1..q_end];
+                let after = &text[q_end + 1..];
+                if let Some(rest) = after.strip_prefix(", Line ") {
+                    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+                    if digits_len > 0 && !path.is_empty() {
+                        if let Ok(line) = rest[..digits_len].parse::<u32>() {
+                            if line >= 1 {
+                                let span_end = q_end + 1 + ", Line ".len() + digits_len;
+                                out.push((i, span_end, path.to_string(), line));
+                                i = span_end;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Pattern 2: `Path.To.Script:Line` or `ScriptName:Line`
+    let mut colon = 0;
+    while colon < bytes.len() {
+        if bytes[colon] == b':' {
+            // Digits immediately after ':'
+            let mut end = colon + 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let valid_after = end > colon + 1
+                && !(end < bytes.len() && bytes[end] == b':' && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit()))
+                && !bytes.get(end).is_some_and(|&b| is_ident_char(b));
+            if valid_after {
+                // Walk backwards across identifier segments separated by '.'
+                let mut start = colon;
+                while start > 0 && (is_ident_char(bytes[start - 1]) || bytes[start - 1] == b'.') {
+                    start -= 1;
+                }
+                // Trim leading dots
+                while start < colon && bytes[start] == b'.' {
+                    start += 1;
+                }
+                let boundary_ok = start == 0 || !matches!(bytes[start - 1], b'/' | b':');
+                let candidate = &text[start..colon];
+                if boundary_ok && is_valid_script_path(candidate) {
+                    if let Ok(line) = text[colon + 1..end].parse::<u32>() {
+                        if line >= 1 {
+                            let overlaps = out.iter().any(|(a, b, _, _)| start < *b && end > *a);
+                            if !overlaps {
+                                out.push((start, end, candidate.to_string(), line));
+                            }
+                        }
+                    }
+                }
+                colon = end;
+                continue;
+            }
+        }
+        colon += 1;
+    }
+
+    out.sort_by_key(|(a, _, _, _)| *a);
+    out
 }
 
 pub fn parse(l: &LogLine) -> Shown<'_> {
@@ -97,14 +216,17 @@ pub fn parse(l: &LogLine) -> Shown<'_> {
         Some(rest) => (rest, true),
         None => (t, false),
     };
-    let (message, source) = match t.rsplit_once("  —  ") {
-        Some((m, loc)) => (m, Some(short_loc(loc))),
+    let (message, source, source_full) = match t.rsplit_once("  —  ") {
+        Some((m, loc)) => (m, Some(short_loc(loc)), parse_path_line(loc)),
         // An error names its script in front: "Full.Name:3: boom - Name:3".
-        None if l.level == Level::Error => (t, error_origin(t).map(|(p, n)| short_loc(&format!("{p}:{n}")))),
-        None => (t, None),
+        None if l.level == Level::Error => match error_origin(t) {
+            Some((p, n)) => (t, Some(short_loc(&format!("{p}:{n}"))), Some((p.to_string(), n))),
+            None => (t, None, None),
+        },
+        None => (t, None, None),
     };
     if stack {
-        return Shown { kind: Kind::Info, context: Context::None, message, source };
+        return Shown { kind: Kind::Info, context: Context::None, message, source, source_full };
     }
     // Script output (from a side, or with a source) prints in the normal
     // colour; rustudio's own lines are Studio's blue info lines.
@@ -114,7 +236,7 @@ pub fn parse(l: &LogLine) -> Shown<'_> {
         Level::Info if context != Context::None || source.is_some() => Kind::Print,
         Level::Info => Kind::Info,
     };
-    Shown { kind, context, message, source }
+    Shown { kind, context, message, source, source_full }
 }
 
 /// The run of same-kind characters (word chars, spaces, or one other mark)
@@ -219,6 +341,8 @@ pub struct OutputState {
     pub show_timestamp: bool,
     pub show_context: bool,
     pub show_source: bool,
+    pub collapse_duplicates: bool,
+    pub pending_jump: Option<(String, u32)>,
     pub sel: OutputSelection,
     rows: OutputRows,
     pub(crate) log_generation: u64,
@@ -226,9 +350,10 @@ pub struct OutputState {
 
 #[derive(Default)]
 struct OutputRows {
-    filter: Option<(MessageFilter, ContextFilter, String)>,
+    filter: Option<(MessageFilter, ContextFilter, String, bool)>,
     indexed: usize,
     shown: Vec<usize>,
+    counts: Vec<usize>,
     tops: Vec<f32>,
     height: f32,
     row_height: f32,
@@ -241,6 +366,7 @@ impl OutputRows {
     fn clear(&mut self) {
         self.indexed = 0;
         self.shown.clear();
+        self.counts.clear();
         self.tops.clear();
         self.height = 0.0;
         self.width = 0.0;
@@ -277,6 +403,8 @@ impl Default for OutputState {
             show_timestamp: false,
             show_context: false,
             show_source: true,
+            collapse_duplicates: false,
+            pending_jump: None,
             sel: OutputSelection::default(),
             rows: OutputRows::default(),
             log_generation: 0,
@@ -301,17 +429,24 @@ fn wanted(st: &OutputState, filter: &str, s: &Shown, l: &LogLine) -> bool {
     kind_ok && ctx_ok && text_ok
 }
 
-/// The line as one LayoutJob in Studio's colours (bold for warnings / errors).
-pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJob {
+/// The line as one LayoutJob in Studio's colours (bold for warnings / errors),
+/// together with clickable script-reference spans (in char offsets).
+pub fn line_job_with_links(st: &OutputState, l: &LogLine, s: &Shown) -> (egui::text::LayoutJob, Vec<ScriptLink>) {
     let mut job = egui::text::LayoutJob::default();
+    let mut links = Vec::new();
+    let mut char_offset = 0usize;
     let mono = mono_font();
     let plain = |c: Color32| egui::TextFormat { font_id: mono.clone(), color: c, line_height: Some(line_h()), ..Default::default() };
     if st.show_timestamp {
-        job.append(&format!("{}  ", l.at), 0.0, plain(PRINT));
+        let ts = format!("{}  ", l.at);
+        char_offset += ts.chars().count();
+        job.append(&ts, 0.0, plain(PRINT));
     }
     if st.show_context && s.context != Context::None {
         let c = if s.context == Context::Server { "Server" } else { "Client" };
-        job.append(&format!("{c} - "), 0.0, plain(PRINT));
+        let ctx_s = format!("{c} - ");
+        char_offset += ctx_s.chars().count();
+        job.append(&ctx_s, 0.0, plain(PRINT));
     }
     let mut fmt = plain(kind_color(s.kind));
     if matches!(s.kind, Kind::Warn | Kind::Error) {
@@ -319,13 +454,65 @@ pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJ
         // heavier look comes from the "bold" family when it is installed)
         fmt.font_id = FontId::new(mono_px(), egui::FontFamily::Name("mono-bold".into()));
     }
-    job.append(s.message, 0.0, fmt);
-    if st.show_source {
-        if let Some(src) = &s.source {
-            job.append(&format!(" - {src}"), 0.0, plain(PRINT));
+    let msg_refs = scan_script_refs_bytes(s.message);
+    if msg_refs.is_empty() {
+        char_offset += s.message.chars().count();
+        job.append(s.message, 0.0, fmt);
+    } else {
+        let mut cursor = 0usize;
+        for (a, b, script, line) in msg_refs {
+            if a > cursor {
+                let seg = &s.message[cursor..a];
+                char_offset += seg.chars().count();
+                job.append(seg, 0.0, fmt.clone());
+            }
+            let link_text = &s.message[a..b];
+            let link_chars = link_text.chars().count();
+            let mut link_fmt = fmt.clone();
+            link_fmt.underline = egui::Stroke::new(1.0, link_fmt.color);
+            job.append(link_text, 0.0, link_fmt);
+            links.push(ScriptLink {
+                start_char: char_offset,
+                end_char: char_offset + link_chars,
+                script,
+                line,
+            });
+            char_offset += link_chars;
+            cursor = b;
+        }
+        if cursor < s.message.len() {
+            let tail = &s.message[cursor..];
+            char_offset += tail.chars().count();
+            job.append(tail, 0.0, fmt);
         }
     }
-    job
+    if st.show_source {
+        if let Some(src) = &s.source {
+            job.append(" - ", 0.0, plain(PRINT));
+            char_offset += 3;
+            let src_target = s.source_full.clone().or_else(|| parse_path_line(src));
+            if let Some((script, line)) = src_target {
+                let src_chars = src.chars().count();
+                let mut src_fmt = plain(LINK_COLOR);
+                src_fmt.underline = egui::Stroke::new(1.0, LINK_COLOR);
+                job.append(src, 0.0, src_fmt);
+                links.push(ScriptLink {
+                    start_char: char_offset,
+                    end_char: char_offset + src_chars,
+                    script,
+                    line,
+                });
+            } else {
+                job.append(src, 0.0, plain(PRINT));
+            }
+        }
+    }
+    (job, links)
+}
+
+/// The line as one LayoutJob in Studio's colours (bold for warnings / errors).
+pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJob {
+    line_job_with_links(st, l, s).0
 }
 
 impl Editor {
@@ -371,9 +558,18 @@ impl Editor {
                 let more = ui.add(egui::Button::new(String::default()).min_size(Vec2::new(24.0, 20.0))).on_hover_text("Output Settings");
                 rustudio_engine::ti::paint(ui.painter(), more.rect.shrink(2.0), "settings", theme::TEXT);
                 egui::Popup::menu(&more).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-                    ui.checkbox(&mut st.show_timestamp, "Show Timestamp");
-                    ui.checkbox(&mut st.show_context, "Show Context");
-                    ui.checkbox(&mut st.show_source, "Show Source");
+                    if ui.checkbox(&mut st.show_timestamp, "Show Timestamp").changed() {
+                        st.log_generation = st.log_generation.wrapping_add(1);
+                    }
+                    if ui.checkbox(&mut st.show_context, "Show Context").changed() {
+                        st.log_generation = st.log_generation.wrapping_add(1);
+                    }
+                    if ui.checkbox(&mut st.show_source, "Show Source").changed() {
+                        st.log_generation = st.log_generation.wrapping_add(1);
+                    }
+                    if ui.checkbox(&mut st.collapse_duplicates, "Collapse Duplicates").changed() {
+                        st.log_generation = st.log_generation.wrapping_add(1);
+                    }
                     // Studio Settings > Output > Clear Output On Start (the same setting).
                     let mut clear = crate::studio_settings::flag("Studio", "Clear Output On Start", true);
                     if ui.checkbox(&mut clear, "Clear On Play").changed() {
@@ -395,7 +591,54 @@ impl Editor {
             });
         });
         self.hud.output_lines = log_view(ui, &mut self.output_view, &self.game.log);
+        if let Some((script_ref, line)) = self.output_view.pending_jump.take() {
+            self.jump_to_output_script(&script_ref, line);
+        }
         let _ = RichText::new("");
+    }
+
+    fn jump_to_output_script(&mut self, script_ref: &str, line: u32) {
+        let root = self.game.doc.dom.root_ref();
+        let short_name = script_ref.rsplit('.').next().unwrap_or(script_ref);
+        let suffix = format!(".{script_ref}");
+        let mut exact = None;
+        let mut by_suffix = None;
+        let mut by_name = None;
+
+        for inst in self.game.doc.dom.descendants() {
+            if !matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+                continue;
+            }
+            let r = inst.referent();
+            let mut parts = Vec::new();
+            let mut cur = r;
+            while let Some(node) = self.game.doc.dom.get_by_ref(cur) {
+                if cur == root {
+                    break;
+                }
+                parts.push(node.name.as_str());
+                cur = node.parent();
+            }
+            parts.reverse();
+            let full = parts.join(".");
+            if full == script_ref {
+                exact = Some(r);
+                break;
+            }
+            if by_suffix.is_none()
+                && (full.ends_with(&suffix) || script_ref.ends_with(&format!(".{full}")))
+            {
+                by_suffix = Some(r);
+            }
+            if by_name.is_none() && inst.name == short_name {
+                by_name = Some(r);
+            }
+        }
+
+        if let Some(r) = exact.or(by_suffix).or(by_name) {
+            self.scripts.goto.insert(r, line as usize);
+            self.open_script.push(r);
+        }
     }
 }
 
@@ -403,12 +646,15 @@ impl Editor {
 pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usize {
     let row_height = line_h();
     let mut index = std::mem::take(&mut st.rows);
-    let same_filter = index.filter.as_ref().is_some_and(|(messages, contexts, text)| {
-        *messages == st.messages && *contexts == st.contexts && *text == st.filter
+    let same_filter = index.filter.as_ref().is_some_and(|(messages, contexts, text, collapse)| {
+        *messages == st.messages
+            && *contexts == st.contexts
+            && *text == st.filter
+            && *collapse == st.collapse_duplicates
     });
     if !same_filter || index.indexed > log.len() || index.row_height != row_height {
         index.clear();
-        index.filter = Some((st.messages, st.contexts, st.filter.clone()));
+        index.filter = Some((st.messages, st.contexts, st.filter.clone(), st.collapse_duplicates));
     }
     index.row_height = row_height;
     index.tops.pop();
@@ -419,7 +665,18 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
         let unfiltered = st.messages == MessageFilter::All && st.contexts == ContextFilter::All && filter.is_empty();
         for (i, line) in log.iter().enumerate().skip(index.indexed) {
             if unfiltered || wanted(st, &filter, &parse(line), line) {
+                if st.collapse_duplicates {
+                    if let Some(&prev_i) = index.shown.last() {
+                        if log[prev_i].level == line.level && log[prev_i].text == line.text {
+                            if let Some(c) = index.counts.last_mut() {
+                                *c += 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 index.shown.push(i);
+                index.counts.push(1);
                 index.tops.push(index.height);
                 index.height += row_height * (line.text.matches('\n').count() + 1) as f32;
             }
@@ -427,7 +684,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
         index.indexed = log.len();
     }
     index.tops.push(index.height);
-    let (shown, tops) = (&index.shown, &index.tops);
+    let (shown, counts, tops) = (&index.shown, &index.counts, &index.tops);
     let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
     let id = egui::Id::new("output_text");
     let mut drawn = 0;
@@ -450,9 +707,11 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             let mut rows = Vec::new();
             for k in first..last {
                 let i = shown[k];
+                let count = counts.get(k).copied().unwrap_or(1);
                 let l = &log[i];
                 let s = parse(l);
-                let galley = ui.fonts_mut(|f| f.layout_job(line_job(st, l, &s)));
+                let (job, links) = line_job_with_links(st, l, &s);
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
                 let top = content.min.y + tops[k];
                 // One monospace space wide, then one more space.
                 let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, row_height));
@@ -466,14 +725,29 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 }
                 let slot = ui.painter().add(egui::Shape::Noop);
                 // (as the earlier row layout spaced them: bar, gap, space, gap)
-                let pos = egui::pos2(content.min.x + 2.0 * space + 2.0 * ui.spacing().item_spacing.x, top);
+                let mut text_x = content.min.x + 2.0 * space + 2.0 * ui.spacing().item_spacing.x;
+                if count > 1 {
+                    let badge_text = format!("x{count}");
+                    let badge_font = FontId::monospace((mono_px() - 1.5).max(9.0));
+                    let badge_galley = ui.fonts_mut(|f| f.layout_no_wrap(badge_text, badge_font, Color32::WHITE));
+                    let badge_size = Vec2::new(badge_galley.size().x + 8.0, (row_height - 2.0).max(11.0));
+                    let badge_rect = egui::Rect::from_min_size(
+                        egui::pos2(text_x, top + (row_height - badge_size.y) * 0.5),
+                        badge_size,
+                    );
+                    ui.painter().rect_filled(badge_rect, badge_size.y * 0.5, DUP_BADGE_BG);
+                    ui.painter().galley(
+                        egui::pos2(badge_rect.min.x + 4.0, badge_rect.center().y - badge_galley.size().y * 0.5),
+                        badge_galley,
+                        Color32::WHITE,
+                    );
+                    text_x = badge_rect.max.x + space;
+                }
+                let pos = egui::pos2(text_x, top);
                 ui.painter().galley(pos, galley.clone(), PRINT);
                 widest = widest.max(pos.x - content.min.x + galley.size().x + space);
-                rows.push((i, tops[k + 1] - tops[k], top, pos, galley, slot, space));
+                rows.push((i, tops[k + 1] - tops[k], top, pos, galley, slot, space, links));
                 drawn += 1;
-            }
-            if resp.hovered() {
-                ui.set_cursor_icon(egui::CursorIcon::Text);
             }
 
             // Pointer → (line, char) on the lines drawn this frame;
@@ -490,9 +764,39 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 let c = row.4.cursor_from_pos(p - row.3).index.0;
                 Some((row.0, c))
             };
-            let (pressed, down, ptr, now, shift) = ui.input(|i| {
-                (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift)
+            let (pressed, released, down, ptr, now, shift) = ui.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_released(),
+                    i.pointer.primary_down(),
+                    i.pointer.interact_pos(),
+                    i.time,
+                    i.modifiers.shift,
+                )
             });
+            let link_at = |p: egui::Pos2| -> Option<(String, u32)> {
+                let row = rows.iter().find(|r| p.y >= r.2 && p.y < r.2 + r.1)?;
+                if p.x < row.3.x || p.x > row.3.x + row.4.size().x {
+                    return None;
+                }
+                let c = row.4.cursor_from_pos(p - row.3).index.0;
+                row.7
+                    .iter()
+                    .find(|lnk| c >= lnk.start_char && c < lnk.end_char)
+                    .map(|lnk| (lnk.script.clone(), lnk.line))
+            };
+            let hovered_link = if resp.hovered() {
+                ptr.and_then(|p| link_at(p))
+            } else {
+                None
+            };
+            if resp.hovered() {
+                if hovered_link.is_some() {
+                    ui.set_cursor_icon(egui::CursorIcon::PointingHand);
+                } else {
+                    ui.set_cursor_icon(egui::CursorIcon::Text);
+                }
+            }
             let text_on = |line: usize| rows.iter().find(|r| r.0 == line).map(|r| r.4.text().to_string());
             let sel = &mut st.sel;
             let hit = ptr.and_then(|p| at(p).map(|c| (p, c)));
@@ -543,6 +847,13 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                     ui.ctx().request_repaint();
                 }
             }
+            if released && resp.hovered() && sel.anchor == sel.head {
+                if sel.press.is_some_and(|(_, _, n)| n == 1) {
+                    if let Some(target) = hovered_link {
+                        st.pending_jump = Some(target);
+                    }
+                }
+            }
             if !down {
                 sel.drag = None;
             }
@@ -555,7 +866,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             let (lo, hi) = if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) };
             if lo != hi {
                 let fill = ui.visuals().selection.bg_fill;
-                for (i, _, top, pos, galley, slot, space) in &rows {
+                for (i, _, top, pos, galley, slot, space, _) in &rows {
                     if *i < lo.0 || *i > hi.0 {
                         continue;
                     }

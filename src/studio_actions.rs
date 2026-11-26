@@ -170,13 +170,26 @@ impl Editor {
                     (false, None)
                 }
             }
-            "align" => {
+            "align" | "align_tool" => {
                 if self.builtin_tools.plugins_enabled {
-                    self.builtin_button_state("AlignmentTool", Some("Alignment"), Some("AlignTool"))
-                } else {
-                    (false, None)
+                    let s = self.builtin_button_state("AlignmentTool", Some("Alignment"), Some("AlignTool"));
+                    if s.0 {
+                        return s;
+                    }
                 }
+                (
+                    true,
+                    Some(self.is_tool_panel_open(
+                        crate::studio_panels::studio_tools_panels::ToolPanel::AlignmentTool,
+                    )),
+                )
             }
+            "collision_groups" => (
+                true,
+                Some(self.is_tool_panel_open(
+                    crate::studio_panels::studio_tools_panels::ToolPanel::CollisionGroups,
+                )),
+            ),
             "material_manager" => {
                 if self.builtin_tools.plugins_enabled {
                     self.builtin_button_state("MaterialManager", Some("Edit"), Some("MaterialManager"))
@@ -261,13 +274,19 @@ impl Editor {
                     (false, None)
                 }
             }
-            "pivot_reset" => {
+            "pivot_reset" | "reset_pivot" => {
                 if self.builtin_tools.plugins_enabled {
                     let (en, ck) = self.builtin_button_state("PivotEditor", Some("Pivot"), Some("ClearPivot"));
-                    (edit && en, ck)
-                } else {
-                    (false, None)
+                    if en {
+                        return (edit && en, ck);
+                    }
                 }
+                let has_target = self.game.doc.selection.iter().any(|&r| {
+                    self.game.doc.class_of(r).is_some_and(|c| {
+                        rustudio_core::doc::is_a(&c, "BasePart") || c == "Model"
+                    })
+                });
+                (edit && has_target, None)
             }
             "constraint" => {
                 if self.builtin_tools.plugins_enabled {
@@ -437,6 +456,42 @@ impl Editor {
             .map(|r| (r, rbx_dom_weak::ustr(prop), Variant::Bool(v)))
             .collect();
         self.game.doc.set_props(label, edits, None);
+    }
+
+    fn reset_selected_pivots(&mut self) {
+        let identity = rustudio_core::math::Xform {
+            pos: glam::Vec3::ZERO,
+            rot: glam::Mat3::IDENTITY,
+        }
+        .to_cframe();
+        let mut edits = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for &r in &self.game.doc.selection {
+            let Some(cls) = self.game.doc.class_of(r) else {
+                continue;
+            };
+            if rustudio_core::doc::is_a(&cls, "BasePart") {
+                if seen.insert((r, "PivotOffset")) {
+                    edits.push((r, rbx_dom_weak::ustr("PivotOffset"), Variant::CFrame(identity)));
+                }
+            } else if cls == "Model" {
+                if seen.insert((r, "WorldPivotData")) {
+                    edits.push((
+                        r,
+                        rbx_dom_weak::ustr("WorldPivotData"),
+                        Variant::OptionalCFrame(None),
+                    ));
+                }
+                if let Some(Variant::Ref(pp)) = self.game.doc.prop(r, "PrimaryPart") {
+                    if self.game.doc.dom.get_by_ref(pp).is_some() && seen.insert((pp, "PivotOffset")) {
+                        edits.push((pp, rbx_dom_weak::ustr("PivotOffset"), Variant::CFrame(identity)));
+                    }
+                }
+            }
+        }
+        if !edits.is_empty() {
+            self.game.doc.set_props("Reset Pivot", edits, None);
+        }
     }
 
     /// Runs a menu or ribbon action (disabled ones do nothing).
@@ -623,8 +678,19 @@ impl Editor {
             "player_emulator" => {
                 self.trigger_builtin_plugin_button("PlayerEmulator", Some("luaPlayerEmulatorToolbar"), Some("luaPlayerEmulatorButton"));
             }
-            "align" => {
-                self.trigger_builtin_plugin_button("AlignmentTool", Some("Alignment"), Some("AlignTool"));
+            "align" | "align_tool" => {
+                if !self.builtin_tools.plugins_enabled
+                    || !self.trigger_builtin_plugin_button("AlignmentTool", Some("Alignment"), Some("AlignTool"))
+                {
+                    self.toggle_tool_panel(
+                        crate::studio_panels::studio_tools_panels::ToolPanel::AlignmentTool,
+                    );
+                }
+            }
+            "collision_groups" => {
+                self.toggle_tool_panel(
+                    crate::studio_panels::studio_tools_panels::ToolPanel::CollisionGroups,
+                );
             }
             "material_manager" => {
                 self.trigger_builtin_plugin_button("MaterialManager", Some("Edit"), Some("MaterialManager"));
@@ -676,8 +742,12 @@ impl Editor {
             "pivot" => {
                 self.trigger_builtin_plugin_button("PivotEditor", Some("Pivot"), Some("EditPivot"));
             }
-            "pivot_reset" => {
-                self.trigger_builtin_plugin_button("PivotEditor", Some("Pivot"), Some("ClearPivot"));
+            "pivot_reset" | "reset_pivot" => {
+                if !self.builtin_tools.plugins_enabled
+                    || !self.trigger_builtin_plugin_button("PivotEditor", Some("Pivot"), Some("ClearPivot"))
+                {
+                    self.reset_selected_pivots();
+                }
             }
             "constraint_menu" => egui::Popup::open_id(ctx, egui::Id::new(crate::studio_ribbon::CONSTRAINT_MENU_ID)),
             a if a.starts_with("constraint:") => {

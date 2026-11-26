@@ -902,6 +902,44 @@ impl CloudApi {
         Ok(())
     }
 
+    /// Reads the experience's configuration (`GET {develop}/v1/universes/{universe_id}/configuration`).
+    pub fn get_universe_config(&self, universe_id: u64) -> Result<serde_json::Value> {
+        self.get_json(
+            &format!("{}/v1/universes/{universe_id}/configuration", self.ep.develop),
+            "universe configuration",
+        )
+    }
+
+    /// Updates the experience's configuration by fetching the current configuration,
+    /// merging keys from `patch`, and sending `PATCH {develop}/v2/universes/{universe_id}/configuration`.
+    pub fn patch_universe_config(&self, universe_id: u64, patch: serde_json::Value) -> Result<()> {
+        let mut payload = match self.get_universe_config(universe_id) {
+            Ok(Value::Object(obj)) => obj,
+            _ => serde_json::Map::new(),
+        };
+        if let Value::Object(updates) = patch {
+            for (k, v) in updates {
+                payload.insert(k, v);
+            }
+        }
+        write_json(
+            &self.session,
+            "PATCH",
+            &format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop),
+            &format!("Update universe {universe_id} configuration"),
+            Value::Object(payload),
+        )?;
+        Ok(())
+    }
+
+    /// Reverts a place to a historical version by downloading that version's
+    /// bytes and uploading them as a new published version. Returns the new
+    /// published version number.
+    pub fn revert_place_version(&self, universe_id: u64, place_id: u64, version: u64) -> Result<u64> {
+        let (bytes, _) = self.download(place_id, Some(version))?;
+        self.upload_place(universe_id, place_id, &bytes, is_xml(&bytes), VersionType::Published)
+    }
+
     /// Uploads to an explicitly selected destination, with the requested
     /// version type. The destination has no opened version to compare.
     pub fn upload_place(

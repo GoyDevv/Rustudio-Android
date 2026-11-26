@@ -124,6 +124,50 @@ pub struct Opened {
     pub cache_file: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    BasicInfo,
+    Security,
+    Avatar,
+    World,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 4] = [
+        SettingsTab::BasicInfo,
+        SettingsTab::Security,
+        SettingsTab::Avatar,
+        SettingsTab::World,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::BasicInfo => "Basic Info",
+            SettingsTab::Security => "Security",
+            SettingsTab::Avatar => "Avatar",
+            SettingsTab::World => "World",
+        }
+    }
+}
+
+const PLAYABLE_DEVICES: [&str; 5] = ["Computer", "Phone", "Tablet", "Console", "VR"];
+
+#[derive(Default)]
+struct ExperienceSettingsState {
+    tab: SettingsTab,
+    loaded_universe: Option<u64>,
+    loading: bool,
+    saving: bool,
+    error: Option<String>,
+    status_msg: Option<String>,
+    name: String,
+    description: String,
+    playable_devices: HashSet<String>,
+    studio_access_to_apis: bool,
+    cloud_avatar_type: Option<u32>,
+}
+
 enum Msg {
     Log(Level, String),
     Page(ExperienceSource, u32, Result<(Vec<Experience>, bool), String>),
@@ -138,6 +182,19 @@ enum Msg {
     Status(u64, TeamCreateStatus),
     SaveFinished(SaveJob, Result<SaveOutcome, String>),
     AvatarSync(u64, Result<u32, String>),
+    UniverseConfig(u64, Result<serde_json::Value, String>),
+    UniverseConfigSaved {
+        universe_id: u64,
+        new_name: Option<String>,
+        avatar_type: Option<u32>,
+        result: Result<(), String>,
+    },
+    VersionReverted {
+        place_id: u64,
+        place_name: String,
+        from_version: u64,
+        result: Result<u64, String>,
+    },
     Done,
 }
 
@@ -238,10 +295,13 @@ pub struct CloudUi {
     icon_images: Vec<(u64, egui::ColorImage)>,
     icons_asked: HashSet<u64>,
     expanded: HashSet<u64>,
-    /// The place whose versions are shown: (place id, name).
-    versions_of: Option<(u64, String)>,
+    /// The place whose versions are shown: (universe id, place id, name).
+    versions_of: Option<(u64, u64, String)>,
     versions: HashMap<u64, Result<Vec<VersionInfo>, String>>,
     version_input: String,
+    /// Pending confirmation to revert a place version: (universe id, place id, place name, version).
+    confirm_revert: Option<(u64, u64, String, u64)>,
+    exp_settings: ExperienceSettingsState,
     pub url_input: String,
     pub url_error: Option<String>,
     opened: Option<Opened>,
@@ -348,6 +408,8 @@ impl CloudUi {
             versions_of: None,
             versions: HashMap::new(),
             version_input: String::new(),
+            confirm_revert: None,
+            exp_settings: ExperienceSettingsState::default(),
             url_input: String::new(),
             url_error: None,
             opened: None,
@@ -419,6 +481,8 @@ impl CloudUi {
         self.places.clear();
         self.versions.clear();
         self.versions_of = None;
+        self.confirm_revert = None;
+        self.exp_settings = ExperienceSettingsState::default();
         self.expanded.clear();
     }
 
@@ -697,6 +761,44 @@ fn avatar_type_label(v: u32) -> &'static str {
     }
 }
 
+fn parse_universe_avatar_type(v: &serde_json::Value) -> Option<u32> {
+    if let Some(s) = v.as_str() {
+        match s {
+            "MorphToR6" | "R6" => Some(0),
+            "MorphToR15" | "R15" => Some(1),
+            "PlayerChoice" => Some(2),
+            _ => None,
+        }
+    } else if let Some(n) = v.as_u64() {
+        match n {
+            0 => Some(0),
+            1 => Some(1),
+            2 => Some(2),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn universe_avatar_type_str(v: u32) -> &'static str {
+    match v {
+        0 => "MorphToR6",
+        1 => "MorphToR15",
+        _ => "PlayerChoice",
+    }
+}
+
+fn doc_f32(doc: &Document, r: rbx_dom_weak::types::Ref, prop: &str, default: f32) -> f32 {
+    match doc.prop(r, prop) {
+        Some(rbx_dom_weak::types::Variant::Float32(v)) => v,
+        Some(rbx_dom_weak::types::Variant::Float64(v)) => v as f32,
+        Some(rbx_dom_weak::types::Variant::Int32(v)) => v as f32,
+        Some(rbx_dom_weak::types::Variant::Int64(v)) => v as f32,
+        _ => default,
+    }
+}
+
 impl Editor {
     /// The editor's side of the cloud jobs, once a frame.
     pub fn cloud_poll(&mut self, ctx: &egui::Context) {
@@ -785,6 +887,93 @@ impl Editor {
                 }
                 Msg::AvatarSync(universe_id, result) => {
                     self.log_avatar_sync(universe_id, result);
+                    ctx.request_repaint();
+                }
+                Msg::UniverseConfig(u, r) => {
+                    if self.cloud.exp_settings.loaded_universe == Some(u) {
+                        self.cloud.exp_settings.loading = false;
+                        match r {
+                            Ok(cfg) => {
+                                let s = &mut self.cloud.exp_settings;
+                                s.error = None;
+                                if let Some(name) = cfg.get("name").and_then(|v| v.as_str()) {
+                                    s.name = name.to_string();
+                                }
+                                s.description = cfg
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                s.playable_devices.clear();
+                                if let Some(arr) = cfg.get("playableDevices").and_then(|v| v.as_array()) {
+                                    for dev in arr {
+                                        if let Some(d) = dev.as_str() {
+                                            s.playable_devices.insert(d.to_string());
+                                        }
+                                    }
+                                }
+                                s.studio_access_to_apis = cfg
+                                    .get("studioAccessToApisAllowed")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                s.cloud_avatar_type = cfg
+                                    .get("universeAvatarType")
+                                    .and_then(parse_universe_avatar_type);
+                            }
+                            Err(e) => {
+                                self.cloud.exp_settings.error = Some(e);
+                            }
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                Msg::UniverseConfigSaved { universe_id, new_name, avatar_type, result } => {
+                    if self.cloud.exp_settings.loaded_universe == Some(universe_id) {
+                        self.cloud.exp_settings.saving = false;
+                    }
+                    match result {
+                        Ok(()) => {
+                            if let Some(name) = new_name {
+                                if let Some(o) = self.game.doc.cloud.as_mut().filter(|o| o.universe_id == universe_id) {
+                                    o.experience = name;
+                                }
+                            }
+                            if let Some(av) = avatar_type {
+                                if self.cloud.exp_settings.loaded_universe == Some(universe_id) {
+                                    self.cloud.exp_settings.cloud_avatar_type = Some(av);
+                                }
+                            }
+                            if self.cloud.exp_settings.loaded_universe == Some(universe_id) {
+                                self.cloud.exp_settings.error = None;
+                                self.cloud.exp_settings.status_msg = Some("Saved experience settings to Roblox.".into());
+                            }
+                            self.info(format!("Saved experience {universe_id} settings to Roblox"));
+                        }
+                        Err(e) => {
+                            if self.cloud.exp_settings.loaded_universe == Some(universe_id) {
+                                self.cloud.exp_settings.error = Some(e.clone());
+                                self.cloud.exp_settings.status_msg = None;
+                            }
+                            self.error(format!("Could not save experience {universe_id} settings: {e}"));
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Msg::VersionReverted { place_id, place_name, from_version, result } => {
+                    match result {
+                        Ok(new_version) => {
+                            self.info(format!(
+                                "Reverted \"{place_name}\" (place {place_id}) to version {from_version}: published as version {new_version}"
+                            ));
+                            let client = self.game.account.shared_client();
+                            self.cloud.load_versions(client, place_id);
+                        }
+                        Err(e) => {
+                            self.error(format!(
+                                "Could not revert \"{place_name}\" (place {place_id}) to version {from_version}: {e}"
+                            ));
+                        }
+                    }
                     ctx.request_repaint();
                 }
                 Msg::Done => self.cloud.jobs = self.cloud.jobs.saturating_sub(1),
@@ -1965,6 +2154,7 @@ impl Editor {
         self.conflict_modal(ctx);
         self.copy_save_modal(ctx);
         self.save_error_modal(ctx);
+        self.revert_version_modal(ctx);
         self.join_modal(ctx);
     }
 
@@ -2119,85 +2309,574 @@ impl Editor {
         }
     }
 
-    /// File > Experience Settings: what the open place is on Roblox.
+    fn revert_version_modal(&mut self, ctx: &egui::Context) {
+        let Some((universe_id, place_id, place_name, version)) = self.cloud.confirm_revert.clone() else {
+            return;
+        };
+        let mut pick: Option<bool> = None;
+        egui::Modal::new(egui::Id::new("cloud_revert_version")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new("Revert place version?").strong());
+            ui.label(format!(
+                "Download version {version} of \"{place_name}\" (place {place_id}) and publish it as a new live version on Roblox?"
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("Revert & Publish").clicked() {
+                    pick = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    pick = Some(false);
+                }
+            });
+        });
+        if let Some(go) = pick {
+            self.cloud.confirm_revert = None;
+            if go {
+                self.info(format!(
+                    "Reverting \"{place_name}\" (place {place_id}) to version {version}…"
+                ));
+                let api = self.cloud.factory(self.game.account.shared_client());
+                self.cloud.spawn(api, move |a, tx| {
+                    let result = a
+                        .ok_or_else(|| "Sign in to revert place versions on Roblox".to_owned())
+                        .and_then(|a| a.revert_place_version(universe_id, place_id, version).map_err(|e| e.0));
+                    let _ = tx.send(Msg::VersionReverted {
+                        place_id,
+                        place_name,
+                        from_version: version,
+                        result,
+                    });
+                });
+            }
+        }
+    }
+
+    fn fetch_universe_config(&mut self, universe_id: u64, fallback_name: &str) {
+        let s = &mut self.cloud.exp_settings;
+        s.loaded_universe = Some(universe_id);
+        s.loading = true;
+        s.saving = false;
+        s.error = None;
+        s.status_msg = None;
+        if s.name.is_empty() {
+            s.name = fallback_name.to_string();
+        }
+        let api = self.cloud.factory(self.game.account.shared_client());
+        self.cloud.spawn(api, move |a, tx| {
+            let r = a
+                .ok_or_else(|| "Sign in to load experience settings from Roblox".to_owned())
+                .and_then(|a| a.get_universe_config(universe_id).map_err(|e| e.0));
+            let _ = tx.send(Msg::UniverseConfig(universe_id, r));
+        });
+    }
+
+    /// File > Experience Settings: tabbed cloud & local experience configuration.
     fn place_info_window(&mut self, ctx: &egui::Context) {
         if !self.cloud.settings_open {
             return;
         }
-        let mut open = true;
         let origin = self.game.doc.cloud.clone();
-        let mut refresh = false;
+        if let Some(o) = &origin {
+            if self.cloud.exp_settings.loaded_universe != Some(o.universe_id) {
+                self.cloud.exp_settings.name = o.experience.clone();
+                self.cloud.exp_settings.description.clear();
+                self.cloud.exp_settings.playable_devices.clear();
+                self.cloud.exp_settings.studio_access_to_apis = false;
+                self.cloud.exp_settings.cloud_avatar_type = None;
+                self.fetch_universe_config(o.universe_id, &o.experience);
+            }
+        }
+
+        let root = self.game.doc.dom.root_ref();
+        let is_playing = self.game.play.is_some();
+        let doc_dirty = self.game.doc.dirty();
+        let http_ref = self.game.doc.find_child(root, "HttpService");
+        let mut http_enabled = http_ref.is_some_and(|r| {
+            matches!(
+                self.game.doc.prop(r, "HttpEnabled"),
+                Some(rbx_dom_weak::types::Variant::Bool(true))
+            )
+        });
+        let cur_avatar = self.avatar_type();
+        let ws_ref = self.game.doc.find_child(root, "Workspace");
+        let sp_ref = self.game.doc.find_child(root, "StarterPlayer");
+        let mut gravity = ws_ref.map(|r| doc_f32(&self.game.doc, r, "Gravity", 196.2)).unwrap_or(196.2);
+        let mut walk_speed = sp_ref
+            .map(|r| doc_f32(&self.game.doc, r, "CharacterWalkSpeed", 16.0))
+            .unwrap_or(16.0);
+        let mut jump_power = sp_ref
+            .map(|r| doc_f32(&self.game.doc, r, "CharacterJumpPower", 50.0))
+            .unwrap_or(50.0);
+        let mut jump_height = sp_ref
+            .map(|r| doc_f32(&self.game.doc, r, "CharacterJumpHeight", 7.2))
+            .unwrap_or(7.2);
+        let mut max_slope = sp_ref
+            .map(|r| doc_f32(&self.game.doc, r, "CharacterMaxSlopeAngle", 89.0))
+            .unwrap_or(89.0);
+
+        let mut open = true;
+        let mut refresh_tc = false;
+        let mut reload_cfg = false;
+        let mut save_basic_info = false;
+        let mut save_security_api = false;
+        let mut set_http_enabled: Option<bool> = None;
+        let mut set_avatar: Option<u32> = None;
+        let mut world_edit: Option<(&'static str, rbx_dom_weak::types::Ref, &'static str, f32)> = None;
+
         egui::Window::new("Experience Settings")
             .open(&mut open)
-            .default_width(420.0)
+            .default_width(500.0)
             .resizable(true)
             .show(ctx, |ui| {
-                let Some(o) = origin else {
-                    ui.label("This place isn't on Roblox: it was opened from a file or made here.");
-                    ui.label(
-                        RichText::new("Open one with File > Open from Roblox to see its experience, creator and version here.")
-                            .color(theme::TEXT_DIM),
-                    );
-                    return;
-                };
-                ui.label(RichText::new("Basic Info").strong());
-                egui::Grid::new("place_info").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                    let mut row = |k: &str, v: String| {
-                        ui.label(RichText::new(k).color(theme::TEXT_DIM));
-                        ui.label(v);
-                        ui.end_row();
-                    };
-                    row("Place", o.name.clone());
-                    row("Experience", o.experience.clone());
-                    row("Creator", format!("{} ({} {})", o.creator_label(), o.creator_type.as_str(), o.creator_id));
-                    row("Place ID", o.place_id.to_string());
-                    row("Universe ID", o.universe_id.to_string());
-                    row(
-                        "Start place",
-                        if o.root_place_id == o.place_id { "this place".into() } else { o.root_place_id.to_string() },
-                    );
-                    row(
-                        "Opened as",
-                        if o.local_copy {
-                            "a local copy of the last saved version (Team Create is on)".into()
-                        } else {
-                            "the saved version on Roblox".into()
-                        },
-                    );
-                    row("Version", format!("{}{}", o.version, if self.game.doc.dirty() { " (unsaved changes)" } else { "" }));
-                    row("Cached at", self.cloud.cache.dir(o.place_id).display().to_string());
+                ui.horizontal(|ui| {
+                    for tab in SettingsTab::ALL {
+                        if ui
+                            .selectable_label(self.cloud.exp_settings.tab == tab, tab.label())
+                            .clicked()
+                        {
+                            self.cloud.exp_settings.tab = tab;
+                        }
+                    }
+                    if self.cloud.exp_settings.loading || self.cloud.exp_settings.saving {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spinner();
+                        });
+                    }
                 });
                 ui.separator();
-                ui.label(RichText::new("Team Create").strong());
-                match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
-                    Some((_, st)) => {
-                        ui.label(st.describe());
-                        let yn = |b: Option<bool>| match b {
-                            Some(true) => "yes",
-                            Some(false) => "no",
-                            None => "unknown",
+
+                if let Some(err) = &self.cloud.exp_settings.error {
+                    ui.label(RichText::new(err).color(theme::WARN));
+                } else if let Some(msg) = &self.cloud.exp_settings.status_msg {
+                    ui.label(RichText::new(msg).small().color(theme::TEXT_DIM));
+                }
+
+                match self.cloud.exp_settings.tab {
+                    SettingsTab::BasicInfo => {
+                        let Some(o) = &origin else {
+                            ui.label("This place isn't on Roblox: it was opened from a file or made here.");
+                            ui.label(
+                                RichText::new("Open one with File > Open from Roblox to edit its Roblox Basic Info here. Local Security, Avatar and World tabs still work.")
+                                    .color(theme::TEXT_DIM),
+                            );
+                            return;
                         };
+                        ui.label(RichText::new("Experience Configuration").strong());
+                        let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
+                        ui.add_enabled_ui(!busy_cfg, |ui| {
+                            egui::Grid::new("exp_settings_basic")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Name");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.cloud.exp_settings.name)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Description");
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.cloud.exp_settings.description)
+                                            .desired_rows(3)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Playable Devices");
+                                    ui.horizontal_wrapped(|ui| {
+                                        for dev in PLAYABLE_DEVICES {
+                                            let mut checked = self.cloud.exp_settings.playable_devices.contains(dev);
+                                            if ui.checkbox(&mut checked, dev).changed() {
+                                                if checked {
+                                                    self.cloud.exp_settings.playable_devices.insert(dev.to_string());
+                                                } else {
+                                                    self.cloud.exp_settings.playable_devices.remove(dev);
+                                                }
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+                                });
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let can_save = !busy_cfg && !self.cloud.exp_settings.name.trim().is_empty();
+                            if ui.add_enabled(can_save, egui::Button::new("Save Basic Info")).clicked() {
+                                save_basic_info = true;
+                            }
+                            if ui
+                                .add_enabled(!self.cloud.exp_settings.loading, egui::Button::new("Reload"))
+                                .clicked()
+                            {
+                                reload_cfg = true;
+                            }
+                        });
+                        ui.separator();
+                        ui.label(RichText::new("Place Info").strong());
+                        egui::Grid::new("place_info").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                            let mut row = |k: &str, v: String| {
+                                ui.label(RichText::new(k).color(theme::TEXT_DIM));
+                                ui.label(v);
+                                ui.end_row();
+                            };
+                            row("Place", o.name.clone());
+                            row("Experience", o.experience.clone());
+                            row("Creator", format!("{} ({} {})", o.creator_label(), o.creator_type.as_str(), o.creator_id));
+                            row("Place ID", o.place_id.to_string());
+                            row("Universe ID", o.universe_id.to_string());
+                            row(
+                                "Start place",
+                                if o.root_place_id == o.place_id { "this place".into() } else { o.root_place_id.to_string() },
+                            );
+                            row(
+                                "Opened as",
+                                if o.local_copy {
+                                    "a local copy of the last saved version (Team Create is on)".into()
+                                } else {
+                                    "the saved version on Roblox".into()
+                                },
+                            );
+                            row("Version", format!("{}{}", o.version, if doc_dirty { " (unsaved changes)" } else { "" }));
+                            row("Cached at", self.cloud.cache.dir(o.place_id).display().to_string());
+                        });
+                        ui.separator();
+                        ui.label(RichText::new("Team Create").strong());
+                        match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
+                            Some((_, st)) => {
+                                ui.label(st.describe());
+                                let yn = |b: Option<bool>| match b {
+                                    Some(true) => "yes",
+                                    Some(false) => "no",
+                                    None => "unknown",
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Can collaborate: {}{} · can manage: {} · can edit in the cloud: {}",
+                                        yn(st.can_collaborate),
+                                        st.reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default(),
+                                        yn(st.can_manage),
+                                        yn(st.can_cloud_edit)
+                                    ))
+                                    .small()
+                                    .color(theme::TEXT_DIM),
+                                );
+                            }
+                            None => {
+                                ui.label(RichText::new("Not checked yet.").color(theme::TEXT_DIM));
+                            }
+                        }
+                        if ui.add_enabled(!self.cloud.busy(), egui::Button::new("Check again")).clicked() {
+                            refresh_tc = true;
+                        }
+                    }
+                    SettingsTab::Security => {
+                        ui.label(RichText::new("Roblox API Access").strong());
+                        if origin.is_some() {
+                            let busy_cfg = self.cloud.exp_settings.loading || self.cloud.exp_settings.saving;
+                            ui.add_enabled_ui(!busy_cfg, |ui| {
+                                ui.checkbox(
+                                    &mut self.cloud.exp_settings.studio_access_to_apis,
+                                    "Enable Studio Access to API Services",
+                                );
+                            });
+                            ui.label(
+                                RichText::new("Controls studioAccessToApisAllowed on Roblox for DataStore and API access in Studio.")
+                                    .small()
+                                    .color(theme::TEXT_DIM),
+                            );
+                            if ui
+                                .add_enabled(!busy_cfg, egui::Button::new("Save Security to Roblox"))
+                                .clicked()
+                            {
+                                save_security_api = true;
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new("Studio Access to API Services requires a place opened from or published to Roblox.")
+                                    .color(theme::TEXT_DIM),
+                            );
+                        }
+                        ui.separator();
+                        ui.label(RichText::new("Local Place Security").strong());
+                        if ui
+                            .add_enabled(
+                                !is_playing,
+                                egui::Checkbox::new(&mut http_enabled, "Allow HTTP Requests (HttpService.HttpEnabled)"),
+                            )
+                            .changed()
+                        {
+                            set_http_enabled = Some(http_enabled);
+                        }
                         ui.label(
-                            RichText::new(format!(
-                                "Can collaborate: {}{} · can manage: {} · can edit in the cloud: {}",
-                                yn(st.can_collaborate),
-                                st.reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default(),
-                                yn(st.can_manage),
-                                yn(st.can_cloud_edit)
-                            ))
-                            .small()
-                            .color(theme::TEXT_DIM),
+                            RichText::new("Saved with this place on HttpService.HttpEnabled (undoable).")
+                                .small()
+                                .color(theme::TEXT_DIM),
                         );
                     }
-                    None => {
-                        ui.label(RichText::new("Not checked yet.").color(theme::TEXT_DIM));
+                    SettingsTab::Avatar => {
+                        ui.label(RichText::new("Avatar Type").strong());
+                        ui.label(
+                            RichText::new("Updates StarterPlayer.GameSettingsAvatar locally and syncs universeAvatarType on Roblox.")
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(sp_ref.is_some() && !is_playing, |ui| {
+                            ui.horizontal(|ui| {
+                                for (label, v, tip) in [
+                                    ("R6", 0u32, "Characters use the classic R6 body (6 parts)."),
+                                    ("R15", 1u32, "Characters use the R15 body (15 parts)."),
+                                    ("Player Choice", 2u32, "Each player's own avatar decides."),
+                                ] {
+                                    if ui.radio(cur_avatar == v, label).on_hover_text(tip).clicked() {
+                                        set_avatar = Some(v);
+                                    }
+                                }
+                            });
+                        });
+                        if sp_ref.is_none() {
+                            ui.label(RichText::new("This place has no StarterPlayer.").color(theme::WARN));
+                        }
+                        if origin.is_some() {
+                            if let Some(cloud_av) = self.cloud.exp_settings.cloud_avatar_type {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!("Roblox universeAvatarType: {}", avatar_type_label(cloud_av)))
+                                        .small()
+                                        .color(theme::TEXT_DIM),
+                                );
+                            }
+                        }
+                    }
+                    SettingsTab::World => {
+                        ui.label(RichText::new("World & Character Defaults").strong());
+                        ui.label(
+                            RichText::new("Saved directly to Workspace and StarterPlayer with undo support.")
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(!is_playing, |ui| {
+                            egui::Grid::new("exp_settings_world")
+                                .num_columns(2)
+                                .spacing([16.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Gravity (Workspace.Gravity)");
+                                    if ui
+                                        .add_enabled(
+                                            ws_ref.is_some(),
+                                            egui::DragValue::new(&mut gravity)
+                                                .speed(0.5)
+                                                .range(0.0..=1000.0)
+                                                .suffix(" studs/s²"),
+                                        )
+                                        .changed()
+                                    {
+                                        if let Some(ws) = ws_ref {
+                                            world_edit = Some(("Workspace.Gravity", ws, "Gravity", gravity));
+                                        }
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Walk Speed (CharacterWalkSpeed)");
+                                    if ui
+                                        .add_enabled(
+                                            sp_ref.is_some(),
+                                            egui::DragValue::new(&mut walk_speed)
+                                                .speed(0.5)
+                                                .range(0.0..=500.0)
+                                                .suffix(" studs/s"),
+                                        )
+                                        .changed()
+                                    {
+                                        if let Some(sp) = sp_ref {
+                                            world_edit = Some(("CharacterWalkSpeed", sp, "CharacterWalkSpeed", walk_speed));
+                                        }
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Jump Power (CharacterJumpPower)");
+                                    if ui
+                                        .add_enabled(
+                                            sp_ref.is_some(),
+                                            egui::DragValue::new(&mut jump_power)
+                                                .speed(0.5)
+                                                .range(0.0..=500.0),
+                                        )
+                                        .changed()
+                                    {
+                                        if let Some(sp) = sp_ref {
+                                            world_edit = Some(("CharacterJumpPower", sp, "CharacterJumpPower", jump_power));
+                                        }
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Jump Height (CharacterJumpHeight)");
+                                    if ui
+                                        .add_enabled(
+                                            sp_ref.is_some(),
+                                            egui::DragValue::new(&mut jump_height)
+                                                .speed(0.2)
+                                                .range(0.0..=200.0)
+                                                .suffix(" studs"),
+                                        )
+                                        .changed()
+                                    {
+                                        if let Some(sp) = sp_ref {
+                                            world_edit = Some(("CharacterJumpHeight", sp, "CharacterJumpHeight", jump_height));
+                                        }
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Max Slope Angle (CharacterMaxSlopeAngle)");
+                                    if ui
+                                        .add_enabled(
+                                            sp_ref.is_some(),
+                                            egui::DragValue::new(&mut max_slope)
+                                                .speed(0.5)
+                                                .range(0.0..=89.9)
+                                                .suffix("°"),
+                                        )
+                                        .changed()
+                                    {
+                                        if let Some(sp) = sp_ref {
+                                            world_edit = Some((
+                                                "CharacterMaxSlopeAngle",
+                                                sp,
+                                                "CharacterMaxSlopeAngle",
+                                                max_slope,
+                                            ));
+                                        }
+                                    }
+                                    ui.end_row();
+                                });
+                        });
+                        if ws_ref.is_none() || sp_ref.is_none() {
+                            ui.label(
+                                RichText::new("Some services (Workspace or StarterPlayer) are missing from this place.")
+                                    .small()
+                                    .color(theme::WARN),
+                            );
+                        }
                     }
                 }
-                if ui.add_enabled(!self.cloud.busy(), egui::Button::new("Check again")).clicked() {
-                    refresh = true;
-                }
             });
-        if refresh {
+
+        if reload_cfg {
+            if let Some(o) = &origin {
+                self.fetch_universe_config(o.universe_id, &o.experience);
+            }
+        }
+        if save_basic_info {
+            if let Some(o) = &origin {
+                let u = o.universe_id;
+                let name = self.cloud.exp_settings.name.trim().to_string();
+                let desc = self.cloud.exp_settings.description.clone();
+                let devices: Vec<String> = PLAYABLE_DEVICES
+                    .into_iter()
+                    .filter(|&d| self.cloud.exp_settings.playable_devices.contains(d))
+                    .map(str::to_string)
+                    .collect();
+                let patch = serde_json::json!({
+                    "name": name,
+                    "description": desc,
+                    "playableDevices": devices,
+                });
+                self.cloud.exp_settings.saving = true;
+                self.cloud.exp_settings.error = None;
+                self.cloud.exp_settings.status_msg = None;
+                let api = self.cloud.factory(self.game.account.shared_client());
+                self.cloud.spawn(api, move |a, tx| {
+                    let result = a
+                        .ok_or_else(|| "Sign in to save experience settings to Roblox".to_owned())
+                        .and_then(|a| a.patch_universe_config(u, patch).map_err(|e| e.0));
+                    let _ = tx.send(Msg::UniverseConfigSaved {
+                        universe_id: u,
+                        new_name: Some(name),
+                        avatar_type: None,
+                        result,
+                    });
+                });
+            }
+        }
+        if save_security_api {
+            if let Some(o) = &origin {
+                let u = o.universe_id;
+                let allow = self.cloud.exp_settings.studio_access_to_apis;
+                let patch = serde_json::json!({
+                    "studioAccessToApisAllowed": allow,
+                });
+                self.cloud.exp_settings.saving = true;
+                self.cloud.exp_settings.error = None;
+                self.cloud.exp_settings.status_msg = None;
+                let api = self.cloud.factory(self.game.account.shared_client());
+                self.cloud.spawn(api, move |a, tx| {
+                    let result = a
+                        .ok_or_else(|| "Sign in to save experience settings to Roblox".to_owned())
+                        .and_then(|a| a.patch_universe_config(u, patch).map_err(|e| e.0));
+                    let _ = tx.send(Msg::UniverseConfigSaved {
+                        universe_id: u,
+                        new_name: None,
+                        avatar_type: None,
+                        result,
+                    });
+                });
+            }
+        }
+        if let Some(enabled) = set_http_enabled {
+            let hs = self.game.doc.find_child(root, "HttpService").unwrap_or_else(|| {
+                self.game.doc.insert(
+                    root,
+                    rbx_dom_weak::InstanceBuilder::new("HttpService").with_name("HttpService"),
+                )
+            });
+            self.game.doc.set_props(
+                "HttpService.HttpEnabled",
+                vec![(
+                    hs,
+                    rbx_dom_weak::ustr("HttpEnabled"),
+                    rbx_dom_weak::types::Variant::Bool(enabled),
+                )],
+                None,
+            );
+        }
+        if let Some(v) = set_avatar {
+            self.set_avatar_type(v);
+            if let Some(o) = &origin {
+                let u = o.universe_id;
+                let patch = serde_json::json!({
+                    "universeAvatarType": universe_avatar_type_str(v),
+                });
+                self.cloud.exp_settings.saving = true;
+                self.cloud.exp_settings.error = None;
+                self.cloud.exp_settings.status_msg = None;
+                let api = self.cloud.factory(self.game.account.shared_client());
+                self.cloud.spawn(api, move |a, tx| {
+                    let result = a
+                        .ok_or_else(|| "Sign in to sync avatar type to Roblox".to_owned())
+                        .and_then(|a| a.patch_universe_config(u, patch).map_err(|e| e.0));
+                    let _ = tx.send(Msg::UniverseConfigSaved {
+                        universe_id: u,
+                        new_name: None,
+                        avatar_type: Some(v),
+                        result,
+                    });
+                });
+            }
+        }
+        if let Some((label, target_ref, prop_name, value)) = world_edit {
+            self.game.doc.set_props(
+                label,
+                vec![(
+                    target_ref,
+                    rbx_dom_weak::ustr(prop_name),
+                    rbx_dom_weak::types::Variant::Float32(value),
+                )],
+                Some(format!("exp_settings_{prop_name}")),
+            );
+        }
+        if refresh_tc {
             if let Some(u) = self.game.doc.cloud.as_ref().map(|o| o.universe_id) {
                 let api = self.cloud.factory(self.game.account.shared_client());
                 self.cloud.spawn(api, move |a, tx| {
@@ -2209,6 +2888,7 @@ impl Editor {
         }
         if !open {
             self.cloud.settings_open = false;
+            self.cloud.exp_settings.loaded_universe = None;
         }
     }
 
@@ -2272,12 +2952,15 @@ impl Editor {
                     let api = self.cloud.factory(client.clone());
                     self.cloud.load_page(api, src);
                 }
-                PickerDo::Versions(p, name) => {
-                    self.cloud.versions_of = Some((p, name));
+                PickerDo::Versions(u, p, name) => {
+                    self.cloud.versions_of = Some((u, p, name));
                     self.cloud.version_input.clear();
                     if !self.cloud.versions.contains_key(&p) {
                         self.cloud.load_versions(client.clone(), p);
                     }
+                }
+                PickerDo::ConfirmRevert(u, p, name, v) => {
+                    self.cloud.confirm_revert = Some((u, p, name, v));
                 }
                 PickerDo::Open(p, v) => self.open_cloud(p, v, false),
                 PickerDo::Forget(p) => {
@@ -2389,7 +3072,7 @@ impl Editor {
             });
         ui.separator();
         // A place's versions.
-        if let Some((p, name)) = c.versions_of.clone() {
+        if let Some((u, p, name)) = c.versions_of.clone() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Versions of {name}")).strong());
                 let cached = c.cache.cached_versions(p);
@@ -2415,6 +3098,13 @@ impl Editor {
                                 ));
                                 if ui.small_button("Open").clicked() {
                                     todo.push(PickerDo::Open(p, Some(v.version)));
+                                }
+                                if ui
+                                    .add_enabled(!c.busy(), egui::Button::new("Revert").small())
+                                    .on_hover_text("Download this version and publish it as a new live version")
+                                    .clicked()
+                                {
+                                    todo.push(PickerDo::ConfirmRevert(u, p, name.clone(), v.version));
                                 }
                             });
                         }
@@ -2466,7 +3156,8 @@ enum PickerDo {
     Group(u64),
     Expand(u64),
     Icons(Vec<u64>),
-    Versions(u64, String),
+    Versions(u64, u64, String),
+    ConfirmRevert(u64, u64, String, u64),
     Open(u64, Option<u64>),
     Forget(u64),
     Account,
@@ -2573,7 +3264,7 @@ fn experience_list(ui: &mut egui::Ui, c: &CloudUi, src: ExperienceSource, empty:
                                 todo.push(PickerDo::Open(p.id, None));
                             }
                             if ui.small_button("Versions…").clicked() {
-                                todo.push(PickerDo::Versions(p.id, p.name.clone()));
+                                todo.push(PickerDo::Versions(p.universe_id, p.id, p.name.clone()));
                             }
                         });
                     }
@@ -2651,7 +3342,7 @@ fn recent_list(ui: &mut egui::Ui, c: &CloudUi, todo: &mut Vec<PickerDo>) {
                     todo.push(PickerDo::Forget(o.place_id));
                 }
                 if ui.small_button("Versions…").clicked() {
-                    todo.push(PickerDo::Versions(o.place_id, o.name.clone()));
+                    todo.push(PickerDo::Versions(o.universe_id, o.place_id, o.name.clone()));
                 }
                 if ui
                     .small_button("Open")

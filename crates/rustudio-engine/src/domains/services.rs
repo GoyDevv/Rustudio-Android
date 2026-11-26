@@ -2123,6 +2123,19 @@ pub mod perf {
             X::Brick(_) | X::EnumItem(_) => 5,
             X::UDim(_) => 9,
             X::UDim2(_) => 17,
+            X::Rect(_) => 17,
+            X::Ray(_) => 25,
+            X::Region3(_) => 25,
+            X::NumberRange(_) => 9,
+            X::NumberSequence(ns) => 3 + ns.keypoints.len() as u64 * 12,
+            X::ColorSequence(cs) => 3 + cs.keypoints.len() as u64 * 16,
+            X::PhysicalProperties(_) => 21,
+            X::DateTime(_) => 9,
+            X::Font(f) => f.0.family.len() as u64 + 6,
+            X::TweenInfo(_) => 25,
+            X::Vector2int16(_) => 5,
+            X::Vector3int16(_) => 7,
+            X::Axes(_) | X::Faces(_) => 5,
         }
     }
 

@@ -95,6 +95,8 @@ pub struct DecalDesc {
     pub base_surface: bool,
     /// Texture tiling: studs per tile (u, v) and offset studs (u, v).
     pub tiling: Option<[f32; 4]>,
+    /// Draw order on the same face (lower draws first; higher draws on top).
+    pub z_index: i32,
 }
 
 /// A SurfaceAppearance saved with a TexturePack (newer Studio packs its maps
@@ -232,6 +234,7 @@ fn surface_details(
                         f32_of(doc.prop(*c, "OffsetStudsV")).unwrap_or(0.0),
                     ]
                 });
+                let z_index = i32_of(doc.prop(*c, "ZIndex")).unwrap_or(1);
                 decals.push(DecalDesc {
                     face: enum_u32(doc.prop(*c, "Face")).unwrap_or(5),
                     id,
@@ -239,12 +242,24 @@ fn surface_details(
                     transparency: f32_of(doc.prop(*c, "Transparency")).unwrap_or(0.0),
                     base_surface: false,
                     tiling,
+                    z_index,
                 });
             }
             _ => {}
         }
     }
+    decals.sort_by_key(|d| (d.face, d.z_index));
     (texture, decals)
+}
+
+fn i32_of(v: Option<Variant>) -> Option<i32> {
+    match v? {
+        Variant::Int32(n) => Some(n),
+        Variant::Int64(n) => i32::try_from(n).ok(),
+        Variant::Float32(f) => Some(f as i32),
+        Variant::Float64(f) => Some(f as i32),
+        _ => None,
+    }
 }
 
 /// Shirt / Pants templates (and the T-shirt graphic) on the part's character model.
@@ -1022,6 +1037,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 transparency: 0.0,
                 base_surface: true,
                 tiling: Some([studs, studs, 0.0, 0.0]),
+                z_index: i32::MIN,
             });
         }
     }
@@ -1035,7 +1051,9 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             transparency: 0.0,
             base_surface: false,
             tiling: None,
+            z_index: 1,
         });
+        decals.sort_by_key(|d| (!d.base_surface, d.face, d.z_index));
     }
     let mut mesh_asset = if class == "MeshPart" {
         content_string(doc.prop(r, "MeshId"))

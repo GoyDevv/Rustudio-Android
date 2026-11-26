@@ -15,10 +15,10 @@ struct Globals {
     cam_pos: vec4<f32>,
     sun_dir: vec4<f32>,      // xyz toward the sun, w irradiance (0.5 x Brightness)
     sun_color: vec4<f32>,    // rgb (ColorShift_Top hue, average 1), w LightingStyle (0 Realistic, 1 Soft)
-    ambient: vec4<f32>,      // Ambient (squared)
+    ambient: vec4<f32>,      // Ambient (squared), w celestial bodies (0 off, +1 on w/ sun_dir=sun, -1 on w/ sun_dir=moon)
     outdoor: vec4<f32>,      // max(OutdoorAmbient - Ambient, 0) (squared)
-    sky_top: vec4<f32>,
-    sky_horizon: vec4<f32>,
+    sky_top: vec4<f32>,      // rgb gradient top, w Sky.SunAngularSize (radians)
+    sky_horizon: vec4<f32>,  // rgb gradient horizon, w Sky.MoonAngularSize (radians)
     params: vec4<f32>,       // x lights, y exposure (2^ExposureCompensation), z tonemapper (0 Default, 1 Retro), w sky (0 gradient, 1 box)
     fog: vec4<f32>,          // x FogStart, y FogEnd, z on, w sky brightness
     fog_color: vec4<f32>,
@@ -28,7 +28,7 @@ struct Globals {
     sun_casc: array<mat4x4<f32>, 4>, // the sun's shadow cascades: world to the tile's (u, v, depth)
     sun_sphere: array<vec4<f32>, 4>, // each cascade's sphere: centre, radius squared
     sun_rect: array<vec4<f32>, 4>,   // each tile in the atlas: corner, size (UV)
-    sky_rot: vec4<f32>,      // x stars (0/1), y blur size, z debug view, w 1 = the drawn sky takes the time-of-day levels (a custom Sky)
+    sky_rot: vec4<f32>,      // x Sky.StarCount (0..5000), y blur size, z debug view, w 1 = the drawn sky takes the time-of-day levels (a custom Sky)
     env: array<vec4<f32>, 6>, // skybox irradiance x EnvironmentDiffuseScale (+X, -X, +Y, -Y, +Z, -Z)
     sky_tint: vec4<f32>,     // the sky (and its light) by time of day: 1 by day, a dim blue at dusk, 0 deep at night
     lightgrid: vec4<f32>,    // xyz Studio's light grid's first voxel, w studs out along the normal (0 = none yet)
@@ -376,13 +376,50 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     if (under_water()) {
         return vec4<f32>(fog_rgb(), 1.0);
     }
-    // Stars on a night sky (Sky.StarCount > 0): each its own brightness,
-    // most faint (round 26: Studio's stars read 28 on screen at the median,
-    // a few up to ~190; they were all 200 here), under the haze band.
-    if (g.sky_rot.x > 0.5 && dir.y > 0.0) {
+    let haze_vis = atmos_t(dir);
+    // Stars on a night sky (Sky.StarCount > 0), scaled continuously by StarCount:
+    // each its own brightness, most faint (round 26: Studio's stars read 28 on
+    // screen at the median, a few up to ~190; they were all 200 here), under the haze band.
+    if (g.sky_rot.x > 0.0 && dir.y > 0.0) {
+        let star_density = clamp(g.sky_rot.x / 3000.0, 0.0, 2.0);
+        let star_thresh = 1.0 - 0.0015 * star_density;
         let cell = floor(dir * 300.0);
-        let s = step(0.9985, hash3(cell)) * pow(hash3(cell + vec3<f32>(7.31, 1.7, 3.9)), 4.0);
-        c += vec3<f32>(s * 0.6) * (1.0 - g.fog.w) * atmos_t(dir);
+        let s = step(star_thresh, hash3(cell)) * pow(hash3(cell + vec3<f32>(7.31, 1.7, 3.9)), 4.0);
+        c += vec3<f32>(s * 0.6) * (1.0 - g.fog.w) * haze_vis;
+    }
+    // Celestial bodies (Sky.CelestialBodiesShown): bright solar disc + soft halo
+    // along true sun direction, and crisp moon disc opposite when above horizon.
+    if (abs(g.ambient.w) > 0.5) {
+        let sun_sign = select(-1.0, 1.0, g.ambient.w > 0.0);
+        let sun_dir = normalize(g.sun_dir.xyz) * sun_sign;
+        let moon_dir = -sun_dir;
+        let above_ground = smoothstep(-0.02, 0.02, dir.y);
+        let sun_half = g.sky_top.w * 0.5;
+        if (sun_half > 1e-4 && sun_dir.y > -0.1) {
+            let sun_elev = smoothstep(-0.08, 0.05, sun_dir.y);
+            let sun_ang = acos(clamp(dot(dir, sun_dir), -1.0, 1.0));
+            let core_r = sun_half * 0.28;
+            let disc = 1.0 - smoothstep(core_r * 0.82, core_r * 1.08, sun_ang);
+            let u1 = sun_ang / max(sun_half * 0.65, 1e-4);
+            let u2 = sun_ang / max(sun_half * 1.45, 1e-4);
+            let halo = exp(-u1 * u1) * 0.55 + exp(-u2 * u2) * 0.18;
+            let sun_vis = sun_elev * above_ground * mix(0.35, 1.0, haze_vis);
+            let sun_col = vec3<f32>(1.0, 0.96, 0.88);
+            c += sun_col * (disc * 4.5 + halo * 0.9) * sun_vis;
+        }
+        let moon_half = g.sky_horizon.w * 0.5;
+        if (moon_half > 1e-4 && moon_dir.y > -0.05) {
+            let moon_elev = smoothstep(-0.05, 0.05, moon_dir.y);
+            let moon_ang = acos(clamp(dot(dir, moon_dir), -1.0, 1.0));
+            let moon_r = moon_half * 0.45;
+            let moon_disc = 1.0 - smoothstep(moon_r * 0.92, moon_r * 1.03, moon_ang);
+            let um = moon_ang / max(moon_half * 0.9, 1e-4);
+            let moon_glow = exp(-um * um) * 0.12;
+            let moon_vis = moon_elev * above_ground * haze_vis;
+            let moon_col = vec3<f32>(0.84, 0.90, 1.0);
+            c = mix(c, moon_col * 1.15, moon_disc * moon_vis);
+            c += moon_col * moon_glow * moon_vis;
+        }
     }
     return vec4<f32>(c, 1.0);
 }

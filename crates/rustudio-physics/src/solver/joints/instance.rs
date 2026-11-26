@@ -767,11 +767,17 @@ impl Inst {
                     o.k = k;
                     o.d = dd;
                 }
+                let look_dir = if *align_type == 4 && !*one_attachment {
+                    let chord = b.pos - a.pos;
+                    if chord.length_squared() > 1.0e-12 { chord.normalize() } else { b1 }
+                } else {
+                    b1
+                };
                 if let Kind::Align2Axes(c) = &mut self.conns[1].kind {
                     c.axis_a = a.x();
-                    c.axis_b = b1;
+                    c.axis_b = look_dir;
                     // [J3] Studio: s1 / s2 = Studio(B axis)
-                    (c.s1_b, c.s2_b) = d::perp_pair_b(b1);
+                    (c.s1_b, c.s2_b) = d::perp_pair_b(look_dir);
                     c.servo = servo;
                     c.max_speed = *max_ang_vel;
                     c.max_torque = clamp_f(*max_torque);
@@ -793,12 +799,9 @@ impl Inst {
                 // which one (slot 0, Studio): legacy pair for AlignType 0/1, current API 2..5
                 active = match (align_type, primary_only) {
                     (0, false) | (1, false) | (5, _) => 1,
-                    (0, true) | (2, _) => 1 << 1,
+                    (0, true) | (2, _) | (4, _) => 1 << 1,
                     (1, true) | (3, _) => 1 << 2,
-                    _ => {
-                        crate::todo_spec!("JOINT Open 11: AlignAxisToChord's helper  (AlignType PrimaryAxisLookAt) — no rows");
-                        0
-                    }
+                    _ => 1 << 1,
                 };
             }
             Class::AngularVelocity { ang_vel, max_torque, relative_to, reaction } => {
@@ -838,10 +841,13 @@ impl Inst {
                     m.max_force = clamp_f(*max_force);
                     m.target = -*line_velocity;
                     m.frame = frame;
-                    // the LineDirection setter writes the world axis only for RelativeTo World;
-                    // the attachment-relative axis (frames 0 / 1) is the attachment's X (stand-in, Open 15)
-                    m.axis_a = if frame == 2 { line_direction.normalize_or_zero() } else { a.x() };
-                    m.axis_b = b.x();
+                    let dir = line_direction.normalize_or_zero();
+                    m.axis_a = match frame {
+                        0 => (a.rot * dir).normalize_or_zero(),
+                        2 => dir,
+                        _ => a.x(),
+                    };
+                    m.axis_b = if frame == 1 { (b.rot * dir).normalize_or_zero() } else { b.x() };
                     m.p_a = a.pos;
                     m.p_b = b.pos;
                 }
@@ -1142,9 +1148,15 @@ impl Inst {
                     (r1.x_axis, r1.y_axis)
                 };
                 if *align_type == 4 {
-                    // PrimaryAxisLookAt: angle(X0, LookAtPosition − p0) > 0.1°; the port keeps
-                    // no LookAt rows (JOINTS-3 Open) nor its position: not tested.
-                    return false;
+                    let (_, p0) = world_end(&self.a, body);
+                    let dir = if *one_attachment {
+                        xg
+                    } else {
+                        let (_, p1) = world_end(&self.b, body);
+                        let chord = p1 - p0;
+                        if chord.length_squared() > 1.0e-12 { chord.normalize() } else { xg }
+                    };
+                    return deg(angle(r0.x_axis, dir)).abs() > DEG;
                 }
                 let tx = deg(angle(r0.x_axis, xg)).abs();
                 if *align_type == 3 || (*primary_only && *align_type == 1) {

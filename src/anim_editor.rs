@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use egui::{Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use glam::{Mat3, Quat, Vec3};
-use rbx_dom_weak::types::{CFrame, Ref, Variant};
+use rbx_dom_weak::types::{CFrame, Enum, Ref, Variant};
 use rbx_dom_weak::{ustr, InstanceBuilder};
 use rustudio_core::doc::Document;
 use rustudio_core::math::{v3, Xform};
@@ -100,6 +100,15 @@ pub struct AnimEditorState {
     // Publish modal
     publish: Option<PublishDialog>,
 
+    // Animation Events (KeyframeMarker) input fields
+    new_marker_name: String,
+    new_marker_value: String,
+
+    // Import from Roblox (rbxassetid://)
+    import_asset_input: String,
+    import_status: Option<String>,
+    import_rx: Option<Receiver<Result<(u64, Vec<u8>), String>>>,
+
     // Accessory Fitter
     accessory_target_part: usize,
 
@@ -142,6 +151,13 @@ impl Default for AnimEditorState {
             saved_part_cframes: Vec::new(),
 
             publish: None,
+
+            new_marker_name: String::new(),
+            new_marker_value: String::new(),
+
+            import_asset_input: String::new(),
+            import_status: None,
+            import_rx: None,
 
             accessory_target_part: 0,
 
@@ -288,11 +304,174 @@ fn rig_joints(doc: &Document, rig_r: Ref) -> Vec<RigJointInfo> {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoseEasingStyle {
+    Linear,
+    Constant,
+    Cubic,
+    Elastic,
+    Bounce,
+}
+
+impl PoseEasingStyle {
+    const ALL: [Self; 5] = [
+        Self::Linear,
+        Self::Constant,
+        Self::Cubic,
+        Self::Elastic,
+        Self::Bounce,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Constant => "Constant",
+            Self::Cubic => "Cubic",
+            Self::Elastic => "Elastic",
+            Self::Bounce => "Bounce",
+        }
+    }
+
+    fn from_variant(v: Option<Variant>) -> Self {
+        match v {
+            Some(Variant::Enum(e)) => match e.to_u32() {
+                1 => Self::Constant,
+                2 => Self::Elastic,
+                3 | 5 => Self::Cubic,
+                4 => Self::Bounce,
+                _ => Self::Linear,
+            },
+            _ => Self::Linear,
+        }
+    }
+
+    fn to_variant(self) -> Variant {
+        let code = match self {
+            Self::Linear => 0,
+            Self::Constant => 1,
+            Self::Elastic => 2,
+            Self::Cubic => 3,
+            Self::Bounce => 4,
+        };
+        Variant::Enum(Enum::from_u32(code))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoseEasingDirection {
+    In,
+    Out,
+    InOut,
+}
+
+impl PoseEasingDirection {
+    const ALL: [Self; 3] = [Self::In, Self::Out, Self::InOut];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::In => "In",
+            Self::Out => "Out",
+            Self::InOut => "InOut",
+        }
+    }
+
+    fn from_variant(v: Option<Variant>) -> Self {
+        match v {
+            Some(Variant::Enum(e)) => match e.to_u32() {
+                1 => Self::Out,
+                2 => Self::InOut,
+                _ => Self::In,
+            },
+            _ => Self::In,
+        }
+    }
+
+    fn to_variant(self) -> Variant {
+        let code = match self {
+            Self::In => 0,
+            Self::Out => 1,
+            Self::InOut => 2,
+        };
+        Variant::Enum(Enum::from_u32(code))
+    }
+}
+
+fn ease_in_curve(style: PoseEasingStyle, t: f32) -> f32 {
+    match style {
+        PoseEasingStyle::Linear => t,
+        PoseEasingStyle::Constant => if t >= 1.0 { 1.0 } else { 0.0 },
+        PoseEasingStyle::Cubic => t * t * t,
+        PoseEasingStyle::Elastic => {
+            if t <= 0.0 || t >= 1.0 {
+                return t;
+            }
+            -(2.0f32.powf(10.0 * (t - 1.0))) * ((t - 1.075) * std::f32::consts::TAU / 0.3).sin()
+        }
+        PoseEasingStyle::Bounce => {
+            let mut u = 1.0 - t;
+            let b = if u < 1.0 / 2.75 {
+                7.5625 * u * u
+            } else if u < 2.0 / 2.75 {
+                u -= 1.5 / 2.75;
+                7.5625 * u * u + 0.75
+            } else if u < 2.5 / 2.75 {
+                u -= 2.25 / 2.75;
+                7.5625 * u * u + 0.9375
+            } else {
+                u -= 2.625 / 2.75;
+                7.5625 * u * u + 0.984375
+            };
+            1.0 - b
+        }
+    }
+}
+
+fn evaluate_easing(alpha: f32, style: PoseEasingStyle, dir: PoseEasingDirection) -> f32 {
+    let a = alpha.clamp(0.0, 1.0);
+    match style {
+        PoseEasingStyle::Linear => a,
+        PoseEasingStyle::Constant => match dir {
+            PoseEasingDirection::In => 1.0,
+            PoseEasingDirection::Out => 0.0,
+            PoseEasingDirection::InOut => if a >= 0.5 { 1.0 } else { 0.0 },
+        },
+        _ => match dir {
+            PoseEasingDirection::In => ease_in_curve(style, a),
+            PoseEasingDirection::Out => 1.0 - ease_in_curve(style, 1.0 - a),
+            PoseEasingDirection::InOut => {
+                if a < 0.5 {
+                    ease_in_curve(style, a * 2.0) * 0.5
+                } else {
+                    1.0 - ease_in_curve(style, (1.0 - a) * 2.0) * 0.5
+                }
+            }
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PoseData {
+    #[allow(dead_code)]
+    pose_ref: Ref,
+    xform: Xform,
+    weight: f32,
+    easing_style: PoseEasingStyle,
+    easing_dir: PoseEasingDirection,
+}
+
+#[derive(Clone)]
+struct KeyframeMarkerData {
+    marker_ref: Ref,
+    name: String,
+    value: String,
+}
+
 #[derive(Clone)]
 struct KeyframeData {
     kf_ref: Ref,
     time: f32,
-    poses: HashMap<String, (Ref, Xform, f32)>,
+    poses: HashMap<String, PoseData>,
+    markers: Vec<KeyframeMarkerData>,
 }
 
 fn read_keyframes(doc: &Document, clip_r: Ref) -> Vec<KeyframeData> {
@@ -328,17 +507,65 @@ fn read_keyframes(doc: &Document, clip_r: Ref) -> Vec<KeyframeData> {
                     Some(Variant::Float64(w)) => w as f32,
                     _ => 1.0,
                 };
-                poses.insert(desc.name.clone(), (pr, xf, weight));
+                let easing_style = PoseEasingStyle::from_variant(doc.prop(pr, "EasingStyle"));
+                let easing_dir = PoseEasingDirection::from_variant(doc.prop(pr, "EasingDirection"));
+                poses.insert(
+                    desc.name.clone(),
+                    PoseData {
+                        pose_ref: pr,
+                        xform: xf,
+                        weight,
+                        easing_style,
+                        easing_dir,
+                    },
+                );
+            }
+        }
+        let mut markers = Vec::new();
+        for &mc in kf_inst.children() {
+            let Some(m_inst) = doc.dom.get_by_ref(mc) else {
+                continue;
+            };
+            if m_inst.class == "KeyframeMarker" {
+                let value = match doc.prop(mc, "Value") {
+                    Some(Variant::String(s)) => s,
+                    _ => String::new(),
+                };
+                markers.push(KeyframeMarkerData {
+                    marker_ref: mc,
+                    name: m_inst.name.clone(),
+                    value,
+                });
             }
         }
         kfs.push(KeyframeData {
             kf_ref: child,
             time,
             poses,
+            markers,
         });
     }
     kfs.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
     kfs
+}
+
+fn parse_roblox_asset_id(input: &str) -> Option<u64> {
+    let s = input.trim();
+    if let Some(rest) = s.strip_prefix("rbxassetid://") {
+        return rest.trim().parse::<u64>().ok();
+    }
+    if let Ok(id) = s.parse::<u64>() {
+        return Some(id);
+    }
+    let mut digits = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse::<u64>().ok()
 }
 
 fn clip_duration(kfs: &[KeyframeData]) -> f32 {
@@ -346,24 +573,37 @@ fn clip_duration(kfs: &[KeyframeData]) -> f32 {
 }
 
 fn slerp_xform(a: Xform, b: Xform, alpha: f32) -> Xform {
-    let t = alpha.clamp(0.0, 1.0);
-    let pos = a.pos.lerp(b.pos, t);
+    let pos = a.pos.lerp(b.pos, alpha);
     let qa = Quat::from_mat3(&a.rot).normalize();
-    let qb = Quat::from_mat3(&b.rot).normalize();
-    let q = qa.slerp(qb, t);
+    let mut qb = Quat::from_mat3(&b.rot).normalize();
+    if qa.dot(qb) < 0.0 {
+        qb = -qb;
+    }
+    let q = if (0.0..=1.0).contains(&alpha) {
+        qa.slerp(qb, alpha)
+    } else {
+        let delta = (qa.conjugate() * qb).normalize();
+        let (axis, angle) = delta.to_axis_angle();
+        (qa * Quat::from_axis_angle(axis, angle * alpha)).normalize()
+    };
     Xform {
         pos,
         rot: Mat3::from_quat(q),
     }
 }
 
-/// Evaluates the KeyframeSequence at time `t`, returning per-joint-name Xform.
+/// Evaluates the KeyframeSequence at time `t`, returning per-joint-name Xform
+/// with per-keyframe PoseEasingStyle and PoseEasingDirection curves.
 fn evaluate_clip(kfs: &[KeyframeData], t: f32) -> HashMap<String, Xform> {
-    let mut tracks: HashMap<String, Vec<(f32, Xform)>> = HashMap::new();
+    let mut tracks: HashMap<String, Vec<(f32, Xform, PoseEasingStyle, PoseEasingDirection)>> =
+        HashMap::new();
     for kf in kfs {
-        for (name, &(_, xf, weight)) in &kf.poses {
-            if weight > 0.0 {
-                tracks.entry(name.clone()).or_default().push((kf.time, xf));
+        for (name, p) in &kf.poses {
+            if p.weight > 0.0 {
+                tracks
+                    .entry(name.clone())
+                    .or_default()
+                    .push((kf.time, p.xform, p.easing_style, p.easing_dir));
             }
         }
     }
@@ -381,7 +621,9 @@ fn evaluate_clip(kfs: &[KeyframeData], t: f32) -> HashMap<String, Xform> {
             for w in samples.windows(2) {
                 if t >= w[0].0 && t <= w[1].0 {
                     let span = (w[1].0 - w[0].0).max(1e-5);
-                    res = slerp_xform(w[0].1, w[1].1, (t - w[0].0) / span);
+                    let raw = (t - w[0].0) / span;
+                    let eased = evaluate_easing(raw, w[0].2, w[0].3);
+                    res = slerp_xform(w[0].1, w[1].1, eased);
                     break;
                 }
             }
@@ -941,6 +1183,62 @@ impl Editor {
         }
     }
 
+    fn start_import_animation(&mut self) {
+        let Some(id) = parse_roblox_asset_id(&self.ui.anim.import_asset_input) else {
+            self.ui.anim.import_status =
+                Some("Invalid asset ID (use rbxassetid://12345 or numeric ID).".into());
+            return;
+        };
+        let session = self.current_account_session();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = if let Some(s) = session {
+                s.download_asset(id, None)
+                    .map_err(|e| e.to_string())
+                    .or_else(|_| {
+                        rustudio_core::assets::content_blocking(&format!("rbxassetid://{id}"))
+                            .map(|b| (*b).clone())
+                    })
+            } else {
+                rustudio_core::assets::content_blocking(&format!("rbxassetid://{id}"))
+                    .map(|b| (*b).clone())
+            };
+            let _ = tx.send(res.map(|bytes| (id, bytes)));
+        });
+        self.ui.anim.import_rx = Some(rx);
+        self.ui.anim.import_status = Some(format!("Fetching rbxassetid://{id}..."));
+    }
+
+    fn set_keyframe_easing(
+        &mut self,
+        clip_r: Ref,
+        time: f32,
+        style: Option<PoseEasingStyle>,
+        dir: Option<PoseEasingDirection>,
+    ) {
+        let kf_r = self.ensure_keyframe_at(clip_r, time);
+        let pose_refs: Vec<Ref> = self
+            .game
+            .doc
+            .dom
+            .descendants_of(kf_r)
+            .filter(|i| i.class == "Pose")
+            .map(|i| i.referent())
+            .collect();
+        for pr in pose_refs {
+            if let Some(s) = style {
+                self.game
+                    .doc
+                    .set_prop_live(pr, ustr("EasingStyle"), s.to_variant());
+            }
+            if let Some(d) = dir {
+                self.game
+                    .doc
+                    .set_prop_live(pr, ustr("EasingDirection"), d.to_variant());
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Main Per-Frame Window Entry Point (called from insert_popup_ui)
     // -----------------------------------------------------------------------
@@ -982,6 +1280,95 @@ impl Editor {
                     }
                 } else {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+            }
+        }
+
+        // 1b. Poll Roblox animation import background thread
+        let import_done = if let Some(rx) = self.ui.anim.import_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(res) => Some(res),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Import thread disconnected.".into()))
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(res) = import_done {
+            self.ui.anim.import_rx = None;
+            match res {
+                Ok((id, bytes)) => {
+                    let target_parent = if let Some(rig_r) = self.ui.anim.rig_ref.filter(|r| self.game.doc.exists(*r)) {
+                        self.game
+                            .doc
+                            .dom
+                            .get_by_ref(rig_r)
+                            .and_then(|i| {
+                                i.children().iter().copied().find(|&c| {
+                                    self.game
+                                        .doc
+                                        .dom
+                                        .get_by_ref(c)
+                                        .is_some_and(|ci| ci.name == "AnimSaves")
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                self.game
+                                    .doc
+                                    .insert(rig_r, InstanceBuilder::new("Folder").with_name("AnimSaves"))
+                            })
+                    } else {
+                        self.game
+                            .doc
+                            .workspace()
+                            .unwrap_or_else(|| self.game.doc.default_parent())
+                    };
+                    let inserted = self.game.doc.paste(
+                        &bytes,
+                        target_parent,
+                        &format!("Import Animation rbxassetid://{id}"),
+                    );
+                    let mut found_clip = None;
+                    for &r in &inserted {
+                        if self.game.doc.class_of(r).as_deref() == Some("KeyframeSequence") {
+                            found_clip = Some(r);
+                            break;
+                        }
+                        for desc in self.game.doc.dom.descendants_of(r) {
+                            if desc.class == "KeyframeSequence" {
+                                found_clip = Some(desc.referent());
+                                break;
+                            }
+                        }
+                        if found_clip.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some(clip_r) = found_clip {
+                        self.ui.anim.clip_ref = Some(clip_r);
+                        self.ui.anim.time = 0.0;
+                        if let Some(Variant::Bool(l)) = self.game.doc.prop(clip_r, "Loop") {
+                            self.ui.anim.looping = l;
+                        }
+                        if let Some(rr) = self.ui.anim.rig_ref.filter(|r| self.game.doc.exists(*r)) {
+                            self.apply_live_pose(rr, clip_r);
+                        }
+                        self.ui.anim.import_status = Some(format!("Imported rbxassetid://{id}"));
+                    } else if inserted.is_empty() {
+                        self.ui.anim.import_status =
+                            Some(format!("Could not decode rbxassetid://{id} as Roblox animation."));
+                    } else {
+                        self.ui.anim.import_status =
+                            Some(format!("Asset rbxassetid://{id} contains no KeyframeSequence."));
+                    }
+                }
+                Err(e) => {
+                    self.ui.anim.import_status = Some(format!("Import failed: {e}"));
                 }
             }
         }
@@ -1248,6 +1635,38 @@ impl Editor {
                     self.open_publish_dialog("Animation", vec![cr], cname);
                 }
             }
+
+            ui.separator();
+            let importing = self.ui.anim.import_rx.is_some();
+            let resp = ui.add_enabled(
+                !importing,
+                egui::TextEdit::singleline(&mut self.ui.anim.import_asset_input)
+                    .hint_text("rbxassetid://...")
+                    .desired_width(135.0),
+            );
+            let enter_pressed =
+                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(!importing, egui::Button::new("Import"))
+                .on_hover_text("Fetch a Roblox animation by rbxassetid:// and load its KeyframeSequence")
+                .clicked()
+                || (enter_pressed && !importing)
+            {
+                self.start_import_animation();
+            }
+            if importing {
+                ui.spinner();
+            }
+            if let Some(status) = self.ui.anim.import_status.as_deref() {
+                let col = if status.starts_with("Imported") {
+                    Color32::from_rgb(90, 220, 120)
+                } else if status.starts_with("Fetching") {
+                    theme::TEXT_DIM
+                } else {
+                    theme::WARN
+                };
+                ui.label(RichText::new(status).small().color(col));
+            }
         });
 
         ui.separator();
@@ -1456,8 +1875,9 @@ impl Editor {
             }
         }
 
-        // Diamond markers for each keyframe
+        // Diamond markers for each keyframe + event flags for KeyframeMarkers
         let cy = rect.max.y - 12.0;
+        let event_col = Color32::from_rgb(80, 210, 240);
         for kf in kfs {
             let x = time_to_x(kf.time);
             let is_near = (kf.time - self.ui.anim.time).abs() < 0.025;
@@ -1470,6 +1890,33 @@ impl Editor {
                 Pos2::new(x - r, cy),
             ];
             painter.add(egui::Shape::convex_polygon(pts, fill, Stroke::new(1.0, Color32::BLACK)));
+
+            if !kf.markers.is_empty() {
+                let flag = vec![
+                    Pos2::new(x, rect.min.y + 11.0),
+                    Pos2::new(x - 4.5, rect.min.y + 3.0),
+                    Pos2::new(x + 4.5, rect.min.y + 3.0),
+                ];
+                painter.add(egui::Shape::convex_polygon(
+                    flag,
+                    event_col,
+                    Stroke::new(1.0, Color32::BLACK),
+                ));
+                if let Some(first) = kf.markers.first() {
+                    let tag = if kf.markers.len() > 1 {
+                        format!("{} (+{})", first.name, kf.markers.len() - 1)
+                    } else {
+                        first.name.clone()
+                    };
+                    painter.text(
+                        Pos2::new(x + 6.0, rect.min.y + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        tag,
+                        FontId::proportional(9.0),
+                        event_col,
+                    );
+                }
+            }
         }
 
         // Playhead line
@@ -1556,6 +2003,143 @@ impl Editor {
             self.write_joint_pose(clip_r, t, &joint_name, new_xf);
             self.apply_live_pose(rig_r, clip_r);
         }
+
+        ui.add_space(6.0);
+        ui.separator();
+
+        // 3. Per-keyframe EasingStyle & EasingDirection controls
+        let current_kf = kfs
+            .iter()
+            .filter(|k| (k.time - self.ui.anim.time).abs() < 0.05)
+            .min_by(|a, b| {
+                (a.time - self.ui.anim.time)
+                    .abs()
+                    .partial_cmp(&(b.time - self.ui.anim.time).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let cur_pose = current_kf.and_then(|kf| {
+            kf.poses
+                .get(&joint_name)
+                .or_else(|| kf.poses.values().next())
+        });
+        let cur_style = cur_pose
+            .map(|p| p.easing_style)
+            .unwrap_or(PoseEasingStyle::Linear);
+        let cur_dir = cur_pose
+            .map(|p| p.easing_dir)
+            .unwrap_or(PoseEasingDirection::In);
+
+        let mut picked_style: Option<PoseEasingStyle> = None;
+        let mut picked_dir: Option<PoseEasingDirection> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Easing:").strong());
+            egui::ComboBox::from_id_salt("anim_easing_style")
+                .selected_text(cur_style.label())
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for s in PoseEasingStyle::ALL {
+                        if ui.selectable_label(cur_style == s, s.label()).clicked() {
+                            picked_style = Some(s);
+                        }
+                    }
+                });
+            ui.label("Direction:");
+            egui::ComboBox::from_id_salt("anim_easing_dir")
+                .selected_text(cur_dir.label())
+                .width(72.0)
+                .show_ui(ui, |ui| {
+                    for d in PoseEasingDirection::ALL {
+                        if ui.selectable_label(cur_dir == d, d.label()).clicked() {
+                            picked_dir = Some(d);
+                        }
+                    }
+                });
+        });
+        if picked_style.is_some() || picked_dir.is_some() {
+            let t = current_kf
+                .map(|k| k.time)
+                .unwrap_or_else(|| (self.ui.anim.time * 100.0).round() / 100.0);
+            self.set_keyframe_easing(clip_r, t, picked_style, picked_dir);
+            self.apply_live_pose(rig_r, clip_r);
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+
+        // 4. Animation Events (KeyframeMarker) editing on the current Keyframe
+        ui.label(RichText::new("Animation Events (KeyframeMarker)").strong());
+        let mut delete_marker: Option<Ref> = None;
+        if let Some(kf) = current_kf {
+            if kf.markers.is_empty() {
+                ui.label(
+                    RichText::new(format!("No events on keyframe at {:.2}s.", kf.time))
+                        .small()
+                        .color(theme::TEXT_DIM),
+                );
+            } else {
+                for m in &kf.markers {
+                    ui.horizontal(|ui| {
+                        let text = if m.value.is_empty() {
+                            m.name.clone()
+                        } else {
+                            format!("{} = \"{}\"", m.name, m.value)
+                        };
+                        ui.label(RichText::new(text).color(event_col));
+                        if ui.small_button("Delete").clicked() {
+                            delete_marker = Some(m.marker_ref);
+                        }
+                    });
+                }
+            }
+        } else {
+            ui.label(
+                RichText::new("No keyframe at playhead (adding an event creates one).")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        if let Some(mr) = delete_marker {
+            self.game.doc.remove(&[mr]);
+        }
+
+        let mut add_marker = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ui.anim.new_marker_name)
+                    .hint_text("Event name")
+                    .desired_width(110.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ui.anim.new_marker_value)
+                    .hint_text("Value (optional)")
+                    .desired_width(110.0),
+            );
+            let can_add = !self.ui.anim.new_marker_name.trim().is_empty();
+            if ui
+                .add_enabled(can_add, egui::Button::new("+ Add Event"))
+                .clicked()
+            {
+                add_marker = true;
+            }
+        });
+        if add_marker {
+            let name = self.ui.anim.new_marker_name.trim().to_string();
+            let value = self.ui.anim.new_marker_value.trim().to_string();
+            if !name.is_empty() {
+                let t = current_kf
+                    .map(|k| k.time)
+                    .unwrap_or_else(|| (self.ui.anim.time * 100.0).round() / 100.0);
+                let kf_r = self.ensure_keyframe_at(clip_r, t);
+                self.game.doc.insert(
+                    kf_r,
+                    InstanceBuilder::new("KeyframeMarker")
+                        .with_name(name)
+                        .with_property("Value", Variant::String(value)),
+                );
+                self.ui.anim.new_marker_name.clear();
+                self.ui.anim.new_marker_value.clear();
+            }
+        }
     }
 
     fn graph_editor_right_ui(
@@ -1641,9 +2225,9 @@ impl Editor {
         let mut pts_z = Vec::new();
         let mut kf_times = Vec::new();
         for kf in kfs {
-            if let Some(&(_, xf, w)) = kf.poses.get(&joint_name) {
-                if w > 0.0 {
-                    let deg = xf.orientation_deg();
+            if let Some(p) = kf.poses.get(&joint_name) {
+                if p.weight > 0.0 {
+                    let deg = p.xform.orientation_deg();
                     let x = t_to_x(kf.time);
                     pts_x.push(Pos2::new(x, deg_to_y(deg.x)));
                     pts_y.push(Pos2::new(x, deg_to_y(deg.y)));

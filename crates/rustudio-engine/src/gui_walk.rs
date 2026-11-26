@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 use super::*;
 use rustudio_core::mech;
 
+extern "Rust" {
+    fn __rustudio_path2d_points_snapshot(r: Ref) -> Option<Vec<[f32; 12]>>;
+}
+
 fn safe_font_size(size: f32) -> f32 {
     if size.is_finite() {
         size.max(mech::GUI_MIN_FONT_SIZE)
@@ -669,6 +673,7 @@ impl Walk<'_, '_> {
                         folders.push(child);
                         gui_children(d, child, out, folders, gui, by)
                     }
+                    Some("Path2D") => out.push(child),
                     Some(class) if doc::is_a(class, "GuiObject") => out.push(child),
                     _ => {}
                 }
@@ -1949,12 +1954,144 @@ impl Walk<'_, '_> {
         }
     }
 
+    fn draw_path2d(&mut self, r: Ref, parent: Rect, dn: Down) {
+        let d = self.input.doc;
+        self.gui.no_cache = Some("Path2D");
+        let thickness = num(d, r, "Thickness", 1.0) * dn.scale;
+        let transparency = num(d, r, "Transparency", 0.0).clamp(0.0, 1.0);
+        if thickness <= 0.0 || transparency >= 1.0 {
+            return;
+        }
+        let Some(pts) = (unsafe { __rustudio_path2d_points_snapshot(r) }) else {
+            return;
+        };
+        let n = pts.len();
+        if n < 2 {
+            return;
+        }
+        let mut me = dn;
+        if self.global_z {
+            me.z = num(d, r, "ZIndex", 1.0) as i32;
+        }
+        let closed = boolp(d, r, "Closed", false);
+        let c = color(d, r, "Color3", [0.0, 0.0, 0.0]);
+        let col = rgba(
+            [c[0] * me.tint[0], c[1] * me.tint[1], c[2] * me.tint[2]],
+            (1.0 - transparency) * me.alpha,
+        );
+        let w = parent.width();
+        let h = parent.height();
+        let s = dn.scale;
+        let resolve_pos = |xs: f32, xo: f32, ys: f32, yo: f32| -> Pos2 {
+            Pos2::new(parent.left() + xs * w + xo * s, parent.top() + ys * h + yo * s)
+        };
+        let resolve_tan = |xs: f32, xo: f32, ys: f32, yo: f32| -> egui::Vec2 {
+            egui::vec2(xs * w + xo * s, ys * h + yo * s)
+        };
+
+        let seg_count = if closed && n > 2 { n } else { n - 1 };
+        let mut poly: Vec<Pos2> = Vec::with_capacity(seg_count * 16 + 1);
+        const STEPS: usize = 24;
+        for i in 0..seg_count {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            let p0 = resolve_pos(a[0], a[1], a[2], a[3]);
+            let p1 = resolve_pos(b[0], b[1], b[2], b[3]);
+            let rt = resolve_tan(a[8], a[9], a[10], a[11]);
+            let lt = resolve_tan(b[4], b[5], b[6], b[7]);
+            if i == 0 {
+                poly.push(p0);
+            }
+            if rt == egui::Vec2::ZERO && lt == egui::Vec2::ZERO {
+                poly.push(p1);
+            } else {
+                let p0v = p0.to_vec2();
+                let p1v = p1.to_vec2();
+                if rt != egui::Vec2::ZERO && lt == egui::Vec2::ZERO {
+                    let ctrl = p0v + rt;
+                    for k in 1..=STEPS {
+                        let t = k as f32 / STEPS as f32;
+                        let u = 1.0 - t;
+                        poly.push((p0v * (u * u) + ctrl * (2.0 * u * t) + p1v * (t * t)).to_pos2());
+                    }
+                } else if rt == egui::Vec2::ZERO && lt != egui::Vec2::ZERO {
+                    let ctrl = p1v + lt;
+                    for k in 1..=STEPS {
+                        let t = k as f32 / STEPS as f32;
+                        let u = 1.0 - t;
+                        poly.push((p0v * (u * u) + ctrl * (2.0 * u * t) + p1v * (t * t)).to_pos2());
+                    }
+                } else {
+                    let c1 = p0v + rt;
+                    let c2 = p1v + lt;
+                    for k in 1..=STEPS {
+                        let t = k as f32 / STEPS as f32;
+                        let u = 1.0 - t;
+                        let pt = p0v * (u * u * u)
+                            + c1 * (3.0 * u * u * t)
+                            + c2 * (3.0 * u * t * t)
+                            + p1v * (t * t * t);
+                        poly.push(pt.to_pos2());
+                    }
+                }
+            }
+        }
+
+        let mut mesh = Mesh::default();
+        let half = thickness * 0.5;
+        let push_tri = |m: &mut Mesh, a: Pos2, b: Pos2, c_pt: Pos2| {
+            let base = m.vertices.len() as u32;
+            m.vertices.push(Vertex { pos: a, uv: egui::epaint::WHITE_UV, color: col });
+            m.vertices.push(Vertex { pos: b, uv: egui::epaint::WHITE_UV, color: col });
+            m.vertices.push(Vertex { pos: c_pt, uv: egui::epaint::WHITE_UV, color: col });
+            m.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        };
+        let mut prev_end: Option<(Pos2, egui::Vec2)> = None;
+        let mut first_start: Option<(Pos2, egui::Vec2)> = None;
+        for pair in poly.windows(2) {
+            let p0 = pair[0];
+            let p1 = pair[1];
+            let dv = p1 - p0;
+            let len = dv.length();
+            if len < 1e-4 {
+                continue;
+            }
+            let normal = egui::vec2(-dv.y / len, dv.x / len) * half;
+            if let Some((pp, pn)) = prev_end {
+                push_tri(&mut mesh, pp, pp + pn, p0 + normal);
+                push_tri(&mut mesh, pp, pp - pn, p0 - normal);
+            } else {
+                first_start = Some((p0, normal));
+            }
+            let base = mesh.vertices.len() as u32;
+            mesh.vertices.push(Vertex { pos: p0 - normal, uv: egui::epaint::WHITE_UV, color: col });
+            mesh.vertices.push(Vertex { pos: p0 + normal, uv: egui::epaint::WHITE_UV, color: col });
+            mesh.vertices.push(Vertex { pos: p1 + normal, uv: egui::epaint::WHITE_UV, color: col });
+            mesh.vertices.push(Vertex { pos: p1 - normal, uv: egui::epaint::WHITE_UV, color: col });
+            mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            prev_end = Some((p1, normal));
+        }
+        if closed {
+            if let (Some((pp, pn)), Some((fp, fn_))) = (prev_end, first_start) {
+                push_tri(&mut mesh, pp, pp + pn, fp + fn_);
+                push_tri(&mut mesh, pp, pp - pn, fp - fn_);
+            }
+        }
+        if !mesh.indices.is_empty() {
+            self.push(Shape::Mesh(mesh.into()), &me);
+        }
+    }
+
     fn object(&mut self, r: Ref, parent: Rect, laid: Option<Rect>, dn: Down) {
         let d = self.input.doc;
         let Some(class) = d.class_of(r).map(|c| c.to_string()) else {
             return;
         };
         if !boolp(d, r, "Visible", true) {
+            return;
+        }
+        if class == "Path2D" {
+            self.draw_path2d(r, parent, dn);
             return;
         }
         // Drawn: its modifiers (and theirs: a UIStroke's UIGradient) are read.

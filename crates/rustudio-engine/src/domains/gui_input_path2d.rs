@@ -111,6 +111,80 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Lightweight, thread-safe snapshot of a `Path2DControlPoint` for the GUI renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Path2DPointData {
+    pub pos_x_scale: f32,
+    pub pos_x_offset: i32,
+    pub pos_y_scale: f32,
+    pub pos_y_offset: i32,
+    pub left_x_scale: f32,
+    pub left_x_offset: i32,
+    pub left_y_scale: f32,
+    pub left_y_offset: i32,
+    pub right_x_scale: f32,
+    pub right_x_offset: i32,
+    pub right_y_scale: f32,
+    pub right_y_offset: i32,
+}
+
+impl From<&LPath2DControlPoint> for Path2DPointData {
+    fn from(c: &LPath2DControlPoint) -> Self {
+        Self {
+            pos_x_scale: c.pos.x.scale,
+            pos_x_offset: c.pos.x.offset,
+            pos_y_scale: c.pos.y.scale,
+            pos_y_offset: c.pos.y.offset,
+            left_x_scale: c.left.x.scale,
+            left_x_offset: c.left.x.offset,
+            left_y_scale: c.left.y.scale,
+            left_y_offset: c.left.y.offset,
+            right_x_scale: c.right.x.scale,
+            right_x_offset: c.right.x.offset,
+            right_y_scale: c.right.y.scale,
+            right_y_offset: c.right.y.offset,
+        }
+    }
+}
+
+static PATH2D_CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<Ref, Vec<Path2DPointData>>>> =
+    std::sync::OnceLock::new();
+
+fn path2d_cache() -> &'static std::sync::RwLock<HashMap<Ref, Vec<Path2DPointData>>> {
+    PATH2D_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Returns a snapshot of the control points for a `Path2D` instance, if any.
+pub fn path2d_points(r: Ref) -> Option<Vec<Path2DPointData>> {
+    path2d_cache().read().ok()?.get(&r).cloned()
+}
+
+/// Crate-internal symbol bridge allowing `gui_walk.rs` to read the `Path2D`
+/// control-point snapshot without altering `gui_input.rs`'s module visibility.
+#[no_mangle]
+pub extern "Rust" fn __rustudio_path2d_points_snapshot(r: Ref) -> Option<Vec<[f32; 12]>> {
+    path2d_points(r).map(|pts| {
+        pts.into_iter()
+            .map(|p| {
+                [
+                    p.pos_x_scale,
+                    p.pos_x_offset as f32,
+                    p.pos_y_scale,
+                    p.pos_y_offset as f32,
+                    p.left_x_scale,
+                    p.left_x_offset as f32,
+                    p.left_y_scale,
+                    p.left_y_offset as f32,
+                    p.right_x_scale,
+                    p.right_x_offset as f32,
+                    p.right_y_scale,
+                    p.right_y_offset as f32,
+                ]
+            })
+            .collect()
+    })
+}
+
 #[derive(Default)]
 struct Paths(HashMap<Ref, Vec<LPath2DControlPoint>>);
 
@@ -121,6 +195,14 @@ fn points(lua: &Lua, r: Ref) -> Vec<LPath2DControlPoint> {
 }
 
 fn set_points(lua: &Lua, r: Ref, v: Vec<LPath2DControlPoint>) -> mlua::Result<()> {
+    let snap: Vec<Path2DPointData> = v.iter().map(Path2DPointData::from).collect();
+    if let Ok(mut cache) = path2d_cache().write() {
+        if snap.is_empty() {
+            cache.remove(&r);
+        } else {
+            cache.insert(r, snap);
+        }
+    }
     if let Some(mut p) = lua.app_data_mut::<Paths>() {
         p.0.insert(r, v);
     }

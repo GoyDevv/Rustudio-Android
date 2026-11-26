@@ -22,6 +22,10 @@ use std::sync::mpsc::{self, Receiver};
 use egui::{Color32, FontId, RichText, Sense, Vec2};
 use rbx_dom_weak::types::{Ref, Tags, Variant};
 use rbx_dom_weak::ustr;
+use rustudio_core::collision_groups::{
+    self, CollisionGroups, DEFAULT as DEFAULT_COLLISION_GROUP, MAX_GROUPS,
+};
+use rustudio_core::math::{v3, Xform};
 use rustudio_engine::runtime::Side;
 use rustudio_engine::theme;
 
@@ -43,6 +47,8 @@ pub enum ToolPanel {
     RunScript,
     TagEditor,
     TaskScheduler,
+    CollisionGroups,
+    AlignmentTool,
 }
 
 impl ToolPanel {
@@ -59,6 +65,8 @@ impl ToolPanel {
             ToolPanel::RunScript => "Run Script",
             ToolPanel::TagEditor => "Tag Editor",
             ToolPanel::TaskScheduler => "Task Scheduler",
+            ToolPanel::CollisionGroups => "Collision Groups",
+            ToolPanel::AlignmentTool => "Alignment Tool",
         }
     }
 
@@ -75,6 +83,8 @@ impl ToolPanel {
             ToolPanel::RunScript => "run_script",
             ToolPanel::TagEditor => "tag_editor",
             ToolPanel::TaskScheduler => "task_scheduler",
+            ToolPanel::CollisionGroups => "collision_groups",
+            ToolPanel::AlignmentTool => "align_tool",
         }
     }
 
@@ -91,6 +101,8 @@ impl ToolPanel {
             ToolPanel::RunScript => Vec2::new(480.0, 360.0),
             ToolPanel::TagEditor => Vec2::new(340.0, 400.0),
             ToolPanel::TaskScheduler => Vec2::new(400.0, 380.0),
+            ToolPanel::CollisionGroups => Vec2::new(540.0, 420.0),
+            ToolPanel::AlignmentTool => Vec2::new(280.0, 300.0),
         }
     }
 }
@@ -147,7 +159,20 @@ struct HistoryRecord {
     label: String,
 }
 
-/// Persistent UI state for all 11 Studio tool panels, stored on `UiState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignMode {
+    Min,
+    Center,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignRelativeTo {
+    SelectionBoundingBox,
+    ActiveObject,
+}
+
+/// Persistent UI state for all Studio tool panels, stored on `UiState`.
 pub struct StudioToolsState {
     // Open flags
     pub command_bar_open: bool,
@@ -161,6 +186,8 @@ pub struct StudioToolsState {
     pub run_script_open: bool,
     pub tag_editor_open: bool,
     pub task_scheduler_open: bool,
+    pub collision_groups_open: bool,
+    pub align_tool_open: bool,
     focus_next: Option<ToolPanel>,
 
     // Shared Luau eval state
@@ -227,6 +254,23 @@ pub struct StudioToolsState {
     tag_new_name: String,
     tag_filter: String,
     tag_custom: BTreeSet<String>,
+
+    // Collision Groups Editor
+    cg_groups: CollisionGroups,
+    cg_doc_id: u64,
+    cg_last_rev: u64,
+    cg_new_name: String,
+    cg_selected: String,
+    cg_renaming: Option<(String, String)>,
+    cg_status: Option<(bool, String)>,
+
+    // Alignment Tool
+    align_mode: AlignMode,
+    align_axis_x: bool,
+    align_axis_y: bool,
+    align_axis_z: bool,
+    align_relative_to: AlignRelativeTo,
+    align_status: Option<String>,
 }
 
 impl Default for StudioToolsState {
@@ -243,6 +287,8 @@ impl Default for StudioToolsState {
             run_script_open: false,
             tag_editor_open: false,
             task_scheduler_open: false,
+            collision_groups_open: false,
+            align_tool_open: false,
             focus_next: None,
 
             next_eval_id: 900_000,
@@ -299,6 +345,21 @@ impl Default for StudioToolsState {
             tag_new_name: String::new(),
             tag_filter: String::new(),
             tag_custom: BTreeSet::new(),
+
+            cg_groups: CollisionGroups::default(),
+            cg_doc_id: 0,
+            cg_last_rev: u64::MAX,
+            cg_new_name: String::new(),
+            cg_selected: DEFAULT_COLLISION_GROUP.to_string(),
+            cg_renaming: None,
+            cg_status: None,
+
+            align_mode: AlignMode::Center,
+            align_axis_x: true,
+            align_axis_y: false,
+            align_axis_z: false,
+            align_relative_to: AlignRelativeTo::SelectionBoundingBox,
+            align_status: None,
         }
     }
 }
@@ -317,6 +378,8 @@ impl StudioToolsState {
             ToolPanel::RunScript => self.run_script_open,
             ToolPanel::TagEditor => self.tag_editor_open,
             ToolPanel::TaskScheduler => self.task_scheduler_open,
+            ToolPanel::CollisionGroups => self.collision_groups_open,
+            ToolPanel::AlignmentTool => self.align_tool_open,
         }
     }
 
@@ -333,6 +396,8 @@ impl StudioToolsState {
             ToolPanel::RunScript => &mut self.run_script_open,
             ToolPanel::TagEditor => &mut self.tag_editor_open,
             ToolPanel::TaskScheduler => &mut self.task_scheduler_open,
+            ToolPanel::CollisionGroups => &mut self.collision_groups_open,
+            ToolPanel::AlignmentTool => &mut self.align_tool_open,
         }
     }
 
@@ -425,7 +490,7 @@ impl Editor {
         self.poll_tool_evals();
         self.poll_run_script_picker();
 
-        const ALL: [ToolPanel; 11] = [
+        const ALL: [ToolPanel; 13] = [
             ToolPanel::CommandBar,
             ToolPanel::InsertObject,
             ToolPanel::ActivityHistory,
@@ -437,6 +502,8 @@ impl Editor {
             ToolPanel::RunScript,
             ToolPanel::TagEditor,
             ToolPanel::TaskScheduler,
+            ToolPanel::CollisionGroups,
+            ToolPanel::AlignmentTool,
         ];
 
         for panel in ALL {
@@ -473,6 +540,8 @@ impl Editor {
                 ToolPanel::RunScript => self.run_script_panel_ui(ui),
                 ToolPanel::TagEditor => self.tag_editor_panel_ui(ui),
                 ToolPanel::TaskScheduler => self.task_scheduler_panel_ui(ui),
+                ToolPanel::CollisionGroups => self.collision_groups_panel_ui(ui),
+                ToolPanel::AlignmentTool => self.align_tool_panel_ui(ui),
             });
             if focus {
                 if let Some(r) = resp {
@@ -2459,4 +2528,640 @@ impl Editor {
             }
         });
     }
+
+    // =========================================================================
+    // 12. Collision Groups Editor (PhysicsService.CollisionGroups)
+    // =========================================================================
+
+    fn sync_collision_groups_from_doc(&mut self) {
+        if self.ui.tools.cg_doc_id != self.game.doc.id
+            || self.ui.tools.cg_last_rev != self.game.doc.revision
+        {
+            self.ui.tools.cg_groups = CollisionGroups::load_from_doc(&self.game.doc);
+            self.ui.tools.cg_doc_id = self.game.doc.id;
+            self.ui.tools.cg_last_rev = self.game.doc.revision;
+            if !self.ui.tools.cg_groups.is_registered(&self.ui.tools.cg_selected) {
+                self.ui.tools.cg_selected = DEFAULT_COLLISION_GROUP.to_string();
+            }
+            if let Some((orig, _)) = &self.ui.tools.cg_renaming {
+                if !self.ui.tools.cg_groups.is_registered(orig) {
+                    self.ui.tools.cg_renaming = None;
+                }
+            }
+        }
+    }
+
+    fn save_collision_groups_to_doc(&mut self, label: &str, part_remap: Option<(&str, &str)>) {
+        let serialized = serialize_collision_groups(&self.ui.tools.cg_groups);
+        let root = self.game.doc.dom.root_ref();
+        let ps = match self.game.doc.find_child(root, "PhysicsService") {
+            Some(r) => r,
+            None => self.game.doc.insert(
+                root,
+                rbx_dom_weak::InstanceBuilder::new("PhysicsService").with_name("PhysicsService"),
+            ),
+        };
+        let mut edits = vec![(ps, ustr("CollisionGroups"), Variant::String(serialized))];
+        if let Some((old_name, new_name)) = part_remap {
+            for inst in self.game.doc.dom.descendants() {
+                if !rustudio_core::doc::is_a(inst.class.as_str(), "BasePart") {
+                    continue;
+                }
+                if matches!(
+                    inst.properties.get(&ustr("CollisionGroup")),
+                    Some(Variant::String(cur)) if cur == old_name
+                ) {
+                    edits.push((
+                        inst.referent(),
+                        ustr("CollisionGroup"),
+                        Variant::String(new_name.to_string()),
+                    ));
+                }
+            }
+        }
+        self.game.doc.set_props(label, edits, None);
+        self.ui.tools.cg_doc_id = self.game.doc.id;
+        self.ui.tools.cg_last_rev = self.game.doc.revision;
+    }
+
+    pub fn collision_groups_panel_ui(&mut self, ui: &mut egui::Ui) {
+        self.sync_collision_groups_from_doc();
+        let playing = self.game.is_playing();
+        let selected_parts = self.selected_parts();
+
+        // Top bar: create new collision group
+        ui.horizontal(|ui| {
+            let resp = ui.add_enabled(
+                !playing,
+                egui::TextEdit::singleline(&mut self.ui.tools.cg_new_name)
+                    .hint_text("New collision group…")
+                    .desired_width((ui.available_width() - 140.0).max(120.0)),
+            );
+            let add_clicked = ui
+                .add_enabled(!playing, egui::Button::new("Add Group"))
+                .clicked()
+                || (!playing && resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if add_clicked {
+                let name = self.ui.tools.cg_new_name.trim().to_string();
+                if name.contains('^') || name.contains('\\') {
+                    self.ui.tools.cg_status =
+                        Some((false, "Group name cannot contain '^' or '\\'.".into()));
+                } else {
+                    match self.ui.tools.cg_groups.register(&name) {
+                        Ok(()) => {
+                            self.ui.tools.cg_new_name.clear();
+                            self.ui.tools.cg_selected = name.clone();
+                            self.save_collision_groups_to_doc(
+                                &format!("Add Collision Group {name}"),
+                                None,
+                            );
+                            self.ui.tools.cg_status =
+                                Some((true, format!("Added collision group '{name}'.")));
+                        }
+                        Err(e) => {
+                            self.ui.tools.cg_status = Some((false, e));
+                        }
+                    }
+                }
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{}/{}",
+                    self.ui.tools.cg_groups.names().len(),
+                    MAX_GROUPS
+                ))
+                .small()
+                .color(theme::TEXT_DIM),
+            );
+        });
+
+        if playing {
+            ui.label(
+                RichText::new("Stop Play to edit collision groups on the Edit DataModel.")
+                    .small()
+                    .color(theme::WARN),
+            );
+        }
+
+        ui.add_space(4.0);
+
+        // Selected group assignment bar
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Active Group:").small().color(theme::TEXT_DIM));
+            ui.label(RichText::new(&self.ui.tools.cg_selected).small().strong());
+            ui.separator();
+            let assign_label = format!("Assign Selected Parts ({})", selected_parts.len());
+            if ui
+                .add_enabled(!playing && !selected_parts.is_empty(), egui::Button::new(assign_label))
+                .clicked()
+            {
+                let group = self.ui.tools.cg_selected.clone();
+                let edits: Vec<_> = selected_parts
+                    .iter()
+                    .map(|&r| (r, ustr("CollisionGroup"), Variant::String(group.clone())))
+                    .collect();
+                let n = edits.len();
+                self.game
+                    .doc
+                    .set_props(&format!("Assign CollisionGroup {group}"), edits, None);
+                self.ui.tools.cg_last_rev = self.game.doc.revision;
+                self.ui.tools.cg_status = Some((
+                    true,
+                    format!("Assigned {n} part(s) to '{group}'."),
+                ));
+            }
+            if ui.small_button("Select Parts").clicked() {
+                let target = self.ui.tools.cg_selected.clone();
+                let matched: Vec<Ref> = self
+                    .game
+                    .doc
+                    .dom
+                    .descendants()
+                    .filter(|inst| {
+                        if !rustudio_core::doc::is_a(inst.class.as_str(), "BasePart") {
+                            return false;
+                        }
+                        let cur = match inst.properties.get(&ustr("CollisionGroup")) {
+                            Some(Variant::String(s)) if !s.is_empty() => s.as_str(),
+                            _ => DEFAULT_COLLISION_GROUP,
+                        };
+                        cur == target
+                    })
+                    .map(|inst| inst.referent())
+                    .collect();
+                let n = matched.len();
+                self.select(matched);
+                self.ui.tools.cg_status = Some((true, format!("Selected {n} part(s) in '{target}'.")));
+            }
+        });
+
+        ui.separator();
+
+        // N×N Collidability Matrix
+        let names: Vec<String> = self.ui.tools.cg_groups.names().to_vec();
+        let mut toggle_pair: Option<(String, String, bool)> = None;
+        let mut delete_group: Option<String> = None;
+        let mut commit_rename: Option<(String, String)> = None;
+        let mut start_rename: Option<String> = None;
+        let mut cancel_rename = false;
+
+        egui::ScrollArea::both()
+            .id_salt("collision_groups_matrix_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("collision_groups_matrix_grid")
+                    .striped(true)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        // Header row
+                        ui.label(RichText::new("Group").strong().small());
+                        for col_name in &names {
+                            let short = if col_name.chars().count() > 10 {
+                                format!("{}…", col_name.chars().take(9).collect::<String>())
+                            } else {
+                                col_name.clone()
+                            };
+                            ui.label(RichText::new(short).strong().small())
+                                .on_hover_text(col_name);
+                        }
+                        ui.end_row();
+
+                        // Matrix rows
+                        for row_name in &names {
+                            let is_default = row_name == DEFAULT_COLLISION_GROUP;
+                            let is_renaming = self
+                                .ui
+                                .tools
+                                .cg_renaming
+                                .as_ref()
+                                .is_some_and(|(orig, _)| orig == row_name);
+
+                            ui.horizontal(|ui| {
+                                if is_renaming {
+                                    if let Some((_, draft)) = self.ui.tools.cg_renaming.as_mut() {
+                                        let r = ui.add(
+                                            egui::TextEdit::singleline(draft).desired_width(100.0),
+                                        );
+                                        let enter = r.has_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        let esc = r.has_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                        if enter || ui.small_button("✓").clicked() {
+                                            commit_rename =
+                                                Some((row_name.clone(), draft.trim().to_string()));
+                                        }
+                                        if esc || ui.small_button("✕").clicked() {
+                                            cancel_rename = true;
+                                        }
+                                    }
+                                } else {
+                                    let selected = self.ui.tools.cg_selected == *row_name;
+                                    if ui.selectable_label(selected, row_name).clicked() {
+                                        self.ui.tools.cg_selected = row_name.clone();
+                                    }
+                                    if !is_default && !playing {
+                                        if ui
+                                            .small_button("✎")
+                                            .on_hover_text("Rename group")
+                                            .clicked()
+                                        {
+                                            start_rename = Some(row_name.clone());
+                                        }
+                                        if ui
+                                            .small_button("✕")
+                                            .on_hover_text("Delete group")
+                                            .clicked()
+                                        {
+                                            delete_group = Some(row_name.clone());
+                                        }
+                                    }
+                                }
+                            });
+
+                            for col_name in &names {
+                                let mut on = self.ui.tools.cg_groups.collidable(row_name, col_name);
+                                let resp = ui
+                                    .add_enabled(!playing, egui::Checkbox::without_text(&mut on))
+                                    .on_hover_text(format!("{row_name} ↔ {col_name}"));
+                                if resp.changed() {
+                                    toggle_pair = Some((row_name.clone(), col_name.clone(), on));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if cancel_rename {
+            self.ui.tools.cg_renaming = None;
+        }
+        if let Some(name) = start_rename {
+            self.ui.tools.cg_renaming = Some((name.clone(), name));
+        }
+        if let Some((from, to)) = commit_rename {
+            self.ui.tools.cg_renaming = None;
+            if from != to {
+                if to.contains('^') || to.contains('\\') {
+                    self.ui.tools.cg_status =
+                        Some((false, "Group name cannot contain '^' or '\\'.".into()));
+                } else if let Err(e) = collision_groups::check_name(&to) {
+                    self.ui.tools.cg_status = Some((false, e));
+                } else if self.ui.tools.cg_groups.is_registered(&to) {
+                    self.ui.tools.cg_status =
+                        Some((false, format!("Collision group '{to}' already exists.")));
+                } else {
+                    self.ui.tools.cg_groups.rename(&from, &to);
+                    if self.ui.tools.cg_selected == from {
+                        self.ui.tools.cg_selected = to.clone();
+                    }
+                    self.save_collision_groups_to_doc(
+                        &format!("Rename Collision Group {from} to {to}"),
+                        Some((&from, &to)),
+                    );
+                    self.ui.tools.cg_status =
+                        Some((true, format!("Renamed '{from}' to '{to}'.")));
+                }
+            }
+        }
+        if let Some(name) = delete_group {
+            self.ui.tools.cg_groups.unregister(&name);
+            if self.ui.tools.cg_selected == name {
+                self.ui.tools.cg_selected = DEFAULT_COLLISION_GROUP.to_string();
+            }
+            if self
+                .ui
+                .tools
+                .cg_renaming
+                .as_ref()
+                .is_some_and(|(orig, _)| orig == &name)
+            {
+                self.ui.tools.cg_renaming = None;
+            }
+            self.save_collision_groups_to_doc(
+                &format!("Delete Collision Group {name}"),
+                Some((&name, DEFAULT_COLLISION_GROUP)),
+            );
+            self.ui.tools.cg_status = Some((true, format!("Deleted collision group '{name}'.")));
+        }
+        if let Some((a, b, on)) = toggle_pair {
+            self.ui.tools.cg_groups.set_collidable(&a, &b, on);
+            self.save_collision_groups_to_doc(&format!("Toggle Collision {a} / {b}"), None);
+        }
+
+        if let Some((ok, msg)) = &self.ui.tools.cg_status {
+            ui.add_space(4.0);
+            let col = if *ok {
+                Color32::from_rgb(130, 210, 130)
+            } else {
+                theme::ERROR
+            };
+            ui.label(RichText::new(msg).small().color(col));
+        }
+    }
+
+    // =========================================================================
+    // 13. Alignment Tool
+    // =========================================================================
+
+    pub fn align_tool_panel_ui(&mut self, ui: &mut egui::Ui) {
+        let playing = self.game.is_playing();
+        let top = self.game.doc.top_level(&self.game.doc.selection);
+        let alignable_count = top
+            .iter()
+            .filter(|&&r| {
+                self.game.doc.class_of(r).is_some_and(|c| {
+                    rustudio_core::doc::is_a(&c, "BasePart") || c == "Model"
+                })
+            })
+            .count();
+        let active_name = top
+            .iter()
+            .rev()
+            .find(|&&r| {
+                self.game.doc.class_of(r).is_some_and(|c| {
+                    rustudio_core::doc::is_a(&c, "BasePart") || c == "Model"
+                })
+            })
+            .and_then(|&r| self.game.doc.dom.get_by_ref(r).map(|i| i.name.clone()));
+
+        ui.label(RichText::new("Mode").strong().small());
+        ui.horizontal(|ui| {
+            for (mode, label) in [
+                (AlignMode::Min, "Min"),
+                (AlignMode::Center, "Center"),
+                (AlignMode::Max, "Max"),
+            ] {
+                if ui
+                    .selectable_label(self.ui.tools.align_mode == mode, label)
+                    .clicked()
+                {
+                    self.ui.tools.align_mode = mode;
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("Align Axes").strong().small());
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.ui.tools.align_axis_x, "X");
+            ui.checkbox(&mut self.ui.tools.align_axis_y, "Y");
+            ui.checkbox(&mut self.ui.tools.align_axis_z, "Z");
+        });
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("Relative To").strong().small());
+        ui.radio_value(
+            &mut self.ui.tools.align_relative_to,
+            AlignRelativeTo::SelectionBoundingBox,
+            "Selection Bounding Box",
+        );
+        let active_label = match &active_name {
+            Some(n) => format!("Active Object ({n})"),
+            None => "Active Object".to_string(),
+        };
+        ui.radio_value(
+            &mut self.ui.tools.align_relative_to,
+            AlignRelativeTo::ActiveObject,
+            active_label,
+        );
+
+        ui.add_space(8.0);
+        ui.separator();
+
+        let any_axis = self.ui.tools.align_axis_x
+            || self.ui.tools.align_axis_y
+            || self.ui.tools.align_axis_z;
+        let can_align = !playing && alignable_count >= 2 && any_axis;
+
+        if playing {
+            ui.label(
+                RichText::new("Stop Play to align objects.")
+                    .small()
+                    .color(theme::WARN),
+            );
+        } else if alignable_count < 2 {
+            ui.label(
+                RichText::new("Select 2 or more Parts or Models to align.")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+        } else if !any_axis {
+            ui.label(
+                RichText::new("Enable at least one axis (X, Y, or Z).")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+        } else {
+            ui.label(
+                RichText::new(format!("{alignable_count} alignable objects selected"))
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+        }
+
+        ui.add_space(4.0);
+        if ui
+            .add_enabled(
+                can_align,
+                egui::Button::new("Align").min_size(Vec2::new(ui.available_width(), 26.0)),
+            )
+            .clicked()
+        {
+            self.execute_align_selection();
+        }
+
+        if let Some(msg) = &self.ui.tools.align_status {
+            ui.add_space(4.0);
+            ui.label(RichText::new(msg).small().color(theme::TEXT_DIM));
+        }
+    }
+
+    fn execute_align_selection(&mut self) {
+        struct AlignItem {
+            min: glam::Vec3,
+            max: glam::Vec3,
+            parts: Vec<Ref>,
+            models: Vec<Ref>,
+        }
+
+        let top = self.game.doc.top_level(&self.game.doc.selection);
+        let mut items: Vec<AlignItem> = Vec::new();
+
+        for r in top {
+            let Some(cls) = self.game.doc.class_of(r) else {
+                continue;
+            };
+            if rustudio_core::doc::is_a(&cls, "BasePart") {
+                if let Some((min, max)) = part_world_aabb(&self.game.doc, r) {
+                    items.push(AlignItem {
+                        min,
+                        max,
+                        parts: vec![r],
+                        models: Vec::new(),
+                    });
+                }
+            } else if cls == "Model" {
+                let mut lo = glam::Vec3::splat(f32::INFINITY);
+                let mut hi = glam::Vec3::splat(f32::NEG_INFINITY);
+                let mut parts = Vec::new();
+                let mut models = Vec::new();
+                let root_has_pp = matches!(
+                    self.game.doc.prop(r, "PrimaryPart"),
+                    Some(Variant::Ref(pp)) if self.game.doc.dom.get_by_ref(pp).is_some()
+                );
+                if !root_has_pp {
+                    models.push(r);
+                }
+                for inst in self.game.doc.dom.descendants_of(r) {
+                    let dr = inst.referent();
+                    if rustudio_core::doc::is_a(inst.class.as_str(), "BasePart") {
+                        if let Some((pmin, pmax)) = part_world_aabb(&self.game.doc, dr) {
+                            lo = lo.min(pmin);
+                            hi = hi.max(pmax);
+                            parts.push(dr);
+                        }
+                    } else if inst.class.as_str() == "Model" {
+                        let has_pp = matches!(
+                            self.game.doc.prop(dr, "PrimaryPart"),
+                            Some(Variant::Ref(pp)) if self.game.doc.dom.get_by_ref(pp).is_some()
+                        );
+                        if !has_pp && dr != r {
+                            models.push(dr);
+                        }
+                    }
+                }
+                if !parts.is_empty() && lo.is_finite() && hi.is_finite() {
+                    items.push(AlignItem {
+                        min: lo,
+                        max: hi,
+                        parts,
+                        models,
+                    });
+                }
+            }
+        }
+
+        if items.len() < 2 {
+            self.ui.tools.align_status =
+                Some("Select at least 2 Parts or Models with geometry.".into());
+            return;
+        }
+
+        let (ref_min, ref_max) = match self.ui.tools.align_relative_to {
+            AlignRelativeTo::SelectionBoundingBox => {
+                let mut lo = glam::Vec3::splat(f32::INFINITY);
+                let mut hi = glam::Vec3::splat(f32::NEG_INFINITY);
+                for it in &items {
+                    lo = lo.min(it.min);
+                    hi = hi.max(it.max);
+                }
+                (lo, hi)
+            }
+            AlignRelativeTo::ActiveObject => {
+                let last = items.last().unwrap();
+                (last.min, last.max)
+            }
+        };
+
+        let axes = [
+            self.ui.tools.align_axis_x,
+            self.ui.tools.align_axis_y,
+            self.ui.tools.align_axis_z,
+        ];
+        let mode = self.ui.tools.align_mode;
+        let mut edits = Vec::new();
+        let mut moved_objects = 0usize;
+
+        for item in &items {
+            let mut delta = glam::Vec3::ZERO;
+            for axis in 0..3 {
+                if !axes[axis] {
+                    continue;
+                }
+                delta[axis] = match mode {
+                    AlignMode::Min => ref_min[axis] - item.min[axis],
+                    AlignMode::Center => {
+                        (ref_min[axis] + ref_max[axis]) * 0.5
+                            - (item.min[axis] + item.max[axis]) * 0.5
+                    }
+                    AlignMode::Max => ref_max[axis] - item.max[axis],
+                };
+            }
+            if delta.length_squared() <= 1e-8 {
+                continue;
+            }
+            moved_objects += 1;
+            for &pr in &item.parts {
+                if let Some(Variant::CFrame(cf)) = self.game.doc.prop(pr, "CFrame") {
+                    let mut xf = Xform::from_cframe(&cf);
+                    xf.pos += delta;
+                    edits.push((pr, ustr("CFrame"), Variant::CFrame(xf.to_cframe())));
+                }
+            }
+            for &mr in &item.models {
+                if let Some(Variant::OptionalCFrame(Some(cf))) =
+                    self.game.doc.prop(mr, "WorldPivotData")
+                {
+                    let mut xf = Xform::from_cframe(&cf);
+                    xf.pos += delta;
+                    edits.push((
+                        mr,
+                        ustr("WorldPivotData"),
+                        Variant::OptionalCFrame(Some(xf.to_cframe())),
+                    ));
+                }
+            }
+        }
+
+        if edits.is_empty() {
+            self.ui.tools.align_status = Some("Selection is already aligned.".into());
+        } else {
+            self.game.doc.set_props("Align Objects", edits, None);
+            self.ui.tools.align_status = Some(format!("Aligned {moved_objects} object(s)."));
+        }
+    }
+}
+
+fn serialize_collision_groups(groups: &CollisionGroups) -> String {
+    let names = groups.names();
+    let mut out = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let mut mask: u32 = u32::MAX;
+        for (j, other) in names.iter().enumerate() {
+            if !groups.collidable(name, other) {
+                mask &= !(1u32 << j);
+            }
+        }
+        if !out.is_empty() {
+            out.push('\\');
+        }
+        let signed = mask as i32;
+        out.push_str(&format!("{name}^{i}^{signed}"));
+    }
+    out
+}
+
+fn part_world_aabb(
+    doc: &rustudio_core::doc::Document,
+    r: Ref,
+) -> Option<(glam::Vec3, glam::Vec3)> {
+    let Variant::CFrame(cf) = doc.prop(r, "CFrame")? else {
+        return None;
+    };
+    let xf = Xform::from_cframe(&cf);
+    let size = match doc.prop(r, "Size") {
+        Some(Variant::Vector3(v)) => v3(v),
+        _ => glam::Vec3::ONE,
+    };
+    let hx = (0..3)
+        .map(|i| xf.rot.col(i).x.abs() * size[i] * 0.5)
+        .sum::<f32>();
+    let hy = (0..3)
+        .map(|i| xf.rot.col(i).y.abs() * size[i] * 0.5)
+        .sum::<f32>();
+    let hz = (0..3)
+        .map(|i| xf.rot.col(i).z.abs() * size[i] * 0.5)
+        .sum::<f32>();
+    let half = glam::Vec3::new(hx, hy, hz);
+    Some((xf.pos - half, xf.pos + half))
 }

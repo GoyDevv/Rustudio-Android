@@ -13,12 +13,14 @@ use glam::{Mat3, Vec3};
 
 use super::*;
 use rustudio_core::math::Xform;
-use rustudio_render::scene::{vec3_of, xform_of};
+use rustudio_render::scene::{enum_u32, vec3_of, xform_of};
 
 const HANDLE_R: f32 = 0.55;
 
 pub(super) fn is_adornment(class: &str) -> bool {
-    doc::is_a(class, "HandleAdornment") || doc::is_a(class, "HandlesBase")
+    doc::is_a(class, "HandleAdornment")
+        || doc::is_a(class, "HandlesBase")
+        || matches!(class, "SelectionBox" | "SelectionSphere" | "SurfaceSelection")
 }
 
 fn adornee(d: &Document, a: Ref) -> Option<(Xform, Vec3)> {
@@ -76,15 +78,145 @@ impl Gui {
                 continue;
             }
             let Some((cf, size)) = adornee(d, a) else { continue };
-            let alpha = 1.0 - num(d, a, "Transparency", 0.0);
-            let col = rgba(color(d, a, "Color3", [13.0 / 255.0, 105.0 / 255.0, 172.0 / 255.0]), alpha.clamp(0.0, 1.0));
+            let default_rgb = [13.0 / 255.0, 105.0 / 255.0, 172.0 / 255.0];
+            let rgb = color(d, a, "Color3", default_rgb);
+            let alpha = (1.0 - num(d, a, "Transparency", 0.0)).clamp(0.0, 1.0);
+            let col = rgba(rgb, alpha);
             let sphere = |c: Vec3, r: f32, colour: Color32| {
                 if let Some(p) = proj(c) {
                     let px = r / cam.world_per_px(rect, c);
                     painter.circle_filled(p, px, colour);
                 }
             };
+            let draw_box = |frame: &Xform, s: Vec3, off: Vec3, colour: Color32| {
+                let h = s * 0.5;
+                let c = |x: f32, y: f32, z: f32| frame.apply(off + Vec3::new(x * h.x, y * h.y, z * h.z));
+                let quads = [
+                    [c(1., -1., -1.), c(1., 1., -1.), c(1., 1., 1.), c(1., -1., 1.)],
+                    [c(-1., -1., -1.), c(-1., -1., 1.), c(-1., 1., 1.), c(-1., 1., -1.)],
+                    [c(-1., 1., -1.), c(-1., 1., 1.), c(1., 1., 1.), c(1., 1., -1.)],
+                    [c(-1., -1., -1.), c(1., -1., -1.), c(1., -1., 1.), c(-1., -1., 1.)],
+                    [c(-1., -1., 1.), c(1., -1., 1.), c(1., 1., 1.), c(-1., 1., 1.)],
+                    [c(-1., -1., -1.), c(-1., 1., -1.), c(1., 1., -1.), c(1., -1., -1.)],
+                ];
+                // Faces turned to the camera, far first.
+                let mut faces: Vec<(f32, [Vec3; 4])> = quads
+                    .iter()
+                    .filter(|q| {
+                        let n = (q[1] - q[0]).cross(q[2] - q[0]);
+                        n.dot(cam.pos - q[0]) > 0.0
+                    })
+                    .map(|q| (((q[0] + q[2]) * 0.5 - cam.pos).length_squared(), *q))
+                    .collect();
+                faces.sort_by(|a, b| b.0.total_cmp(&a.0));
+                for (_, q) in faces {
+                    let p: Option<Vec<Pos2>> = q.iter().map(|v| proj(*v)).collect();
+                    if let Some(mut p) = p {
+                        // One screen winding for egui's fill.
+                        let area: f32 = (0..p.len())
+                            .map(|i| {
+                                let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                                a.x * b.y - b.x * a.y
+                            })
+                            .sum();
+                        if area < 0.0 {
+                            p.reverse();
+                        }
+                        painter.add(Shape::convex_polygon(p, colour, Stroke::NONE));
+                    }
+                }
+            };
             match class.as_str() {
+                "SelectionBox" => {
+                    let surf_alpha = (1.0 - num(d, a, "SurfaceTransparency", 1.0)).clamp(0.0, 1.0);
+                    if surf_alpha > 0.0 {
+                        let surf_col = rgba(color(d, a, "SurfaceColor3", default_rgb), surf_alpha);
+                        draw_box(&cf, size, Vec3::ZERO, surf_col);
+                    }
+                    let line_thickness = num(d, a, "LineThickness", 0.15).max(0.0);
+                    if alpha > 0.0 && line_thickness > 0.0 {
+                        let stroke_px = (line_thickness / cam.world_per_px(rect, cf.pos).max(1e-4)).clamp(1.0, 24.0);
+                        let stroke = Stroke::new(stroke_px, col);
+                        let h = size * 0.5;
+                        let c = |x: f32, y: f32, z: f32| cf.apply(Vec3::new(x * h.x, y * h.y, z * h.z));
+                        let corners = [
+                            c(-1., -1., -1.), c(1., -1., -1.), c(1., 1., -1.), c(-1., 1., -1.),
+                            c(-1., -1., 1.),  c(1., -1., 1.),  c(1., 1., 1.),  c(-1., 1., 1.),
+                        ];
+                        const EDGES: [(usize, usize); 12] = [
+                            (0, 1), (1, 2), (2, 3), (3, 0),
+                            (4, 5), (5, 6), (6, 7), (7, 4),
+                            (0, 4), (1, 5), (2, 6), (3, 7),
+                        ];
+                        for (i, j) in EDGES {
+                            if let (Some(p0), Some(p1)) = (proj(corners[i]), proj(corners[j])) {
+                                painter.line_segment([p0, p1], stroke);
+                            }
+                        }
+                    }
+                }
+                "SelectionSphere" => {
+                    let radius = (size * 0.5).length();
+                    let surf_alpha = (1.0 - num(d, a, "SurfaceTransparency", 1.0)).clamp(0.0, 1.0);
+                    if let Some(p) = proj(cf.pos) {
+                        let px = radius / cam.world_per_px(rect, cf.pos).max(1e-4);
+                        if surf_alpha > 0.0 {
+                            let surf_col = rgba(color(d, a, "SurfaceColor3", default_rgb), surf_alpha);
+                            painter.circle_filled(p, px, surf_col);
+                        }
+                        if alpha > 0.0 {
+                            painter.circle_stroke(p, px, Stroke::new(1.5, col));
+                        }
+                    }
+                    if alpha > 0.0 {
+                        let stroke = Stroke::new(1.0, col);
+                        for (u, v) in [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)] {
+                            let mut prev: Option<Pos2> = None;
+                            for i in 0..=48 {
+                                let t = i as f32 / 48.0 * std::f32::consts::TAU;
+                                let cur = proj(cf.apply((u * t.cos() + v * t.sin()) * radius));
+                                if let (Some(p0), Some(p1)) = (prev, cur) {
+                                    painter.line_segment([p0, p1], stroke);
+                                }
+                                prev = cur;
+                            }
+                        }
+                    }
+                }
+                "SurfaceSelection" => {
+                    if alpha > 0.0 {
+                        let h = size * 0.5;
+                        let c = |x: f32, y: f32, z: f32| cf.apply(Vec3::new(x * h.x, y * h.y, z * h.z));
+                        let face = match enum_u32(d.prop(a, "TargetSurface")).unwrap_or(0) {
+                            0 => [c(1., -1., -1.), c(1., 1., -1.), c(1., 1., 1.), c(1., -1., 1.)],
+                            1 => [c(-1., 1., -1.), c(-1., 1., 1.), c(1., 1., 1.), c(1., 1., -1.)],
+                            2 => [c(-1., -1., 1.), c(1., -1., 1.), c(1., 1., 1.), c(-1., 1., 1.)],
+                            3 => [c(-1., -1., -1.), c(-1., -1., 1.), c(-1., 1., 1.), c(-1., 1., -1.)],
+                            4 => [c(-1., -1., -1.), c(1., -1., -1.), c(1., -1., 1.), c(-1., -1., 1.)],
+                            _ => [c(-1., -1., -1.), c(-1., 1., -1.), c(1., 1., -1.), c(1., -1., -1.)],
+                        };
+                        let stroke = Stroke::new(2.0, col);
+                        if let Some(mut p) = face.iter().map(|v| proj(*v)).collect::<Option<Vec<Pos2>>>() {
+                            let area: f32 = (0..p.len())
+                                .map(|i| {
+                                    let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                                    a.x * b.y - b.x * a.y
+                                })
+                                .sum();
+                            if area < 0.0 {
+                                p.reverse();
+                            }
+                            let fill = rgba(rgb, (alpha * 0.25).clamp(0.0, 1.0));
+                            painter.add(Shape::convex_polygon(p, fill, stroke));
+                        } else {
+                            for i in 0..4 {
+                                if let (Some(p0), Some(p1)) = (proj(face[i]), proj(face[(i + 1) % 4])) {
+                                    painter.line_segment([p0, p1], stroke);
+                                }
+                            }
+                        }
+                    }
+                }
                 "Handles" => {
                     let faces = match d.prop(a, "Faces") {
                         Some(Variant::Faces(f)) => f,
@@ -139,44 +271,7 @@ impl Gui {
                     };
                     let rel = vec3_of(d.prop(a, "SizeRelativeOffset")).unwrap_or(Vec3::ZERO);
                     let base = then(&Xform { pos: cf.apply(size * rel * 0.5), rot: cf.rot }, &local);
-                    let boxed = |s: Vec3, off: Vec3| {
-                        let h = s * 0.5;
-                        let c = |x: f32, y: f32, z: f32| base.apply(off + Vec3::new(x * h.x, y * h.y, z * h.z));
-                        let quads = [
-                            [c(1., -1., -1.), c(1., 1., -1.), c(1., 1., 1.), c(1., -1., 1.)],
-                            [c(-1., -1., -1.), c(-1., -1., 1.), c(-1., 1., 1.), c(-1., 1., -1.)],
-                            [c(-1., 1., -1.), c(-1., 1., 1.), c(1., 1., 1.), c(1., 1., -1.)],
-                            [c(-1., -1., -1.), c(1., -1., -1.), c(1., -1., 1.), c(-1., -1., 1.)],
-                            [c(-1., -1., 1.), c(1., -1., 1.), c(1., 1., 1.), c(-1., 1., 1.)],
-                            [c(-1., -1., -1.), c(-1., 1., -1.), c(1., 1., -1.), c(1., -1., -1.)],
-                        ];
-                        // Faces turned to the camera, far first.
-                        let mut faces: Vec<(f32, [Vec3; 4])> = quads
-                            .iter()
-                            .filter(|q| {
-                                let n = (q[1] - q[0]).cross(q[2] - q[0]);
-                                n.dot(cam.pos - q[0]) > 0.0
-                            })
-                            .map(|q| (((q[0] + q[2]) * 0.5 - cam.pos).length_squared(), *q))
-                            .collect();
-                        faces.sort_by(|a, b| b.0.total_cmp(&a.0));
-                        for (_, q) in faces {
-                            let p: Option<Vec<Pos2>> = q.iter().map(|v| proj(*v)).collect();
-                            if let Some(mut p) = p {
-                                // One screen winding for egui's fill.
-                                let area: f32 = (0..p.len())
-                                    .map(|i| {
-                                        let (a, b) = (p[i], p[(i + 1) % p.len()]);
-                                        a.x * b.y - b.x * a.y
-                                    })
-                                    .sum();
-                                if area < 0.0 {
-                                    p.reverse();
-                                }
-                                painter.add(Shape::convex_polygon(p, col, Stroke::NONE));
-                            }
-                        }
-                    };
+                    let boxed = |s: Vec3, off: Vec3| draw_box(&base, s, off, col);
                     match class.as_str() {
                         "SphereHandleAdornment" => sphere(base.pos, num(d, a, "Radius", 1.0), col),
                         "BoxHandleAdornment" => boxed(vec3_of(d.prop(a, "Size")).unwrap_or(Vec3::ONE), Vec3::ZERO),

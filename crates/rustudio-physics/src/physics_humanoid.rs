@@ -379,6 +379,14 @@ pub struct Hums {
     /// RUSTUDIO_SOLVER=studio, `RUSTUDIO_REPL=interp` (default): the receiving side's
     /// interpolation buffer of each copied body (`Repl`).
     pub(super) repl: HashMap<rp::RigidBodyHandle, Repl>,
+    /// Cached Workspace.FluidForces == Experimental (`sync_fluid_forces`).
+    pub(super) fluid_forces_enabled: bool,
+    /// Cached Workspace.AirDensity (studs/mass density; default 0.0012 when unset).
+    pub(super) air_density: f32,
+    /// Cached Workspace.GlobalWind (studs/s).
+    pub(super) global_wind: Vec3,
+    /// Dynamic non-humanoid parts with BasePart.EnableFluidForces == true (`sync_fluid_forces`).
+    pub(super) fluid_parts: HashSet<Ref>,
 }
 
 impl Hums {
@@ -396,6 +404,7 @@ impl Hums {
         self.ghosts.clear();
         self.history.clear();
         self.repl.clear();
+        self.fluid_parts.clear();
     }
 }
 
@@ -1164,11 +1173,37 @@ impl Physics {
         }
     }
 
+    /// Syncs Workspace fluid/aerodynamics settings (`FluidForces`, `AirDensity`,
+    /// `GlobalWind`) and per-part `EnableFluidForces` flags for dynamic assemblies.
+    pub fn sync_fluid_forces(&mut self, doc: &Document) {
+        let Some(ws) = doc.workspace() else {
+            self.hums.fluid_forces_enabled = false;
+            self.hums.air_density = 0.0;
+            self.hums.global_wind = Vec3::ZERO;
+            self.hums.fluid_parts.clear();
+            return;
+        };
+        self.hums.fluid_forces_enabled = enum_u32(doc.prop(ws, "FluidForces")) == Some(1);
+        self.hums.air_density = f32_of(doc.prop(ws, "AirDensity")).unwrap_or(0.0012).max(0.0);
+        self.hums.global_wind = vec3_of(doc.prop(ws, "GlobalWind")).unwrap_or(Vec3::ZERO);
+        self.hums.fluid_parts.clear();
+        if self.hums.fluid_forces_enabled {
+            for a in self.asms.values() {
+                for &r in &a.parts {
+                    if matches!(doc.prop(r, "EnableFluidForces"), Some(Variant::Bool(true))) {
+                        self.hums.fluid_parts.insert(r);
+                    }
+                }
+            }
+        }
+    }
+
     /// Bodies whose character left Workspace (destroyed, respawned,
     /// unparented) go: a LoadCharacter while the old character was alive
     /// left its assembly standing at the spawn, unseen, and the new
     /// character was thrown off it.
     pub fn prune_humanoids(&mut self, doc: &Document) {
+        self.sync_fluid_forces(doc);
         let Some(ws) = doc.workspace() else { return };
         let gone: Vec<Ref> = self.hums.by_model.keys().copied().filter(|m| !doc.exists(*m) || !doc.is_ancestor(ws, *m)).collect();
         for m in gone {
@@ -2569,6 +2604,160 @@ impl Physics {
             }
         }
         self.hums.fext.clear();
+        self.apply_fluid_forces(h);
+    }
+
+    /// Rigid-body water buoyancy, water drag, and aerodynamic fluid forces
+    /// (`Workspace.FluidForces == Experimental` & `BasePart.EnableFluidForces == true`)
+    /// for unanchored non-humanoid `BasePart` assemblies.
+    fn apply_fluid_forces(&mut self, h: f32) {
+        let has_water = self.voxels.is_some();
+        let aero_on = self.hums.fluid_forces_enabled
+            && self.hums.air_density > 0.0
+            && !self.hums.fluid_parts.is_empty();
+        if (!has_water && !aero_on) || self.asms.is_empty() {
+            return;
+        }
+        // Water density in Roblox physics units (Plastic = 0.7 floats, Concrete = 2.4 sinks).
+        const WATER_DENSITY: f32 = 1.0;
+        const WATER_LIN_DRAG: f32 = 3.0;
+        const WATER_QUAD_CD: f32 = 0.8;
+        const WATER_ANG_DRAG: f32 = 4.0;
+        const AERO_CD: f32 = 1.05;
+        // Conservative max step for adaptive level-4 stability clamp (4 * h = 1/60 s).
+        let dt_stab = (4.0 * h).max(1.0e-4);
+        let gravity = self.gravity;
+        let air_density = self.hums.air_density;
+        let global_wind = self.hums.global_wind;
+
+        let mut forces: Vec<(rp::RigidBodyHandle, Vec3, Vec3)> = Vec::new();
+        for asm in self.asms.values() {
+            let Some(b) = self.world.bodies.get(asm.body) else { continue };
+            if !b.is_dynamic() || b.is_sleeping() {
+                continue;
+            }
+            let body_pose = *b.position();
+            let body_mass = b.mass();
+            if body_mass <= 1.0e-6 {
+                continue;
+            }
+            let com = gv(b.center_of_mass());
+            let mut f_total = Vec3::ZERO;
+            let mut t_total = Vec3::ZERO;
+            let mut max_sub_frac = 0.0_f32;
+
+            for &part_ref in &asm.parts {
+                let Some(pb) = self.parts.get(&part_ref) else { continue };
+                let Some(col) = self.world.colliders.get(pb.collider) else { continue };
+                let local_pose = col.position_wrt_parent().copied().unwrap_or(pb.local);
+                let world_pose = body_pose * local_pose;
+                let aabb = col.shape().compute_aabb(&world_pose);
+                let mins = gv(aabb.mins);
+                let maxs = gv(aabb.maxs);
+                let ext = (maxs - mins).max(Vec3::splat(1.0e-3));
+                let center = (mins + maxs) * 0.5;
+                let half_y = (ext.y * 0.5).max(1.0e-3);
+
+                // 1. Water buoyancy & linear water drag.
+                let mut sub_frac = 0.0_f32;
+                if has_water {
+                    let probe_bottom = Vec3::new(center.x, mins.y + half_y.min(0.1), center.z);
+                    let surface_y = self.water_top(probe_bottom).or_else(|| self.water_top(center));
+                    if let Some(water_y) = surface_y {
+                        let depth = (water_y - mins.y).clamp(0.0, 2.0 * half_y);
+                        sub_frac = (depth / (2.0 * half_y)).clamp(0.0, 1.0);
+                        if sub_frac > 0.0 {
+                            max_sub_frac = max_sub_frac.max(sub_frac);
+                            let shape_vol = col.shape().mass_properties(1.0).mass();
+                            let vol = if shape_vol > 1.0e-6 { shape_vol } else { ext.x * ext.y * ext.z };
+                            let submerged_vol = vol * sub_frac;
+                            let buoyancy_pt = Vec3::new(center.x, mins.y + 0.5 * depth, center.z);
+                            let f_buoy = Vec3::new(0.0, submerged_vol * WATER_DENSITY * gravity, 0.0);
+                            f_total += f_buoy;
+                            t_total += (buoyancy_pt - com).cross(f_buoy);
+
+                            let v_pt = gv(b.velocity_at_point(rv(buoyancy_pt)));
+                            let speed = v_pt.length();
+                            if speed > 1.0e-4 {
+                                let dir = v_pt / speed;
+                                let area = ext.y * ext.z * dir.x.abs()
+                                    + ext.x * ext.z * dir.y.abs()
+                                    + ext.x * ext.y * dir.z.abs();
+                                let sub_area = area * sub_frac;
+                                let raw_mag = WATER_LIN_DRAG * submerged_vol * speed
+                                    + 0.5 * WATER_DENSITY * WATER_QUAD_CD * sub_area * speed * speed;
+                                let max_mag = 0.5 * body_mass * speed / dt_stab;
+                                let f_drag = -dir * raw_mag.min(max_mag);
+                                f_total += f_drag;
+                                t_total += (buoyancy_pt - com).cross(f_drag);
+                            }
+                        }
+                    }
+                }
+
+                // 2. Aerodynamics (Workspace.FluidForces == Experimental & BasePart.EnableFluidForces).
+                if aero_on && sub_frac < 1.0 && self.hums.fluid_parts.contains(&part_ref) {
+                    let v_pt = gv(b.velocity_at_point(rv(center)));
+                    let v_rel = v_pt - global_wind;
+                    let speed = v_rel.length();
+                    if speed > 1.0e-4 {
+                        let dir = v_rel / speed;
+                        let area = if let Some(cuboid) = col.shape().as_cuboid() {
+                            let s = gv(cuboid.half_extents) * 2.0;
+                            let rot = xform(&world_pose).rot;
+                            s.y * s.z * rot.x_axis.dot(dir).abs()
+                                + s.x * s.z * rot.y_axis.dot(dir).abs()
+                                + s.x * s.y * rot.z_axis.dot(dir).abs()
+                        } else if let Some(ball) = col.shape().as_ball() {
+                            std::f32::consts::PI * ball.radius * ball.radius
+                        } else {
+                            ext.y * ext.z * dir.x.abs()
+                                + ext.x * ext.z * dir.y.abs()
+                                + ext.x * ext.y * dir.z.abs()
+                        };
+                        let exposed = 1.0 - sub_frac;
+                        let rho = air_density * (-center.y.max(0.0) / 33381.0).exp();
+                        let raw_mag = 0.5 * rho * AERO_CD * area * exposed * speed * speed;
+                        let max_mag = 0.5 * body_mass * speed / dt_stab;
+                        let f_aero = -dir * raw_mag.min(max_mag);
+                        f_total += f_aero;
+                        t_total += (center - com).cross(f_aero);
+                    }
+                }
+            }
+
+            // Angular water drag damping for submerged assemblies.
+            if max_sub_frac > 0.0 {
+                let w = gv(b.angvel());
+                if w.length_squared() > 1.0e-8 {
+                    let mp = b.mass_properties().local_mprops;
+                    let li = mp.reconstruct_inertia_matrix();
+                    let li = Mat3::from_cols(
+                        Vec3::new(li.x_axis.x, li.x_axis.y, li.x_axis.z),
+                        Vec3::new(li.y_axis.x, li.y_axis.y, li.y_axis.z),
+                        Vec3::new(li.z_axis.x, li.z_axis.y, li.z_axis.z),
+                    );
+                    let rot = xform(&body_pose).rot;
+                    let inertia = rot * li * rot.transpose();
+                    t_total -= inertia * w * (WATER_ANG_DRAG * max_sub_frac);
+                }
+            }
+
+            if (f_total.length_squared() > 1.0e-12 || t_total.length_squared() > 1.0e-12)
+                && f_total.is_finite()
+                && t_total.is_finite()
+            {
+                forces.push((asm.body, f_total, t_total));
+            }
+        }
+
+        for (handle, f, t) in forces {
+            if let Some(b) = self.world.bodies.get_mut(handle) {
+                b.add_force(rv(f), false);
+                b.add_torque(rv(t), false);
+                self.pushed.insert(handle);
+            }
+        }
     }
 
     /// The floor under a character for the controller (Studio via

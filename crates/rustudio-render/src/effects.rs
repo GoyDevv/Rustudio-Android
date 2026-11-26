@@ -34,7 +34,7 @@ use crate::world_gui::{FxFrame, FxLook, FxParticle, FxVertex};
 #[path = "effects_constraints.rs"]
 mod constraints;
 
-const CLASSES: [&str; 7] = ["ParticleEmitter", "Sparkles", "Beam", "Trail", "RopeConstraint", "RodConstraint", "SpringConstraint"];
+const CLASSES: [&str; 9] = ["ParticleEmitter", "Sparkles", "Fire", "Smoke", "Beam", "Trail", "RopeConstraint", "RodConstraint", "SpringConstraint"];
 
 // ------------------------------------------------------------ script calls
 
@@ -531,7 +531,7 @@ pub fn is_emitter_host(d: &Document, part: Ref) -> bool {
     fn contains(d: &Document, r: Ref) -> bool {
         d.dom.get_by_ref(r).is_some_and(|i| i.children().iter().any(|&child| {
             match d.class_of(child).as_deref() {
-                Some("ParticleEmitter") => true,
+                Some("ParticleEmitter" | "Fire" | "Smoke") => true,
                 Some("Attachment" | "Bone") => contains(d, child),
                 _ => false,
             }
@@ -848,6 +848,135 @@ fn sparkles_cfgs(d: &Document, r: Ref) -> [EmitterCfg; 2] {
     e2.rot_speed = (-500.0, 500.0);
 
     [e1, e2]
+}
+
+fn color3(d: &Document, r: Ref, k: &str, dflt: Vec3) -> Vec3 {
+    match d.prop(r, k) {
+        Some(Variant::Color3(c)) => Vec3::new(c.r, c.g, c.b),
+        Some(Variant::Color3uint8(c)) => Vec3::new(c.r as f32, c.g as f32, c.b as f32) / 255.0,
+        _ => dflt,
+    }
+}
+
+/// Legacy Fire emitter: soft additive rising flame particles that shrink and
+/// blend from SecondaryColor (inner core) to Color (outer flame).
+fn fire_cfg(d: &Document, r: Ref) -> EmitterCfg {
+    let enabled = flag(d, r, "Enabled", true);
+    let heat = num(d, r, "Heat", 9.0).clamp(-25.0, 25.0);
+    let size = num(d, r, "Size", 5.0).clamp(2.0, 30.0);
+    let outer = color3(d, r, "Color", Vec3::new(236.0 / 255.0, 139.0 / 255.0, 70.0 / 255.0));
+    let inner = color3(d, r, "SecondaryColor", Vec3::new(220.0 / 255.0, 70.0 / 255.0, 20.0 / 255.0));
+    let time_scale = num(d, r, "TimeScale", 1.0).clamp(0.0, 1.0);
+    let alpha = 1.0 - num(d, r, "LocalTransparencyModifier", 0.0).clamp(0.0, 1.0);
+    let life = (0.5 + size * 0.04).clamp(0.5, 1.8);
+    let rise = heat.abs();
+    EmitterCfg {
+        host: host_of(d, r),
+        enabled,
+        rate: (25.0 + size * 1.5).min(80.0),
+        life: (life * 0.7, life),
+        speed: if rise > 0.01 { (rise * 0.4, rise * 0.8) } else { (0.0, 0.5) },
+        spread: Vec2::new(25.0, 25.0),
+        dir: if heat >= 0.0 { 1 } else { 4 },
+        shape: 0,
+        style: 0,
+        inout: 0,
+        partial: 1.0,
+        accel: Vec3::new(0.0, heat * 1.2, 0.0),
+        drag: 0.5,
+        inherit: 0.0,
+        locked: false,
+        wind: false,
+        time_scale,
+        size: Seq(vec![
+            (0.0, size * 0.45, size * 0.08),
+            (0.3, size * 0.40, size * 0.06),
+            (1.0, 0.0, 0.0),
+        ]),
+        transparency: Seq(vec![
+            (0.0, 0.85, 0.0),
+            (0.15, 0.1, 0.0),
+            (0.7, 0.35, 0.0),
+            (1.0, 1.0, 0.0),
+        ]),
+        color: CSeq(vec![
+            (0.0, inner),
+            (0.4, inner.lerp(outer, 0.5)),
+            (1.0, outer),
+        ]),
+        squash: Seq(vec![(0.0, 0.0, 0.0)]),
+        rotation: (-180.0, 180.0),
+        rot_speed: (-90.0, 90.0),
+        texture: Some("rbxasset://textures/particles/fire_main.dds".into()),
+        grid: (1, 1),
+        flip_mode: 0,
+        flip_fps: (1.0, 1.0),
+        flip_random_start: false,
+        flip_blend: false,
+        orientation: 0,
+        zoffset: 0.0,
+        look: Look { influence: 0.0, brightness: 1.5, emission: 1.0, alpha },
+        sparkles: false,
+        modulate: Vec3::ONE,
+    }
+}
+
+/// Legacy Smoke emitter: soft alpha-blended expanding smoke puffs that rise
+/// and fade out over their lifetime.
+fn smoke_cfg(d: &Document, r: Ref) -> EmitterCfg {
+    let enabled = flag(d, r, "Enabled", true);
+    let col = color3(d, r, "Color", Vec3::splat(0.5));
+    let opacity = num(d, r, "Opacity", 0.5).clamp(0.0, 1.0);
+    let rise_vel = num(d, r, "RiseVelocity", 1.0).clamp(-25.0, 25.0);
+    let size = num(d, r, "Size", 1.0).clamp(0.1, 100.0);
+    let time_scale = num(d, r, "TimeScale", 1.0).clamp(0.0, 1.0);
+    let alpha = 1.0 - num(d, r, "LocalTransparencyModifier", 0.0).clamp(0.0, 1.0);
+    let peak_t = 1.0 - opacity;
+    let rise = rise_vel.abs();
+    EmitterCfg {
+        host: host_of(d, r),
+        enabled,
+        rate: 10.0,
+        life: (3.5, 5.5),
+        speed: if rise > 0.01 { (rise * 0.7, rise * 1.1) } else { (0.0, 0.3) },
+        spread: Vec2::new(20.0, 20.0),
+        dir: if rise_vel >= 0.0 { 1 } else { 4 },
+        shape: 0,
+        style: 0,
+        inout: 0,
+        partial: 1.0,
+        accel: Vec3::new(0.0, rise_vel * 0.25, 0.0),
+        drag: 0.3,
+        inherit: 0.0,
+        locked: false,
+        wind: false,
+        time_scale,
+        size: Seq(vec![
+            (0.0, size * 0.6, size * 0.1),
+            (1.0, size * 2.2, size * 0.25),
+        ]),
+        transparency: Seq(vec![
+            (0.0, 1.0, 0.0),
+            (0.15, peak_t, 0.0),
+            (0.65, peak_t + (1.0 - peak_t) * 0.4, 0.0),
+            (1.0, 1.0, 0.0),
+        ]),
+        color: CSeq(vec![(0.0, col)]),
+        squash: Seq(vec![(0.0, 0.0, 0.0)]),
+        rotation: (-180.0, 180.0),
+        rot_speed: (-30.0, 30.0),
+        texture: Some("rbxasset://textures/particles/smoke_main.dds".into()),
+        grid: (1, 1),
+        flip_mode: 0,
+        flip_fps: (1.0, 1.0),
+        flip_random_start: false,
+        flip_blend: false,
+        orientation: 0,
+        zoffset: 0.0,
+        look: Look { influence: 1.0, brightness: 1.0, emission: 0.0, alpha },
+        sparkles: false,
+        modulate: Vec3::ONE,
+    }
 }
 
 #[derive(Clone)]
@@ -2241,6 +2370,8 @@ impl Effects {
                 match d.class_of(r).as_deref() {
                     Some("ParticleEmitter") => Cfg::Emitter(Box::new(emitter_cfg(d, r))),
                     Some("Sparkles") => Cfg::Sparkles(Box::new(sparkles_cfgs(d, r))),
+                    Some("Fire") => Cfg::Emitter(Box::new(fire_cfg(d, r))),
+                    Some("Smoke") => Cfg::Emitter(Box::new(smoke_cfg(d, r))),
                     Some("Beam") => Cfg::Beam(Box::new(beam_cfg(d, r))),
                     Some("RopeConstraint" | "RodConstraint" | "SpringConstraint") => Cfg::Constraint(r),
                     _ => Cfg::Trail(Box::new(trail_cfg(d, r))),
@@ -2967,5 +3098,51 @@ mod texture_tests {
         assert!(total >= 35, "expected >= 35 live sparkle particles, got {total}");
         let max_y = st1.particles.iter().map(|p| p.pos.y).fold(0.0f32, f32::max);
         assert!(max_y >= 4.0, "expected sparkles to rise >= 4 studs, got {max_y:.2}");
+    }
+
+    #[test]
+    fn fire_and_smoke_emit_and_simulate() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let part = d.dom.insert(ws, InstanceBuilder::new("Part"));
+        let fire = d.dom.insert(
+            part,
+            InstanceBuilder::new("Fire")
+                .with_property("Enabled", true)
+                .with_property("Heat", 9.0f32)
+                .with_property("Size", 5.0f32)
+                .with_property("Color", rbx_dom_weak::types::Color3::new(1.0, 0.5, 0.1))
+                .with_property("SecondaryColor", rbx_dom_weak::types::Color3::new(1.0, 0.2, 0.0)),
+        );
+        let fc = fire_cfg(&d, fire);
+        assert!(fc.enabled);
+        assert_eq!(fc.look.emission, 1.0);
+        assert!(fc.size.at(0.0, 0.0) > fc.size.at(1.0, 0.0));
+        assert!((fc.color.at(0.0) - Vec3::new(1.0, 0.2, 0.0)).length() < 1e-5);
+        assert!((fc.color.at(1.0) - Vec3::new(1.0, 0.5, 0.1)).length() < 1e-5);
+
+        let smoke = d.dom.insert(
+            part,
+            InstanceBuilder::new("Smoke")
+                .with_property("Enabled", true)
+                .with_property("Opacity", 0.6f32)
+                .with_property("RiseVelocity", 2.0f32)
+                .with_property("Size", 2.0f32),
+        );
+        let sc = smoke_cfg(&d, smoke);
+        assert!(sc.enabled);
+        assert_eq!(sc.look.emission, 0.0);
+        assert!(sc.size.at(1.0, 0.0) > sc.size.at(0.0, 0.0));
+        assert!((sc.transparency.at(0.15, 0.0) - 0.4).abs() < 1e-5);
+
+        let xf = Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY };
+        let mut fst = EmitterState::default();
+        let mut sst = EmitterState::default();
+        for _ in 0..60 {
+            fst.step(&fc, fire, &xf, Vec3::ONE, 1.0 / 60.0, 0, None, Vec3::ZERO);
+            sst.step(&sc, smoke, &xf, Vec3::ONE, 1.0 / 60.0, 0, None, Vec3::ZERO);
+        }
+        assert!(!fst.particles.is_empty());
+        assert!(!sst.particles.is_empty());
     }
 }

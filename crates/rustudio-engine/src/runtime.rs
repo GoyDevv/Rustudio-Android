@@ -114,6 +114,20 @@ pub enum Xfer {
     EnumItem(LEnumItem),
     /// A Luau buffer (copied, as Roblox copies buffers across remotes).
     Buffer(Vec<u8>),
+    Rect(LRect),
+    Ray(LRay),
+    Region3(LRegion3),
+    NumberRange(LNumberRange),
+    NumberSequence(LNumberSequence),
+    ColorSequence(LColorSequence),
+    PhysicalProperties(LPhysicalProperties),
+    DateTime(LDateTime),
+    Font(LFont),
+    TweenInfo(LTweenInfo),
+    Vector2int16(LVector2int16),
+    Vector3int16(LVector3int16),
+    Axes(LAxes),
+    Faces(LFaces),
 }
 
 #[derive(Debug, Clone)]
@@ -5660,7 +5674,12 @@ fn call_method_routed(
             none()
         }
         "Fire" => {
-            let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+            let mut rest = Vec::with_capacity(args.len().saturating_sub(1));
+            let mut seen = HashSet::new();
+            for v in args.iter().skip(1) {
+                seen.clear();
+                rest.push(deep_copy_bindable(lua, v, &mut seen, 0)?);
+            }
             world(lua)?.fire(this, "Event", rest);
             none()
         }
@@ -5670,6 +5689,19 @@ fn call_method_routed(
             }
             let payload: Vec<Xfer> = args.iter().skip(1).map(|v| export(v, 0)).collect();
             let mut w = world(lua)?;
+            if w.d().class_of(this).is_some_and(|k| k == "UnreliableRemoteEvent") {
+                let size = payload_byte_size(&payload);
+                if size > UNRELIABLE_REMOTE_MAX_BYTES {
+                    let full = w.full_name(this);
+                    w.output.push((
+                        Level::Warn,
+                        format!(
+                            "UnreliableRemoteEvent {full} payload size ({size} bytes) exceeds the 900 byte limit and was dropped"
+                        ),
+                    ));
+                    return none();
+                }
+            }
             if w.has_peer {
                 w.outbox.push(RemoteMsg {
                     inst: this,
@@ -5692,6 +5724,19 @@ fn call_method_routed(
             let skip = if name == "FireClient" { 2 } else { 1 };
             let payload: Vec<Xfer> = args.iter().skip(skip).map(|v| export(v, 0)).collect();
             let mut w = world(lua)?;
+            if w.d().class_of(this).is_some_and(|k| k == "UnreliableRemoteEvent") {
+                let size = payload_byte_size(&payload);
+                if size > UNRELIABLE_REMOTE_MAX_BYTES {
+                    let full = w.full_name(this);
+                    w.output.push((
+                        Level::Warn,
+                        format!(
+                            "UnreliableRemoteEvent {full} payload size ({size} bytes) exceeds the 900 byte limit and was dropped"
+                        ),
+                    ));
+                    return none();
+                }
+            }
             let has_recipient = if name == "FireAllClients" {
                 let d = w.d();
                 d.find_child(d.dom.root_ref(), "Players").is_some_and(|players| {
@@ -8191,12 +8236,108 @@ pub fn export(v: &Value, depth: usize) -> Xfer {
                 Xfer::UDim2(x)
             } else if let Some(x) = opt_ud::<LEnumItem>(v) {
                 Xfer::EnumItem(x)
+            } else if let Some(x) = opt_ud::<LRect>(v) {
+                Xfer::Rect(x)
+            } else if let Some(x) = opt_ud::<LRay>(v) {
+                Xfer::Ray(x)
+            } else if let Some(x) = opt_ud::<LRegion3>(v) {
+                Xfer::Region3(x)
+            } else if let Some(x) = opt_ud::<LNumberRange>(v) {
+                Xfer::NumberRange(x)
+            } else if let Some(x) = opt_ud::<LNumberSequence>(v) {
+                Xfer::NumberSequence(x)
+            } else if let Some(x) = opt_ud::<LColorSequence>(v) {
+                Xfer::ColorSequence(x)
+            } else if let Some(x) = opt_ud::<LPhysicalProperties>(v) {
+                Xfer::PhysicalProperties(x)
+            } else if let Some(x) = opt_ud::<LDateTime>(v) {
+                Xfer::DateTime(x)
+            } else if let Some(x) = opt_ud::<LFont>(v) {
+                Xfer::Font(x)
+            } else if let Some(x) = opt_ud::<LTweenInfo>(v) {
+                Xfer::TweenInfo(x)
+            } else if let Some(x) = opt_ud::<LVector2int16>(v) {
+                Xfer::Vector2int16(x)
+            } else if let Some(x) = opt_ud::<LVector3int16>(v) {
+                Xfer::Vector3int16(x)
+            } else if let Some(x) = opt_ud::<LAxes>(v) {
+                Xfer::Axes(x)
+            } else if let Some(x) = opt_ud::<LFaces>(v) {
+                Xfer::Faces(x)
             } else {
                 Xfer::Nil
             }
         }
         _ => Xfer::Nil,
     }
+}
+
+/// Deep-copies Lua tables for `BindableEvent:Fire(...)`, stripping metatables
+/// and breaking cyclic references to prevent infinite recursion.
+fn deep_copy_bindable(
+    lua: &Lua,
+    v: &Value,
+    seen: &mut HashSet<usize>,
+    depth: usize,
+) -> mlua::Result<Value> {
+    match v {
+        Value::Table(t) => {
+            if depth >= 64 {
+                return Ok(Value::Nil);
+            }
+            let ptr = t.to_pointer() as usize;
+            if !seen.insert(ptr) {
+                return Ok(Value::Nil);
+            }
+            let copy = lua.create_table()?;
+            for pair in t.pairs::<Value, Value>() {
+                let (k, val) = pair?;
+                let kc = deep_copy_bindable(lua, &k, seen, depth + 1)?;
+                if !kc.is_nil() {
+                    let vc = deep_copy_bindable(lua, &val, seen, depth + 1)?;
+                    copy.raw_set(kc, vc)?;
+                }
+            }
+            seen.remove(&ptr);
+            Ok(Value::Table(copy))
+        }
+        Value::Buffer(b) => Ok(Value::Buffer(lua.create_buffer(b.to_vec())?)),
+        _ => Ok(v.clone()),
+    }
+}
+
+const UNRELIABLE_REMOTE_MAX_BYTES: usize = 900;
+
+fn xfer_byte_size(x: &Xfer) -> usize {
+    match x {
+        Xfer::Nil | Xfer::Bool(_) => 1,
+        Xfer::Num(_) => 9,
+        Xfer::Str(s) => 1 + s.len(),
+        Xfer::Buffer(b) => 1 + b.len(),
+        Xfer::Table(items) => {
+            1 + items
+                .iter()
+                .map(|(k, v)| xfer_byte_size(k) + xfer_byte_size(v))
+                .sum::<usize>()
+        }
+        Xfer::Inst(_) => 8,
+        Xfer::V3(_) | Xfer::C3(_) => 12,
+        Xfer::V2(_) | Xfer::UDim(_) | Xfer::EnumItem(_) | Xfer::NumberRange(_) | Xfer::DateTime(_) => 8,
+        Xfer::CF(_) => 48,
+        Xfer::Brick(_) | Xfer::Vector2int16(_) => 4,
+        Xfer::UDim2(_) | Xfer::Rect(_) => 16,
+        Xfer::Ray(_) | Xfer::Region3(_) | Xfer::TweenInfo(_) => 24,
+        Xfer::NumberSequence(ns) => 1 + ns.keypoints.len() * 12,
+        Xfer::ColorSequence(cs) => 1 + cs.keypoints.len() * 16,
+        Xfer::PhysicalProperties(_) => 20,
+        Xfer::Font(f) => 4 + f.0.family.len(),
+        Xfer::Vector3int16(_) => 6,
+        Xfer::Axes(_) | Xfer::Faces(_) => 1,
+    }
+}
+
+fn payload_byte_size(args: &[Xfer]) -> usize {
+    args.iter().map(xfer_byte_size).sum()
 }
 
 /// Rebuilds a transferred value in this VM; `map` turns the sender's
@@ -8231,6 +8372,20 @@ pub fn import(lua: &Lua, x: &Xfer, map: &dyn Fn(Ref) -> Option<Ref>) -> mlua::Re
         Xfer::UDim(u) => ud(lua.create_userdata(*u)?),
         Xfer::UDim2(u) => ud(lua.create_userdata(*u)?),
         Xfer::EnumItem(e) => ud(lua.create_userdata(e.clone())?),
+        Xfer::Rect(r) => ud(lua.create_userdata(*r)?),
+        Xfer::Ray(r) => ud(lua.create_userdata(*r)?),
+        Xfer::Region3(r) => ud(lua.create_userdata(*r)?),
+        Xfer::NumberRange(r) => ud(lua.create_userdata(*r)?),
+        Xfer::NumberSequence(s) => ud(lua.create_userdata(s.clone())?),
+        Xfer::ColorSequence(s) => ud(lua.create_userdata(s.clone())?),
+        Xfer::PhysicalProperties(p) => ud(lua.create_userdata(*p)?),
+        Xfer::DateTime(d) => ud(lua.create_userdata(*d)?),
+        Xfer::Font(f) => ud(lua.create_userdata(f.clone())?),
+        Xfer::TweenInfo(t) => ud(lua.create_userdata(t.clone())?),
+        Xfer::Vector2int16(v) => ud(lua.create_userdata(*v)?),
+        Xfer::Vector3int16(v) => ud(lua.create_userdata(*v)?),
+        Xfer::Axes(a) => ud(lua.create_userdata(*a)?),
+        Xfer::Faces(f) => ud(lua.create_userdata(*f)?),
     })
 }
 
@@ -8245,6 +8400,9 @@ const INVOKE_PRELUDE: &str = r##"
 local yield, running = coroutine.yield, coroutine.running
 function __rs_lua_methods.InvokeServer(self, ...)
     __rs_member_check(self, "RemoteFunction", "InvokeServer")
+    if not __rs_is_client() then
+        error("InvokeServer can only be called from the client", 2)
+    end
     if __rs_has_peer() then
         __rs_invoke_server(self, running(), ...)
         return yield()
@@ -8258,6 +8416,9 @@ function __rs_lua_methods.InvokeServer(self, ...)
 end
 function __rs_lua_methods.InvokeClient(self, player, ...)
     __rs_member_check(self, "RemoteFunction", "InvokeClient")
+    if not __rs_is_server() then
+        error("InvokeClient can only be called from the server", 2)
+    end
     if typeof(player) ~= "Instance" or not player:IsA("Player") then
         error("Unable to cast value to Object", 2)
     end
@@ -8310,6 +8471,14 @@ impl Runtime {
         g.set(
             "__rs_has_peer",
             lua.create_function(|lua, ()| Ok(world(lua)?.has_peer))?,
+        )?;
+        g.set(
+            "__rs_is_client",
+            lua.create_function(|lua, ()| Ok(world(lua)?.side == Side::Client))?,
+        )?;
+        g.set(
+            "__rs_is_server",
+            lua.create_function(|lua, ()| Ok(world(lua)?.side == Side::Server))?,
         )?;
         g.set(
             "__rs_invoke_server",
@@ -10742,6 +10911,7 @@ mod weld_offset_tests {
         );
         let rt = Runtime::new().unwrap();
         let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
         w.has_peer = true;
         rt.enter(w);
         rt.bind_globals().unwrap();

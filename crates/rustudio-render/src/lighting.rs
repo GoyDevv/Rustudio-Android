@@ -111,8 +111,34 @@ pub fn sun_direction(clock: f32, latitude: f32) -> Vec3 {
     Vec3::new(th.cos() * ph.cos(), th.sin() * ph.cos(), ph.sin())
 }
 
-/// Lighting.LightingStyle is Soft (enum 1; Realistic 0). Without a stored
-/// one (old places, live joins) it is what Studio has then
+/// Lighting.PrioritizeLightingQuality. Without a stored one, derived via
+/// `doc::lighting_style_default` (true for migrated places, ShadowMap, and
+/// Future; false for Voxel/Compatibility/Legacy), or true when `LightingStyle`
+/// is explicitly Realistic.
+pub fn prioritize_lighting_quality(d: &Document) -> bool {
+    let Some(l) = d.find_child(d.dom.root_ref(), "Lighting") else {
+        return true;
+    };
+    let Some(i) = d.dom.get_by_ref(l) else { return true };
+    match i.properties.get(&rbx_dom_weak::ustr("PrioritizeLightingQuality")) {
+        Some(Variant::Bool(b)) => *b,
+        _ => {
+            let explicit_style = enum_u32(
+                i.properties.get(&rbx_dom_weak::ustr("LightingStyle")).cloned(),
+            );
+            if explicit_style == Some(0) {
+                true
+            } else {
+                rustudio_core::doc::lighting_style_default(i).1
+            }
+        }
+    }
+}
+
+/// Whether local lighting uses the soft/voxel path: either `Lighting.LightingStyle`
+/// is Soft (enum 1) or `LightingStyle` is Realistic (enum 0) with
+/// `PrioritizeLightingQuality == false`. Without a stored `LightingStyle`
+/// (old places, live joins) it is what Studio has then
 /// (`doc::lighting_style_default`: the constructor's Realistic once the place
 /// was migrated, else derived from Technology).
 pub fn soft_style(d: &Document) -> bool {
@@ -120,10 +146,11 @@ pub fn soft_style(d: &Document) -> bool {
         return false;
     };
     let Some(i) = d.dom.get_by_ref(l) else { return false };
-    match enum_u32(i.properties.get(&rbx_dom_weak::ustr("LightingStyle")).cloned()) {
+    let is_soft = match enum_u32(i.properties.get(&rbx_dom_weak::ustr("LightingStyle")).cloned()) {
         Some(style) => style == 1,
         None => rustudio_core::doc::lighting_style_default(i).0 == 1,
-    }
+    };
+    is_soft || !prioritize_lighting_quality(d)
 }
 
 /// How bright the sky (and the light it gives) is for a sun height: full
@@ -438,7 +465,8 @@ pub fn globals(
     // exp2 form as Studio's FogParams). Only with a Sky too: Studio's
     // Atmosphere sky/haze and fog only activate
     // when Lighting has both an Atmosphere and a Sky.
-    let has_sky = lighting.and_then(|l| sky_child(d, l)).is_some();
+    let sky = lighting.and_then(|l| sky_child(d, l));
+    let has_sky = sky.is_some();
     let atmos = if override_flag("noatmos") || !has_sky { None } else { atmosphere(d) };
     let fog = match atmos {
         Some(a) if a.fog_k > 0.0 => [0.0, a.fog_k / std::f32::consts::LN_2, 3.0, day],
@@ -475,11 +503,30 @@ pub fn globals(
         let cube = atmos_haze_cube(&a, &atmos_irr);
         cube.map(|c| c * tint)
     });
-    let stars = d
-        .find_child(d.dom.root_ref(), "Lighting")
-        .and_then(|l| sky_child(d, l))
-        .map(|s| f32_of(d.prop(s, "StarCount")).unwrap_or(3000.0) > 0.0)
+    let celestial_shown = sky
+        .map(|s| boolp(d, s, "CelestialBodiesShown", true))
         .unwrap_or(true);
+    let sun_angular_size = sky
+        .and_then(|s| f32_of(d.prop(s, "SunAngularSize")))
+        .unwrap_or(21.0)
+        .clamp(0.0, 60.0);
+    let moon_angular_size = sky
+        .and_then(|s| f32_of(d.prop(s, "MoonAngularSize")))
+        .unwrap_or(11.0)
+        .clamp(0.0, 60.0);
+    let star_count = sky
+        .and_then(|s| f32_of(d.prop(s, "StarCount")))
+        .unwrap_or(3000.0)
+        .clamp(0.0, 5000.0);
+    // ambient.w carries CelestialBodiesShown (0 off, ±1 on) and the sign of
+    // true sun relative to light_dir (sun_dir.xyz flips to -sun at night).
+    let celestial_flag = if celestial_shown {
+        if sun.y >= mech::LAMP_MOON_BELOW_SUN_Y { 1.0 } else { -1.0 }
+    } else {
+        0.0
+    };
+    let soft = soft_style(d);
+    let quality = prioritize_lighting_quality(d);
 
     // Without a BloomEffect Studio still glows what is over-bright (Neon):
     // tools/fidelity control shots show a ~12 px halo around a 1-stud Neon bar
@@ -501,16 +548,21 @@ pub fn globals(
         inv_view_proj: mat_cols(cam.inv_view_proj_rel(rect)),
         cam_pos: cam.pos.extend(1.0).to_array(),
         sun_dir: light_dir.extend(light_irr).to_array(),
-        // w: Lighting.LightingStyle (Realistic 0, Soft 1).
+        // w: soft/voxel local-light flag (LightingStyle Soft, or Realistic with
+        // PrioritizeLightingQuality false).
         sun_color: sun_color
-            .extend(if soft_style(d) { 1.0 } else { 0.0 })
+            .extend(if soft { 1.0 } else { 0.0 })
             .to_array(),
-        ambient: ambient.extend(1.0).to_array(),
+        ambient: ambient.extend(celestial_flag).to_array(),
         outdoor: outdoor_extra.extend(1.0).to_array(),
         low_ambient: (ambient + indoor_diffuse).extend(low_gloss).to_array(),
         low_outdoor: (outdoor_extra + outdoor_diffuse - indoor_diffuse).extend(0.0).to_array(),
-        sky_top: (sq(mech::SKY_GRADIENT_TOP)).extend(1.0).to_array(),
-        sky_horizon: (sq(mech::SKY_GRADIENT_HORIZON)).extend(1.0).to_array(),
+        sky_top: (sq(mech::SKY_GRADIENT_TOP))
+            .extend(sun_angular_size.to_radians())
+            .to_array(),
+        sky_horizon: (sq(mech::SKY_GRADIENT_HORIZON))
+            .extend(moon_angular_size.to_radians())
+            .to_array(),
         params: [
             light_count as f32,
             2f32.powf(exposure),
@@ -532,7 +584,7 @@ pub fn globals(
         sun_rect: [[0.0; 4]; 4],
         // z: RUSTUDIO_SHADE_DEBUG=normals|albedo shows those instead of light.
         sky_rot: [
-            if stars { 1.0 } else { 0.0 },
+            star_count,
             fx.blur,
             match shade_debug().as_deref() {
                 Some("normals") => 1.0,
@@ -602,7 +654,7 @@ pub fn globals(
         // Only ShadowMap / Future part shaders reflect the sky and draw the
         // sun's highlight (Voxel / Compatibility's FS uses the scale for
         // the sun highlight only).
-        env_spec: if !soft_style(d) || mech::TECHNOLOGY_QUALITY.contains(&tech) {
+        env_spec: if !soft || quality || mech::TECHNOLOGY_QUALITY.contains(&tech) {
             [env_specular, mech::ENV_SPEC_ROUGHNESS, 1.0, 0.0]
         } else {
             [0.0, mech::ENV_SPEC_ROUGHNESS, 0.0, 0.0]
@@ -1366,6 +1418,60 @@ mod tests {
         let lights = cache.gather(&mut d, &Camera::default(), &|_, _| true, false);
         assert_eq!(lights.len(), 1);
         assert_eq!(&lights[0].pos_range[..3], &[11., 1., 0.]);
+    }
+
+    #[test]
+    fn sky_celestials_and_prioritize_lighting_quality() {
+        use rbx_dom_weak::types::Enum;
+        let irr = [Vec3::ZERO; 6];
+        let cam = Camera::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // Realistic + PrioritizeLightingQuality=false -> soft local-light flag set,
+        // Sky defaults: CelestialBodiesShown=true, Sun=21°, Moon=11°, StarCount=3000.
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Lighting")
+                    .with_name("Lighting")
+                    .with_property("LightingStyle", Enum::from_u32(0))
+                    .with_property("PrioritizeLightingQuality", false)
+                    .with_child(InstanceBuilder::new("Sky")),
+            ),
+        );
+        let d = Document::from_play_dom(dom, "celestial_defaults".into());
+        assert!(soft_style(&d));
+        let fl = globals(&d, &cam, rect, 0, false, &irr, &irr);
+        assert_eq!(fl.globals.sun_color[3], 1.0);
+        assert_eq!(fl.globals.ambient[3], 1.0);
+        assert!((fl.globals.sky_top[3] - 21.0f32.to_radians()).abs() < 1e-5);
+        assert!((fl.globals.sky_horizon[3] - 11.0f32.to_radians()).abs() < 1e-5);
+        assert!((fl.globals.sky_rot[0] - 3000.0).abs() < 1e-5);
+
+        // Realistic + PrioritizeLightingQuality=true (Future) -> soft flag off,
+        // custom Sky values honored.
+        let dom_future = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Lighting")
+                    .with_name("Lighting")
+                    .with_property("LightingStyle", Enum::from_u32(0))
+                    .with_property("PrioritizeLightingQuality", true)
+                    .with_child(
+                        InstanceBuilder::new("Sky")
+                            .with_property("CelestialBodiesShown", false)
+                            .with_property("SunAngularSize", 30.0f32)
+                            .with_property("MoonAngularSize", 15.0f32)
+                            .with_property("StarCount", 1200i32),
+                    ),
+            ),
+        );
+        let d_future = Document::from_play_dom(dom_future, "celestial_custom".into());
+        assert!(!soft_style(&d_future));
+        let fl_future = globals(&d_future, &cam, rect, 0, false, &irr, &irr);
+        assert_eq!(fl_future.globals.sun_color[3], 0.0);
+        assert_eq!(fl_future.globals.ambient[3], 0.0);
+        assert!((fl_future.globals.sky_top[3] - 30.0f32.to_radians()).abs() < 1e-5);
+        assert!((fl_future.globals.sky_horizon[3] - 15.0f32.to_radians()).abs() < 1e-5);
+        assert!((fl_future.globals.sky_rot[0] - 1200.0).abs() < 1e-5);
     }
 }
 
