@@ -63,6 +63,37 @@ impl Editor {
         if ui.checkbox(&mut overlay, "Show Performance Overlay").changed() {
             rustudio_core::rustudio_settings::set_perf_overlay_enabled(overlay);
         }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Graphics Quality Preset").strong());
+        let cur_q = rustudio_core::rustudio_settings::quality_preset();
+        ui.horizontal_wrapped(|ui| {
+            for (id, label) in [
+                ("automatic", "Auto"),
+                ("low", "Low"),
+                ("medium", "Medium"),
+                ("high", "High"),
+                ("custom", "Custom"),
+            ] {
+                if ui.selectable_label(cur_q == id, label).clicked() {
+                    rustudio_core::rustudio_settings::set_quality_preset(id);
+                }
+            }
+        });
+        ui.label(RichText::new("3D Render Resolution Scale").strong());
+        let cur_scale = (rustudio_core::rustudio_settings::render_resolution_scale() * 100.0).round() as i32;
+        ui.horizontal_wrapped(|ui| {
+            for (id, pct, label) in [
+                ("50", 50, "50%"),
+                ("67", 67, "67%"),
+                ("75", 75, "75%"),
+                ("80", 80, "80%"),
+                ("100", 100, "100%"),
+            ] {
+                if ui.selectable_label((cur_scale - pct).abs() <= 2, label).clicked() {
+                    rustudio_core::rustudio_settings::set_render_resolution_scale(id);
+                }
+            }
+        });
         let mut float_win = rustudio_core::rustudio_settings::mobile_floating_windows();
         if ui.checkbox(&mut float_win, "Floating Mobile Windows (drag / resize / tap title to collapse)").changed() {
             rustudio_core::rustudio_settings::set_mobile_floating_windows(float_win);

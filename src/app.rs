@@ -2779,16 +2779,18 @@ impl RustudioApp {
                 Self::schedule_plugin_repaint(ed, &ctx);
             }
             self.watchdog.stage("plugins", "project and scene synchronization");
-            ed.project_tick();
-            ed.file_sync_tick();
-            ed.template_preview_tick();
             ed.plugins_tick();
-            if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
-                ed.toolbox_tick(&ctx);
-            }
-            ed.asset_manager_tick(&ctx);
-            if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
-                ed.toolbox_harness_tick();
+            if ed.game.play.is_none() {
+                ed.project_tick();
+                ed.file_sync_tick();
+                ed.template_preview_tick();
+                if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+                    ed.toolbox_tick(&ctx);
+                }
+                ed.asset_manager_tick(&ctx);
+                if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+                    ed.toolbox_harness_tick();
+                }
             }
         }
         if self.ed.harness.run.no_ui {

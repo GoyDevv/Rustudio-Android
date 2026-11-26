@@ -1385,19 +1385,24 @@ impl Rig {
                 let (part, body_cf) = body_atts.get(&name)?;
                 Some((*part, cf_mul(body_cf, &cf_inv(&cf_prop(doc, *a, "CFrame")))))
             });
-            // Hats without a matching attachment sit on the head (legacy behaviour).
+            // Hats/hairs without a matching attachment sit on the head by
+            // their AttachmentPoint (matching avatar::weld_accessory and
+            // Roblox's Humanoid:AddAccessory: Handle = Head · (0, half, 0) · AttachmentPoint⁻¹).
             let found = found.or_else(|| {
                 let head = body
                     .iter()
                     .copied()
                     .find(|p| doc.dom.get_by_ref(*p).is_some_and(|i| i.name == "Head"))?;
-                Some((
-                    head,
-                    Xform {
-                        pos: Vec3::Y * 0.6,
-                        rot: Mat3::IDENTITY,
-                    },
-                ))
+                let half = match doc.prop(head, "Size") {
+                    Some(Variant::Vector3(sz)) => sz.y / 2.0,
+                    _ => 0.5,
+                };
+                let c1 = Xform {
+                    pos: Vec3::Y * half,
+                    rot: Mat3::IDENTITY,
+                };
+                let c0 = cf_prop(doc, acc, "AttachmentPoint");
+                Some((head, cf_mul(&c1, &cf_inv(&c0))))
             });
             if let Some((part, offset)) = found {
                 self.attached.push(Attached {

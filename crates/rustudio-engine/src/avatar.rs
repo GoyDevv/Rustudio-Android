@@ -323,7 +323,12 @@ pub fn look_from_info(
             }
             k if is_animation_pack(k) => look.animations.push((kind.clone(), a.id, bytes)),
             _ => {
-                look.accessories.push(bytes);
+                let acc_bytes = if look.r15 {
+                    meshpart_accessory(a.id).unwrap_or(bytes)
+                } else {
+                    bytes
+                };
+                look.accessories.push(acc_bytes);
                 look.accessory_ids.push((kind.clone(), a.id));
             }
         }
