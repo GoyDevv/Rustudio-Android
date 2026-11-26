@@ -48,6 +48,12 @@ pub enum Purpose {
     TemplateThumb(String),
     /// … another place file for one of the person's templates.
     TemplateReplace(String),
+    /// File > Import (3D Models: .obj, .fbx, .glb, .gltf).
+    Import3D,
+    /// File > Export as .obj (the selection when the dialog opened).
+    ExportObj(Vec<Ref>),
+    /// File > Export as glTF (the selection when the dialog opened).
+    ExportGltf(Vec<Ref>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

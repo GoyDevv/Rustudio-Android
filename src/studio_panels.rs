@@ -130,9 +130,7 @@ impl Editor {
 
     /// The place's avatar type (StarterPlayer.GameSettingsAvatar), Studio's default R15.
     fn avatar_body_rules(&self) -> Option<Ref> {
-        let root = self.game.doc.dom.root_ref();
-        let settings = self.game.doc.find_child(root, "AvatarSettings")?;
-        self.game.doc.find_child(settings, "AvatarBodyRules")
+        self.game.doc.find_avatar_body_rules()
     }
 
     pub fn avatar_type(&self) -> u32 {
@@ -154,26 +152,44 @@ impl Editor {
         if v > 2 {
             return;
         }
+        let root = self.game.doc.dom.root_ref();
         let sp = self.starter_player();
         let sp_matches = sp.is_none_or(|sp| {
             rustudio_render::scene::enum_u32(self.game.doc.prop(sp, "GameSettingsAvatar")) == Some(v)
         });
-        let rules_matches = self.avatar_body_rules().is_some_and(|b| {
-            rustudio_render::scene::enum_u32(self.game.doc.prop(b, "AvatarType")) == Some(v)
-        });
+        let settings_existing = self.game.doc.find_child(root, "AvatarSettings");
+        let stray_direct = settings_existing.and_then(|s| self.game.doc.find_child(s, "AvatarBodyRules"));
+        let nested_rules = settings_existing
+            .and_then(|s| self.game.doc.find_child(s, "AvatarRules"))
+            .and_then(|r| self.game.doc.find_child(r, "AvatarBodyRules"));
+        let rules_matches = stray_direct.is_none()
+            && nested_rules.is_some_and(|b| {
+                rustudio_render::scene::enum_u32(self.game.doc.prop(b, "AvatarType")) == Some(v)
+            });
         if sp_matches && rules_matches {
             return;
         }
-        let root = self.game.doc.dom.root_ref();
-        let settings = self.game.doc.find_child(root, "AvatarSettings").unwrap_or_else(|| {
+        let settings = settings_existing.unwrap_or_else(|| {
             self.game.doc.insert(
                 root,
                 rbx_dom_weak::InstanceBuilder::new("AvatarSettings").with_name("AvatarSettings"),
             )
         });
-        let rules = self.game.doc.find_child(settings, "AvatarBodyRules").unwrap_or_else(|| {
+        // Remove any stray orphaned direct child AvatarSettings/AvatarBodyRules from earlier builds.
+        while let Some(stray) = self.game.doc.find_child(settings, "AvatarBodyRules") {
+            if self.game.doc.remove(&[stray]) == 0 {
+                break;
+            }
+        }
+        let avatar_rules = self.game.doc.find_child(settings, "AvatarRules").unwrap_or_else(|| {
             self.game.doc.insert(
                 settings,
+                rbx_dom_weak::InstanceBuilder::new("AvatarRules").with_name("DefaultAvatarRules"),
+            )
+        });
+        let body_rules = self.game.doc.find_child(avatar_rules, "AvatarBodyRules").unwrap_or_else(|| {
+            self.game.doc.insert(
+                avatar_rules,
                 rbx_dom_weak::InstanceBuilder::new("AvatarBodyRules").with_name("AvatarBodyRules"),
             )
         });
@@ -181,7 +197,7 @@ impl Editor {
         if let Some(sp) = sp {
             edit.push((sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v))));
         }
-        edit.push((rules, rbx_dom_weak::ustr("AvatarType"), Variant::Enum(Enum::from_u32(v))));
+        edit.push((body_rules, rbx_dom_weak::ustr("AvatarType"), Variant::Enum(Enum::from_u32(v))));
         self.game.doc.set_props("Avatar Type", edit, None);
     }
 
@@ -196,8 +212,7 @@ impl Editor {
         );
         ui.add_space(6.0);
         let cur = self.avatar_type();
-        let has_sp = self.starter_player().is_some();
-        ui.add_enabled_ui(has_sp && self.game.play.is_none(), |ui| {
+        ui.add_enabled_ui(self.game.play.is_none(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Avatar Type");
                 for (label, v, tip) in AVATAR_TYPES {
@@ -209,9 +224,6 @@ impl Editor {
                 }
             });
         });
-        if !has_sp {
-            ui.label(RichText::new("This place has no StarterPlayer.").color(theme::WARN));
-        }
         let (rig, source) = self.game.rig_choice();
         let name = if rig == rustudio_engine::rig::RigType::R15 { "R15" } else { "R6" };
         ui.add_space(4.0);

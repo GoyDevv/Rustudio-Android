@@ -2097,7 +2097,11 @@ struct SeeThrough {
 }
 
 impl SeeThrough {
-    fn new(device: &wgpu::Device, shader: &wgpu::ShaderModule, globals: &wgpu::BindGroupLayout, ms: wgpu::MultisampleState, hdr_format: wgpu::TextureFormat, see_format: wgpu::TextureFormat) -> Self {
+    fn make_layouts(
+        device: &wgpu::Device,
+        globals: &wgpu::BindGroupLayout,
+        ms: wgpu::MultisampleState,
+    ) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("see-through scene"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -2116,34 +2120,47 @@ impl SeeThrough {
             bind_group_layouts: &[Some(globals), Some(&layout)],
             immediate_size: 0,
         });
-        let pipe = |label: &str, fs: &str, depth: bool, fmt: wgpu::TextureFormat| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState { module: shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
-                primitive: Default::default(),
-                depth_stencil: depth.then(|| wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Always),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                fragment: Some(wgpu::FragmentState {
-                    module: shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
+        (layout, pl)
+    }
+
+    fn make_pipe(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        pl: &wgpu::PipelineLayout,
+        ms: wgpu::MultisampleState,
+        label: &str,
+        fs: &str,
+        depth: bool,
+        fmt: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(pl),
+            vertex: wgpu::VertexState { module: shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: depth.then(|| wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ms,
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    }
+
+    fn from_parts(layout: wgpu::BindGroupLayout, encode: wgpu::RenderPipeline, decode: wgpu::RenderPipeline) -> Self {
         SeeThrough {
-            encode: pipe("see-through encode", "fs_see_encode", false, see_format),
-            // (in the pass that also draws the editor's lines: with depth)
-            decode: pipe("see-through decode", "fs_see_decode", true, hdr_format),
+            encode,
+            decode,
             layout,
             linear: cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_LINEAR_BLEND").is_some(),
         }
@@ -2252,7 +2269,897 @@ fn post_float_formats(caps: &crate::gpu_caps::GpuCaps) -> (wgpu::TextureFormat, 
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PipelineStep {
+    ShaderAndLayouts,
+    Sky,
+    Opaque,
+    OpaqueTwoSided,
+    Cutout,
+    CutoutTwoSided,
+    OpaquePlainBack,
+    OpaquePlainTwoSided,
+    OpaqueLow(usize, usize),
+    TransparentLow(usize, usize),
+    DecalDepth,
+    DecalDepthCulled,
+    Transparent,
+    TransparentCulled,
+    Glass,
+    GlassCulled,
+    SeeTransparent,
+    SeeTransparentCulled,
+    SeeGlass,
+    SeeGlassCulled,
+    SeeOverlay,
+    VfOpaque,
+    VfOpaqueTwoSided,
+    VfTransparent,
+    VfTransparentCulled,
+    SeeEncode,
+    SeeDecode,
+    Water,
+    Overlay,
+    Terrain,
+    TerrainLow,
+    GlassResolve,
+    SsaoDown,
+    SsaoMain,
+    SsaoBlurX,
+    SsaoBlurY,
+    SsaoApply,
+    Lines,
+}
+
+fn part_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: &[wgpu::VertexAttribute] =
+        &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: ATTRS,
+    }
+}
+
+fn part_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: &[wgpu::VertexAttribute] = &wgpu::vertex_attr_array![
+        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
+        6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 13 => Float32x4
+    ];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: ATTRS,
+    }
+}
+
+fn line_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: &[wgpu::VertexAttribute] = &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<LineVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: ATTRS,
+    }
+}
+
+fn terrain_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: &[wgpu::VertexAttribute] =
+        &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<rustudio_core::terrain::TerrainVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: ATTRS,
+    }
+}
+
+/// Incremental state machine that builds `ViewportPipelines` across frames on
+/// `wgpu::Backend::Gl` (e.g. PowerVR GE8320) so the Android UI thread never
+/// stalls on ~37 synchronous `create_render_pipeline` calls (ANR).
+struct GlPipelineBuilder {
+    samples: u32,
+    reduced: bool,
+    caps: crate::gpu_caps::GpuCaps,
+    bgl: wgpu::BindGroupLayout,
+    tex_layout: wgpu::BindGroupLayout,
+    glass_layout: wgpu::BindGroupLayout,
+    terrain_bgl: wgpu::BindGroupLayout,
+    queue: wgpu::Queue,
+    started_at: Instant,
+    steps: Vec<PipelineStep>,
+    step_idx: usize,
+    // Step 0 outputs
+    spec_base: Option<std::sync::Arc<String>>,
+    shader: Option<wgpu::ShaderModule>,
+    layout: Option<wgpu::PipelineLayout>,
+    part_layout: Option<wgpu::PipelineLayout>,
+    terrain_layout: Option<wgpu::PipelineLayout>,
+    ssao_layout: Option<wgpu::BindGroupLayout>,
+    ssao_pl: Option<wgpu::PipelineLayout>,
+    see_layout: Option<wgpu::BindGroupLayout>,
+    see_pl: Option<wgpu::PipelineLayout>,
+    // Incremental pipeline outputs
+    sky: Option<wgpu::RenderPipeline>,
+    opaque: Option<wgpu::RenderPipeline>,
+    opaque_two_sided: Option<wgpu::RenderPipeline>,
+    cutout: Option<wgpu::RenderPipeline>,
+    cutout_two_sided: Option<wgpu::RenderPipeline>,
+    opaque_plain: [Option<wgpu::RenderPipeline>; 2],
+    opaque_low: [[Option<wgpu::RenderPipeline>; 2]; 2],
+    transparent_low: [[Option<wgpu::RenderPipeline>; 2]; 2],
+    decal_depth: Option<wgpu::RenderPipeline>,
+    decal_depth_culled: Option<wgpu::RenderPipeline>,
+    transparent: Option<wgpu::RenderPipeline>,
+    transparent_culled: Option<wgpu::RenderPipeline>,
+    glass: Option<wgpu::RenderPipeline>,
+    glass_culled: Option<wgpu::RenderPipeline>,
+    see_transparent: Option<wgpu::RenderPipeline>,
+    see_transparent_culled: Option<wgpu::RenderPipeline>,
+    see_glass: Option<wgpu::RenderPipeline>,
+    see_glass_culled: Option<wgpu::RenderPipeline>,
+    see_overlay: Option<wgpu::RenderPipeline>,
+    vf_opaque: Option<wgpu::RenderPipeline>,
+    vf_opaque_two_sided: Option<wgpu::RenderPipeline>,
+    vf_transparent: Option<wgpu::RenderPipeline>,
+    vf_transparent_culled: Option<wgpu::RenderPipeline>,
+    see_encode: Option<wgpu::RenderPipeline>,
+    see_decode: Option<wgpu::RenderPipeline>,
+    water: Option<crate::water::WaterPass>,
+    overlay: Option<wgpu::RenderPipeline>,
+    terrain: Option<wgpu::RenderPipeline>,
+    terrain_low: Option<wgpu::RenderPipeline>,
+    glass_resolve: Option<wgpu::RenderPipeline>,
+    ssao_down: Option<wgpu::RenderPipeline>,
+    ssao_main: Option<wgpu::RenderPipeline>,
+    ssao_blur_x: Option<wgpu::RenderPipeline>,
+    ssao_blur_y: Option<wgpu::RenderPipeline>,
+    ssao_apply: Option<wgpu::RenderPipeline>,
+    lines: Option<wgpu::RenderPipeline>,
+}
+
+impl GlPipelineBuilder {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        bgl: wgpu::BindGroupLayout,
+        tex_layout: wgpu::BindGroupLayout,
+        glass_layout: wgpu::BindGroupLayout,
+        terrain_bgl: wgpu::BindGroupLayout,
+        queue: wgpu::Queue,
+        samples: u32,
+        reduced: bool,
+        caps: crate::gpu_caps::GpuCaps,
+    ) -> Self {
+        use PipelineStep as S;
+        let hdr_format = scene_hdr_format(&caps);
+        let see_format = scene_hdr_alpha_format(&caps);
+        let mut steps = Vec::with_capacity(42);
+        steps.extend_from_slice(&[
+            S::ShaderAndLayouts,
+            S::Sky,
+            S::Opaque,
+            S::OpaqueTwoSided,
+            S::Cutout,
+            S::CutoutTwoSided,
+        ]);
+        if spec_pipelines_on() {
+            steps.push(S::OpaquePlainBack);
+            steps.push(S::OpaquePlainTwoSided);
+        }
+        if samples == 1 {
+            steps.extend_from_slice(&[
+                S::OpaqueLow(0, 0),
+                S::OpaqueLow(0, 1),
+                S::OpaqueLow(1, 0),
+                S::OpaqueLow(1, 1),
+                S::TransparentLow(0, 0),
+                S::TransparentLow(0, 1),
+                S::TransparentLow(1, 0),
+                S::TransparentLow(1, 1),
+            ]);
+        }
+        steps.extend_from_slice(&[
+            S::DecalDepth,
+            S::DecalDepthCulled,
+            S::Transparent,
+            S::TransparentCulled,
+            S::Glass,
+            S::GlassCulled,
+            S::SeeTransparent,
+            S::SeeTransparentCulled,
+            S::SeeGlass,
+            S::SeeGlassCulled,
+            S::SeeOverlay,
+        ]);
+        if see_format != hdr_format {
+            steps.extend_from_slice(&[
+                S::VfOpaque,
+                S::VfOpaqueTwoSided,
+                S::VfTransparent,
+                S::VfTransparentCulled,
+            ]);
+        }
+        steps.extend_from_slice(&[
+            S::SeeEncode,
+            S::SeeDecode,
+            S::Water,
+            S::Overlay,
+            S::Terrain,
+        ]);
+        if samples == 1 {
+            steps.push(S::TerrainLow);
+        }
+        steps.extend_from_slice(&[
+            S::GlassResolve,
+            S::SsaoDown,
+            S::SsaoMain,
+            S::SsaoBlurX,
+            S::SsaoBlurY,
+            S::SsaoApply,
+            S::Lines,
+        ]);
+
+        Self {
+            samples,
+            reduced,
+            caps,
+            bgl,
+            tex_layout,
+            glass_layout,
+            terrain_bgl,
+            queue,
+            started_at: Instant::now(),
+            steps,
+            step_idx: 0,
+            spec_base: None,
+            shader: None,
+            layout: None,
+            part_layout: None,
+            terrain_layout: None,
+            ssao_layout: None,
+            ssao_pl: None,
+            see_layout: None,
+            see_pl: None,
+            sky: None,
+            opaque: None,
+            opaque_two_sided: None,
+            cutout: None,
+            cutout_two_sided: None,
+            opaque_plain: [None, None],
+            opaque_low: [[None, None], [None, None]],
+            transparent_low: [[None, None], [None, None]],
+            decal_depth: None,
+            decal_depth_culled: None,
+            transparent: None,
+            transparent_culled: None,
+            glass: None,
+            glass_culled: None,
+            see_transparent: None,
+            see_transparent_culled: None,
+            see_glass: None,
+            see_glass_culled: None,
+            see_overlay: None,
+            vf_opaque: None,
+            vf_opaque_two_sided: None,
+            vf_transparent: None,
+            vf_transparent_culled: None,
+            see_encode: None,
+            see_decode: None,
+            water: None,
+            overlay: None,
+            terrain: None,
+            terrain_low: None,
+            glass_resolve: None,
+            ssao_down: None,
+            ssao_main: None,
+            ssao_blur_x: None,
+            ssao_blur_y: None,
+            ssao_apply: None,
+            lines: None,
+        }
+    }
+
+    fn ms(&self) -> wgpu::MultisampleState {
+        wgpu::MultisampleState {
+            count: self.samples,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_fmt(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        vs: &str,
+        fs: &str,
+        buffers: &[Option<wgpu::VertexBufferLayout>],
+        topology: wgpu::PrimitiveTopology,
+        cull: Option<wgpu::Face>,
+        depth_write: bool,
+        depth_compare: wgpu::CompareFunction,
+        blend: Option<wgpu::BlendState>,
+        constants: &[(&str, f64)],
+        fmt: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let shader = self.shader.as_ref().expect("shader built in step 0");
+        let pl = if fs.starts_with("fs_part") || fs == "fs_decal_depth" {
+            self.part_layout.as_ref().expect("part_layout built in step 0")
+        } else {
+            self.layout.as_ref().expect("layout built in step 0")
+        };
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(pl),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(vs),
+                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+                buffers,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology,
+                cull_mode: cull,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(depth_compare),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: self.ms(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: fmt,
+                    blend,
+                    write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    }
+
+    fn make_cutout(&self, device: &wgpu::Device, label: &str, cull: Option<wgpu::Face>) -> wgpu::RenderPipeline {
+        let shader = self.shader.as_ref().expect("shader built in step 0");
+        let part_layout = self.part_layout.as_ref().expect("part_layout built in step 0");
+        let fs = if self.samples > 1 { "fs_part_cutout" } else { "fs_part_cutout_test" };
+        let hdr_format = scene_hdr_format(&self.caps);
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(part_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_part"),
+                compilation_options: Default::default(),
+                buffers: &[Some(part_vertex_layout()), Some(part_instance_layout())],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: cull,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: self.samples,
+                mask: !0,
+                alpha_to_coverage_enabled: self.samples > 1,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: hdr_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    }
+
+    fn make_terrain(&self, device: &wgpu::Device, constants: &[(&str, f64)]) -> wgpu::RenderPipeline {
+        let shader = self.shader.as_ref().expect("shader built in step 0");
+        let terrain_layout = self.terrain_layout.as_ref().expect("terrain_layout built in step 0");
+        let hdr_format = scene_hdr_format(&self.caps);
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain"),
+            layout: Some(terrain_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_terrain"),
+                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+                buffers: &[Some(terrain_vertex_layout())],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: self.ms(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_terrain"),
+                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: hdr_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    }
+
+    fn make_ssao(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        fs: &str,
+        format: wgpu::TextureFormat,
+        blend: Option<wgpu::BlendState>,
+    ) -> wgpu::RenderPipeline {
+        let shader = self.shader.as_ref().expect("shader built in step 0");
+        let ssao_pl = self.ssao_pl.as_ref().expect("ssao_pl built in step 0");
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(ssao_pl),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_post"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    }
+
+    fn step_one(&mut self, device: &wgpu::Device) -> bool {
+        if self.step_idx >= self.steps.len() {
+            return true;
+        }
+        use PipelineStep as S;
+        use wgpu::CompareFunction as C;
+        use wgpu::PrimitiveTopology as T;
+        let step = self.steps[self.step_idx];
+        let hdr_format = scene_hdr_format(&self.caps);
+        let see_format = scene_hdr_alpha_format(&self.caps);
+        let (depth_format, ao_format) = post_float_formats(&self.caps);
+        let pm = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let parts = [Some(part_vertex_layout()), Some(part_instance_layout())];
+
+        match step {
+            S::ShaderAndLayouts => {
+                let mut source = shader_source(
+                    self.reduced,
+                    self.caps.storage_lights(),
+                    self.caps.compact_mat_params(),
+                )
+                .replace(
+                    "const VIEWPORT_SAMPLES: i32 = 4;",
+                    &format!("const VIEWPORT_SAMPLES: i32 = {};", self.samples),
+                );
+                if cfg!(target_os = "android") {
+                    source = source
+                        .replace("const SSAO_STEPS: u32 = 7u;", "const SSAO_STEPS: u32 = 3u;")
+                        .replace("const SSAO_BLUR_RADIUS: i32 = 3;", "const SSAO_BLUR_RADIUS: i32 = 2;");
+                }
+                let spec_base = std::sync::Arc::new(crate::gpu_caps::shader_for(
+                    device,
+                    &if self.samples == 1 { single_sample_shader(source) } else { source },
+                ));
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("viewport color and depth"),
+                    source: wgpu::ShaderSource::Wgsl(spec_base.as_str().into()),
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("viewport"),
+                    bind_group_layouts: &[Some(&self.bgl), Some(&self.tex_layout)],
+                    immediate_size: 0,
+                });
+                let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("parts with glass scene"),
+                    bind_group_layouts: &[Some(&self.bgl), Some(&self.tex_layout), Some(&self.glass_layout)],
+                    immediate_size: 0,
+                });
+                let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("terrain"),
+                    bind_group_layouts: &[Some(&self.bgl), Some(&self.terrain_bgl)],
+                    immediate_size: 0,
+                });
+                let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ssao"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: crate::gpu_caps::depth_sample_type(device),
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: self.samples > 1,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+                let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("ssao"),
+                    bind_group_layouts: &[Some(&self.bgl), Some(&ssao_layout)],
+                    immediate_size: 0,
+                });
+                let (see_layout, see_pl) = SeeThrough::make_layouts(device, &self.bgl, self.ms());
+                self.spec_base = Some(spec_base);
+                self.shader = Some(shader);
+                self.layout = Some(layout);
+                self.part_layout = Some(part_layout);
+                self.terrain_layout = Some(terrain_layout);
+                self.ssao_layout = Some(ssao_layout);
+                self.ssao_pl = Some(ssao_pl);
+                self.see_layout = Some(see_layout);
+                self.see_pl = Some(see_pl);
+            }
+            S::Sky => {
+                let sky_cmp = if device.adapter_info().backend == wgpu::Backend::Gl {
+                    C::Always
+                } else {
+                    C::GreaterEqual
+                };
+                self.sky = Some(self.make_fmt(
+                    device, "sky", "vs_sky", "fs_sky", &[], T::TriangleList, None, false, sky_cmp, None, &[], hdr_format,
+                ));
+            }
+            S::Opaque => {
+                self.opaque = Some(self.make_fmt(
+                    device, "parts", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::OpaqueTwoSided => {
+                self.opaque_two_sided = Some(self.make_fmt(
+                    device, "parts-two-sided", "vs_part", "fs_part", &parts, T::TriangleList, None, true, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::Cutout => {
+                self.cutout = Some(self.make_cutout(device, "parts-cutout", Some(wgpu::Face::Back)));
+            }
+            S::CutoutTwoSided => {
+                self.cutout_two_sided = Some(self.make_cutout(device, "parts-cutout-two-sided", None));
+            }
+            S::OpaquePlainBack | S::OpaquePlainTwoSided => {
+                let keep = std::env::var("RUSTUDIO_SPEC_KEEP").unwrap_or_default();
+                let spec_base = self.spec_base.as_ref().expect("spec_base built in step 0");
+                let part_layout = self.part_layout.as_ref().expect("part_layout built in step 0");
+                let src = (
+                    std::sync::Arc::new(spec_source(spec_base, keep.contains('t'), keep.contains('k'), None)),
+                    part_layout.clone(),
+                    self.ms(),
+                    hdr_format,
+                );
+                if matches!(step, S::OpaquePlainBack) {
+                    self.opaque_plain[0] = Some(opaque_part_pipeline(device, &src, Some(wgpu::Face::Back)));
+                } else {
+                    self.opaque_plain[1] = Some(opaque_part_pipeline(device, &src, None));
+                }
+            }
+            S::OpaqueLow(v, c) => {
+                let entry = if v == 0 { "fs_part_opaque_low" } else { "fs_part_opaque_shadowed" };
+                let cull = if c == 0 { Some(wgpu::Face::Back) } else { None };
+                self.opaque_low[v][c] = Some(self.make_fmt(
+                    device, entry, "vs_part_opaque_low", entry, &parts, T::TriangleList, cull, true, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::TransparentLow(v, c) => {
+                let entry = if v == 0 { "fs_part_transparent_low" } else { "fs_part_transparent_shadowed" };
+                let cull = if c == 0 { Some(wgpu::Face::Back) } else { None };
+                self.transparent_low[v][c] = Some(self.make_fmt(
+                    device, entry, "vs_part_opaque_low", entry, &parts, T::TriangleList, cull, false, C::GreaterEqual, pm, &[], hdr_format,
+                ));
+            }
+            S::DecalDepth => {
+                self.decal_depth = Some(self.make_fmt(
+                    device, "decal opaque texel depth", "vs_part", "fs_decal_depth", &parts, T::TriangleList, None, true, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::DecalDepthCulled => {
+                self.decal_depth_culled = Some(self.make_fmt(
+                    device, "decal opaque texel depth culled", "vs_part", "fs_decal_depth", &parts, T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::Transparent => {
+                self.transparent = Some(self.make_fmt(
+                    device, "parts-transparent", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, pm, &[], hdr_format,
+                ));
+            }
+            S::TransparentCulled => {
+                self.transparent_culled = Some(self.make_fmt(
+                    device, "parts-transparent-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm, &[], hdr_format,
+                ));
+            }
+            S::Glass => {
+                self.glass = Some(self.make_fmt(
+                    device, "glass-composite", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::GlassCulled => {
+                self.glass_culled = Some(self.make_fmt(
+                    device, "glass-composite-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None, &[], hdr_format,
+                ));
+            }
+            S::SeeTransparent => {
+                self.see_transparent = Some(self.make_fmt(
+                    device, "parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm, &[], see_format,
+                ));
+            }
+            S::SeeTransparentCulled => {
+                self.see_transparent_culled = Some(self.make_fmt(
+                    device, "parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm, &[], see_format,
+                ));
+            }
+            S::SeeGlass => {
+                self.see_glass = Some(self.make_fmt(
+                    device, "glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None, &[], see_format,
+                ));
+            }
+            S::SeeGlassCulled => {
+                self.see_glass_culled = Some(self.make_fmt(
+                    device, "glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None, &[], see_format,
+                ));
+            }
+            S::SeeOverlay => {
+                self.see_overlay = Some(self.make_fmt(
+                    device, "parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm, &[], see_format,
+                ));
+            }
+            S::VfOpaque => {
+                self.vf_opaque = Some(self.make_fmt(
+                    device, "vf-parts", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None, &[], see_format,
+                ));
+            }
+            S::VfOpaqueTwoSided => {
+                self.vf_opaque_two_sided = Some(self.make_fmt(
+                    device, "vf-parts-two-sided", "vs_part", "fs_part", &parts, T::TriangleList, None, true, C::Greater, None, &[], see_format,
+                ));
+            }
+            S::VfTransparent => {
+                self.vf_transparent = Some(self.make_fmt(
+                    device, "vf-parts-transparent", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, pm, &[], see_format,
+                ));
+            }
+            S::VfTransparentCulled => {
+                self.vf_transparent_culled = Some(self.make_fmt(
+                    device, "vf-parts-transparent-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm, &[], see_format,
+                ));
+            }
+            S::SeeEncode => {
+                let shader = self.shader.as_ref().expect("shader built in step 0");
+                let see_pl = self.see_pl.as_ref().expect("see_pl built in step 0");
+                self.see_encode = Some(SeeThrough::make_pipe(
+                    device, shader, see_pl, self.ms(), "see-through encode", "fs_see_encode", false, see_format,
+                ));
+            }
+            S::SeeDecode => {
+                let shader = self.shader.as_ref().expect("shader built in step 0");
+                let see_pl = self.see_pl.as_ref().expect("see_pl built in step 0");
+                self.see_decode = Some(SeeThrough::make_pipe(
+                    device, shader, see_pl, self.ms(), "see-through decode", "fs_see_decode", true, hdr_format,
+                ));
+            }
+            S::Water => {
+                let shader = self.shader.as_ref().expect("shader built in step 0");
+                self.water = Some(crate::water::WaterPass::new(
+                    device,
+                    &self.queue,
+                    shader,
+                    &self.bgl,
+                    &self.tex_layout,
+                    &parts,
+                    hdr_format,
+                    self.samples,
+                ));
+            }
+            S::Overlay => {
+                self.overlay = Some(self.make_fmt(
+                    device, "parts-overlay", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, pm, &[], hdr_format,
+                ));
+            }
+            S::Terrain => {
+                self.terrain = Some(self.make_terrain(device, &[]));
+            }
+            S::TerrainLow => {
+                self.terrain_low = Some(self.make_terrain(device, &[("TERRAIN_LOW", 1.0)]));
+            }
+            S::GlassResolve => {
+                self.glass_resolve = Some(self.make_ssao(device, "glass depth", "fs_glass_depth", depth_format, None));
+            }
+            S::SsaoDown => {
+                self.ssao_down = Some(self.make_ssao(device, "ssao depth", "fs_ssao_down", depth_format, None));
+            }
+            S::SsaoMain => {
+                self.ssao_main = Some(self.make_ssao(device, "ssao", "fs_ssao", ao_format, None));
+            }
+            S::SsaoBlurX => {
+                self.ssao_blur_x = Some(self.make_ssao(device, "ssao blur across", "fs_ssao_blur_x", ao_format, None));
+            }
+            S::SsaoBlurY => {
+                self.ssao_blur_y = Some(self.make_ssao(device, "ssao blur down", "fs_ssao_blur_y", ao_format, None));
+            }
+            S::SsaoApply => {
+                self.ssao_apply = Some(self.make_ssao(
+                    device,
+                    "ssao apply",
+                    "fs_ssao_apply",
+                    hdr_format,
+                    Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::Src,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::OVER,
+                    }),
+                ));
+            }
+            S::Lines => {
+                self.lines = Some(self.make_fmt(
+                    device, "lines", "vs_line", "fs_line", &[Some(line_vertex_layout())], T::LineList, None, false, C::GreaterEqual, Some(wgpu::BlendState::ALPHA_BLENDING), &[], hdr_format,
+                ));
+            }
+        }
+
+        self.step_idx += 1;
+        self.step_idx >= self.steps.len()
+    }
+
+    /// Compiles one frame's chunk: step 0 compiles the shader module and yields;
+    /// subsequent calls compile 1-2 pipelines or stop once `budget` has elapsed.
+    fn step_chunk(&mut self, device: &wgpu::Device, max_pipelines: usize, budget: std::time::Duration) -> bool {
+        if self.step_idx >= self.steps.len() {
+            return true;
+        }
+        if self.step_idx == 0 {
+            return self.step_one(device);
+        }
+        let t0 = Instant::now();
+        let mut built = 0usize;
+        while built < max_pipelines && self.step_idx < self.steps.len() {
+            let done = self.step_one(device);
+            built += 1;
+            if done {
+                return true;
+            }
+            if t0.elapsed() >= budget {
+                break;
+            }
+        }
+        self.step_idx >= self.steps.len()
+    }
+
+    fn finish(self) -> ViewportPipelines {
+        let hdr_format = scene_hdr_format(&self.caps);
+        let see_format = scene_hdr_alpha_format(&self.caps);
+        let ms = self.ms();
+        let [op0, op1] = self.opaque_plain;
+        let opaque_plain = match (op0, op1) {
+            (Some(a), Some(b)) => Some([a, b]),
+            _ => None,
+        };
+        let opaque_low = (self.samples == 1).then(|| {
+            let [[a0, a1], [b0, b1]] = self.opaque_low;
+            [[a0.unwrap(), a1.unwrap()], [b0.unwrap(), b1.unwrap()]]
+        });
+        let transparent_low = (self.samples == 1).then(|| {
+            let [[a0, a1], [b0, b1]] = self.transparent_low;
+            [[a0.unwrap(), a1.unwrap()], [b0.unwrap(), b1.unwrap()]]
+        });
+        let see_pipes = SeePipes {
+            transparent: self.see_transparent.unwrap(),
+            transparent_culled: self.see_transparent_culled.unwrap(),
+            glass: self.see_glass.unwrap(),
+            glass_culled: self.see_glass_culled.unwrap(),
+            overlay: self.see_overlay.unwrap(),
+        };
+        let vf_alpha = (see_format != hdr_format).then(|| VfAlphaPipelines {
+            opaque: self.vf_opaque.unwrap(),
+            opaque_two_sided: self.vf_opaque_two_sided.unwrap(),
+            transparent: self.vf_transparent.unwrap(),
+            transparent_culled: self.vf_transparent_culled.unwrap(),
+        });
+        let see = SeeThrough::from_parts(
+            self.see_layout.unwrap(),
+            self.see_encode.unwrap(),
+            self.see_decode.unwrap(),
+        );
+        ViewportPipelines {
+            water: self.water.unwrap(),
+            glass_resolve: self.glass_resolve.unwrap(),
+            sky: self.sky.unwrap(),
+            opaque: self.opaque.unwrap(),
+            opaque_two_sided: self.opaque_two_sided.unwrap(),
+            cutout: self.cutout.unwrap(),
+            cutout_two_sided: self.cutout_two_sided.unwrap(),
+            opaque_low,
+            transparent_low,
+            opaque_plain,
+            plain_spec: Default::default(),
+            plain_src: (self.spec_base.unwrap(), self.part_layout.unwrap(), ms, hdr_format),
+            transparent_culled: self.transparent_culled.unwrap(),
+            glass: self.glass.unwrap(),
+            glass_culled: self.glass_culled.unwrap(),
+            transparent: self.transparent.unwrap(),
+            decal_depth: self.decal_depth.unwrap(),
+            decal_depth_culled: self.decal_depth_culled.unwrap(),
+            lines: self.lines.unwrap(),
+            ssao_layout: self.ssao_layout.unwrap(),
+            ssao_down: self.ssao_down.unwrap(),
+            ssao_main: self.ssao_main.unwrap(),
+            ssao_blur_x: self.ssao_blur_x.unwrap(),
+            ssao_blur_y: self.ssao_blur_y.unwrap(),
+            ssao_apply: self.ssao_apply.unwrap(),
+            terrain: self.terrain.unwrap(),
+            terrain_low: self.terrain_low,
+            overlay: self.overlay.unwrap(),
+            see_pipes,
+            see,
+            vf_alpha,
+        }
+    }
+}
+
 impl ViewportPipelines {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -2264,508 +3171,18 @@ impl ViewportPipelines {
         reduced: bool,
         caps: &crate::gpu_caps::GpuCaps,
     ) -> Self {
-        let mut source = shader_source(reduced, caps.storage_lights(), caps.compact_mat_params()).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
-        if cfg!(target_os = "android") {
-            source = source
-                .replace("const SSAO_STEPS: u32 = 7u;", "const SSAO_STEPS: u32 = 3u;")
-                .replace("const SSAO_BLUR_RADIUS: i32 = 3;", "const SSAO_BLUR_RADIUS: i32 = 2;");
-        }
-        let spec_base = std::sync::Arc::new(crate::gpu_caps::shader_for(device, &if samples == 1 { single_sample_shader(source) } else { source }));
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("viewport color and depth"),
-            source: wgpu::ShaderSource::Wgsl(spec_base.as_str().into()),
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("viewport"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
-            immediate_size: 0,
-        });
-
-        let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("parts with glass scene"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&glass_layout)],
-            immediate_size: 0,
-        });
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4],
-        };
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<InstanceRaw>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 13 => Float32x4],
-        };
-        let line_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LineVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
-        };
-
-        let ms = wgpu::MultisampleState {
-            count: samples,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        };
-        let hdr_format = scene_hdr_format(caps);
-        let see_format = scene_hdr_alpha_format(caps);
-        let make_fmt = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>,
-                    constants: &[(&str, f64)],
-                    fmt: wgpu::TextureFormat| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(if fs.starts_with("fs_part") || fs == "fs_decal_depth" { &part_layout } else { &layout }),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(depth_compare),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: fmt,
-                        blend,
-                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
-                    })],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
-        let _make_c = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>,
-                    constants: &[(&str, f64)]| {
-            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, constants, hdr_format)
-        };
-        let make = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
-            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[], hdr_format)
-        };
-        let make_see = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
-            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[], hdr_format)
-        };
-        use wgpu::CompareFunction as C;
-        use wgpu::PrimitiveTopology as T;
-        let sky_cmp = if device.adapter_info().backend == wgpu::Backend::Gl {
-            C::Always
-        } else {
-            C::GreaterEqual
-        };
-        let sky = make(
-            "sky",
-            "vs_sky",
-            "fs_sky",
-            &[],
-            T::TriangleList,
-            None,
-            false,
-            sky_cmp,
-            None,
-        );
-        let opaque = make(
-            "parts",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            true,
-            C::Greater,
-            None,
-        );
-        let opaque_two_sided = make(
-            "parts-two-sided",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            true,
-            C::Greater,
-            None,
-        );
-        let make_cutout = |label: &str, cull: Option<wgpu::Face>| {
-            let fs = if samples > 1 { "fs_part_cutout" } else { "fs_part_cutout_test" };
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&part_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_part"),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: T::TriangleList,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(C::Greater),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: samples,
-                    mask: !0,
-                    alpha_to_coverage_enabled: samples > 1,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: hdr_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
-        let cutout = make_cutout("parts-cutout", Some(wgpu::Face::Back));
-        let cutout_two_sided = make_cutout("parts-cutout-two-sided", None);
-        // The debug views stay compiled in: without them ANV fuses some of
-        // the lighting's shared products differently (one test-place pixel's
-        // green rounded a step lower, deterministically); with them every
-        // pixel is the generic program's. (RUSTUDIO_SPEC_KEEP=t,k keeps
-        // those paths too: a diagnostic.)
-        let keep = std::env::var("RUSTUDIO_SPEC_KEEP").unwrap_or_default();
-        let flag = |c: char| if keep.contains(c) { 1.0 } else { 0.0 };
-        let plain = [("SPEC_TEXTURED", flag('t')), ("SPEC_SPECIAL_KINDS", flag('k')), ("SPEC_DEBUG_VIEWS", 1.0)];
-        // Off unless RUSTUDIO_SPEC_PIPELINE is set: on Intel (Mesa ANV) the
-        // specialised program rounds one test-place pixel's green differently
-        // (27,75,20 vs 27,74,20), so it is not yet the same image.
-        let opaque_plain = spec_pipelines_on().then(|| {
-            let src = (std::sync::Arc::new(spec_source(&spec_base, plain[0].1 > 0.5, plain[1].1 > 0.5, None)), part_layout.clone(), ms, hdr_format);
-            [Some(wgpu::Face::Back), None].map(|cull| opaque_part_pipeline(device, &src, cull))
-        });
-        let opaque_low = (samples == 1).then(|| {
-            ["fs_part_opaque_low", "fs_part_opaque_shadowed"].map(|entry| {
-                [Some(wgpu::Face::Back), None].map(|cull| make(
-                    entry, "vs_part_opaque_low", entry,
-                    &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-                    T::TriangleList, cull, true, C::Greater, None,
-                ))
-            })
-        });
-        let transparent_low = (samples == 1).then(|| {
-            ["fs_part_transparent_low", "fs_part_transparent_shadowed"].map(|entry| {
-                [Some(wgpu::Face::Back), None].map(|cull| make(
-                    entry, "vs_part_opaque_low", entry,
-                    &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-                    T::TriangleList, cull, false, C::GreaterEqual,
-                    Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                ))
-            })
-        });
-        // fs_part writes premultiplied colour (round 26): see-through Neon
-        // adds its glow with cover 0, everything else blends as before.
-        let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, true, C::Greater, None);
-        let decal_depth_culled = make("decal opaque texel depth culled", "vs_part", "fs_decal_depth",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None);
-        let transparent = make(
-            "parts-transparent",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // See-through built-in shapes show their front faces only, as in
-        // Studio (round 19: from inside a translucent part it draws nothing).
-        let transparent_culled = make(
-            "parts-transparent-culled",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // GlassTransparentFS already composites the opaque scene. Replace RGB
-        // and preserve its energy-derived alpha; ordinary transparents remain
-        // premultiplied One / OneMinusSrcAlpha.
-        let glass = make("glass-composite", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, false, C::Greater, None);
-        let glass_culled = make("glass-composite-culled", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None);
-        // The same five, drawing into the see-through encoding (shader.wgsl
-        // see_out; SeeThrough below).
-        let pm = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
-        let parts = [Some(vertex_layout.clone()), Some(instance_layout.clone())];
-        let make_see_alpha = |label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend| {
-            make_fmt(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[], see_format)
-        };
-        let see_pipes = SeePipes {
-            transparent: make_see_alpha("parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-            transparent_culled: make_see_alpha("parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
-            glass: make_see_alpha("glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None),
-            glass_culled: make_see_alpha("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
-            overlay: make_see_alpha("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-        };
-        let vf_alpha = (see_format != hdr_format).then(|| VfAlphaPipelines {
-            opaque: make_see_alpha("vf-parts", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None),
-            opaque_two_sided: make_see_alpha("vf-parts-two-sided", "vs_part", "fs_part", &parts, T::TriangleList, None, true, C::Greater, None),
-            transparent: make_see_alpha("vf-parts-transparent", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-            transparent_culled: make_see_alpha("vf-parts-transparent-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
-        });
-        let see = SeeThrough::new(device, &shader, &bgl, ms, hdr_format, see_format);
-        let water = crate::water::WaterPass::new(
-            device,
-            queue,
-            &shader,
-            &bgl,
-            &tex_layout,
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            hdr_format,
+        let mut builder = GlPipelineBuilder::new(
+            bgl.clone(),
+            tex_layout.clone(),
+            glass_layout.clone(),
+            terrain_bgl.clone(),
+            queue.clone(),
             samples,
+            reduced,
+            caps.clone(),
         );
-        // Hover highlight: the same geometry again, on top of itself.
-        let overlay = make(
-            "parts-overlay",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        let terrain_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<rustudio_core::terrain::TerrainVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
-        };
-        let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("terrain"),
-            bind_group_layouts: &[Some(&bgl), Some(&terrain_bgl)],
-            immediate_size: 0,
-        });
-        let terrain_pipeline = |constants| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&terrain_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain"),
-                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: ms,
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_terrain"),
-                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: hdr_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
-        });
-        let terrain = terrain_pipeline(&[]);
-        let terrain_low = (samples == 1).then(|| terrain_pipeline(&[("TERRAIN_LOW", 1.0)]));
-        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ssao"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: crate::gpu_caps::depth_sample_type(device),
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: samples > 1,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
-                },
-            ],
-        });
-        let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ssao"),
-            bind_group_layouts: &[Some(&bgl), Some(&ssao_layout)],
-            immediate_size: 0,
-        });
-        let ssao_pipe = |label: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&ssao_pl),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
-        let (depth_format, ao_format) = post_float_formats(caps);
-        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", depth_format, None);
-        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", depth_format, None);
-        let ssao_main = ssao_pipe("ssao", "fs_ssao", ao_format, None);
-        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", ao_format, None);
-        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", ao_format, None);
-        // SSAOApply: the scene × the occlusion.
-        let ssao_apply = ssao_pipe(
-            "ssao apply",
-            "fs_ssao_apply",
-            hdr_format,
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::Src,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::OVER,
-            }),
-        );
-        let lines = make(
-            "lines",
-            "vs_line",
-            "fs_line",
-            &[Some(line_layout)],
-            T::LineList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-        );
-
-
-        Self {
-            water,
-            glass_resolve,
-            sky,
-            opaque,
-            opaque_two_sided,
-            cutout,
-            cutout_two_sided,
-            opaque_low,
-            transparent_low,
-            opaque_plain,
-            plain_spec: Default::default(),
-            plain_src: (spec_base.clone(), part_layout.clone(), ms, hdr_format),
-            transparent_culled,
-            glass,
-            glass_culled,
-            transparent,
-            decal_depth,
-            decal_depth_culled,
-            lines,
-            ssao_layout,
-            ssao_down,
-            ssao_main,
-            ssao_blur_x,
-            ssao_blur_y,
-            ssao_apply,
-            terrain,
-            terrain_low,
-            overlay,
-            see_pipes,
-            see,
-            vf_alpha,
-        }
+        while !builder.step_one(device) {}
+        builder.finish()
     }
 }
 
@@ -2936,6 +3353,10 @@ pub struct Renderer {
     /// the first frame takes them instead of compiling them itself (seconds
     /// on Mesa ANV the first time a build's shaders are seen).
     lower_pending: Option<std::sync::mpsc::Receiver<ViewportPipelines>>,
+    /// Incremental GLES pipeline builder (prevents main-thread ANR on PowerVR/GLES).
+    gl_builder: Option<GlPipelineBuilder>,
+    /// Cloned queue handle so `tick_pipeline_warmup` can drive `gl_builder`.
+    queue: wgpu::Queue,
     terrain_layout: wgpu::BindGroupLayout,
     /// Skinned parts deformed on the GPU (skin_gpu.rs).
     skin: crate::skin_gpu::SkinGpu,
@@ -3819,6 +4240,8 @@ impl Renderer {
             pipelines: [None, None, None],
             probe_samples,
             lower_pending: None,
+            gl_builder: None,
+            queue: queue.clone(),
             terrain_layout: terrain_bgl,
             skin: crate::skin_gpu::SkinGpu::new(device, caps.compute()),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
@@ -5002,9 +5425,65 @@ impl Renderer {
         self.pipelines[sample_slot(samples)].as_ref().expect("viewport pipelines made by ensure_pipelines")
     }
 
-    /// Returns `true` while background 1x viewport pipelines are compiling.
+    /// Returns `true` while viewport pipelines are compiling (background worker
+    /// or incremental GLES chunked builder).
     pub fn pipelines_compiling(&self) -> bool {
-        self.lower_pending.is_some()
+        self.lower_pending.is_some() || self.gl_builder.is_some()
+    }
+
+    /// Returns `Some((done, total))` while the incremental GLES pipeline builder
+    /// is active, or `None` when idle/complete.
+    pub fn pipelines_progress(&self) -> Option<(usize, usize)> {
+        self.gl_builder.as_ref().map(|b| (b.step_idx, b.steps.len()))
+    }
+
+    /// Advances incremental GLES pipeline compilation by one frame budget
+    /// (shader module in step 0, then 1-2 pipelines or up to 25 ms per call).
+    /// No-op on non-GLES backends or once the startup pipeline set is built.
+    pub fn tick_pipeline_warmup(&mut self, device: &wgpu::Device) {
+        if self.caps.backend != wgpu::Backend::Gl {
+            return;
+        }
+        if self.gl_builder.is_none() {
+            let samples = self.probe_samples;
+            if self.pipelines[sample_slot(samples)].is_some() {
+                return;
+            }
+            self.gl_builder = Some(GlPipelineBuilder::new(
+                self.globals_layout.clone(),
+                self.tex_layout.clone(),
+                self.glass_layout.clone(),
+                self.terrain_layout.clone(),
+                self.queue.clone(),
+                samples,
+                self.reduced,
+                self.caps.clone(),
+            ));
+        }
+        let _ = self.step_gl_builder(device);
+    }
+
+    fn step_gl_builder(&mut self, device: &wgpu::Device) -> bool {
+        const MAX_PIPELINES_PER_FRAME: usize = 2;
+        const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+        let done = match self.gl_builder.as_mut() {
+            Some(b) => b.step_chunk(device, MAX_PIPELINES_PER_FRAME, FRAME_BUDGET),
+            None => return false,
+        };
+        if done {
+            if let Some(b) = self.gl_builder.take() {
+                let samples = b.samples;
+                let elapsed_ms = b.started_at.elapsed().as_millis();
+                let made = b.finish();
+                if rustudio_core::load_trace::startup_trace() {
+                    eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built incrementally in {elapsed_ms} ms");
+                }
+                self.pipelines[sample_slot(samples)] = Some(made);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// The viewport's passes for `samples` a pixel, built on first use.
@@ -5013,6 +5492,21 @@ impl Renderer {
         let slot = sample_slot(samples);
         if self.pipelines[slot].is_some() {
             return true;
+        }
+        if self.caps.backend == wgpu::Backend::Gl {
+            if self.gl_builder.as_ref().map_or(true, |b| b.samples != samples) {
+                self.gl_builder = Some(GlPipelineBuilder::new(
+                    self.globals_layout.clone(),
+                    self.tex_layout.clone(),
+                    self.glass_layout.clone(),
+                    self.terrain_layout.clone(),
+                    rs.queue.clone(),
+                    samples,
+                    self.reduced,
+                    self.caps.clone(),
+                ));
+            }
+            return self.step_gl_builder(&rs.device);
         }
         if samples == 1 {
             if let Some(rx) = self.lower_pending.as_ref() {

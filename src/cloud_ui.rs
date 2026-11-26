@@ -322,6 +322,7 @@ pub struct CloudUi {
     upload_mode: Option<(u64, VersionType)>,
     upload_result: Option<Result<Option<u64>, String>>,
     pub save_error: Option<String>,
+    pub avatar_sync_warning: Option<String>,
     /// The last save that went through: (version, Saved/Published).
     pub last_saved: Option<(u64, VersionType)>,
     window_title: String,
@@ -426,6 +427,7 @@ impl CloudUi {
             upload_mode: None,
             upload_result: None,
             save_error: None,
+            avatar_sync_warning: None,
             last_saved: None,
             window_title: String::new(),
             open_when_ready: None,
@@ -687,6 +689,7 @@ impl CloudUi {
         overwrite: bool,
     ) {
         self.save_error = None;
+        self.avatar_sync_warning = None;
         self.conflict = None;
         self.save_pending = true;
         let avatar_type = doc_avatar_type(doc);
@@ -748,8 +751,7 @@ fn doc_avatar_type(doc: &Document) -> Option<u32> {
     doc.find_child(root, "StarterPlayer")
         .and_then(|sp| rustudio_render::scene::enum_u32(doc.prop(sp, "GameSettingsAvatar")))
         .or_else(|| {
-            doc.find_child(root, "AvatarSettings")
-                .and_then(|s| doc.find_child(s, "AvatarBodyRules"))
+            doc.find_avatar_body_rules()
                 .and_then(|b| rustudio_render::scene::enum_u32(doc.prop(b, "AvatarType")))
         })
 }
@@ -2074,13 +2076,20 @@ impl Editor {
 
     fn log_avatar_sync(&mut self, universe_id: u64, result: Result<u32, String>) {
         match result {
-            Ok(av) => self.info(format!(
-                "Synced experience {universe_id} avatar type to {}",
-                avatar_type_label(av),
-            )),
-            Err(err) => self.warn(format!(
-                "Published place, but could not sync experience {universe_id} avatar type: {err}",
-            )),
+            Ok(av) => {
+                self.cloud.avatar_sync_warning = None;
+                self.info(format!(
+                    "Synced experience {universe_id} avatar type to {}",
+                    avatar_type_label(av),
+                ));
+            }
+            Err(err) => {
+                let msg = format!(
+                    "Published place, but could not sync experience {universe_id} avatar type: {err}",
+                );
+                self.warn(msg.clone());
+                self.cloud.avatar_sync_warning = Some(msg);
+            }
         }
     }
 
@@ -2147,6 +2156,7 @@ impl Editor {
         self.close_cloud_upload();
         self.cloud.conflict = None;
         self.cloud.save_error = None;
+        self.cloud.avatar_sync_warning = None;
         self.cloud.confirm_copy_save = None;
     }
 
@@ -2158,6 +2168,7 @@ impl Editor {
         self.conflict_modal(ctx);
         self.copy_save_modal(ctx);
         self.save_error_modal(ctx);
+        self.avatar_sync_warning_modal(ctx);
         self.revert_version_modal(ctx);
         self.join_modal(ctx);
     }
@@ -2310,6 +2321,34 @@ impl Editor {
         }
         if save_as {
             self.save_as();
+        }
+    }
+
+    fn avatar_sync_warning_modal(&mut self, ctx: &egui::Context) {
+        let Some(warning) = self.cloud.avatar_sync_warning.clone() else { return };
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("cloud_avatar_sync_warning")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new("Avatar Type Sync Warning").strong().color(theme::WARN));
+            ui.add_space(4.0);
+            ui.label(&warning);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Your place changes were published, but the experience's live R6/R15 avatar setting on Roblox may still reflect the previous value.",
+                )
+                .small()
+                .color(theme::TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.cloud.avatar_sync_warning = None;
         }
     }
 

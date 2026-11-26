@@ -2778,8 +2778,7 @@ impl Game {
             .and_then(|sp| rustudio_render::scene::enum_u32(self.doc.prop(sp, "GameSettingsAvatar")))
             .or_else(|| {
                 self.doc
-                    .find_child(root, "AvatarSettings")
-                    .and_then(|s| self.doc.find_child(s, "AvatarBodyRules"))
+                    .find_avatar_body_rules()
                     .and_then(|b| rustudio_render::scene::enum_u32(self.doc.prop(b, "AvatarType")))
             })
             .and_then(|v| match v {

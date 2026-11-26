@@ -69,8 +69,11 @@ impl Editor {
     }
 
     pub fn open_settings_dialog(&mut self) {
-        let Some(st) = self.project.as_ref() else { return };
-        let cfg = (*st.config).clone();
+        let cfg = self
+            .project
+            .as_ref()
+            .map(|st| (*st.config).clone())
+            .unwrap_or_default();
         self.project_settings = Some(SettingsDialog { ignore_text: cfg.ignore_globs.join("\n"), cfg, error: None });
     }
 
@@ -202,6 +205,41 @@ impl Editor {
     fn settings_window(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.project_settings.take() else { return };
         if self.project.is_none() {
+            let mut open = true;
+            let mut do_export = false;
+            let mut do_open_folder = false;
+            egui::Window::new("Project Settings")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("No folder-based project is currently open.");
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Project Settings configure folder-based (Rojo / Argon) projects, including script sync rules, ignore globs, line endings, and sourcemaps.",
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save as Project Folder…").clicked() {
+                            do_export = true;
+                        }
+                        if ui.button("Open Folder…").clicked() {
+                            do_open_folder = true;
+                        }
+                    });
+                });
+            if do_export {
+                self.open_export_dialog();
+                return;
+            }
+            if do_open_folder {
+                self.request(crate::app::PendingAction::OpenFolder);
+                return;
+            }
+            if open {
+                self.project_settings = Some(d);
+            }
             return;
         }
         let mut open = true;

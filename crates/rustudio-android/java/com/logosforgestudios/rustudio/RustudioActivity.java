@@ -334,6 +334,19 @@ public class RustudioActivity extends NativeActivity {
         }
     }
 
+    /**
+     * Relaunches the app in a fresh task and terminates the current process.
+     */
+    public void restartApp() {
+        Intent intent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (intent != null) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            startActivity(intent);
+        }
+        finishAffinity();
+        Runtime.getRuntime().exit(0);
+    }
+
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);

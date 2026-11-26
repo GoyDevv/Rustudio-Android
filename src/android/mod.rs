@@ -199,6 +199,9 @@ pub fn run(app: AndroidApp) {
     if let Err(e) = assets::unpack(&app) {
         log::error!("assets: {e}");
     }
+    let _ = std::thread::Builder::new().name("rustudio-api-dump".into()).spawn(|| {
+        let _ = rustudio_core::api::get();
+    });
     // os.clock counts from here; the Luau flags are process-global and set
     // before any VM exists.
     let _ = rustudio_engine::runtime::process_start();

@@ -2368,21 +2368,52 @@ impl Game {
             }
             None => {
                 let compiling = self.renderer.as_ref().is_some_and(|r| r.pipelines_compiling());
+                let progress = if compiling {
+                    self.renderer.as_ref().and_then(|r| r.pipelines_progress())
+                } else {
+                    None
+                };
                 if compiling {
                     ctx.request_repaint();
                 }
                 painter.rect_filled(rect, 0.0, theme::BG);
+                let label = if compiling {
+                    match progress {
+                        Some((done, total)) if total > 0 => {
+                            format!("Compiling shaders ({done}/{total})...")
+                        }
+                        _ => "Compiling shaders...".to_string(),
+                    }
+                } else {
+                    "3D viewport unavailable (no wgpu device)".to_string()
+                };
+                let text_pos = if progress.is_some_and(|(_, total)| total > 0) {
+                    Pos2::new(rect.center().x, rect.center().y - 12.0)
+                } else {
+                    rect.center()
+                };
                 painter.text(
-                    rect.center(),
+                    text_pos,
                     egui::Align2::CENTER_CENTER,
-                    if compiling {
-                        "Compiling shaders…"
-                    } else {
-                        "3D viewport unavailable (no wgpu device)"
-                    },
+                    label,
                     egui::FontId::proportional(16.0),
                     theme::TEXT_DIM,
                 );
+                if let Some((done, total)) = progress.filter(|(_, total)| *total > 0) {
+                    let frac = (done.min(total) as f32) / (total as f32);
+                    let bar_w = (rect.width() * 0.45).clamp(120.0, 260.0);
+                    let bar_h = 6.0;
+                    let bar_rect = Rect::from_center_size(
+                        Pos2::new(rect.center().x, rect.center().y + 12.0),
+                        Vec2::new(bar_w, bar_h),
+                    );
+                    painter.rect_filled(bar_rect, 3.0, theme::PANEL_ALT);
+                    let fill_rect = Rect::from_min_size(
+                        bar_rect.min,
+                        Vec2::new(bar_rect.width() * frac, bar_h),
+                    );
+                    painter.rect_filled(fill_rect, 3.0, theme::ACCENT);
+                }
             }
         }
 

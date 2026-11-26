@@ -1058,3 +1058,12 @@ pub fn install_apk(apk_path: &std::path::Path) -> Result<String> {
         Ok(s)
     })
 }
+
+/// Relaunches the app in a fresh task and terminates the current process
+/// via `RustudioActivity.restartApp()`.
+pub fn restart_app() {
+    let _ = with_activity(|env, activity| {
+        env.call_method(activity, jni_str!("restartApp"), jni_sig!("()V"), &[])?;
+        Ok(())
+    });
+}

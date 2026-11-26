@@ -78,17 +78,22 @@ impl Editor {
             "import_3d" => {
                 if self.builtin_tools.plugins_enabled {
                     let (en, ck) = self.builtin_button_state("AssetImporter", Some("Mesh Importer"), Some("Import"));
-                    (edit && en, ck)
-                } else {
-                    (false, None)
+                    if en {
+                        return (edit, ck);
+                    }
                 }
+                (edit, None)
             }
             "save" | "save_as" => (edit, None),
             "save_roblox" | "save_roblox_as" | "publish" | "publish_as" => {
                 (edit && self.game.doc.kind == rustudio_core::doc::DocKind::Place, None)
             }
             "export_project" => (edit, None),
-            "project_settings" => (edit && self.project.is_some(), None),
+            "export_obj" | "export_gltf" => (edit && !self.game.scene.parts.is_empty(), None),
+            "project_settings" => (edit, None),
+            "manage_audience" => (self.game.doc.cloud.is_some() || self.live_team_create_ids().is_some(), None),
+            "auto_saves" => (edit, None),
+            "open_configs" | "beta_features" => (true, None),
             "experience_settings" | "account" | "add_account" => (true, None),
             "live_collaborators" | "invite_collaborators" => (true,None),
             "avatar_settings" => (true, open("Avatar Settings")),
@@ -124,7 +129,7 @@ impl Editor {
                 edit && self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder),
                 None,
             ),
-            "about" | "exit" | "studio_settings" | "logs_folder" => (true, None),
+            "about" | "exit" | "restart" | "studio_settings" | "logs_folder" => (true, None),
             "customize_shortcuts" => (true, Some(self.plugin_bar.shortcuts.open)),
             a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") || a.starts_with("ribbon_tab:") => (true, None),
             "undo" => (edit && self.game.doc.can_undo().is_some(), None),
@@ -515,8 +520,34 @@ impl Editor {
             }
             "import_model" => self.insert_from_file(),
             "import_3d" => {
-                self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import"));
+                if !self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import")) {
+                    self.import_3d_dialog();
+                }
             }
+            "export_obj" => self.export_obj_dialog(),
+            "export_gltf" => self.export_gltf_dialog(),
+            "manage_audience" => {
+                let universe_id = self
+                    .live_team_create_ids()
+                    .map(|(u, _)| u)
+                    .or_else(|| self.game.doc.cloud.as_ref().map(|c| c.universe_id));
+                if let Some(uid) = universe_id {
+                    let url = format!("https://create.roblox.com/dashboard/creations/experiences/{uid}/access");
+                    crate::browser::open_url(ctx, &url);
+                }
+            }
+            "auto_saves" => {
+                let dir = rustudio_core::paths::data().join("AutoSaves");
+                let _ = std::fs::create_dir_all(&dir);
+                use crate::file_dialog::{Kind, Purpose};
+                let d = crate::file_dialog::Request::new()
+                    .set_title("Open Auto Save")
+                    .set_directory(dir)
+                    .add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"]);
+                self.dialogs.start(Purpose::OpenPlace, d, Kind::PickFile);
+            }
+            "open_configs" => self.open_configs_action(),
+            "beta_features" => self.beta_features_open = true,
             "character" => {
                 if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
                     self.trigger_promoted_plugin_button("RigGenerator");
@@ -1061,13 +1092,55 @@ impl Editor {
                     }
                 }
                 M::Sub("Recent", _) => {
-                    let recent = self.ui.recent.clone();
-                    ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                    let local = self.ui.recent.clone();
+                    let had_local = !local.is_empty();
+                    let cloud = self.cloud.cache.recent();
+                    ui.add_enabled_ui(had_local || !cloud.is_empty(), |ui| {
                         ui.menu_button(sub_label("Recent"), |ui| {
-                            for p in recent {
-                                if ui.button(p.display().to_string()).clicked() {
-                                    self.request(PendingAction::Open(Some(p)));
-                                    ui.close();
+                            if had_local {
+                                let home = rustudio_core::paths::home();
+                                for p in local {
+                                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                                    let label = match p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                                        Some(parent) if !name.is_empty() => {
+                                            let p_str = match parent.strip_prefix(&home) {
+                                                Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+                                                Ok(rel) => format!("~/{}", rel.display()),
+                                                Err(_) => parent.display().to_string(),
+                                            };
+                                            format!("{name}  —  {p_str}")
+                                        }
+                                        _ => p.display().to_string(),
+                                    };
+                                    if ui.button(label).on_hover_text(p.display().to_string()).clicked() {
+                                        self.request(PendingAction::Open(Some(p)));
+                                        ui.close();
+                                    }
+                                }
+                            }
+                            if !cloud.is_empty() {
+                                if had_local {
+                                    ui.separator();
+                                }
+                                ui.label(RichText::new("Roblox Places").small().strong().color(theme::TEXT_DIM));
+                                for r in cloud.into_iter().take(10) {
+                                    let o = r.origin;
+                                    let label = if !o.experience.is_empty() && o.experience != o.name {
+                                        format!("{} ({})", o.name, o.experience)
+                                    } else {
+                                        o.name.clone()
+                                    };
+                                    let tip = format!(
+                                        "{} by {}\nplace {} · universe {}",
+                                        o.experience,
+                                        o.creator_label(),
+                                        o.place_id,
+                                        o.universe_id
+                                    );
+                                    if ui.button(label).on_hover_text(tip).clicked() {
+                                        self.open_cloud(o.place_id, None, false);
+                                        ui.close();
+                                    }
                                 }
                             }
                         });

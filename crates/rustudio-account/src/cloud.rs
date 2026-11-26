@@ -870,36 +870,71 @@ impl CloudApi {
         Ok(SaveOutcome::Saved { version })
     }
 
+    fn patch_universe_config_map(
+        &self,
+        universe_id: u64,
+        action: &str,
+        mut payload: serde_json::Map<String, Value>,
+    ) -> Result<()> {
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
+        let url = format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop);
+        let added_engine_settings = payload.contains_key("universeAvatarType")
+            && !payload.contains_key("engineAvatarSettings");
+        if added_engine_settings {
+            payload.insert("engineAvatarSettings".into(), Value::String("{}".into()));
+        }
+        let send = |body: &serde_json::Map<String, Value>| -> Result<(u16, String)> {
+            let body_json = Value::Object(body.clone()).to_string();
+            self.session
+                .send_csrf("PATCH", &url, "application/json", body_json.as_bytes())
+                .map_err(|e| Error::new(format!("{action} failed: {e}")))
+        };
+        let (status, text) = send(&payload)?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        if added_engine_settings
+            && status == 400
+            && text.to_ascii_lowercase().contains("engineavatarsettings")
+        {
+            payload.remove("engineAvatarSettings");
+            let (retry_status, retry_text) = send(&payload)?;
+            if (200..300).contains(&retry_status) {
+                return Ok(());
+            }
+            let why = error_message(&retry_text).map(|m| format!(": {m}")).unwrap_or_default();
+            return Err(Error::new(format!("{action} returned HTTP {retry_status}{why}")));
+        }
+        let why = error_message(&text).map(|m| format!(": {m}")).unwrap_or_default();
+        Err(Error::new(format!("{action} returned HTTP {status}{why}")))
+    }
+
     /// Updates the experience's live avatar rig setting (`MorphToR6`, `MorphToR15`, or `PlayerChoice`)
     /// via `PATCH /v2/universes/{universe_id}/configuration` so published places match
     /// `StarterPlayer.GameSettingsAvatar` on Roblox.
     ///
-    /// Reads the existing configuration via `GET /v1/universes/{universe_id}/configuration`
-    /// first and merges `"universeAvatarType"` into it (falling back to a minimal body if the
-    /// GET fails), because Roblox's v2 PATCH endpoint can reject partial configuration payloads.
+    /// Sends a minimal payload with `"engineAvatarSettings": "{}"` to clear stale server-side
+    /// avatar settings, automatically retrying without `"engineAvatarSettings"` if Roblox
+    /// returns HTTP 400 mentioning that field.
     pub fn set_universe_avatar_type(&self, universe_id: u64, game_avatar_type: u32) -> Result<()> {
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
         let avatar_type = match game_avatar_type {
             0 => "MorphToR6",
             1 => "MorphToR15",
             2 => "PlayerChoice",
             _ => return Ok(()),
         };
-        let get_url = format!("{}/v1/universes/{universe_id}/configuration", self.ep.develop);
-        let payload = match self.get_json(&get_url, "universe configuration") {
-            Ok(Value::Object(mut obj)) => {
-                obj.insert("universeAvatarType".into(), Value::String(avatar_type.into()));
-                Value::Object(obj)
-            }
-            _ => json!({ "universeAvatarType": avatar_type }),
-        };
-        write_json(
-            &self.session,
-            "PATCH",
-            &format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop),
+        let mut payload = serde_json::Map::new();
+        payload.insert("universeAvatarType".into(), Value::String(avatar_type.into()));
+        self.patch_universe_config_map(
+            universe_id,
             &format!("Sync universe {universe_id} avatar type ({avatar_type})"),
             payload,
-        )?;
-        Ok(())
+        )
     }
 
     /// Reads the experience's configuration (`GET {develop}/v1/universes/{universe_id}/configuration`).
@@ -910,26 +945,22 @@ impl CloudApi {
         )
     }
 
-    /// Updates the experience's configuration by fetching the current configuration,
-    /// merging keys from `patch`, and sending `PATCH {develop}/v2/universes/{universe_id}/configuration`.
+    /// Updates the experience's configuration by sending ONLY the fields present in `patch`
+    /// to `PATCH {develop}/v2/universes/{universe_id}/configuration`. When `patch` includes
+    /// `"universeAvatarType"`, also clears `"engineAvatarSettings"` (with automatic HTTP 400 fallback).
     pub fn patch_universe_config(&self, universe_id: u64, patch: serde_json::Value) -> Result<()> {
-        let mut payload = match self.get_universe_config(universe_id) {
-            Ok(Value::Object(obj)) => obj,
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
+        let payload = match patch {
+            Value::Object(updates) => updates,
             _ => serde_json::Map::new(),
         };
-        if let Value::Object(updates) = patch {
-            for (k, v) in updates {
-                payload.insert(k, v);
-            }
-        }
-        write_json(
-            &self.session,
-            "PATCH",
-            &format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop),
+        self.patch_universe_config_map(
+            universe_id,
             &format!("Update universe {universe_id} configuration"),
-            Value::Object(payload),
-        )?;
-        Ok(())
+            payload,
+        )
     }
 
     /// Reverts a place to a historical version by downloading that version's
@@ -1793,6 +1824,49 @@ mod tests {
             assert_eq!(s.requests().len(), if redirect { 2 } else { 1 });
         }
         assert!(foreign.requests().is_empty());
+    }
+
+    #[test]
+    fn set_universe_avatar_type_sends_minimal_patch_and_retries_on_engine_avatar_settings_400() {
+        let s = MockServer::start(Arc::new(|r| {
+            assert_eq!(r.method, "PATCH");
+            assert_eq!(r.path, "/develop/v2/universes/28220420/configuration");
+            let body: Value = serde_json::from_slice(&r.body).expect("json body");
+            if body.get("engineAvatarSettings").is_some() {
+                assert_eq!(body, json!({ "universeAvatarType": "MorphToR6", "engineAvatarSettings": "{}" }));
+                MockReply::json(400, r#"{"errors":[{"code":1,"message":"Invalid engineAvatarSettings"}]}"#)
+            } else {
+                assert_eq!(body, json!({ "universeAvatarType": "MorphToR6" }));
+                MockReply::json(200, "{}")
+            }
+        })).unwrap();
+        let a = api(&s, None);
+        assert!(a.set_universe_avatar_type(0, 0).is_err());
+        assert!(s.requests().is_empty());
+        a.set_universe_avatar_type(28220420, 0).expect("retry without engineAvatarSettings");
+        assert_eq!(s.requests().len(), 2);
+    }
+
+    #[test]
+    fn patch_universe_config_sends_only_patch_fields_without_v1_get() {
+        let s = MockServer::start(Arc::new(|r| {
+            assert_eq!(r.method, "PATCH");
+            assert_eq!(r.path, "/develop/v2/universes/28220420/configuration");
+            let body: Value = serde_json::from_slice(&r.body).expect("json body");
+            assert_eq!(
+                body,
+                json!({
+                    "name": "My Game",
+                    "universeAvatarType": "MorphToR6",
+                    "engineAvatarSettings": "{}",
+                }),
+            );
+            MockReply::json(200, "{}")
+        })).unwrap();
+        api(&s, None)
+            .patch_universe_config(28220420, json!({ "name": "My Game", "universeAvatarType": "MorphToR6" }))
+            .expect("minimal patch");
+        assert_eq!(s.requests().len(), 1);
     }
 }
 

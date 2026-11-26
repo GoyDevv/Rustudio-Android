@@ -1304,6 +1304,28 @@ impl Document {
         self.find_child(self.dom.root_ref(), "Workspace")
     }
 
+    /// Finds the `AvatarBodyRules` instance under the `AvatarSettings` service,
+    /// preferring one whose parent has class `AvatarRules` (e.g.
+    /// `AvatarSettings > DefaultAvatarRules > AvatarBodyRules`) and falling
+    /// back to any direct child `AvatarBodyRules` of `AvatarSettings`.
+    pub fn find_avatar_body_rules(&self) -> Option<Ref> {
+        let settings = self.find_child(self.dom.root_ref(), "AvatarSettings")?;
+        let mut direct_child = None;
+        for inst in self.dom.descendants_of(settings) {
+            if inst.referent() == settings || inst.class != "AvatarBodyRules" {
+                continue;
+            }
+            let parent = inst.parent();
+            if self.dom.get_by_ref(parent).is_some_and(|p| p.class == "AvatarRules") {
+                return Some(inst.referent());
+            }
+            if parent == settings && direct_child.is_none() {
+                direct_child = Some(inst.referent());
+            }
+        }
+        direct_child
+    }
+
     /// Where new objects go: Workspace for places, the root for models.
     pub fn default_parent(&self) -> Ref {
         match self.kind {

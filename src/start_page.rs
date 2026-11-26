@@ -43,8 +43,8 @@ enum Msg {
     Icon(u64, egui::ColorImage),
     /// Studio's template list (develop `v1/gametemplates`).
     Templates(Result<Vec<TemplateInfo>, String>),
-    /// A template's place file, or why there isn't one.
-    TemplatePlace(TemplateInfo, Result<(Vec<u8>, Source), String>),
+    /// A template's decoded document (built off the UI thread) and how it was sourced.
+    TemplatePlace(TemplateInfo, Result<rustudio_core::doc::Document, String>, String),
     /// One of the person's templates, read from its stored file.
     /// (key, name, the place file)
     CustomPlace(String, String, Result<Vec<u8>, String>),
@@ -85,8 +85,8 @@ pub struct StartPage {
     template_tab: Option<Kind>,
     /// The template whose place is being fetched.
     opening: Option<String>,
-    /// A fetched template place, for the editor to open.
-    opened: Option<(TemplateInfo, Result<(Vec<u8>, Source), String>)>,
+    /// A fetched and decoded template place, for the editor to open.
+    opened: Option<(TemplateInfo, Result<rustudio_core::doc::Document, String>, String)>,
     opened_custom: Option<(String, String, Result<Vec<u8>, String>)>,
     /// A template just opened: its preview is taken from the 3D view once
     /// the place has loaded (key, document, when it opened).
@@ -236,9 +236,9 @@ impl StartPage {
                 }
                 Msg::Templates(Ok(list)) => self.templates = list,
                 Msg::Templates(Err(_)) => {}
-                Msg::TemplatePlace(t, r) => {
+                Msg::TemplatePlace(t, doc, how) => {
                     self.opening = None;
-                    self.opened = Some((t, r));
+                    self.opened = Some((t, doc, how));
                 }
                 Msg::CustomPlace(key, name, r) => {
                     self.opening = None;
@@ -426,7 +426,8 @@ impl Editor {
     }
 
     /// Opens a template as Studio does: its place file (downloaded with the
-    /// session, else cached), else the built-in copy.
+    /// session, else cached), else the built-in copy. Decoding runs inside the
+    /// worker thread so the UI thread never stalls on large `.rbxl` files.
     fn start_open_template(&mut self, t: TemplateInfo) {
         if self.start.opening.is_some() {
             return;
@@ -434,25 +435,24 @@ impl Editor {
         self.start.opening = Some(t.name.clone());
         let (client, ep) = self.start_client();
         self.start.spawn(client, ep, move |a, tx| {
-            let r = templates::fetch_place(a.as_ref(), t.place_id);
-            let _ = tx.send(Msg::TemplatePlace(t, r));
+            let (doc, how) = match templates::fetch_place(a.as_ref(), t.place_id) {
+                Ok((bytes, src)) => match templates::new_place(&t, Some(&bytes)) {
+                    Ok(d) => (Ok(d), match src {
+                        Source::Downloaded(v) => format!("downloaded version {v}"),
+                        Source::Cached(v) => format!("cached version {v}"),
+                        Source::BuiltIn => "built in".into(),
+                    }),
+                    Err(e) => (templates::new_place(&t, None), format!("built in; its place file didn't load: {e}")),
+                },
+                Err(why) => (templates::new_place(&t, None), format!("built in; {why}")),
+            };
+            let _ = tx.send(Msg::TemplatePlace(t, doc, how));
         });
     }
 
-    /// A fetched template becomes the document.
+    /// A fetched and decoded template becomes the document.
     fn start_finish_template(&mut self) {
-        let Some((t, r)) = self.start.opened.take() else { return };
-        let (doc, how) = match r {
-            Ok((bytes, src)) => match templates::new_place(&t, Some(&bytes)) {
-                Ok(d) => (Ok(d), match src {
-                    Source::Downloaded(v) => format!("downloaded version {v}"),
-                    Source::Cached(v) => format!("cached version {v}"),
-                    Source::BuiltIn => "built in".into(),
-                }),
-                Err(e) => (templates::new_place(&t, None), format!("built in; its place file didn't load: {e}")),
-            },
-            Err(why) => (templates::new_place(&t, None), format!("built in; {why}")),
-        };
+        let Some((t, doc, how)) = self.start.opened.take() else { return };
         match doc {
             Ok(doc) => {
                 // The editor camera starts at the template's saved Camera,

@@ -256,6 +256,28 @@ struct DepthPipelines {
     dof_resolve_near: wgpu::RenderPipeline,
 }
 
+struct SunRaysPipelines {
+    march: wgpu::RenderPipeline,
+    radial: wgpu::RenderPipeline,
+}
+
+struct BlurPipelines {
+    blur_down: wgpu::RenderPipeline,
+    fx_composite: wgpu::RenderPipeline,
+    blur_1d: wgpu::RenderPipeline,
+}
+
+struct DofPipelines {
+    cheap: wgpu::RenderPipeline,
+    down_v: wgpu::RenderPipeline,
+    coc_filter: wgpu::RenderPipeline,
+    edge_fatten: wgpu::RenderPipeline,
+    fixup_coc: wgpu::RenderPipeline,
+    bokeh_far: wgpu::RenderPipeline,
+    bokeh_near: wgpu::RenderPipeline,
+    tent: wgpu::RenderPipeline,
+}
+
 struct PostFxTargets {
     size: [u32; 2],
     samples: u32,
@@ -339,30 +361,23 @@ pub struct PostFx {
     tex_layout: wgpu::BindGroupLayout,
     depth_layout_1x: wgpu::BindGroupLayout,
     depth_layout_ms: wgpu::BindGroupLayout,
+    pl_nod: wgpu::PipelineLayout,
     pl_depth_1x: wgpu::PipelineLayout,
     pl_depth_ms: wgpu::PipelineLayout,
+    module: wgpu::ShaderModule,
     black_view: wgpu::TextureView,
     noise_view: wgpu::TextureView,
-    // Non-depth pipelines
+    // Eagerly compiled core non-depth pipelines (always needed or commonly active)
     bloom_extract: wgpu::RenderPipeline,
     bloom_down: wgpu::RenderPipeline,
     bloom_up: wgpu::RenderPipeline,
-    sunrays_march: wgpu::RenderPipeline,
-    sunrays_radial: wgpu::RenderPipeline,
-    blur_down: wgpu::RenderPipeline,
-    fx_composite: wgpu::RenderPipeline,
-    blur_1d: wgpu::RenderPipeline,
-    dof_cheap: wgpu::RenderPipeline,
-    dof_down_v: wgpu::RenderPipeline,
-    dof_coc_filter: wgpu::RenderPipeline,
-    dof_edge_fatten: wgpu::RenderPipeline,
-    dof_fixup_coc: wgpu::RenderPipeline,
-    dof_bokeh_far: wgpu::RenderPipeline,
-    dof_bokeh_near: wgpu::RenderPipeline,
-    dof_tent: wgpu::RenderPipeline,
     image_process: wgpu::RenderPipeline,
     image_process_plain: wgpu::RenderPipeline,
-    // Depth-reading pipelines: [0] = 1x, [1] = MSAA (>1x)
+    // Lazily compiled on first use in `encode()` to keep cold startup fast on GLES
+    sunrays_pipes: Option<SunRaysPipelines>,
+    blur_pipes: Option<BlurPipelines>,
+    dof_pipes: Option<DofPipelines>,
+    // Depth-reading pipelines: [0] = 1x, [1] = MSAA (>1x), lazily compiled when SunRays/DoF active
     depth_pipes: [Option<DepthPipelines>; 2],
     targets: Option<PostFxTargets>,
 }
@@ -643,32 +658,14 @@ impl PostFx {
             alpha: wgpu::BlendComponent::REPLACE,
         });
 
-        let bloom_extract = make_pipe("postfx bloom extract", "fs_bloom_extract", hdr_format, None);
-        let bloom_down = make_pipe("postfx bloom down", "fs_bloom_down", hdr_format, None);
-        let bloom_up = make_pipe("postfx bloom up", "fs_bloom_up", hdr_format, additive);
-        let sunrays_march = make_pipe("postfx sunrays march", "fs_sunrays_march", hdr_format, None);
-        let sunrays_radial = make_pipe("postfx sunrays radial", "fs_sunrays_radial", hdr_format, None);
-        let blur_down = make_pipe("postfx blur down", "fs_blur_down", hdr_format, None);
-        let fx_composite = make_pipe("postfx fx composite", "fs_fx_composite", hdr_format, None);
-        let blur_1d = make_pipe("postfx blur 1d", "fs_blur_1d", hdr_format, None);
-        let dof_cheap = make_pipe("postfx dof cheap", "fs_dof_cheap", hdr_format, None);
-        let dof_down_v = make_pipe("postfx dof down v", "fs_dof_down_v", dof_format, None);
         let r16_fmt = if !r16_float_rt || hdr_format == wgpu::TextureFormat::Rgba8Unorm {
             wgpu::TextureFormat::Rgba8Unorm
         } else {
             wgpu::TextureFormat::R16Float
         };
-        let dof_coc_filter = make_pipe(
-            "postfx dof coc filter",
-            "fs_dof_coc_filter",
-            r16_fmt,
-            None,
-        );
-        let dof_edge_fatten = make_pipe("postfx dof edge fatten", "fs_dof_edge_fatten", dof_format, None);
-        let dof_fixup_coc = make_pipe("postfx dof fixup coc", "fs_dof_fixup_coc", dof_format, None);
-        let dof_bokeh_far = make_pipe("postfx dof bokeh far", "fs_dof_bokeh_far", dof_format, None);
-        let dof_bokeh_near = make_pipe("postfx dof bokeh near", "fs_dof_bokeh_near", dof_format, None);
-        let dof_tent = make_pipe("postfx dof tent", "fs_dof_tent", dof_format, None);
+        let bloom_extract = make_pipe("postfx bloom extract", "fs_bloom_extract", hdr_format, None);
+        let bloom_down = make_pipe("postfx bloom down", "fs_bloom_down", hdr_format, None);
+        let bloom_up = make_pipe("postfx bloom up", "fs_bloom_up", hdr_format, additive);
         let image_process = make_pipe("postfx image process", "fs_image_process", display_format, None);
         let image_process_plain = make_pipe("postfx image process plain", "fs_image_process_plain", display_format, None);
 
@@ -684,31 +681,95 @@ impl PostFx {
             tex_layout,
             depth_layout_1x,
             depth_layout_ms,
+            pl_nod,
             pl_depth_1x,
             pl_depth_ms,
+            module,
             black_view,
             noise_view,
             bloom_extract,
             bloom_down,
             bloom_up,
-            sunrays_march,
-            sunrays_radial,
-            blur_down,
-            fx_composite,
-            blur_1d,
-            dof_cheap,
-            dof_down_v,
-            dof_coc_filter,
-            dof_edge_fatten,
-            dof_fixup_coc,
-            dof_bokeh_far,
-            dof_bokeh_near,
-            dof_tent,
             image_process,
             image_process_plain,
+            sunrays_pipes: None,
+            blur_pipes: None,
+            dof_pipes: None,
             depth_pipes: [None, None],
             targets: None,
         }
+    }
+
+    fn make_nod_pipe(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        fs: &str,
+        format: wgpu::TextureFormat,
+        blend: Option<wgpu::BlendState>,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&self.pl_nod),
+            vertex: wgpu::VertexState {
+                module: &self.module,
+                entry_point: Some("vs_post"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &self.module,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    }
+
+    fn ensure_sunrays_pipes(&mut self, device: &wgpu::Device) {
+        if self.sunrays_pipes.is_some() {
+            return;
+        }
+        self.sunrays_pipes = Some(SunRaysPipelines {
+            march: self.make_nod_pipe(device, "postfx sunrays march", "fs_sunrays_march", self.hdr_format, None),
+            radial: self.make_nod_pipe(device, "postfx sunrays radial", "fs_sunrays_radial", self.hdr_format, None),
+        });
+    }
+
+    fn ensure_blur_pipes(&mut self, device: &wgpu::Device) {
+        if self.blur_pipes.is_some() {
+            return;
+        }
+        self.blur_pipes = Some(BlurPipelines {
+            blur_down: self.make_nod_pipe(device, "postfx blur down", "fs_blur_down", self.hdr_format, None),
+            fx_composite: self.make_nod_pipe(device, "postfx fx composite", "fs_fx_composite", self.hdr_format, None),
+            blur_1d: self.make_nod_pipe(device, "postfx blur 1d", "fs_blur_1d", self.hdr_format, None),
+        });
+    }
+
+    fn ensure_dof_pipes(&mut self, device: &wgpu::Device) {
+        if self.dof_pipes.is_some() {
+            return;
+        }
+        self.dof_pipes = Some(DofPipelines {
+            cheap: self.make_nod_pipe(device, "postfx dof cheap", "fs_dof_cheap", self.hdr_format, None),
+            down_v: self.make_nod_pipe(device, "postfx dof down v", "fs_dof_down_v", self.dof_format, None),
+            coc_filter: self.make_nod_pipe(device, "postfx dof coc filter", "fs_dof_coc_filter", self.r16_format, None),
+            edge_fatten: self.make_nod_pipe(device, "postfx dof edge fatten", "fs_dof_edge_fatten", self.dof_format, None),
+            fixup_coc: self.make_nod_pipe(device, "postfx dof fixup coc", "fs_dof_fixup_coc", self.dof_format, None),
+            bokeh_far: self.make_nod_pipe(device, "postfx dof bokeh far", "fs_dof_bokeh_far", self.dof_format, None),
+            bokeh_near: self.make_nod_pipe(device, "postfx dof bokeh near", "fs_dof_bokeh_near", self.dof_format, None),
+            tent: self.make_nod_pipe(device, "postfx dof tent", "fs_dof_tent", self.dof_format, None),
+        });
     }
 
     fn ensure_depth_pipes(&mut self, device: &wgpu::Device, samples: u32) {
@@ -784,7 +845,6 @@ impl PostFx {
         hdr_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
     ) {
-        self.ensure_depth_pipes(device, samples);
         let mk_tex = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat, copy_src: bool| {
             let mut usage =
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -1094,16 +1154,10 @@ impl PostFx {
         params: &PostFxParams,
         with_gpu_timing: bool,
     ) {
-        let Some(ref t) = self.targets else { return };
-        let samples = t.samples;
-        let dp_slot = usize::from(samples > 1);
-        if self.depth_pipes[dp_slot].is_none() {
-            self.ensure_depth_pipes(device, samples);
-        }
-        let Some(ref t) = self.targets else { return };
-        let Some(ref dp) = self.depth_pipes[dp_slot] else { return };
-
-        let size = t.size;
+        let (samples, size) = match self.targets.as_ref() {
+            Some(t) => (t.samples, t.size),
+            None => return,
+        };
         let scale = post_fx_scale(size);
         let [cc_r, cc_g, cc_b] = studio_cc_matrix(
             params.cc_enabled && !params.raw_debug,
@@ -1125,6 +1179,33 @@ impl PostFx {
             params.sun_rays_spread,
         );
         let (sr_ray_m, sr_radial_n) = studio_sun_rays_taps(size);
+
+        let bypass = params.raw_debug || params.terrain_capture_id;
+        let dof_allowed = !bypass && !params.is_ortho && params.post_fx_tier >= 3;
+        let far_i = if dof_allowed { params.dof[3] } else { 0.0 };
+        let near_i = if dof_allowed { params.dof[2] } else { 0.0 };
+        let need_dof = far_i > 0.0 || near_i > 0.0;
+        let sr_on = !bypass
+            && !params.is_ortho
+            && params.post_fx_tier >= 3
+            && params.sun_rays_enabled
+            && sr_cb_intensity > 0.0;
+        let need_blur = blur_weight > 0.0;
+
+        let dp_slot = usize::from(samples > 1);
+        if (need_dof || sr_on) && self.depth_pipes[dp_slot].is_none() {
+            self.ensure_depth_pipes(device, samples);
+        }
+        if need_dof && self.dof_pipes.is_none() {
+            self.ensure_dof_pipes(device);
+        }
+        if sr_on && self.sunrays_pipes.is_none() {
+            self.ensure_sunrays_pipes(device);
+        }
+        if need_blur && self.blur_pipes.is_none() {
+            self.ensure_blur_pipes(device);
+        }
+        let Some(ref t) = self.targets else { return };
 
         let flags = (u32::from(params.terrain_capture_id)) | (u32::from(params.raw_debug) << 1);
         let base_u = PostFxUniform {
@@ -1210,13 +1291,11 @@ impl PostFx {
         let load = wgpu::LoadOp::Load;
 
         // ----------------------------------------------------------- Stage 1: DepthOfField
-        let bypass = params.raw_debug || params.terrain_capture_id;
-        let dof_allowed = !bypass && !params.is_ortho && params.post_fx_tier >= 3;
-        let far_i = if dof_allowed { params.dof[3] } else { 0.0 };
-        let near_i = if dof_allowed { params.dof[2] } else { 0.0 };
         let mut scene_idx: usize = 0; // 0 = hdr_view, 1 = dof_scene_a, 2 = dof_scene_b
 
         if far_i > 0.0 {
+            let dp = self.depth_pipes[dp_slot].as_ref().expect("postfx depth pipes");
+            let dof = self.dof_pipes.as_ref().expect("postfx dof pipes");
             if far_i < DOF_CHEAP_BELOW {
                 let mut u0 = base_u;
                 u0.extra = [0.0, 0.0, 0.0, 0.0]; // far
@@ -1238,7 +1317,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof far cheap",
-                    &self.dof_cheap,
+                    &dof.cheap,
                     &t.dof_scene_a,
                     clear,
                     &self.uniform_bg,
@@ -1275,7 +1354,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof far down v",
-                    &self.dof_down_v,
+                    &dof.down_v,
                     &t.dof_half_col,
                     clear,
                     &self.uniform_bg,
@@ -1300,7 +1379,7 @@ impl PostFx {
                     draw_pass(
                         encoder,
                         "dof far coc mask",
-                        &self.dof_coc_filter,
+                        &dof.coc_filter,
                         dst,
                         clear,
                         &self.uniform_bg,
@@ -1315,7 +1394,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof far edge fatten",
-                    &self.dof_edge_fatten,
+                    &dof.edge_fatten,
                     &t.dof_half_a,
                     clear,
                     &self.uniform_bg,
@@ -1327,7 +1406,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof far fixup coc",
-                    &self.dof_fixup_coc,
+                    &dof.fixup_coc,
                     &t.dof_half_b,
                     clear,
                     &self.uniform_bg,
@@ -1341,7 +1420,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof far bokeh",
-                    &self.dof_bokeh_far,
+                    &dof.bokeh_far,
                     &t.dof_half_a,
                     clear,
                     &self.uniform_bg,
@@ -1353,7 +1432,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof far tent",
-                    &self.dof_tent,
+                    &dof.tent,
                     &t.dof_half_b,
                     clear,
                     &self.uniform_bg,
@@ -1378,6 +1457,8 @@ impl PostFx {
         }
 
         if near_i > 0.0 {
+            let dp = self.depth_pipes[dp_slot].as_ref().expect("postfx depth pipes");
+            let dof = self.dof_pipes.as_ref().expect("postfx dof pipes");
             if near_i < DOF_CHEAP_BELOW {
                 let mut u0 = base_u;
                 u0.extra = [1.0, 0.0, 0.0, 0.0]; // near
@@ -1399,7 +1480,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof near cheap",
-                    &self.dof_cheap,
+                    &dof.cheap,
                     &t.dof_scene_b,
                     clear,
                     &self.uniform_bg,
@@ -1477,7 +1558,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof near down v",
-                    &self.dof_down_v,
+                    &dof.down_v,
                     v_col,
                     clear,
                     &self.uniform_bg,
@@ -1502,7 +1583,7 @@ impl PostFx {
                     draw_pass(
                         encoder,
                         "dof near coc mask",
-                        &self.dof_coc_filter,
+                        &dof.coc_filter,
                         dst,
                         clear,
                         &self.uniform_bg,
@@ -1516,7 +1597,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof near fixup coc",
-                    &self.dof_fixup_coc,
+                    &dof.fixup_coc,
                     v_b,
                     clear,
                     &self.uniform_bg,
@@ -1530,7 +1611,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof near bokeh",
-                    &self.dof_bokeh_near,
+                    &dof.bokeh_near,
                     v_a,
                     clear,
                     &self.uniform_bg,
@@ -1542,7 +1623,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "dof near tent",
-                    &self.dof_tent,
+                    &dof.tent,
                     v_b,
                     clear,
                     &self.uniform_bg,
@@ -1636,13 +1717,10 @@ impl PostFx {
         }
 
         // ----------------------------------------------------------- Stage 3: SunRays
-        let sr_on = !bypass
-            && !params.is_ortho
-            && params.post_fx_tier >= 3
-            && params.sun_rays_enabled
-            && sr_cb_intensity > 0.0;
         let sr_slot = usize::from(sr_on);
         if sr_on {
+            let dp = self.depth_pipes[dp_slot].as_ref().expect("postfx depth pipes");
+            let sr = self.sunrays_pipes.as_ref().expect("postfx sunrays pipes");
             let od = push_u(base_u);
             draw_pass(
                 encoder,
@@ -1661,7 +1739,7 @@ impl PostFx {
             draw_pass(
                 encoder,
                 "postfx sunrays march",
-                &self.sunrays_march,
+                &sr.march,
                 &t.sr_march,
                 clear,
                 &self.uniform_bg,
@@ -1675,7 +1753,7 @@ impl PostFx {
             draw_pass(
                 encoder,
                 "postfx sunrays radial",
-                &self.sunrays_radial,
+                &sr.radial,
                 &t.sr_radial,
                 clear,
                 &self.uniform_bg,
@@ -1687,6 +1765,7 @@ impl PostFx {
 
         // ----------------------------------------------------------- Stage 4: Blur + FXCompositing
         if blur_weight > 0.0 {
+            let blur = self.blur_pipes.as_ref().expect("postfx blur pipes");
             let qw = t.quarter_size[0] as f32;
             let qh = t.quarter_size[1] as f32;
             let hq_down = if params.post_fx_tier >= 2 { 1.0 } else { 0.0 };
@@ -1700,7 +1779,7 @@ impl PostFx {
             draw_pass(
                 encoder,
                 "postfx blur down",
-                &self.blur_down,
+                &blur.blur_down,
                 if need_fx_comp { &t.blur_b } else { &t.blur_a },
                 clear,
                 &self.uniform_bg,
@@ -1713,7 +1792,7 @@ impl PostFx {
                 draw_pass(
                     encoder,
                     "postfx fx composite",
-                    &self.fx_composite,
+                    &blur.fx_composite,
                     &t.blur_a,
                     clear,
                     &self.uniform_bg,
@@ -1728,7 +1807,7 @@ impl PostFx {
             draw_pass(
                 encoder,
                 "postfx blur h",
-                &self.blur_1d,
+                &blur.blur_1d,
                 &t.blur_b,
                 clear,
                 &self.uniform_bg,
@@ -1742,7 +1821,7 @@ impl PostFx {
             draw_pass(
                 encoder,
                 "postfx blur v",
-                &self.blur_1d,
+                &blur.blur_1d,
                 &t.blur_a,
                 clear,
                 &self.uniform_bg,

@@ -53,6 +53,7 @@ pub mod coverage;
 pub mod crash;
 pub mod crash_dialog;
 pub mod explorer;
+pub mod export_3d;
 pub mod file_dialog;
 pub mod hypr;
 pub mod studio_settings;
@@ -1487,6 +1488,12 @@ pub fn run() -> eframe::Result<()> {
         rustudio_core::telemetry::flush();
         std::process::exit(code.max(app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
     }
+    // Pre-warm api-dump.json off the main thread so frame 1 doesn't stall.
+    let _ = std::thread::Builder::new()
+        .name("api-dump-prewarm".into())
+        .spawn(|| {
+            let _ = rustudio_core::api::get();
+        });
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport,
