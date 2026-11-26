@@ -244,6 +244,18 @@ impl BuiltinToolChoices {
 
 pub const OPTS: &[Opt] = &[
     Opt {
+        key: "graphics_api",
+        cat: "Performance",
+        label: "Graphics API",
+        desc: "Native graphics backend used on startup (restart required). Automatic uses Vulkan with automatic OpenGL ES 3 fallback; choose Vulkan or OpenGL ES 3 to force a specific native backend.",
+        env: "RUSTUDIO_GRAPHICS_API",
+        kind: OptKind::Choice(&[
+            ("auto", "Automatic (Native)"),
+            ("vulkan", "Vulkan (Restart required)"),
+            ("gl", "OpenGL ES 3 (Restart required)"),
+        ]),
+    },
+    Opt {
         key: "quality",
         cat: "Performance",
         label: "Graphics quality",
@@ -1112,6 +1124,15 @@ pub fn view_distance_choice() -> &'static str {
 
 pub fn set_view_distance_choice(id: &str) {
     set_choice("view_distance", id, "auto");
+}
+
+/// Configured native graphics API (`"auto"`, `"vulkan"`, or `"gl"`).
+pub fn graphics_api_choice() -> &'static str {
+    match performance_value("graphics_api") {
+        "vulkan" => "vulkan",
+        "gl" => "gl",
+        _ => "auto",
+    }
 }
 
 pub fn anti_aliasing_choice() -> &'static str {

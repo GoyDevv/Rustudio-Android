@@ -51,3 +51,45 @@ pub unsafe extern "C" fn rustudio_on_create(activity: *mut c_void, saved_state: 
 fn android_main(app: rustudio::android::AndroidApp) {
     rustudio::android::run(app);
 }
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeCommitText(
+    env: *mut c_void,
+    _class: *mut c_void,
+    text: *mut c_void,
+) {
+    unsafe { rustudio::android::ime_bridge::jni_commit_text(env, text) };
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeDelete(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    before: i32,
+    after: i32,
+) {
+    rustudio::android::ime_bridge::on_delete(before, after);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeKey(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    key_code: i32,
+    down: u8,
+) {
+    rustudio::android::ime_bridge::on_key(key_code, down != 0);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeAction(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    action: i32,
+) {
+    rustudio::android::ime_bridge::on_action(action);
+}

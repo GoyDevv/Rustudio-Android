@@ -336,6 +336,7 @@ pub struct SunShadows {
     /// Dynamic-caster generation seen on the previous `plan()` call, to tell
     /// continuous motion (Playtest / active drag) from a just-settled move.
     last_dyn_gen: u64,
+    dyn_idle_frames: u8,
     frame: u64,
 }
 
@@ -490,7 +491,7 @@ impl SunShadows {
         };
         let h_pipe = pipe("sun shadow blur across", "fs_h", &[Some(&h_layout)]);
         let v_pipe = pipe("sun shadow blur down", "fs_v", &[Some(&pass_layout), Some(&v_layout)]);
-        SunShadows { atlas_view, temp_view, pass_buf, pass_layout, pass_bg, h_bg, v_bg, h_pipe, v_pipe, drawn: [None; CASCADES], drawn_dyn: [0; CASCADES], last_dyn_gen: 0, frame: 0 }
+        SunShadows { atlas_view, temp_view, pass_buf, pass_layout, pass_bg, h_bg, v_bg, h_pipe, v_pipe, drawn: [None; CASCADES], drawn_dyn: [0; CASCADES], last_dyn_gen: 0, dyn_idle_frames: 0, frame: 0 }
     }
 
     /// The cascades to redraw this frame. Cascade 0 follows the camera, so
@@ -503,6 +504,16 @@ impl SunShadows {
         let f = self.frame;
         let dyn_active = dyn_gen != self.last_dyn_gen;
         self.last_dyn_gen = dyn_gen;
+        if dyn_active {
+            self.dyn_idle_frames = 0;
+        } else {
+            self.dyn_idle_frames = self.dyn_idle_frames.saturating_add(1);
+        }
+        let allow_settle = if cfg!(target_os = "android") {
+            self.dyn_idle_frames >= 4
+        } else {
+            !dyn_active
+        };
         std::array::from_fn(|i| {
             let now = Drawn { cascade: cascades[i], scene };
             let stale_dyn = self.drawn_dyn[i] != dyn_gen;
@@ -511,10 +522,9 @@ impl SunShadows {
             } else {
                 [true, f % 2 == 0, f % 4 == 1, f % 8 == 3][i]
             };
-            // When dynamic casters stop moving (e.g. after a fast 3D editor
-            // drag), immediately flush any cascade that was skipped by the
-            // stagger schedule so shadows never freeze at an old position.
-            let settle_flush = !dyn_active && stale_dyn;
+            // Wait for 4 idle frames on Android before flushing all staggered
+            // cascades so a single reused PlayWorker frame never causes a 4-cascade spike.
+            let settle_flush = allow_settle && stale_dyn;
             let due = turn || settle_flush || self.drawn[i] != Some(now);
             if due {
                 self.drawn[i] = Some(now);

@@ -574,18 +574,53 @@ mod android_gpu_guard {
             let _ = std::fs::remove_file(&failed);
         }
 
-        if probe.exists() {
+        let render3d_probe = dir.join(".vulkan_3d_probe");
+        if probe.exists() || render3d_probe.exists() {
             log::warn!(
-                "rustudio: Vulkan crashed before completing startup frames on the previous launch; switching to native OpenGL ES 3"
+                "rustudio: Vulkan crashed/stalled before completing {} on the previous launch; switching to native OpenGL ES 3",
+                if render3d_probe.exists() { "3D viewport frames" } else { "startup frames" }
             );
             let _ = std::fs::write(&failed, &fingerprint);
             let _ = std::fs::remove_file(&probe);
+            let _ = std::fs::remove_file(&render3d_probe);
             return true;
         }
 
         // Arm the boot probe; cleared after the first 4 frames submit & present cleanly.
         let _ = std::fs::write(&probe, env!("CARGO_PKG_VERSION"));
         false
+    }
+
+    static RENDER3D_ARMED: AtomicBool = AtomicBool::new(false);
+    static RENDER3D_VERIFIED: AtomicBool = AtomicBool::new(false);
+    static RENDER3D_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn render3d_probe_path() -> std::path::PathBuf {
+        crate::crash::dir().join(".vulkan_3d_probe")
+    }
+
+    /// Arms the second-stage 3D renderer Vulkan probe right before the first 3D viewport frame.
+    pub(crate) fn arm_3d_probe() {
+        if RENDER3D_VERIFIED.load(Ordering::Acquire) || RENDER3D_ARMED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let p = render3d_probe_path();
+        let _ = std::fs::write(&p, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Marks one completed 3D viewport frame; clears `.vulkan_3d_probe` after 4 clean frames.
+    pub(crate) fn note_3d_frame_ok() {
+        if RENDER3D_VERIFIED.load(Ordering::Acquire) {
+            return;
+        }
+        let n = RENDER3D_FRAMES.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= 4 && !RENDER3D_VERIFIED.swap(true, Ordering::AcqRel) {
+            let p = render3d_probe_path();
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+                log::info!("rustudio: 3D viewport verified (4 frames); cleared Vulkan 3D probe");
+            }
+        }
     }
 
     /// Called once the app has cleanly rendered its initial frames on Android.
@@ -607,11 +642,37 @@ pub(crate) fn mark_graphics_boot_ok() {
     android_gpu_guard::mark_boot_ok();
 }
 
-pub(crate) fn wgpu_setup(mut setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu::WgpuSetup {
-    // Native graphics driver only (Vulkan first with native GLES 3 fallback on Android).
+/// Arms the second-stage Android 3D viewport Vulkan probe before the first 3D frame.
+pub(crate) fn arm_3d_renderer_probe() {
     #[cfg(target_os = "android")]
-    if android_gpu_guard::should_force_gles() {
-        setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::GL;
+    android_gpu_guard::arm_3d_probe();
+}
+
+/// Notes a completed 3D viewport frame for the second-stage Android Vulkan probe.
+pub(crate) fn note_3d_renderer_frame_ok() {
+    #[cfg(target_os = "android")]
+    android_gpu_guard::note_3d_frame_ok();
+}
+
+pub(crate) fn wgpu_setup(mut setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu::WgpuSetup {
+    // Native graphics driver only (Vulkan or OpenGL ES 3).
+    #[cfg(target_os = "android")]
+    {
+        match rustudio_core::rustudio_settings::graphics_api_choice() {
+            "gl" => {
+                log::info!("rustudio: user selected OpenGL ES 3 in Studio Settings");
+                setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::GL;
+            }
+            "vulkan" => {
+                log::info!("rustudio: user selected Vulkan in Studio Settings");
+                setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::VULKAN;
+            }
+            _ => {
+                if android_gpu_guard::should_force_gles() {
+                    setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::GL;
+                }
+            }
+        }
     }
     egui_wgpu::WgpuSetup::CreateNew(setup)
 }

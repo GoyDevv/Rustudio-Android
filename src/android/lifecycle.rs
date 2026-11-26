@@ -117,6 +117,8 @@ pub fn take_low_memory() -> bool {
 }
 
 unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
+    crate::crash::begin_shutdown();
+    rustudio_core::crash::begin_shutdown();
     log::info!("activity destroyed: closing the editor");
     if let Some(ctx) = CTX.lock().unwrap().clone() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -139,8 +141,8 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
     // Paused activities run no frames (winit), so the close request can't
     // be seen: the window's state went to disk when the surface was lost
     // (App::save) and a fresh process serves the next launch.
-    log::warn!("the editor's loop didn't end in {GRACE:?}: leaving the process");
-    std::process::exit(0);
+    log::warn!("the editor's loop didn't end in {GRACE:?}: leaving the process cleanly");
+    unsafe { libc::_exit(0) };
 }
 
 /// The Back button (`Key::BrowserBack` through winit): closes what is open
@@ -148,7 +150,7 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
 /// is played (`playing`: Escape's job in Play, what Back does in Roblox's
 /// own app), and otherwise sends the app to the background, where it
 /// stays ready, instead of tearing the activity down.
-pub fn back_pressed(ctx: &egui::Context, raw: &mut egui::RawInput, playing: bool) {
+pub fn back_pressed(_ctx: &egui::Context, raw: &mut egui::RawInput, _playing: bool) {
     let mut back = false;
     raw.events.retain(|e| match e {
         egui::Event::Key { key: egui::Key::BrowserBack, pressed, .. } => {
@@ -160,20 +162,15 @@ pub fn back_pressed(ctx: &egui::Context, raw: &mut egui::RawInput, playing: bool
     if !back {
         return;
     }
-    let something_open = egui::Popup::is_any_open(ctx) || ctx.memory(|m| m.focused().is_some());
-    if something_open || playing {
-        for pressed in [true, false] {
-            raw.events.push(egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: Some(egui::Key::Escape),
-                pressed,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            });
-        }
-        return;
-    }
-    if let Err(e) = super::jni::move_task_to_back() {
-        log::warn!("back: {e}");
+    // Always behave like Esc (close menus/dialogs/popups or toggle Play pause menu)
+    // instead of exiting or backgrounding the app.
+    for pressed in [true, false] {
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: Some(egui::Key::Escape),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
     }
 }

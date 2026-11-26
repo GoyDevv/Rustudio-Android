@@ -2089,14 +2089,43 @@ impl TextureCache {
                     self.entries.insert(id.to_string(), None);
                     return None;
                 }
-                // Small images decode here; bigger ones on the decode
-                // workers (the part waits and is redone on arrival).
-                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None, None))),
-                Fetch::Ready(bytes) => {
-                    let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
-                    texture::decode_async(bytes, tx.clone(), id.to_string());
-                    self.decoding.insert(id.to_string());
-                    return None;
+                // Unwrap Roblox Decal XML/binary assets pointing to an inner image URI
+                // before decoding (many Toolbox Decals/Nextbots store Decal asset IDs).
+                Fetch::Ready(mut bytes) => {
+                    let trimmed = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                    let trimmed = trimmed.iter().position(|b| !b.is_ascii_whitespace()).map_or(trimmed, |i| &trimmed[i..]);
+                    if trimmed.starts_with(b"<roblox") || trimmed.starts_with(b"<?xml") {
+                        let inner = crate::doc::Document::decode(&bytes).ok().and_then(|dom| {
+                            dom.descendants().find_map(|i| {
+                                for prop in ["Texture", "TextureContent"] {
+                                    match i.properties.get(&rbx_dom_weak::ustr(prop)) {
+                                        Some(rbx_dom_weak::types::Variant::ContentId(c)) if !c.as_str().is_empty() => return Some(c.as_str().to_string()),
+                                        Some(rbx_dom_weak::types::Variant::Content(c)) => if let Some(u) = c.as_uri() { if !u.is_empty() { return Some(u.to_string()); } },
+                                        Some(rbx_dom_weak::types::Variant::String(s)) if !s.is_empty() => return Some(s.clone()),
+                                        _ => {}
+                                    }
+                                }
+                                None
+                            })
+                        });
+                        match inner.map(|u| store.content(&u, doc_dir)) {
+                            Some(Fetch::Ready(b)) => bytes = b,
+                            Some(Fetch::Pending) => return None,
+                            _ => {
+                                self.reasons.insert(id.to_string(), "decal XML unwrap failed".into());
+                                self.entries.insert(id.to_string(), None);
+                                return None;
+                            }
+                        }
+                    }
+                    if bytes.len() <= 16 * 1024 || sync_decode() {
+                        Some(texture::decode(&bytes).map(|i| (i, None, None)))
+                    } else {
+                        let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
+                        texture::decode_async(bytes, tx.clone(), id.to_string());
+                        self.decoding.insert(id.to_string());
+                        return None;
+                    }
                 }
             },
         };

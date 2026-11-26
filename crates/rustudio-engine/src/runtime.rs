@@ -410,7 +410,12 @@ impl World {
                     .is_some_and(|c| c == "Script" || c == "LocalScript")
                 && self.runs_here(s)
             {
-                if self.hold_character_scripts && self.in_local_character(s) {
+                let in_backpack = self.d().find_child(self.d().dom.root_ref(), "Players")
+                    .and_then(|pl| self.d().prop(pl, "LocalPlayer"))
+                    .and_then(|v| match v { Variant::Ref(r) if self.d().exists(r) => Some(r), _ => None })
+                    .and_then(|lp| self.d().find_child(lp, "Backpack"))
+                    .is_some_and(|bp| self.d().is_ancestor(bp, s));
+                if self.hold_character_scripts && (self.in_local_character(s) || in_backpack) {
                     self.held.push(s);
                 } else {
                     self.to_start.push(s);

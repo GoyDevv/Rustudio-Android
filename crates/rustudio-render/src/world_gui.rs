@@ -729,7 +729,7 @@ fn beam_light(in: VOut) -> vec3<f32> {
     var voxel = 1.0;
     let q = (in.world * 0.25 - tone.grid.xyz).xzy / vec3<f32>(textureDimensions(sun_grid));
     if (tone.grid.w > 0.0 && all(abs(q - vec3<f32>(0.5)) < vec3<f32>(0.4921875))) {
-        voxel = textureSampleLevel(sun_grid, samp, q, 0.0).g;
+        voxel = textureSampleLevel(sun_grid, sun_sampler, q, 0.0).g;
     }
     var visibility = voxel;
     if (visible >= 0.0) {
@@ -940,7 +940,6 @@ pub struct WorldGuiPass {
 
 /// The scene's HDR format (render.rs HDR_FORMAT) and Studio's R10G10B10A2
 /// effects blend target (`e = sqrt(clamp(L * 0.25 * exposure, 0, 1))`).
-const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const FX_BUF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgb10a2Unorm;
 
 struct DepthBinding {
@@ -1183,7 +1182,7 @@ fn mip_dirty_rect(rect: [u32; 4], source: [u32; 2], target: [u32; 2]) -> [u32; 4
 }
 
 impl WorldGuiPass {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, samples: u32) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, hdr_format: wgpu::TextureFormat, samples: u32) -> Self {
         let source = if samples == 1 { SHADER.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { SHADER.to_owned() };
         let source = crate::gpu_caps::shader_for(device, &source);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1495,7 +1494,7 @@ impl WorldGuiPass {
             })
         };
         let fx_in = full("world gui effects in", "fs_in", FX_BUF_FORMAT);
-        let fx_out = full("world gui effects out", "fs_out", HDR_FORMAT);
+        let fx_out = full("world gui effects out", "fs_out", hdr_format);
         let no_lights = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("effects no lights"),
             size: std::mem::size_of::<crate::render::LightRaw>() as u64,
@@ -1797,7 +1796,7 @@ impl WorldGuiPass {
                     (t, Some(g))
                 }
             };
-            let mipped = tex.size().width.max(tex.size().height) > 1;
+            let mipped = device.adapter_info().backend != wgpu::Backend::Gl && tex.size().width.max(tex.size().height) > 1;
             let revision = if let Some(generation) = native_gen {
                 TextureRevision::Native(generation)
             } else if id == egui::TextureId::default() {
@@ -2140,13 +2139,14 @@ impl WorldGuiPass {
             });
             f(&mut pass);
         };
-        // Full-screen triangle passes overwrite every pixel: Clear avoids tile RAM readback on mobile GPUs.
-        step("effects in", buf, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &mut |p| {
+        // Merge `effects in` + `effects` into ONE render pass targeting `buf` so `fx_tex`
+        // stays in Mali/Adreno on-chip tile memory (saves ~20.6 MB/frame DRAM Store+Load).
+        step("effects in+draw", buf, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &mut |p| {
             p.set_pipeline(&self.fx_in);
             p.set_bind_group(0, &from_hdr, &[]);
             p.draw(0..3, 0..1);
+            self.record(p, &self.fx_pipeline, &up);
         });
-        step("effects", buf, wgpu::LoadOp::Load, &mut |p| self.record(p, &self.fx_pipeline, &up));
         step("effects out", hdr, wgpu::LoadOp::Clear(wgpu::Color::BLACK), &mut |p| {
             p.set_pipeline(&self.fx_out);
             p.set_bind_group(0, &from_buf, &[]);

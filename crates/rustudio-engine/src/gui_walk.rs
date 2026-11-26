@@ -2516,7 +2516,7 @@ impl Walk<'_, '_> {
                 let img_vis = d
                     .class_of(img)
                     .is_some_and(|k| matches!(k.as_str(), "ImageLabel" | "ImageButton"))
-                    && !text_prop(d, img, "Image").is_empty()
+                    && (!text_prop(d, img, "Image").is_empty() || !text_prop(d, img, "ImageContent").is_empty())
                     && num(d, img, "ImageTransparency", 0.0) < 1.0;
                 let child_vis = d.dom.get_by_ref(img).is_some_and(|inst| {
                     inst.children().iter().any(|&c| {
@@ -2552,7 +2552,8 @@ impl Walk<'_, '_> {
             self.gui.no_cache = Some("video");
             crate::runtime::domains::media::video::surface_uri(r).unwrap_or_default()
         } else {
-            text_prop(d, r, "Image")
+            let direct = text_prop(d, r, "Image");
+            if direct.is_empty() { text_prop(d, r, "ImageContent") } else { direct }
         };
         let it = num(d, r, if video { "VideoTransparency" } else { "ImageTransparency" }, 0.0);
         if id.is_empty() || it >= 1.0 {

@@ -268,16 +268,53 @@ impl Editor {
         if matches!(tool, Tool::Select | Tool::None) {
             return out;
         }
-        let Some((origin, axes, half)) = self.gizmo_frame() else {
+        let Some((mut origin, axes, half)) = self.gizmo_frame() else {
             return out;
         };
+        let bounds = self.selection_bounds();
+        // Scale handles always sit on the selection bounding-box faces (never floating on an offset pivot).
+        if tool == Tool::Scale {
+            if let Some((mn, mx)) = bounds {
+                origin = (mn + mx) * 0.5;
+            }
+        }
         let wpp = self.game.cam.world_per_px(rect, origin);
         for axis in 0..3 {
             let dir = axes.col(axis);
             match tool {
                 Tool::Move | Tool::Scale => {
+                    // Project selection AABB corners along `dir` relative to `origin` so each
+                    // side gets its own extent. If an offset Model pivot lies outside the AABB
+                    // on this axis, keep both Move arrows attached around the pivot dot instead
+                    // of shooting one arrow 30+ studs away to the far side of the model.
+                    let (neg_ext, pos_ext) = if let Some((mn, mx)) = bounds {
+                        let mut pmin = f32::INFINITY;
+                        let mut pmax = f32::NEG_INFINITY;
+                        for ix in 0..2 {
+                            for iy in 0..2 {
+                                for iz in 0..2 {
+                                    let corner = Vec3::new(
+                                        if ix == 0 { mn.x } else { mx.x },
+                                        if iy == 0 { mn.y } else { mx.y },
+                                        if iz == 0 { mn.z } else { mx.z },
+                                    );
+                                    let proj = (corner - origin).dot(dir);
+                                    pmin = pmin.min(proj);
+                                    pmax = pmax.max(proj);
+                                }
+                            }
+                        }
+                        if tool == Tool::Move && (pmin > 0.0 || pmax < 0.0) {
+                            (0.0, 0.0)
+                        } else {
+                            ((-pmin).max(0.0), pmax.max(0.0))
+                        }
+                    } else {
+                        (half[axis], half[axis])
+                    };
                     for sign in [1.0f32, -1.0] {
-                        let base = origin + dir * sign * (half[axis] + 6.0 * wpp);
+                        let ext = if sign > 0.0 { pos_ext } else { neg_ext };
+                        let base = origin + dir * sign * (ext + 6.0 * wpp);
                         let len = if tool == Tool::Move {
                             mech::GIZMO_ARROW_PX * 0.55
                         } else {
@@ -481,7 +518,11 @@ impl Editor {
             Tool::Select | Tool::None | Tool::Transform => "Edit",
         };
         changes.extend(crate::part_drag::pivot_changes(&self.game.doc, drag.undo_pivots.as_ref().unwrap_or(&drag.pivots)));
+        let moved_parts: Vec<Ref> = drag.parts.iter().map(|(r, _, _)| *r).collect();
         self.game.doc.record_props(label, changes);
+        if matches!(drag.handle.tool, Tool::Rotate | Tool::Move | Tool::Transform) {
+            self.capture_3d_pose_for_parts(&moved_parts);
+        }
         if let Some(rend) = self.game.renderer.as_mut() {
             rend.invalidate_shadows();
         }
@@ -620,10 +661,17 @@ impl Editor {
             ctx.request_repaint();
         }
         let joystick_zone = show_joystick.then(|| crate::editor_joystick::joystick_rect(rect, &joystick_cfg));
-        if driving {
+        if driving || over_selector {
             self.editor_joystick.reset();
             self.touch_look.reset();
-        } else if !over_selector {
+        } else {
+            // Safety guard: if Android lifted/cancelled the joystick finger outside our event
+            // stream, immediately reset so the knob can never get stuck or snapped.
+            if let Some(active_id) = self.editor_joystick.active_touch() {
+                if !self.game.touch.is_touch_active(active_id) {
+                    self.editor_joystick.reset();
+                }
+            }
             let touch_events: Vec<(egui::TouchId, egui::TouchPhase, Pos2)> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -635,9 +683,13 @@ impl Editor {
             });
             if show_joystick {
                 for (tid, phase, pos) in touch_events {
-                    if self.game.touch.is_ui_touch(tid)
-                        || self.mobile_window_rects.iter().any(|r| r.contains(pos))
-                        || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
+                    // Always deliver Move/End/Cancel to the finger that ALREADY owns the joystick,
+                    // even if the thumb drifted onto a side/bottom panel or floating window.
+                    let owns_joy = self.editor_joystick.active_touch() == Some(tid);
+                    if !owns_joy
+                        && (self.game.touch.is_ui_touch(tid)
+                            || self.mobile_window_rects.iter().any(|r| r.contains(pos))
+                            || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background))
                     {
                         continue;
                     }
@@ -885,7 +937,11 @@ impl Editor {
         }
         drop(vp_prepare);
         let painter = ui.painter_at(rect);
+        crate::arm_3d_renderer_probe();
         self.game.draw_world(&ctx, &painter, rect, lines, &overlay, self.harness.run.started);
+        if self.game.viewport_drawn {
+            crate::note_3d_renderer_frame_ok();
+        }
         if !self.game.is_playing()
             && self.game.renderer.as_ref().is_some_and(|r| r.has_stale_shadows())
         {

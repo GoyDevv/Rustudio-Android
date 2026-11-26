@@ -487,25 +487,38 @@ impl<Tab> DockArea<'_, Tab> {
                 let mut expand = Vec2::ZERO;
                 expand.dim_point += style.separator.extra_interact_width / 2.0;
                 let interact_rect = separator.expand2(expand);
-                ui.ctx().data_mut(|d| {
-                    d.get_temp_mut_or_default::<Vec<Rect>>(egui::Id::new("egui_dock_separator_rects"))
-                        .push(interact_rect);
+                let modal_open = ui.ctx().data(|d| {
+                    d.get_temp::<bool>(egui::Id::new("rustudio_modal_open")).unwrap_or(false)
                 });
+                let pill_hit_rect = if separator.height() >= separator.width() {
+                    Rect::from_center_size(separator.center(), Vec2::new(48.0, 92.0_f32.min(separator.height() * 0.7)))
+                } else {
+                    Rect::from_center_size(separator.center(), Vec2::new(92.0_f32.min(separator.width() * 0.7), 48.0))
+                };
+                if !modal_open {
+                    ui.ctx().data_mut(|d| {
+                        d.get_temp_mut_or_default::<Vec<Rect>>(egui::Id::new("egui_dock_separator_rects"))
+                            .push(if cfg!(target_os = "android") { pill_hit_rect } else { interact_rect });
+                    });
+                }
 
-                let response = if cfg!(target_os = "android") {
-                    egui::Area::new(ui.id().with(("dock_sep_hit", path)))
+                let (response, pill_drag_delta, pill_dragged) = if cfg!(target_os = "android") && !modal_open {
+                    let edge_resp = ui.allocate_rect(interact_rect, Sense::drag())
+                        .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]});
+                    let pill_resp = egui::Area::new(ui.id().with(("dock_sep_hit", path)))
                         .order(egui::Order::Middle)
-                        .fixed_pos(interact_rect.min)
+                        .fixed_pos(pill_hit_rect.min)
                         .constrain(false)
                         .interactable(true)
                         .show(ui.ctx(), |ui| {
-                            ui.allocate_rect(interact_rect, Sense::click_and_drag())
+                            ui.allocate_exact_size(pill_hit_rect.size(), Sense::drag()).1
                         })
-                        .inner
-                        .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]})
+                        .inner;
+                    (edge_resp, pill_resp.drag_delta(), pill_resp.dragged())
                 } else {
-                    ui.allocate_rect(interact_rect, Sense::click_and_drag())
-                        .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]})
+                    let r = ui.allocate_rect(interact_rect, Sense::click_and_drag())
+                        .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]});
+                    (r, Vec2::ZERO, false)
                 };
 
                 let should_respond_to_arrow_keys = ui.input(|i| i.modifiers.command || i.modifiers.shift);
@@ -549,7 +562,8 @@ impl<Tab> DockArea<'_, Tab> {
                     f32::round,
                 );
 
-                let color = if response.dragged() {
+                let is_dragged = response.dragged() || pill_dragged;
+                let color = if is_dragged {
                     style.separator.color_dragged
                 } else if response.hovered() || response.has_focus() {
                     style.separator.color_hovered
@@ -560,17 +574,17 @@ impl<Tab> DockArea<'_, Tab> {
                 ui.painter().rect_filled(separator, CornerRadius::ZERO, color);
                 if cfg!(target_os = "android") {
                     let pill_size = if separator.height() >= separator.width() {
-                        Vec2::new(5.0, 36.0_f32.min(separator.height() * 0.4))
+                        Vec2::new(9.0, 52.0_f32.min(separator.height() * 0.45))
                     } else {
-                        Vec2::new(36.0_f32.min(separator.width() * 0.4), 5.0)
+                        Vec2::new(52.0_f32.min(separator.width() * 0.45), 9.0)
                     };
                     let pill = Rect::from_center_size(separator.center(), pill_size);
-                    let pill_col = if response.dragged() {
+                    let pill_col = if is_dragged {
                         style.separator.color_dragged
                     } else {
-                        style.separator.color_hovered.gamma_multiply(0.75)
+                        style.separator.color_hovered.gamma_multiply(0.92)
                     };
-                    ui.painter().rect_filled(pill, CornerRadius::same(3), pill_col);
+                    ui.painter().rect_filled(pill, CornerRadius::same(4), pill_col);
                 }
 
                 // Update 'fraction' interaction after drawing separator,
@@ -581,7 +595,8 @@ impl<Tab> DockArea<'_, Tab> {
                     let min = (style.separator.extra / range).min(1.0);
                     let max = 1.0 - min;
                     let (min, max) = (min.min(max), max.max(min));
-                    let delta = arrow_key_offset.unwrap_or(response.drag_delta()).dim_point;
+                    let raw_delta = if pill_dragged { pill_drag_delta } else { response.drag_delta() };
+                    let delta = arrow_key_offset.unwrap_or(raw_delta).dim_point;
                     split.fraction = (split.fraction + delta / range).clamp(min, max);
                 }
 

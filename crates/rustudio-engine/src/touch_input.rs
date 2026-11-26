@@ -490,18 +490,23 @@ impl Touch {
                     // (a lift in this same frame owes no PointerGone: the
                     // pointer is this finger now)
                     self.gone = false;
+                    let is_direct = !in_view && fresh && self.zones.direct_drag.iter().any(|r| r.contains(pos));
                     self.pointer = Some(Pointer {
                         id,
                         start: pos,
                         pos,
                         since: now,
                         in_view,
-                        mode: Mode::Pending,
+                        mode: if is_direct { Mode::Press } else { Mode::Pending },
                         samples: VecDeque::from([(now, pos)]),
                     });
-                    // Hover follows at once (the viewport's handle hit test
-                    // and the chrome's highlights use it).
+                    // Hover follows at once; for direct_drag controls (dock splitters,
+                    // floating window handles, sliders) press immediately at touch-down
+                    // so egui hit-tests at the exact landing point with zero SLOP jump.
                     out.push(Event::PointerMoved(pos));
+                    if is_direct {
+                        out.push(button(pos, PointerButton::Primary, true));
+                    }
                 } else if let Some(p) = self.pointer.as_mut() {
                     // A second finger on the 3D view (only if BOTH fingers are
                     // on the unobstructed viewport): a pinch or a pan from here
@@ -871,6 +876,11 @@ impl Touch {
     }
 
     /// Whether `id` is locked to UI chrome/overlays (never allowed to drive the 3D viewport).
+    /// Returns true if `id` is currently pressed down on screen.
+    pub fn is_touch_active(&self, id: TouchId) -> bool {
+        self.active.contains(&id)
+    }
+
     pub fn is_ui_touch(&self, id: TouchId) -> bool {
         self.owners.get(&id) == Some(&TouchOwner::Ui)
     }

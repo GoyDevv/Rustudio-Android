@@ -170,11 +170,15 @@ fn soft_input(show: bool) {
     match super::app() {
         Some(app) if show => {
             if !rustudio_engine::touch_input::has_hardware_keyboard() {
-                app.show_soft_input(true);
+                if !super::ime_bridge::set_ime_open(true) {
+                    app.show_soft_input(true);
+                }
             }
         }
         Some(app) => {
-            app.hide_soft_input(true);
+            if !super::ime_bridge::set_ime_open(false) {
+                app.hide_soft_input(true);
+            }
             // (the navigation bar came up with the keyboard; API 26–29's
             // sticky flags don't always take it down again)
             super::system_bars::keyboard_closed();
@@ -341,10 +345,14 @@ impl Keyboard {
     /// At the end of the frame: keeps egui's IME output from egui-winit
     /// and asks the activity for the keyboard when what wants it changes
     /// (the module comment).
-    pub fn end_frame(&mut self, ctx: &egui::Context, textbox: bool) {
+    pub fn end_frame(&mut self, ctx: &egui::Context, textbox: bool, keep_open: bool) {
         ctx.output_mut(|o| o.ime = None);
         let want = wanted(ctx, textbox);
         let now = Instant::now();
+        if keep_open && self.shown {
+            self.unwanted_since = None;
+            return;
+        }
         match (want, self.shown) {
             (Some(w), false) => {
                 self.shown = true;
@@ -398,8 +406,7 @@ impl Keyboard {
     /// window's bottom gives up while the keyboard is up (0 while it is
     /// down).
     pub fn room(&self, ctx: &egui::Context) -> f32 {
-        let keyboard = self.height(ctx);
-        if keyboard <= 0.0 { 0.0 } else { keyboard + super::text_bar::HEIGHT }
+        self.height(ctx)
     }
 
     /// What the keyboard and the bar cover of the window while the

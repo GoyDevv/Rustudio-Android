@@ -108,6 +108,12 @@ pub struct AnimEditorState {
     ugc_last_target: Option<Ref>,
 }
 
+impl AnimEditorState {
+    pub fn has_publish_dialog(&self) -> bool {
+        self.publish.is_some()
+    }
+}
+
 impl Default for AnimEditorState {
     fn default() -> Self {
         Self {
@@ -478,8 +484,16 @@ impl Editor {
                     }
                 }
             }
+            let joints = rig_joints(&self.game.doc, rig_r);
+            // If user selected a specific limb part of the rig in the 3D viewport, focus that joint.
+            if let Some(&sel) = self.game.doc.selection.first() {
+                if let Some(inst) = self.game.doc.dom.get_by_ref(sel) {
+                    if joints.iter().any(|j| j.part1_name == inst.name) {
+                        self.ui.anim.selected_joint = Some(inst.name.clone());
+                    }
+                }
+            }
             if self.ui.anim.selected_joint.is_none() {
-                let joints = rig_joints(&self.game.doc, rig_r);
                 self.ui.anim.selected_joint = joints.first().map(|j| j.part1_name.clone());
             }
         }
@@ -553,6 +567,52 @@ impl Editor {
                 .unwrap_or_else(|| part_cframe(&self.game.doc, rig.root));
             let solved = rig.solve(root_xf, &transforms);
             write_pose(&mut self.game.doc, &solved, None);
+        }
+    }
+
+    /// Captures 3D Rotate/Move edits made on rig limbs directly in the 3D viewport
+    /// and saves the resulting Motor6D.Transform into the active keyframe.
+    pub fn capture_3d_pose_for_parts(&mut self, moved_parts: &[Ref]) {
+        if !self.ui.anim.anim_open || moved_parts.is_empty() {
+            return;
+        }
+        let Some(rig_r) = self.ui.anim.rig_ref else { return };
+        let Some(clip_r) = self.ui.anim.clip_ref else { return };
+        if !self.game.doc.exists(rig_r) || !self.game.doc.exists(clip_r) {
+            return;
+        }
+        let rig = Rig::read(&self.game.doc, rig_r);
+        let t = (self.ui.anim.time * 100.0).round() / 100.0;
+        let mut any_captured = false;
+        for &part_r in moved_parts {
+            let Some(j) = rig.joints.iter().find(|j| j.part1 == part_r) else {
+                continue;
+            };
+            let Some(p1_name) = self.game.doc.dom.get_by_ref(j.part1).map(|i| i.name.clone()) else {
+                continue;
+            };
+            // Snapshot rest pose before mutating (if not already snapshotted)
+            self.ui.anim.playing = false;
+            self.ui.anim.last_tick = None;
+            if self.ui.anim.active_pose_rig != Some(rig_r) {
+                self.ensure_pose_snapshot(rig_r);
+            }
+            // Inverse of Rig::solve: Part1 = Part0 * C0 * Transform * C1^-1
+            // => Transform = (Part0 * C0)^-1 * Part1 * C1
+            let p0 = part_cframe(&self.game.doc, j.part0);
+            let p1 = part_cframe(&self.game.doc, j.part1);
+            let p0_c0 = rustudio_engine::ltypes::cf_mul(&p0, &j.c0);
+            let inv_p0_c0 = rustudio_engine::ltypes::cf_inv(&p0_c0);
+            let transform = rustudio_engine::ltypes::cf_mul(
+                &rustudio_engine::ltypes::cf_mul(&inv_p0_c0, &p1),
+                &j.c1,
+            );
+            self.write_joint_pose(clip_r, t, &p1_name, transform);
+            self.ui.anim.selected_joint = Some(p1_name);
+            any_captured = true;
+        }
+        if any_captured {
+            self.apply_live_pose(rig_r, clip_r);
         }
     }
 
@@ -724,7 +784,7 @@ impl Editor {
     }
 
     /// Starts the Roblox Publish dialog for an Animation or Model.
-    fn open_publish_dialog(&mut self, asset_type: &'static str, refs: Vec<Ref>, default_name: String) {
+    pub(crate) fn open_publish_dialog(&mut self, asset_type: &'static str, refs: Vec<Ref>, default_name: String) {
         let signed_in = self.current_account_session().is_some();
         self.ui.anim.publish = Some(PublishDialog {
             asset_type,
@@ -1183,6 +1243,7 @@ impl Editor {
                     .suffix("s")
                     .fixed_decimals(2),
             );
+            self.game.touch.zones.direct_drag.push(slider.rect.expand(8.0));
             if slider.drag_started() || slider.dragged() || (slider.changed() && slider.has_focus()) {
                 self.ui.anim.playing = false;
                 self.ui.anim.last_tick = None;
@@ -1197,15 +1258,25 @@ impl Editor {
 
             let near_kf = kfs
                 .iter()
-                .find(|k| (k.time - self.ui.anim.time).abs() < 0.025)
+                .filter(|k| (k.time - self.ui.anim.time).abs() < 0.05)
+                .min_by(|a, b| {
+                    (a.time - self.ui.anim.time)
+                        .abs()
+                        .partial_cmp(&(b.time - self.ui.anim.time).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .map(|k| k.kf_ref);
             if ui
-                .add_enabled(near_kf.is_some() && kfs.len() > 1, egui::Button::new("Delete Keyframe"))
+                .add_enabled(near_kf.is_some(), egui::Button::new("Delete Keyframe"))
                 .clicked()
             {
                 if let Some(kr) = near_kf {
                     self.game.doc.remove(&[kr]);
-                    self.apply_live_pose(rig_r, clip_r);
+                    if kfs.len() <= 1 {
+                        self.stop_anim_preview();
+                    } else {
+                        self.apply_live_pose(rig_r, clip_r);
+                    }
                 }
             }
         });
@@ -1263,6 +1334,7 @@ impl Editor {
         // 1. Visual Timeline with diamond keyframe markers
         let timeline_w = ui.available_width().max(200.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(timeline_w, 44.0), Sense::click_and_drag());
+        self.game.touch.zones.direct_drag.push(rect.expand(6.0));
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, theme::PANEL_DARK);
         painter.rect_stroke(rect, 4.0, Stroke::new(1.0, theme::DIVIDER), egui::StrokeKind::Inside);
@@ -1349,46 +1421,50 @@ impl Editor {
             }
         });
 
+        let mut slider_rects: Vec<Rect> = Vec::with_capacity(6);
         egui::Grid::new("anim_pose_sliders")
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
+                let mut pose_slider = |ui: &mut egui::Ui, val: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, dec: usize| {
+                    let mut sl = egui::Slider::new(val, range)
+                        .clamping(egui::SliderClamping::Never)
+                        .fixed_decimals(dec);
+                    if !suffix.is_empty() {
+                        sl = sl.suffix(suffix);
+                    }
+                    let r = ui.add(sl);
+                    slider_rects.push(r.rect.expand(8.0));
+                    if r.dragged() || r.drag_stopped() || (r.changed() && r.has_focus()) {
+                        changed = true;
+                    }
+                };
+
                 ui.label(RichText::new("Rot X").color(Color32::from_rgb(240, 100, 100)));
-                changed |= ui
-                    .add(egui::Slider::new(&mut rot.x, -180.0..=180.0).suffix("°").fixed_decimals(1))
-                    .changed();
+                pose_slider(ui, &mut rot.x, -180.0..=180.0, "°", 1);
                 ui.end_row();
 
                 ui.label(RichText::new("Rot Y").color(Color32::from_rgb(100, 220, 120)));
-                changed |= ui
-                    .add(egui::Slider::new(&mut rot.y, -180.0..=180.0).suffix("°").fixed_decimals(1))
-                    .changed();
+                pose_slider(ui, &mut rot.y, -180.0..=180.0, "°", 1);
                 ui.end_row();
 
                 ui.label(RichText::new("Rot Z").color(Color32::from_rgb(100, 160, 250)));
-                changed |= ui
-                    .add(egui::Slider::new(&mut rot.z, -180.0..=180.0).suffix("°").fixed_decimals(1))
-                    .changed();
+                pose_slider(ui, &mut rot.z, -180.0..=180.0, "°", 1);
                 ui.end_row();
 
                 ui.label("Pos X");
-                changed |= ui
-                    .add(egui::Slider::new(&mut pos.x, -5.0..=5.0).fixed_decimals(2))
-                    .changed();
+                pose_slider(ui, &mut pos.x, -5.0..=5.0, "", 2);
                 ui.end_row();
 
                 ui.label("Pos Y");
-                changed |= ui
-                    .add(egui::Slider::new(&mut pos.y, -5.0..=5.0).fixed_decimals(2))
-                    .changed();
+                pose_slider(ui, &mut pos.y, -5.0..=5.0, "", 2);
                 ui.end_row();
 
                 ui.label("Pos Z");
-                changed |= ui
-                    .add(egui::Slider::new(&mut pos.z, -5.0..=5.0).fixed_decimals(2))
-                    .changed();
+                pose_slider(ui, &mut pos.z, -5.0..=5.0, "", 2);
                 ui.end_row();
             });
+        self.game.touch.zones.direct_drag.extend(slider_rects);
 
         if changed {
             let new_xf = Xform::from_orientation_deg(pos, rot);

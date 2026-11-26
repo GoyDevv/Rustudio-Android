@@ -892,16 +892,22 @@ impl<Tab> Tree<Tab> {
 
     /// Updates the collapsed state of the node and its parents.
     pub(crate) fn node_update_collapsed(&mut self, node_index: NodeIndex) {
+        if node_index.0 >= self.nodes.len() || self[node_index].is_empty() {
+            return;
+        }
         let collapsed = self[node_index].is_collapsed();
         if !collapsed {
             // Recursively notify parent nodes that the leaf has expanded
             let mut parent_index_option = node_index.parent();
             while let Some(parent_index) = parent_index_option {
                 parent_index_option = parent_index.parent();
-
-                // Update collapsed leaf count and collapse status
-                let left_count = self[parent_index.left()].collapsed_leaf_count();
-                let right_count = self[parent_index.right()].collapsed_leaf_count();
+                if parent_index.0 >= self.nodes.len() || self[parent_index].is_empty() {
+                    continue;
+                }
+                let left_idx = parent_index.left();
+                let right_idx = parent_index.right();
+                let left_count = self.nodes.get(left_idx.0).map_or(0, |n| n.collapsed_leaf_count());
+                let right_count = self.nodes.get(right_idx.0).map_or(0, |n| n.collapsed_leaf_count());
                 self[parent_index].set_collapsed(false);
 
                 if self[parent_index].is_horizontal() {
@@ -919,9 +925,13 @@ impl<Tab> Tree<Tab> {
             while let Some(parent_index) = parent_index_option {
                 parent_index_option = parent_index.parent();
 
-                // Update collapsed leaf count and collapse status
-                let left_count = self[parent_index.left()].collapsed_leaf_count();
-                let right_count = self[parent_index.right()].collapsed_leaf_count();
+                if parent_index.0 >= self.nodes.len() || self[parent_index].is_empty() {
+                    continue;
+                }
+                let left_idx = parent_index.left();
+                let right_idx = parent_index.right();
+                let left_count = self.nodes.get(left_idx.0).map_or(0, |n| n.collapsed_leaf_count());
+                let right_count = self.nodes.get(right_idx.0).map_or(0, |n| n.collapsed_leaf_count());
 
                 if self[parent_index].is_horizontal() {
                     self[parent_index].set_collapsed_leaf_count(max(left_count, right_count));
@@ -929,9 +939,9 @@ impl<Tab> Tree<Tab> {
                     self[parent_index].set_collapsed_leaf_count(left_count + right_count);
                 }
 
-                if self[parent_index.left()].is_collapsed()
-                    && self[parent_index.right()].is_collapsed()
-                {
+                let left_collapsed = self.nodes.get(left_idx.0).is_some_and(|n| n.is_collapsed());
+                let right_collapsed = self.nodes.get(right_idx.0).is_some_and(|n| n.is_collapsed());
+                if left_collapsed && right_collapsed {
                     self[parent_index].set_collapsed(true);
                 }
             }

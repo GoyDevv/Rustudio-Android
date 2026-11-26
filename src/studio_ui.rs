@@ -96,6 +96,7 @@ pub struct UiState {
     pub minimized_tabs: Vec<Tab>,
     pub minimize_requests: Vec<Tab>,
     pub restore_requests: Vec<Tab>,
+    pub minimized_tray_collapsed: bool,
     /// The panel windows last frame: key and tabs (menus and the self-test).
     pub popped: Vec<(String, Vec<Tab>)>,
     /// The tabs in the 3D view's tab group last frame.
@@ -136,6 +137,7 @@ impl Default for UiState {
             minimized_tabs: Vec::new(),
             minimize_requests: Vec::new(),
             restore_requests: Vec::new(),
+            minimized_tray_collapsed: false,
             popped: Vec::new(),
             viewport_group: Vec::new(),
             viewport_hidden: false,

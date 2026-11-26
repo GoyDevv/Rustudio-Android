@@ -647,6 +647,16 @@ impl Editor {
         }
     }
 
+    /// Re-enables a closed plugin panel widget from the bottom recovery tray.
+    pub fn plugin_widget_show(&mut self, n: u32) {
+        if let Some(s) = self.plugin_ui.slots.get(n as usize) {
+            if s.r.is_some() {
+                let (r, at) = (s.r, s.at);
+                self.plugin_ui.q(at).push(In::Show(r));
+            }
+        }
+    }
+
     /// The DataModel whose widgets the dock shows (and whose toolbars the
     /// Plugins tab shows): the edit one, or the Play side in front.
     pub fn plugin_front(&self) -> Where {

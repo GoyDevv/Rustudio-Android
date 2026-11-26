@@ -96,7 +96,15 @@ impl Editor {
         let ray = self.game.cam.ray(rect, rect.center());
         match self.ray_distance(&ray).filter(|t| *t <= 2048.0) {
             Some(t) => ray.origin + ray.dir * t,
-            None => self.game.cam.pos + ray.dir * 64.0,
+            None => {
+                if ray.dir.y < -1e-3 && ray.origin.y > 0.0 {
+                    let t = -ray.origin.y / ray.dir.y;
+                    if t > 0.0 && t <= 2048.0 {
+                        return ray.origin + ray.dir * t;
+                    }
+                }
+                self.game.cam.pos + ray.dir * 64.0
+            }
         }
     }
 
@@ -1046,6 +1054,9 @@ fn insert_boxes_except(doc: &rustudio_core::doc::Document, root: Ref, skip: &std
         let r = i.referent();
         let (Some(xf), Some(size)) = (rustudio_render::scene::xform_of(doc, r), rustudio_render::scene::vec3_of(doc.prop(r, "Size"))) else { continue };
         if matches!(doc.prop(r, "CanCollide"), Some(Variant::Bool(false))) {
+            continue;
+        }
+        if matches!(doc.prop(r, "Transparency"), Some(Variant::Float32(t)) if t >= 0.99) {
             continue;
         }
         let half = size * 0.5;

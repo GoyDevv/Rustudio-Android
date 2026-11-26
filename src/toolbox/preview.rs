@@ -27,7 +27,7 @@ pub struct TreeRow {
 pub enum PState {
     Loading,
     Loaded(Box<WeakDom>),
-    Installed { vf: Ref, center: Vec3, radius: f32 },
+    Installed { vf: Ref, center: Vec3, radius: f32, has_visible_3d: bool },
     Failed(String),
 }
 
@@ -143,10 +143,56 @@ impl Previews {
                 Some((lo, hi)) => ((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(0.5)),
                 None => (Vec3::ZERO, 2.0),
             };
+            // Check whether the model actually has visible 3D BasePart geometry (or a Decal/Texture
+            // on a BasePart). Models made purely of Transparency=1 parts with BillboardGui/Beam
+            // (e.g. Nextbots) render empty in ViewportFrame, so keep their 2D thumbnail instead.
+            let mut has_opaque_part = false;
+            let mut has_non_face_decal = false;
+            let mut has_2d_overlay = false;
+            let mut stack = vec![vf];
+            while let Some(r) = stack.pop() {
+                if let Some(inst) = doc.dom.get_by_ref(r) {
+                    if matches!(inst.class.as_str(), "BillboardGui" | "SurfaceGui" | "ParticleEmitter" | "Beam" | "Trail") {
+                        has_2d_overlay = true;
+                    } else if matches!(inst.class.as_str(), "Decal" | "Texture") {
+                        let tr = match inst.properties.get(&rbx_dom_weak::ustr("Transparency")) {
+                            Some(rbx_dom_weak::types::Variant::Float32(v)) => *v,
+                            Some(rbx_dom_weak::types::Variant::Float64(v)) => *v as f32,
+                            _ => 0.0,
+                        };
+                        let has_tex = ["Texture", "TextureContent"].iter().any(|k| match inst.properties.get(&rbx_dom_weak::ustr(k)) {
+                            Some(rbx_dom_weak::types::Variant::ContentId(c)) => !c.as_str().is_empty(),
+                            Some(rbx_dom_weak::types::Variant::Content(c)) => c.as_uri().is_some_and(|u| !u.is_empty()),
+                            Some(rbx_dom_weak::types::Variant::String(u)) => !u.is_empty(),
+                            _ => false,
+                        });
+                        let parent_is_part = doc.dom.get_by_ref(inst.parent()).is_some_and(|par| {
+                            matches!(par.class.as_str(), "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "MeshPart" | "UnionOperation" | "NegateOperation" | "IntersectOperation" | "SpawnLocation" | "Seat" | "VehicleSeat" | "SkateboardPlatform" | "FlagStand")
+                        });
+                        if parent_is_part && tr < 0.999 && has_tex && !inst.name.eq_ignore_ascii_case("face") {
+                            has_non_face_decal = true;
+                        }
+                    } else if matches!(inst.class.as_str(), "Part" | "WedgePart" | "CornerWedgePart" | "TrussPart" | "MeshPart" | "UnionOperation" | "NegateOperation" | "IntersectOperation" | "SpawnLocation" | "Seat" | "VehicleSeat" | "SkateboardPlatform" | "FlagStand") {
+                        let tr = match inst.properties.get(&rbx_dom_weak::ustr("Transparency")) {
+                            Some(rbx_dom_weak::types::Variant::Float32(v)) => *v,
+                            Some(rbx_dom_weak::types::Variant::Float64(v)) => *v as f32,
+                            _ => 0.0,
+                        };
+                        if tr < 0.999 {
+                            has_opaque_part = true;
+                        }
+                    }
+                    stack.extend_from_slice(inst.children());
+                }
+            }
+            // If all BaseParts are invisible (Transparency=1) and the model relies on
+            // BillboardGui/SurfaceGui/ParticleEmitter (which ViewportFrame cannot draw),
+            // keep the crisp 2D Roblox thumbnail instead of a blank gray 3D box.
+            let has_visible_3d = has_opaque_part || (has_non_face_decal && !has_2d_overlay);
             self.orbit = Orbit::default();
-            self.state.insert(id, PState::Installed { vf, center, radius });
+            self.state.insert(id, PState::Installed { vf, center, radius, has_visible_3d });
         }
-        if let Some(PState::Installed { vf, center, radius }) = self.state.get(&id) {
+        if let Some(PState::Installed { vf, center, radius, has_visible_3d: true }) = self.state.get(&id) {
             let fov = 70f32.to_radians();
             let dist = radius / (fov * 0.5).tan() * 1.05 * self.orbit.zoom;
             let rot = Mat3::from_rotation_y(self.orbit.yaw) * Mat3::from_rotation_x(self.orbit.pitch);

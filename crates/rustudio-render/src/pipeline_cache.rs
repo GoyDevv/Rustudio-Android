@@ -16,7 +16,7 @@
 //! costs one slow start, not a crash. `RUSTUDIO_NO_PIPELINE_CACHE=1`
 //! turns it off.
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -33,6 +33,24 @@ struct Cache {
 static CACHE: OnceLock<Option<Cache>> = OnceLock::new();
 /// Pipeline descriptors that asked for the cache ([`current`] calls).
 static MADE: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard for background pipeline compilation threads so `save()` never
+/// calls `VkPipelineCache::get_data()` concurrently on stock Adreno 6xx drivers.
+pub struct BuildGuard;
+
+impl BuildGuard {
+    pub fn enter() -> Self {
+        ACTIVE_BUILDS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        ACTIVE_BUILDS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 /// When the last one asked, as milliseconds since [`epoch`].
 static LAST_MADE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -106,6 +124,9 @@ pub fn current() -> Option<&'static wgpu::PipelineCache> {
 /// for the last two seconds (a set is built in a burst; one write covers
 /// it), or at once with `force`. Cheap otherwise: called once a frame.
 pub fn save(force: bool) {
+    if !force && ACTIVE_BUILDS.load(Ordering::Acquire) > 0 {
+        return;
+    }
     let Some(c) = CACHE.get().and_then(|c| c.as_ref()) else { return };
     let made = MADE.load(Ordering::Relaxed);
     let Ok(mut saved) = c.saved.try_lock() else { return };

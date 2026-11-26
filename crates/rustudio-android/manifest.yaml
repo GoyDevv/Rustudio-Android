@@ -66,9 +66,11 @@ android:
         required: false
     application:
       label: rustudio
-      theme: "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+      has_code: true
+      theme: "@android:style/Theme.Black.NoTitleBar.Fullscreen"
       activities:
-        - # The editor is a landscape tool; a place's
+        - name: com.logosforgestudios.rustudio.RustudioActivity
+          # The editor is a landscape tool; a place's
           # StarterGui.ScreenOrientation re-requests the orientation while
           # it plays (Activity.setRequestedOrientation, src/android/jni.rs).
           orientation: sensorLandscape

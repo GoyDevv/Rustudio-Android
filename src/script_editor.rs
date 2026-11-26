@@ -1048,6 +1048,21 @@ pub struct ScriptTabs {
     pub script_portrait: bool,
     /// Last orientation pushed to Android via `sync_orientation`.
     last_applied_portrait: Option<bool>,
+    /// Portrait-only helper bar: when true, arrows and center-snap slider hold Shift to select text.
+    pub portrait_select_mode: bool,
+    /// Portrait-only helper bar: normalized offset in [-1.0, 1.0] for the spring-back cursor slider.
+    pub portrait_slider_norm: f32,
+    /// Portrait-only helper bar: accumulated fractional cursor steps while sliding.
+    pub portrait_slide_accum: f32,
+    /// Portrait-only helper bar: screen rect of the slider (registered in direct_drag).
+    pub portrait_slider_rect: Option<egui::Rect>,
+    /// Portrait-only helper bar: egui events queued for the next frame's raw_input_hook.
+    pub portrait_queued_events: Vec<egui::Event>,
+    /// True while the user is tapping/holding/dragging anything in the Portrait helper bar
+    /// so Android never hides the soft keyboard during a bar button tap.
+    pub portrait_bar_keep_kb: bool,
+    /// Multi-frame hold counter keeping Gboard & editor focus alive across tap-release frames.
+    pub portrait_bar_keep_kb_frames: u8,
 }
 
 fn apply_android_orientation(portrait: bool) {
@@ -1257,6 +1272,7 @@ impl Editor {
                 {
                     toggle_portrait = true;
                 }
+
             });
         });
 
@@ -1306,6 +1322,309 @@ impl Editor {
         let mut caret_pos: Option<(egui::Pos2, egui::Pos2)> = None;
         let mut post_edit_cursor: Option<usize> = None;
 
+        // Portrait-only horizontally scrollable helper bar docked directly at the
+        // bottom of the Script Editor (sits right above the soft keyboard when open,
+        // never clipped by content_rect, and strictly hidden in Landscape).
+        let screen_rect = ui.ctx().viewport_rect();
+        let show_portrait_bar = cfg!(target_os = "android") && screen_rect.height() > screen_rect.width();
+        let mut bar_select_mode = self.scripts.portrait_select_mode;
+        let mut bar_slider_norm = self.scripts.portrait_slider_norm;
+        let mut bar_slide_accum = self.scripts.portrait_slide_accum;
+        let mut bar_slider_rect: Option<egui::Rect> = None;
+        let bar_events: Vec<egui::Event> = Vec::new();
+        let mut bar_acted = false;
+        let mut bar_keep_kb = false;
+
+        if show_portrait_bar {
+            let mut te_state = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            let total_chars = buf.text.chars().count();
+            let mut cur_range = te_state
+                .cursor
+                .char_range()
+                .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(total_chars)));
+            let has_selection = !cur_range.is_empty();
+            let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.001, 0.1);
+            let mut cursor_dirty = false;
+
+            let move_vertical = |text: &str, idx: usize, delta_lines: isize| -> usize {
+                let chars: Vec<char> = text.chars().collect();
+                let idx = idx.min(chars.len());
+                let mut line_starts = vec![0usize];
+                for (i, &c) in chars.iter().enumerate() {
+                    if c == '\n' {
+                        line_starts.push(i + 1);
+                    }
+                }
+                let line = match line_starts.binary_search(&idx) {
+                    Ok(i) => i,
+                    Err(i) => i.saturating_sub(1),
+                };
+                let col = idx - line_starts[line];
+                let target_line = (line as isize + delta_lines).clamp(0, (line_starts.len() - 1) as isize) as usize;
+                let start = line_starts[target_line];
+                let mut end = if target_line + 1 < line_starts.len() {
+                    line_starts[target_line + 1].saturating_sub(1)
+                } else {
+                    chars.len()
+                };
+                if end > start && chars[end - 1] == '\r' {
+                    end -= 1;
+                }
+                (start + col).min(end)
+            };
+
+            let move_cursor = |cr: &mut egui::text::CCursorRange, next_idx: usize, select: bool| {
+                let c = egui::text::CCursor::new(next_idx.min(total_chars));
+                if select {
+                    cr.primary = c;
+                } else {
+                    *cr = egui::text::CCursorRange::one(c);
+                }
+            };
+
+            let bar_panel = egui::Panel::bottom(egui::Id::new(("script_portrait_helper_bar", r)))
+                .exact_size(44.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(24, 26, 32))
+                        .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                        .inner_margin(egui::Margin::symmetric(6, 5)),
+                )
+                .show(ui, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt(("portrait_script_bar_scroll", r))
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let btn_h = 32.0;
+
+                                // 1. Directional arrows — mutate CCursorRange directly (instant, zero focus race!)
+                                if ui.add(egui::Button::new(RichText::new("◀").size(14.0)).min_size(egui::vec2(36.0, btn_h))).clicked() {
+                                    let next = cur_range.primary.index.0.saturating_sub(1);
+                                    move_cursor(&mut cur_range, next, bar_select_mode);
+                                    cursor_dirty = true;
+                                    bar_acted = true;
+                                }
+                                if ui.add(egui::Button::new(RichText::new("▶").size(14.0)).min_size(egui::vec2(36.0, btn_h))).clicked() {
+                                    let next = (cur_range.primary.index.0 + 1).min(total_chars);
+                                    move_cursor(&mut cur_range, next, bar_select_mode);
+                                    cursor_dirty = true;
+                                    bar_acted = true;
+                                }
+                                if ui.add(egui::Button::new(RichText::new("▲").size(14.0)).min_size(egui::vec2(36.0, btn_h))).clicked() {
+                                    let next = move_vertical(&buf.text, cur_range.primary.index.0, -1);
+                                    move_cursor(&mut cur_range, next, bar_select_mode);
+                                    cursor_dirty = true;
+                                    bar_acted = true;
+                                }
+                                if ui.add(egui::Button::new(RichText::new("▼").size(14.0)).min_size(egui::vec2(36.0, btn_h))).clicked() {
+                                    let next = move_vertical(&buf.text, cur_range.primary.index.0, 1);
+                                    move_cursor(&mut cur_range, next, bar_select_mode);
+                                    cursor_dirty = true;
+                                    bar_acted = true;
+                                }
+
+                                // 2. Spring-back center-snap cursor slider — mutates CCursorRange directly!
+                                let (track_rect, track_resp) = ui.allocate_exact_size(
+                                    egui::vec2(140.0, btn_h),
+                                    egui::Sense::click_and_drag(),
+                                );
+                                bar_slider_rect = Some(track_rect.expand(6.0));
+
+                                if track_resp.dragged() {
+                                    if let Some(pos) = track_resp.interact_pointer_pos() {
+                                        let half = (track_rect.width() * 0.5 - 12.0).max(1.0);
+                                        let norm = ((pos.x - track_rect.center().x) / half).clamp(-1.0, 1.0);
+                                        bar_slider_norm = norm;
+                                        let abs_n = norm.abs();
+                                        if abs_n > 0.14 {
+                                            let speed = 5.0 + 26.0 * ((abs_n - 0.14) / 0.86).powf(1.5);
+                                            bar_slide_accum += norm.signum() * speed * dt;
+                                            while bar_slide_accum >= 1.0 {
+                                                bar_slide_accum -= 1.0;
+                                                let next = (cur_range.primary.index.0 + 1).min(total_chars);
+                                                move_cursor(&mut cur_range, next, bar_select_mode);
+                                                cursor_dirty = true;
+                                                bar_acted = true;
+                                            }
+                                            while bar_slide_accum <= -1.0 {
+                                                bar_slide_accum += 1.0;
+                                                let next = cur_range.primary.index.0.saturating_sub(1);
+                                                move_cursor(&mut cur_range, next, bar_select_mode);
+                                                cursor_dirty = true;
+                                                bar_acted = true;
+                                            }
+                                        }
+                                        ui.ctx().request_repaint();
+                                    }
+                                } else {
+                                    if bar_slider_norm.abs() > 0.01 {
+                                        bar_slider_norm = 0.0;
+                                        ui.ctx().request_repaint();
+                                    }
+                                    bar_slide_accum = 0.0;
+                                }
+
+                                let p = ui.painter();
+                                let track_bg = if bar_select_mode {
+                                    Color32::from_rgb(36, 46, 68)
+                                } else {
+                                    Color32::from_rgb(34, 37, 46)
+                                };
+                                p.rect_filled(track_rect, 15.0, track_bg);
+                                p.rect_stroke(
+                                    track_rect,
+                                    15.0,
+                                    egui::Stroke::new(
+                                        1.0,
+                                        if track_resp.dragged() { theme::ACCENT } else { theme::DIVIDER },
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let cx = track_rect.center().x;
+                                let cy = track_rect.center().y;
+                                p.line_segment(
+                                    [egui::Pos2::new(cx, track_rect.min.y + 6.0), egui::Pos2::new(cx, track_rect.max.y - 6.0)],
+                                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 190, 210, 80)),
+                                );
+                                p.text(
+                                    egui::Pos2::new(track_rect.min.x + 10.0, cy),
+                                    egui::Align2::CENTER_CENTER,
+                                    "‹",
+                                    egui::FontId::proportional(13.0),
+                                    theme::TEXT_DIM,
+                                );
+                                p.text(
+                                    egui::Pos2::new(track_rect.max.x - 10.0, cy),
+                                    egui::Align2::CENTER_CENTER,
+                                    "›",
+                                    egui::FontId::proportional(13.0),
+                                    theme::TEXT_DIM,
+                                );
+                                let max_travel = (track_rect.width() * 0.5 - 14.0).max(1.0);
+                                let thumb_x = cx + bar_slider_norm * max_travel;
+                                let thumb_color = if bar_select_mode {
+                                    Color32::from_rgb(80, 165, 255)
+                                } else if track_resp.dragged() {
+                                    theme::ACCENT
+                                } else {
+                                    Color32::from_rgb(200, 210, 228)
+                                };
+                                p.circle_filled(egui::Pos2::new(thumb_x, cy), 10.5, thumb_color);
+
+                                // 3. Select toggle (holds selection anchor while sliding or tapping arrows)
+                                let sel_btn = if bar_select_mode {
+                                    egui::Button::new(RichText::new("Select").size(12.5).strong().color(Color32::WHITE))
+                                        .fill(theme::ACCENT)
+                                        .min_size(egui::vec2(58.0, btn_h))
+                                } else {
+                                    egui::Button::new(RichText::new("Select").size(12.5))
+                                        .min_size(egui::vec2(58.0, btn_h))
+                                };
+                                if ui.add(sel_btn).clicked() {
+                                    bar_select_mode = !bar_select_mode;
+                                    bar_acted = true;
+                                }
+
+                                // 4. Select All, Cut, Copy, Paste — direct buffer & clipboard operations!
+                                if ui
+                                    .add(egui::Button::new(RichText::new("Select All").size(12.5)).min_size(egui::vec2(74.0, btn_h)))
+                                    .clicked()
+                                {
+                                    cur_range = egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(0),
+                                        egui::text::CCursor::new(total_chars),
+                                    );
+                                    cursor_dirty = true;
+                                    bar_select_mode = false;
+                                    bar_acted = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        has_selection,
+                                        egui::Button::new(RichText::new("Cut").size(12.5)).min_size(egui::vec2(48.0, btn_h)),
+                                    )
+                                    .clicked()
+                                {
+                                    let [lo, hi] = cur_range.sorted_cursors();
+                                    let chars: Vec<char> = buf.text.chars().collect();
+                                    let a = lo.index.0.min(chars.len());
+                                    let b = hi.index.0.min(chars.len());
+                                    let selected: String = chars[a..b].iter().collect();
+                                    ui.ctx().copy_text(selected);
+                                    buf.text = chars[..a].iter().chain(chars[b..].iter()).collect();
+                                    buf.edited = Instant::now();
+                                    changed = true;
+                                    cur_range = egui::text::CCursorRange::one(egui::text::CCursor::new(a));
+                                    cursor_dirty = true;
+                                    bar_select_mode = false;
+                                    bar_acted = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        has_selection,
+                                        egui::Button::new(RichText::new("Copy").size(12.5)).min_size(egui::vec2(52.0, btn_h)),
+                                    )
+                                    .clicked()
+                                {
+                                    let [lo, hi] = cur_range.sorted_cursors();
+                                    let chars: Vec<char> = buf.text.chars().collect();
+                                    let a = lo.index.0.min(chars.len());
+                                    let b = hi.index.0.min(chars.len());
+                                    let selected: String = chars[a..b].iter().collect();
+                                    ui.ctx().copy_text(selected);
+                                    bar_select_mode = false;
+                                    bar_acted = true;
+                                }
+                                if ui
+                                    .add(egui::Button::new(RichText::new("Paste").size(12.5)).min_size(egui::vec2(54.0, btn_h)))
+                                    .clicked()
+                                {
+                                    #[cfg(target_os = "android")]
+                                    let text = crate::android::clipboard::text_now()
+                                        .or_else(crate::android::clipboard::text)
+                                        .unwrap_or_default();
+                                    #[cfg(not(target_os = "android"))]
+                                    let text = String::new();
+                                    if !text.is_empty() {
+                                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                                        let [lo, hi] = cur_range.sorted_cursors();
+                                        let chars: Vec<char> = buf.text.chars().collect();
+                                        let a = lo.index.0.min(chars.len());
+                                        let b = hi.index.0.min(chars.len());
+                                        let ins: Vec<char> = normalized.chars().collect();
+                                        let new_cur = a + ins.len();
+                                        buf.text = chars[..a].iter().chain(ins.iter()).chain(chars[b..].iter()).collect();
+                                        buf.edited = Instant::now();
+                                        changed = true;
+                                        cur_range = egui::text::CCursorRange::one(egui::text::CCursor::new(new_cur));
+                                        cursor_dirty = true;
+                                    }
+                                    bar_select_mode = false;
+                                    bar_acted = true;
+                                }
+                            });
+                        });
+                });
+            if cursor_dirty {
+                te_state.cursor.set_char_range(Some(cur_range));
+                te_state.store(ui.ctx(), editor_id);
+            }
+            let bar_rect = bar_panel.response.rect;
+            bar_slider_rect = Some(bar_rect.expand(4.0));
+            let pointer_in_bar = ui.ctx().input(|i| {
+                (i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released() || i.pointer.any_click())
+                    && i.pointer
+                        .interact_pos()
+                        .or_else(|| i.pointer.hover_pos())
+                        .is_some_and(|p| bar_rect.expand(8.0).contains(p))
+            });
+            if bar_acted || pointer_in_bar {
+                bar_keep_kb = true;
+            }
+        }
+
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .id_salt(("script_scroll", r))
@@ -1351,6 +1670,16 @@ impl Editor {
                         }
                         ui.fonts_mut(|f| f.layout_job(job))
                     };
+                    let prev_surrender = if bar_keep_kb && focused {
+                        Some(ui.ctx().options_mut(|o| {
+                            std::mem::replace(
+                                &mut o.input_options.surrender_focus_on,
+                                egui::SurrenderFocusOn::Never,
+                            )
+                        }))
+                    } else {
+                        None
+                    };
                     let out = egui::TextEdit::multiline(&mut buf.text)
                         .id(editor_id)
                         .code_editor()
@@ -1360,6 +1689,9 @@ impl Editor {
                         .lock_focus(true)
                         .layouter(&mut layouter)
                         .show(ui);
+                    if let Some(prev) = prev_surrender {
+                        ui.ctx().options_mut(|o| o.input_options.surrender_focus_on = prev);
+                    }
                     // The soft keyboard came up under the editor: the caret
                     // scrolls into the room left above it.
                     #[cfg(target_os = "android")]
@@ -1372,6 +1704,9 @@ impl Editor {
                             out.galley_pos.to_vec2() - egui::vec2(out.galley.rect.left(), 0.0),
                         );
                         caret_pos = Some((translated.left_bottom(), translated.left_top()));
+                        if bar_acted {
+                            ui.scroll_to_rect(translated.expand2(egui::vec2(8.0, 8.0)), None);
+                        }
                         let (a, b) = (cr.primary.index.0, cr.secondary.index.0);
                         if a == b {
                             post_edit_cursor = Some(a);
@@ -1404,7 +1739,7 @@ impl Editor {
         // Apply auto-closing brackets/quotes, smart skip-over, smart backspace,
         // and smart Luau block auto-close on Enter.
         let mut cursor_override: Option<usize> = None;
-        if changed {
+        if changed && !bar_acted {
             if let (Some(pc), Some(nc)) = (prev_cursor, post_edit_cursor) {
                 if let Some((updated, new_cur)) = apply_auto_edit(&prev_text, pc, &buf.text, nc) {
                     buf.text = updated;
@@ -1666,12 +2001,61 @@ impl Editor {
             }
         }
 
+        // Commit Portrait helper bar state and keep focus on the code editor after bar actions.
+        self.scripts.portrait_select_mode = bar_select_mode;
+        self.scripts.portrait_slider_norm = bar_slider_norm;
+        self.scripts.portrait_slide_accum = bar_slide_accum;
+        self.scripts.portrait_slider_rect = bar_slider_rect;
+        if bar_acted || bar_keep_kb {
+            self.scripts.portrait_bar_keep_kb_frames = 12;
+        } else {
+            self.scripts.portrait_bar_keep_kb_frames = self.scripts.portrait_bar_keep_kb_frames.saturating_sub(1);
+        }
+        let keep_kb_active = self.scripts.portrait_bar_keep_kb_frames > 0;
+        self.scripts.portrait_bar_keep_kb = keep_kb_active;
+        if !bar_events.is_empty() {
+            self.scripts.portrait_queued_events.extend(bar_events);
+        }
+        if keep_kb_active {
+            ui.ctx().memory_mut(|m| {
+                if !m.has_focus(editor_id) {
+                    m.request_focus(editor_id);
+                }
+                m.set_focus_lock_filter(
+                    editor_id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        tab: true,
+                        escape: false,
+                    },
+                );
+            });
+            ui.ctx().request_repaint();
+        }
+
         // Apply toolbar button actions after mutable borrows of `buf` are done.
         if toggle_maximize {
-            self.scripts.maximized = if is_maximized { None } else { Some(r) };
+            if is_maximized {
+                self.scripts.maximized = None;
+                self.scripts.portrait_bar_keep_kb = false;
+                self.scripts.portrait_bar_keep_kb_frames = 0;
+                if self.scripts.script_portrait {
+                    self.scripts.script_portrait = false;
+                    self.sync_orientation(true);
+                }
+            } else {
+                self.scripts.maximized = Some(r);
+            }
         }
         if toggle_portrait {
-            self.scripts.script_portrait = !is_portrait;
+            let next_portrait = !is_portrait;
+            self.scripts.script_portrait = next_portrait;
+            // Portrait mode always opens the Script Editor fullscreen so dock panels
+            // never squeeze or hide buttons behind them.
+            if next_portrait {
+                self.scripts.maximized = Some(r);
+            }
             self.sync_orientation(true);
         }
 

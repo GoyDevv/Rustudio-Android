@@ -178,7 +178,7 @@ pub fn waypoint(id: u64, kind: Kind) -> String {
 // ------------------------------------------------------------- placement
 
 fn is_part(class: &str) -> bool {
-    rustudio_core::doc::is_a(class, "BasePart")
+    rustudio_core::doc::is_a(class, "BasePart") && class != "Terrain"
 }
 
 /// World AABB of the BaseParts under `roots` in `dom`.
@@ -190,13 +190,22 @@ pub fn aabb(dom: &WeakDom, roots: &[Ref]) -> Option<(Vec3, Vec3)> {
         let mut stack = vec![r];
         while let Some(x) = stack.pop() {
             let Some(i) = dom.get_by_ref(x) else { continue };
+            // Skip dormant backup models stored inside Scripts (e.g. Nextbot Respawn scripts)
+            // so their stale coordinates don't inflate the bounding box and float the model.
+            if matches!(i.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+                continue;
+            }
             stack.extend_from_slice(i.children());
             if !is_part(i.class.as_str()) {
                 continue;
             }
-            let (Some(Variant::CFrame(cf)), Some(Variant::Vector3(sz))) = (i.properties.get(&"CFrame".into()), i.properties.get(&"Size".into())) else { continue };
+            let Some(Variant::CFrame(cf)) = i.properties.get(&"CFrame".into()) else { continue };
+            let sz = match i.properties.get(&"Size".into()) {
+                Some(Variant::Vector3(sz)) => Vec3::new(sz.x, sz.y, sz.z),
+                _ => Vec3::new(4.0, 1.0, 2.0),
+            };
             let xf = Xform::from_cframe(cf);
-            let half = Vec3::new(sz.x, sz.y, sz.z) * 0.5;
+            let half = sz * 0.5;
             let ext = xf.rot.x_axis.abs() * half.x + xf.rot.y_axis.abs() * half.y + xf.rot.z_axis.abs() * half.z;
             if !ext.is_finite() || !xf.pos.is_finite() {
                 continue;
@@ -212,22 +221,49 @@ pub fn aabb(dom: &WeakDom, roots: &[Ref]) -> Option<(Vec3, Vec3)> {
 /// Moves everything under `roots` by `d` (BasePart CFrames, Model
 /// WorldPivots; attachments and bones are relative and follow).
 pub fn translate(dom: &mut WeakDom, roots: &[Ref], d: Vec3) {
-    if d == Vec3::ZERO || !d.is_finite() {
-        return;
+    if d.is_finite() && d != Vec3::ZERO {
+        let mut stack: Vec<Ref> = roots.to_vec();
+        while let Some(x) = stack.pop() {
+            let Some(i) = dom.get_by_ref_mut(x) else { continue };
+            stack.extend_from_slice(i.children());
+            for key in ["CFrame", "WorldPivotData", "WorldPivot"] {
+                match i.properties.get_mut(&key.into()) {
+                    Some(Variant::CFrame(cf)) if key == "CFrame" && is_part(i.class.as_str()) || key != "CFrame" => {
+                        cf.position = Vector3::new(cf.position.x + d.x, cf.position.y + d.y, cf.position.z + d.z);
+                    }
+                    Some(Variant::OptionalCFrame(Some(cf))) => {
+                        cf.position = Vector3::new(cf.position.x + d.x, cf.position.y + d.y, cf.position.z + d.z);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
-    let mut stack: Vec<Ref> = roots.to_vec();
-    while let Some(x) = stack.pop() {
-        let Some(i) = dom.get_by_ref_mut(x) else { continue };
-        stack.extend_from_slice(i.children());
-        for key in ["CFrame", "WorldPivotData", "WorldPivot"] {
-            match i.properties.get_mut(&key.into()) {
-                Some(Variant::CFrame(cf)) if key == "CFrame" && is_part(i.class.as_str()) || key != "CFrame" => {
-                    cf.position = Vector3::new(cf.position.x + d.x, cf.position.y + d.y, cf.position.z + d.z);
+    // Sanitize broken/stale WorldPivotData on top-level inserted Models (without PrimaryPart)
+    // whose authored pivot sits far outside the model's own parts (common on Toolbox Nextbots).
+    for &r in roots {
+        let is_model_no_primary = dom.get_by_ref(r).is_some_and(|i| {
+            i.class == "Model"
+                && !matches!(i.properties.get(&"PrimaryPart".into()), Some(Variant::Ref(p)) if p.is_some())
+        });
+        if !is_model_no_primary {
+            continue;
+        }
+        let Some((lo, hi)) = aabb(dom, &[r]) else { continue };
+        let center = (lo + hi) * 0.5;
+        let max_dist = (hi - lo).length().max(4.0);
+        if let Some(i) = dom.get_by_ref_mut(r) {
+            for key in ["WorldPivotData", "WorldPivot"] {
+                let far = match i.properties.get(&key.into()) {
+                    Some(Variant::CFrame(cf)) | Some(Variant::OptionalCFrame(Some(cf))) => {
+                        let p = Vec3::new(cf.position.x, cf.position.y, cf.position.z);
+                        !p.is_finite() || (p - center).length() > max_dist
+                    }
+                    _ => false,
+                };
+                if far {
+                    i.properties.remove(&key.into());
                 }
-                Some(Variant::OptionalCFrame(Some(cf))) => {
-                    cf.position = Vector3::new(cf.position.x + d.x, cf.position.y + d.y, cf.position.z + d.z);
-                }
-                _ => {}
             }
         }
     }

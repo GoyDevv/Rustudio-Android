@@ -669,6 +669,10 @@ impl Editor {
             ui.separator();
             item(ui, "Convert to Package", false);
             ui.menu_button("Save / Export", |ui| {
+                if item(ui, "Save to Roblox…", true) {
+                    actions.push(RowAction::SaveSelectionToRoblox);
+                    ui.close();
+                }
                 if item(ui, "Save to File…", true) {
                     actions.push(RowAction::SaveSelection);
                     ui.close();
@@ -756,6 +760,26 @@ impl Editor {
                 self.insert_from_file_into(Some(parent));
             }
             RowAction::SaveSelection => self.save_selection(),
+            RowAction::SaveSelectionToRoblox => {
+                let refs = self.game.doc.selection.clone();
+                if refs.is_empty() {
+                    self.warn("Select one or more objects to save to Roblox.");
+                } else {
+                    let first_inst = self.game.doc.dom.get_by_ref(refs[0]);
+                    let default_name = first_inst
+                        .map(|i| i.name.clone())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "Model".to_string());
+                    let asset_type = if refs.len() == 1
+                        && first_inst.is_some_and(|i| i.class.as_str() == "KeyframeSequence")
+                    {
+                        "Animation"
+                    } else {
+                        "Model"
+                    };
+                    self.open_publish_dialog(asset_type, refs, default_name);
+                }
+            }
             RowAction::GroupFolder => {
                 let sel = self.game.doc.selection.clone();
                 if let Some(f) = self.game.doc.group_as(&sel, "Folder") {
@@ -787,6 +811,7 @@ enum RowAction {
     ImportModel(Ref),
     GroupFolder,
     SaveSelection,
+    SaveSelectionToRoblox,
     Action(&'static str),
     SelectChildren(Ref),
     OpenScript(Ref),

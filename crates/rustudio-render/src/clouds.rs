@@ -387,7 +387,7 @@ impl CloudsGpu {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Equal),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),

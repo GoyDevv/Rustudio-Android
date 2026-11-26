@@ -174,6 +174,9 @@ pub fn setter_clamp(class: &str, prop: &str, v: f32) -> Option<f32> {
             v.clamp(0.0, ENV_SCALE_MAX)
         }
         ("Lighting", "ShadowSoftness") => v.clamp(0.0, SHADOW_SOFTNESS_MAX),
+        ("Humanoid", "WalkSpeed" | "JumpHeight" | "MaxHealth") => v.max(0.0),
+        ("Humanoid", "JumpPower") => v.clamp(0.0, 1000.0),
+        ("Humanoid", "MaxSlopeAngle") => v.clamp(0.0, 89.9),
         _ => return None,
     })
 }

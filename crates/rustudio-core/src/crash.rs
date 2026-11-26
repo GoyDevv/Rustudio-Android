@@ -28,6 +28,11 @@ static SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
 /// not overwrite its own report with the abort's.
 static WRITTEN: AtomicBool = AtomicBool::new(false);
 
+/// Disarms core crash reporting during normal application exit.
+pub fn begin_shutdown() {
+    WRITTEN.store(true, Ordering::SeqCst);
+}
+
 thread_local! {
     /// Inside `recoverable`: a panic here is caught and handled, not a crash.
     static RECOVERING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };

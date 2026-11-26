@@ -901,6 +901,9 @@ impl Editor {
         self.marquee_base.clear();
         self.ui.dock_moves.clear();
         self.ui.panel_requests.retain(|(tab, _)| !matches!(tab, Tab::Script(_)));
+        self.ui.minimized_tabs.retain(|tab| !matches!(tab, Tab::Script(_)));
+        self.ui.minimize_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
+        self.ui.restore_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
         self.game.doc = doc;
         self.game.edit_audio.reset();
         self.game.scene = Scene::default();
@@ -1949,6 +1952,9 @@ impl Editor {
             crate::plugin_host::script_docs::set_active(Some(*r));
         }
         for r in std::mem::take(&mut self.open_script) {
+            if self.game.doc.dom.get_by_ref(r).is_none() {
+                continue;
+            }
             let tab = Tab::Script(r);
             if let Some(w) = panels.popped.iter_mut().find(|w| w.dock.find_tab(&tab).is_some()) {
                 if let Some(at) = w.dock.find_tab(&tab) {
@@ -2196,9 +2202,18 @@ impl TabViewer for Viewer<'_> {
         }
         if let Tab::Plugin(n) = *tab {
             // The plugin hears of it (BindToClose, or Enabled = false) and
-            // the panel goes when the widget is disabled.
+            // the panel goes when the widget is disabled. Save it in the bottom
+            // recovery tray so the user can restore it in 1 tap.
+            if !self.ed.ui.minimized_tabs.contains(tab) {
+                self.ed.ui.minimized_tabs.push(*tab);
+            }
             self.ed.plugin_widget_close(n);
             return egui_dock::tab_viewer::OnCloseResponse::Ignore;
+        }
+        if !matches!(*tab, Tab::Viewport | Tab::Script(_))
+            && !self.ed.ui.minimized_tabs.contains(tab)
+        {
+            self.ed.ui.minimized_tabs.push(*tab);
         }
         egui_dock::tab_viewer::OnCloseResponse::Close
     }
@@ -2216,6 +2231,16 @@ impl RustudioApp {
     fn reset_document_tabs(&mut self) {
         if std::mem::take(&mut self.ed.document_tabs_reset) {
             crate::panels::close_document_tabs(&mut self.dock, &mut self.panels);
+            let script_win_ids: Vec<String> = self
+                .mobile_windows
+                .windows()
+                .iter()
+                .filter(|w| matches!(w.tab, Tab::Script(_)))
+                .map(|w| w.id.clone())
+                .collect();
+            for id in script_win_ids {
+                self.mobile_windows.close(&id);
+            }
             strip_disabled_native_tabs(&mut self.dock, &mut self.panels, self.ed.builtin_tools);
             self.ed.ui.popped.clear();
             self.ed.ui.viewport_group.clear();
@@ -2369,6 +2394,8 @@ impl RustudioApp {
 
 impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
+        crate::crash::begin_shutdown();
+        rustudio_core::crash::begin_shutdown();
         crate::studio_settings::flush();
         rustudio_core::rustudio_settings::flush();
         rustudio_render::pipeline_cache::save(true);
@@ -2407,8 +2434,12 @@ impl eframe::App for RustudioApp {
             // for the system clipboard's text; the menu's and the bar's
             // pastes come with their text)
             crate::android::clipboard::before_frame(raw);
+            crate::android::ime_bridge::before_frame(ctx, raw);
             self.text_menu.before_frame(raw);
             self.text_bar.before_frame(raw);
+            if !self.ed.scripts.portrait_queued_events.is_empty() {
+                raw.events.append(&mut self.ed.scripts.portrait_queued_events);
+            }
             let textbox = self.ed.textbox_focused();
             let game_box = self.ed.game.play.is_some() && self.ed.game.gui.focus.is_some();
             self.keyboard.before_frame(ctx, raw, textbox, game_box);
@@ -2847,6 +2878,8 @@ impl RustudioApp {
             ed.cloud_windows(&ctx);
             ed.mcp_windows(&ctx);
             ed.file_sync_popover_ui(&ctx);
+            ed.graphics_settings_ui(&ctx);
+            ed.studio_settings_ui(&ctx);
             ed.mcp_tick(&ctx);
             if ed.harness.run.screenshot.is_some() {
                 ed.harness_tick(&ctx);
@@ -2864,8 +2897,18 @@ impl RustudioApp {
             || matches!(self.dock.find_active_focused(), Some((_, Tab::Script(_))));
         self.ed.sync_orientation(script_active);
         if self.ed.is_script_maximized() {
+            let screen = ctx.viewport_rect();
+            let top_notch = if cfg!(target_os = "android") && screen.height() > screen.width() {
+                34
+            } else {
+                0
+            };
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(theme::BG))
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BG)
+                        .inner_margin(egui::Margin { top: top_notch, left: 0, right: 0, bottom: 0 }),
+                )
                 .show(ui, |ui| {
                     self.ed.maximized_script_ui(ui);
                 });
@@ -2877,7 +2920,12 @@ impl RustudioApp {
                 self.text_menu.end_frame(&ctx);
                 let want = crate::android::keyboard::wanted(&ctx, false);
                 self.text_bar.end_frame(&ctx, &self.keyboard, want);
-                self.keyboard.end_frame(&ctx, false);
+                if let Some(sr) = self.text_bar.slider_rect.or(self.ed.scripts.portrait_slider_rect) {
+                    self.ed.game.touch.zones.direct_drag = vec![sr];
+                } else {
+                    self.ed.game.touch.zones.direct_drag.clear();
+                }
+                self.keyboard.end_frame(&ctx, false, self.ed.scripts.portrait_bar_keep_kb);
             }
             self.watchdog.complete();
             return;
@@ -2923,50 +2971,110 @@ impl RustudioApp {
                         .inner_margin(egui::Margin::symmetric(8, 3)),
                 )
                 .show(ui, |ui| ed.status_bar(ui));
-            let min_floating = self.mobile_windows.minimized_windows();
-            if !self.ed.ui.minimized_tabs.is_empty() || !min_floating.is_empty() {
-                egui::Panel::bottom("minimized_windows_bar")
-                    .frame(
-                        egui::Frame::new()
-                            .fill(theme::PANEL)
-                            .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
-                            .inner_margin(egui::Margin::symmetric(8, 3)),
-                    )
-                    .show(ui, |ui| {
-                        egui::ScrollArea::horizontal()
-                            .id_salt("minimized_windows_scroll")
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Minimized:").small().color(theme::TEXT_DIM));
-                                    let docked_min = self.ed.ui.minimized_tabs.clone();
-                                    for tab in docked_min {
-                                        if ui.button(format!("▴ {}", tab.title())).clicked() {
-                                            self.ed.ui.restore_requests.push(tab);
-                                        }
-                                    }
-                                    for (id, title, _tab) in &min_floating {
-                                        if ui.button(format!("▴ {title}")).clicked() {
-                                            self.mobile_windows.restore(id);
-                                        }
-                                    }
-                                    let total_min = self.ed.ui.minimized_tabs.len() + min_floating.len();
-                                    if total_min >= 2 && ui.button("Restore All").clicked() {
-                                        let all: Vec<Tab> = self.ed.ui.minimized_tabs.clone();
-                                        self.ed.ui.restore_requests.extend(all);
-                                        for (id, _, _) in &min_floating {
-                                            self.mobile_windows.restore(id);
-                                        }
-                                    }
-                                });
-                            });
-                    });
+            // Keep any currently-open tab out of the recovery tray, and always surface
+            // missing default panels so the bottom tray stays visible whenever the layout
+            // is non-default (minimized or closed panels can be recovered in 1 tap).
+            let is_tab_open = |t: &Tab| {
+                self.dock.find_tab(t).is_some()
+                    || self.panels.popped.iter().any(|w| w.dock.find_tab(t).is_some())
+                    || self.mobile_windows.contains_tab(t)
+            };
+            self.ed.ui.minimized_tabs.retain(|t| !is_tab_open(t));
+            let mut tray_tabs: Vec<Tab> = self.ed.ui.minimized_tabs.clone();
+            let mut default_tabs = vec![Tab::Explorer, Tab::Properties, Tab::Output];
+            if native_tab_enabled(Tab::Toolbox, self.ed.builtin_tools) {
+                default_tabs.push(Tab::Toolbox);
             }
+            for dt in default_tabs {
+                if !is_tab_open(&dt) && !tray_tabs.contains(&dt) {
+                    tray_tabs.push(dt);
+                }
+            }
+            let min_floating = self.mobile_windows.minimized_windows();
+            let total_min = tray_tabs.len() + min_floating.len();
+            let mut tray_handle_rect: Option<egui::Rect> = None;
+            if total_min > 0 {
+                if self.ed.ui.minimized_tray_collapsed {
+                    // Super compact collapsed pill — tap or drag up to expand!
+                    egui::Panel::bottom("minimized_windows_bar_mini")
+                        .frame(
+                            egui::Frame::new()
+                                .fill(theme::PANEL_DARK)
+                                .inner_margin(egui::Margin::symmetric(8, 1)),
+                        )
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let pill = ui.add(
+                                    egui::Button::new(
+                                        RichText::new(format!("▴ Panels ({total_min})")).small().color(theme::TEXT_DIM),
+                                    )
+                                    .frame(false)
+                                    .sense(egui::Sense::click_and_drag()),
+                                );
+                                tray_handle_rect = Some(pill.rect.expand(6.0));
+                                if pill.clicked() || (pill.dragged() && pill.drag_delta().y < -3.0) {
+                                    self.ed.ui.minimized_tray_collapsed = false;
+                                }
+                            });
+                        });
+                } else {
+                    egui::Panel::bottom("minimized_windows_bar")
+                        .frame(
+                            egui::Frame::new()
+                                .fill(theme::PANEL)
+                                .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                                .inner_margin(egui::Margin::symmetric(6, 2)),
+                        )
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let handle = ui.add(
+                                    egui::Button::new(RichText::new("▾").small().color(theme::TEXT_DIM))
+                                        .min_size(egui::vec2(26.0, 22.0))
+                                        .sense(egui::Sense::click_and_drag()),
+                                ).on_hover_text("Tap or drag down to shrink tray");
+                                tray_handle_rect = Some(handle.rect.expand(6.0));
+                                if handle.clicked() || (handle.dragged() && handle.drag_delta().y > 3.0) {
+                                    self.ed.ui.minimized_tray_collapsed = true;
+                                }
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("minimized_windows_scroll")
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for tab in &tray_tabs {
+                                                let label = match *tab {
+                                                    Tab::Plugin(n) => self.ed.plugin_widget_title(n),
+                                                    _ => tab.title().to_string(),
+                                                };
+                                                if ui.button(format!("▴ {label}")).clicked() {
+                                                    self.ed.ui.restore_requests.push(*tab);
+                                                }
+                                            }
+                                            for (id, title, _tab) in &min_floating {
+                                                if ui.button(format!("▴ {title}")).clicked() {
+                                                    self.mobile_windows.restore(id);
+                                                }
+                                            }
+                                            if total_min >= 2 && ui.button("Restore All").clicked() {
+                                                self.ed.ui.restore_requests.extend(tray_tabs.iter().copied());
+                                                for (id, _, _) in &min_floating {
+                                                    self.mobile_windows.restore(id);
+                                                }
+                                            }
+                                        });
+                                    });
+                            });
+                        });
+                }
+            }
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("rustudio_tray_handle_rect"), tray_handle_rect));
         }
 
         // Editor::start_run requests this when a playtest begins.
         if std::mem::take(&mut self.ed.switch_to_viewport) {
             self.ed.set_script_maximized(None);
+            self.ed.scripts.portrait_bar_keep_kb = false;
+            self.ed.scripts.portrait_bar_keep_kb_frames = 0;
             self.ed.sync_orientation(false);
             if let Some(loc) = self.dock.find_tab(&Tab::Viewport) {
                 let _ = self.dock.set_active_tab(loc);
@@ -2992,6 +3100,13 @@ impl RustudioApp {
         } else {
             self.panels.popped.iter().map(|w| (w.key.clone(), w.title())).collect()
         };
+        let dock_modal_open = self.ed.ui.studio_settings.open
+            || self.ed.ui.graphics_settings
+            || self.ed.ui.about
+            || self.ed.confirm_discard.is_some()
+            || self.ed.game.account.open
+            || egui::Popup::is_any_open(&ctx);
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("rustudio_modal_open"), dock_modal_open));
         let mut dock_rect = egui::Rect::NOTHING;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
@@ -3034,6 +3149,9 @@ impl RustudioApp {
         let restore_reqs = std::mem::take(&mut self.ed.ui.restore_requests);
         for tab in restore_reqs {
             self.ed.ui.minimized_tabs.retain(|t| *t != tab);
+            if let Tab::Plugin(n) = tab {
+                self.ed.plugin_widget_show(n);
+            }
             if self.dock.find_tab(&tab).is_none() {
                 let mut homes = self.panels.homes.clone();
                 homes.remove("__topology");
@@ -3055,11 +3173,30 @@ impl RustudioApp {
                     homes.remove("__topology");
                     crate::panels::place(&mut self.dock, tab, &homes);
                 }
-                crate::mobile_windows::MobileWindowAction::Closed(_) => {}
+                crate::mobile_windows::MobileWindowAction::Closed(tab) => {
+                    if !matches!(tab, Tab::Viewport | Tab::Script(_))
+                        && !self.ed.ui.minimized_tabs.contains(&tab)
+                    {
+                        self.ed.ui.minimized_tabs.push(tab);
+                    }
+                }
             }
         }
         self.ed.mobile_window_rects = self.mobile_windows.hit_rects();
-        self.ed.mobile_drag_rects = self.mobile_windows.drag_handle_rects();
+        let mut end_drag_rects = self.mobile_windows.drag_handle_rects();
+        let frame_sep_rects = ctx.data(|d| {
+            d.get_temp::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects"))
+                .unwrap_or_default()
+        });
+        end_drag_rects.extend(frame_sep_rects);
+        if let Some(sr) = self.ed.scripts.portrait_slider_rect {
+            end_drag_rects.push(sr);
+        }
+        if let Some(tr) = ctx.data(|d| d.get_temp::<Option<egui::Rect>>(egui::Id::new("rustudio_tray_handle_rect")).flatten()) {
+            end_drag_rects.push(tr);
+        }
+        self.ed.mobile_drag_rects = end_drag_rects.clone();
+        self.ed.game.touch.zones.direct_drag = end_drag_rects;
         self.reset_document_tabs();
         // Window > Explorer / Properties / Output / Avatar Settings toggles
         // (in a panel window too), new panels where Studio docks them
@@ -3100,6 +3237,9 @@ impl RustudioApp {
             match (found, open) {
                 (Some(_), false) => {
                     self.panels.take(&mut self.dock, &tab);
+                    if matches!(tab, Tab::Plugin(_)) && !self.ed.ui.minimized_tabs.contains(&tab) {
+                        self.ed.ui.minimized_tabs.push(tab);
+                    }
                 }
                 (Some(Location::Main(at)), true) => {
                     let _ = self.dock.set_active_tab(at);
@@ -3216,7 +3356,12 @@ impl RustudioApp {
             let textbox = self.ed.textbox_focused();
             let want = crate::android::keyboard::wanted(&ctx, textbox);
             self.text_bar.end_frame(&ctx, &self.keyboard, want);
-            self.keyboard.end_frame(&ctx, textbox);
+            if let Some(sr) = self.text_bar.slider_rect {
+                self.ed.game.touch.zones.direct_drag.push(sr);
+            }
+            let keep_kb = self.ed.scripts.portrait_bar_keep_kb && self.ed.game.play.is_none() && (self.ed.scripts.maximized.is_some() || self.ed.scripts.script_portrait);
+            if !keep_kb { self.ed.scripts.portrait_bar_keep_kb = false; self.ed.scripts.portrait_bar_keep_kb_frames = 0; }
+            self.keyboard.end_frame(&ctx, textbox, keep_kb);
         }
         // The memory, as it grows (src/android/memory.rs).
         #[cfg(target_os = "android")]
@@ -3372,7 +3517,7 @@ impl RustudioApp {
             let textbox = self.ed.textbox_focused();
             let want = crate::android::keyboard::wanted(ctx, textbox);
             self.text_bar.end_frame(ctx, &self.keyboard, want);
-            self.keyboard.end_frame(ctx, textbox);
+            self.keyboard.end_frame(ctx, textbox, false);
             let doing = match &self.ed.game.doc.path {
                 Some(p) => format!("playing {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
                 None => String::new(),

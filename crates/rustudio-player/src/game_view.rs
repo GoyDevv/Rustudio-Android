@@ -605,23 +605,10 @@ impl Game {
             self.lighting.lightgrid_dirty = true;
             self.lighting.lightocc_dirty = true;
         } else if !changes.moved.is_empty() {
-            // On Android Playtest, ignore character-rig-only idle/walk motion so
-            // Motor6D breathing does not trigger 0.5s/1.5s lightgrid/lightocc stutter spikes.
-            let non_char_moved = if cfg!(target_os = "android") && self.is_playing() {
-                let char_model = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
-                changes.moved.iter().any(|&r| {
-                    char_model.is_none_or(|cm| {
-                        let mut cur = r;
-                        while let Some(inst) = self.doc.dom.get_by_ref(cur) {
-                            if cur == cm { return false; }
-                            cur = inst.parent();
-                        }
-                        true
-                    })
-                })
-            } else {
-                true
-            };
+            // On Android Playtest, skip periodic lightgrid/lightocc voxel rebuilds on
+            // pure CFrame moves (characters, NPCs, physics parts) to eliminate 0.5s/1.5s
+            // main-thread + GPU 3D-texture stutter spikes (structural/lighting edits still rebuild).
+            let non_char_moved = !(cfg!(target_os = "android") && self.is_playing());
             if non_char_moved {
                 self.lighting.lightgrid_moves = true;
                 self.lighting.lightocc_dirty = true;
@@ -2299,7 +2286,17 @@ impl Game {
             }
             None => rect,
         };
-        let scale = rustudio_core::rustudio_settings::render_resolution_scale();
+        let mut scale = rustudio_core::rustudio_settings::render_resolution_scale();
+        // On Android fullscreen Playtest (e.g. 2388x1080 = 2.58 Mpx on FHD+ phones),
+        // cap default 3D render target to ~1.25 Mpx (~720p-class, matching Roblox Mobile)
+        // while keeping 2D UI/HUD crisp at native FHD+.
+        if cfg!(target_os = "android") && self.is_playing() && scale >= 0.999 {
+            let px = (size[0] as f32) * (size[1] as f32);
+            const MOBILE_PLAY_MAX_PX: f32 = 1_250_000.0;
+            if px > MOBILE_PLAY_MAX_PX {
+                scale = (MOBILE_PLAY_MAX_PX / px).sqrt().clamp(0.55, 1.0);
+            }
+        }
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
         self.last_render_scale = scale;
         self.last_render_target = size;
@@ -2320,7 +2317,9 @@ impl Game {
         });
         let vp_render = rustudio_core::bench::scope("vp_render");
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
-            (Some(r), Some(rs)) => r.render(
+            (Some(r), Some(rs)) => {
+                r.defer_postfx = true;
+                r.render(
                 rs,
                 size,
                 &Frame {
@@ -2343,7 +2342,8 @@ impl Game {
                         .then(|| rustudio_render::clouds::look(&self.doc)).flatten(),
                     probe,
                 },
-            ),
+            )
+            },
             _ => None,
         };
         drop(vp_render);
@@ -2363,11 +2363,19 @@ impl Game {
                 self.viewport_drawn = true;
             }
             None => {
+                let compiling = self.renderer.as_ref().is_some_and(|r| r.pipelines_compiling());
+                if compiling {
+                    ctx.request_repaint();
+                }
                 painter.rect_filled(rect, 0.0, theme::BG);
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "3D viewport unavailable (no wgpu device)",
+                    if compiling {
+                        "Compiling shaders…"
+                    } else {
+                        "3D viewport unavailable (no wgpu device)"
+                    },
                     egui::FontId::proportional(16.0),
                     theme::TEXT_DIM,
                 );

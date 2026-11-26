@@ -1157,6 +1157,7 @@ impl Game {
         });
         rustudio_core::load_trace::mark("play: server scripts started");
         if two {
+            self.server_head_start();
             self.create_player();
             if self.play.as_ref().is_some_and(|s| s.map.streaming()) {
                 let (position, _) = self.character_spawn_point();
@@ -1411,6 +1412,26 @@ impl Game {
 
     /// Creates Players.Player1 on the server with Backpack and PlayerGui
     /// filled from StarterPack / StarterGui (both replicate to the client).
+    /// Steps the server for 6 Heartbeat/PostSimulation ticks before client join
+    /// (matching upstream TouseefX/rustudio 5daf91f) so instances created by
+    /// server scripts in task.spawn / task.wait exist before LocalScripts run.
+    fn server_head_start(&mut self) {
+        const FRAMES: u32 = 6;
+        let dt = 1.0 / 60.0;
+        let root = self.doc.dom.root_ref();
+        let run_service = self.doc.find_child(root, "RunService");
+        self.with_side(Side::Server, |rt, _, _| {
+            for _ in 0..FRAMES {
+                if let Some(rs) = run_service {
+                    rt.fire(rs, "PostSimulation", vec![Value::Number(dt)]);
+                    rt.fire(rs, "Heartbeat", vec![Value::Number(dt)]);
+                }
+                rt.step(dt);
+            }
+        });
+        rustudio_core::load_trace::mark("play: server head start");
+    }
+
     fn create_player(&mut self) {
         let root = self.doc.dom.root_ref();
         let players = match self.doc.find_child(root, "Players") {
@@ -1461,22 +1482,11 @@ impl Game {
             InstanceBuilder::new("PlayerGui").with_name("PlayerGui"),
         );
         self.doc.dom.insert(player, InstanceBuilder::new("StarterGear"));
-        // PlayerGui starts empty: StarterGui is copied in when a character
-        // spawns (reset_player_gui), as on Roblox.
-        let _ = gui;
-        for (from, to) in [(self.doc.find_child(root, "StarterPack"), backpack)] {
-            let Some(from) = from else { continue };
-            for k in self
-                .doc
-                .dom
-                .get_by_ref(from)
-                .map(|i| i.children().to_vec())
-                .unwrap_or_default()
-            {
-                let c = self.doc.dom.clone_within(k);
-                self.doc.dom.transfer_within(c, to);
-            }
-        }
+        // PlayerGui & Backpack start empty: StarterGui and StarterPack are
+        // copied in when a character spawns (reset_player_gui / refill_backpack),
+        // as on Roblox, so StarterPack LocalScripts see LocalPlayer.Character
+        // and Humanoid already present.
+        let _ = (gui, backpack);
         // Teams: join the auto-assignable team with the fewest players.
         let team = self.doc.find_child(root, "Teams").and_then(|t| {
             let d = &self.doc;
@@ -2976,9 +2986,8 @@ impl Game {
                 }
             });
         }
-        let pack = (!first)
-            .then(|| self.doc.find_child(self.doc.dom.root_ref(), "StarterPack"))
-            .flatten();
+        let _ = first;
+        let pack = self.doc.find_child(self.doc.dom.root_ref(), "StarterPack");
         let gear = self.doc.find_child(player, "StarterGear");
         let mut copies = Vec::new();
         for source in [pack, gear].into_iter().flatten() {

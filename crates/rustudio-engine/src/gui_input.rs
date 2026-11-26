@@ -360,7 +360,7 @@ impl Gui {
                                 self.billboard_model_centers.clear();
                                 break;
                             }
-                            doc::Mark::Prop(r, name) if matches!(name.as_str(), "CFrame" | "Position" | "Orientation" | "Rotation") => {
+                            doc::Mark::Prop(r, name) if matches!(name.as_str(), "CFrame" | "Position" | "Orientation" | "Rotation" | "Size") => {
                                 let mut part = r;
                                 while let Some(inst) = d.dom.get_by_ref(part) {
                                     self.billboard_model_centers.remove(&part);
@@ -2930,7 +2930,7 @@ fn place_3d(
     view_proj: &glam::Mat4,
     rect: Rect,
     g: Ref,
-    model_centers: &mut HashMap<Ref, Option<Vec3>>,
+    model_centers: &mut HashMap<Ref, Option<(Vec3, Vec3)>>,
 ) -> Option<(Target, [f32; 2], f32)> {
     let class = d.class_of(g)?;
     let adornee = match d.prop(g, "Adornee") {
@@ -2951,8 +2951,17 @@ fn place_3d(
         Some(Variant::CFrame(cf)) => Some(Vec3::new(cf.position.x, cf.position.y, cf.position.z)),
         _ => None,
     };
-    let base = if doc::is_a(&host_class, "BasePart") {
-        part_position(host)?
+    let part_half = |r| {
+        let sz = vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::new(4.0, 1.0, 2.0));
+        if let Some(xf) = xform_of(d, r) {
+            let h = sz * 0.5;
+            xf.rot.x_axis.abs() * h.x + xf.rot.y_axis.abs() * h.y + xf.rot.z_axis.abs() * h.z
+        } else {
+            sz * 0.5
+        }
+    };
+    let (base, half_ext) = if doc::is_a(&host_class, "BasePart") {
+        (part_position(host)?, part_half(host))
     } else if host_class == "Attachment" {
         let pxf = xform_of(d, d.dom.get_by_ref(host)?.parent())?;
         let cf = match d.prop(host, "CFrame") {
@@ -2962,22 +2971,38 @@ fn place_3d(
                 rot: Mat3::IDENTITY,
             },
         };
-        pxf.apply(cf.pos)
+        (pxf.apply(cf.pos), Vec3::ZERO)
     } else if doc::is_a(&host_class, "Model") {
         (*model_centers.entry(host).or_insert_with(|| {
-            let (sum, count) = d.dom.descendants_of(host)
-                .filter(|i| doc::is_a(&i.class, "BasePart"))
-                .filter_map(|i| part_position(i.referent()))
-                .fold((Vec3::ZERO, 0u32), |(sum, count), pos| (sum + pos, count + 1));
-            (count > 0).then(|| sum / count as f32)
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            let mut any = false;
+            for i in d.dom.descendants_of(host) {
+                if doc::is_a(&i.class, "BasePart") && i.class != "Terrain" {
+                    let r = i.referent();
+                    if let Some(pos) = part_position(r) {
+                        let ext = part_half(r);
+                        lo = lo.min(pos - ext);
+                        hi = hi.max(pos + ext);
+                        any = true;
+                    }
+                }
+            }
+            any.then(|| ((lo + hi) * 0.5, (hi - lo) * 0.5))
         }))?
     } else {
         return None;
     };
     let world_off = vec3_of(d.prop(g, "StudsOffsetWorldSpace")).unwrap_or(Vec3::ZERO);
     let cam_off = vec3_of(d.prop(g, "StudsOffset")).unwrap_or(Vec3::ZERO);
-    let p = base + world_off + cam.right() * cam_off.x + cam.up() * cam_off.y
-        - cam.forward() * cam_off.z;
+    let ext_world = vec3_of(d.prop(g, "ExtentsOffsetWorldSpace")).unwrap_or(Vec3::ZERO);
+    let ext_cam = vec3_of(d.prop(g, "ExtentsOffset")).unwrap_or(Vec3::ZERO);
+    let p = base
+        + world_off
+        + ext_world * half_ext
+        + cam.right() * (cam_off.x + ext_cam.x * half_ext.x)
+        + cam.up() * (cam_off.y + ext_cam.y * half_ext.y)
+        - cam.forward() * (cam_off.z + ext_cam.z * half_ext.z);
     let dist = (p - cam.pos).length();
     let max = num(d, g, "MaxDistance", 0.0);
     if max > 0.0 && max.is_finite() && dist > max {
@@ -3004,10 +3029,11 @@ fn place_3d(
     // descendants lay out in the rounded box, and sub-pixel motion changes
     // nothing — the test place's 200 NPC name tags re-walked every frame on
     // ~1e-6 stud jitter).
-    let canvas = [(s[0] * px_per_stud + s[1]).round(), (s[2] * px_per_stud + s[3]).round()];
-    if canvas[0] <= 0.0 || canvas[1] <= 0.0 || canvas[0] > 8192.0 || canvas[1] > 8192.0 {
+    let raw_canvas = [(s[0] * px_per_stud + s[1]).round(), (s[2] * px_per_stud + s[3]).round()];
+    if raw_canvas[0] <= 0.0 || raw_canvas[1] <= 0.0 {
         return None;
     }
+    let canvas = [raw_canvas[0].min(8192.0), raw_canvas[1].min(8192.0)];
     // SizeOffset shifts the billboard center in fractions of its rendered size
     // (+X right, +Y up in Roblox's screen-space offset convention).
     let size_off = vec2(d, g, "SizeOffset", [0.0, 0.0]);

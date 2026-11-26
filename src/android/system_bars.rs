@@ -95,6 +95,12 @@ fn apply() -> super::jni::Result<()> {
             return Ok(());
         }
         if super::jni::sdk_int() >= 30 {
+            let _ = env.call_method(
+                &window,
+                jni_str!("setDecorFitsSystemWindows"),
+                jni_sig!("(Z)V"),
+                &[JValue::Bool(false)],
+            );
             // (a pending controller before the view is attached: it replays
             // the behaviour and the hide at the attach)
             let controller = env
@@ -103,6 +109,13 @@ fn apply() -> super::jni::Result<()> {
             if controller.is_null() {
                 return Ok(());
             }
+            // Clear APPEARANCE_LIGHT_STATUS_BARS (0x08) | APPEARANCE_LIGHT_NAVIGATION_BARS (0x10)
+            let _ = env.call_method(
+                &controller,
+                jni_str!("setSystemBarsAppearance"),
+                jni_sig!("(II)V"),
+                &[JValue::Int(0), JValue::Int(0x08 | 0x10)],
+            );
             env.call_method(
                 &controller,
                 jni_str!("setSystemBarsBehavior"),

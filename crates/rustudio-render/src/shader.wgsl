@@ -305,7 +305,9 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
     let x = f32(i32(i & 1u) * 4 - 1);
     let y = f32(i32(i >> 1u) * 4 - 1);
     var o: SkyOut;
-    o.pos = vec4<f32>(x, y, 0.0, 1.0);
+    // Slightly above 0.0 (still < NEAR / FAR) so GLES3's 2*z - w stays strictly
+    // inside (-1, 1) and never clips at z == -w; passes GreaterEqual on clear 0.0.
+    o.pos = vec4<f32>(x, y, 1e-7, 1.0);
     o.ndc = vec2<f32>(x, y);
     return o;
 }

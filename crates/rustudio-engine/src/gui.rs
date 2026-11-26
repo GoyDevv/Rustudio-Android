@@ -578,7 +578,7 @@ pub struct Gui {
     /// ScreenGuis drawn as they were last frame (gui_input.rs `RootCache`).
     cache: rustc_hash::FxHashMap<Ref, input::RootCache>,
     /// Model billboard anchors, invalidated through the document journal.
-    billboard_model_centers: HashMap<Ref, Option<Vec3>>,
+    billboard_model_centers: HashMap<Ref, Option<(Vec3, Vec3)>>,
     /// Workspace SurfaceGuis' own placement properties (gui_input.rs
     /// `SurfaceSpec`), invalidated through the document journal.
     surface_specs: rustc_hash::FxHashMap<Ref, input::SurfaceSpec>,
@@ -2048,14 +2048,20 @@ impl Gui {
             }
         };
         // A Decal asset (XML) points at its image.
-        if bytes.starts_with(b"<roblox") {
-            let inner = Document::decode(&bytes).ok().and_then(|dom| {
+        let trimmed_xml = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        let trimmed_xml = trimmed_xml.iter().position(|b| !b.is_ascii_whitespace()).map_or(trimmed_xml, |i| &trimmed_xml[i..]);
+        if trimmed_xml.starts_with(b"<roblox") || trimmed_xml.starts_with(b"<?xml") {
+            let inner = Document::decode(trimmed_xml).ok().and_then(|dom| {
                 dom.descendants().find_map(|i| {
-                    match i.properties.get(&rbx_dom_weak::ustr("Texture")) {
-                        Some(Variant::ContentId(c)) => Some(c.as_str().to_string()),
-                        Some(Variant::Content(c)) => c.as_uri().map(|s| s.to_string()),
-                        _ => None,
+                    for prop in ["Texture", "TextureContent"] {
+                        match i.properties.get(&rbx_dom_weak::ustr(prop)) {
+                            Some(Variant::ContentId(c)) if !c.as_str().is_empty() => return Some(c.as_str().to_string()),
+                            Some(Variant::Content(c)) => if let Some(u) = c.as_uri() { if !u.is_empty() { return Some(u.to_string()); } },
+                            Some(Variant::String(s)) if !s.is_empty() => return Some(s.clone()),
+                            _ => {}
+                        }
                     }
+                    None
                 })
             });
             match inner.map(|i| store.content(&i, doc_dir)) {
@@ -2177,14 +2183,23 @@ impl Gui {
                 return None;
             }
         };
-        if bytes.starts_with(b"<roblox") {
-            let inner = Document::decode(&bytes).ok().and_then(|dom| {
+        let trimmed_fx = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        if trimmed_fx.starts_with(b"<roblox") || trimmed_fx.starts_with(b"<?xml") {
+            let inner = Document::decode(trimmed_fx).ok().and_then(|dom| {
                 dom.descendants().find_map(|i| {
-                    match i.properties.get(&rbx_dom_weak::ustr("Texture")) {
-                        Some(Variant::ContentId(c)) => Some(c.as_str().to_string()),
-                        Some(Variant::Content(c)) => c.as_uri().map(|s| s.to_string()),
-                        _ => None,
+                    for prop in ["Texture", "TextureContent"] {
+                        match i.properties.get(&rbx_dom_weak::ustr(prop)) {
+                            Some(Variant::ContentId(c)) if !c.as_str().is_empty() => return Some(c.as_str().to_string()),
+                            Some(Variant::Content(c)) => {
+                                if let Some(u) = c.as_uri() {
+                                    if !u.is_empty() { return Some(u.to_string()); }
+                                }
+                            }
+                            Some(Variant::String(s)) if !s.is_empty() => return Some(s.clone()),
+                            _ => {}
+                        }
                     }
+                    None
                 })
             });
             match inner.map(|i| store.content(&i, doc_dir)) {

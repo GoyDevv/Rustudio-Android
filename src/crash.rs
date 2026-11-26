@@ -335,6 +335,27 @@ fn auto_export_public_crash(file_name: &str, body: &str) {
 /// Ensures the first fatal event wins (a panic that later aborts will not
 /// overwrite the panic report with an abort tombstone).
 static WRITTEN: AtomicBool = AtomicBool::new(false);
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Disarms panic and fatal-signal crash recording during normal app shutdown so
+/// closing the app never produces a fake crash dialog on next launch.
+pub fn begin_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    WRITTEN.store(true, Ordering::SeqCst);
+    #[cfg(unix)]
+    unsafe {
+        for sig in [
+            libc::SIGSEGV,
+            libc::SIGABRT,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGTRAP,
+        ] {
+            libc::signal(sig, libc::SIG_DFL);
+        }
+    }
+}
 
 /// Tracks whether `take_pending_crash()` has already handed the pending crash
 /// to the UI during this process lifetime.
@@ -490,7 +511,7 @@ pub fn install() {
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if RECOVERING.with(|r| r.get()) > 0 {
+        if SHUTTING_DOWN.load(Ordering::Acquire) || RECOVERING.with(|r| r.get()) > 0 {
             return;
         }
         if !WRITTEN.swap(true, Ordering::SeqCst) {
@@ -680,6 +701,11 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     // SAFETY: Strictly async-signal-safe operations only (`open`, `write`, `close`,
     // atomic loads, stack buffers, `sigaction`, `raise`).
     unsafe {
+        if SHUTTING_DOWN.load(Ordering::Acquire) {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+            return;
+        }
         if !WRITTEN.swap(true, Ordering::SeqCst) {
             for p in [SIGNAL_PATH.get(), PUBLIC_SIGNAL_PATH.get()].into_iter().flatten() {
                 let fd = libc::open(
@@ -857,4 +883,19 @@ pub fn unseen_reports() -> Vec<String> {
         ));
     }
     lines
+}
+
+/// Persists a non-panic fatal error (e.g. GPU watchdog or eframe error) so the
+/// next launch displays the crash dialog instead of exiting silently.
+pub fn record_fatal_message(kind: &str, message: &str) {
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
+    if !WRITTEN.swap(true, Ordering::SeqCst) {
+        let body = format!(
+            "=== Rustudio Fatal Error Report ===\nTimestamp: {}\nKind: {kind}\nMessage: {message}\n",
+            stamp_human()
+        );
+        let _ = write_pending_panic_report(&body);
+    }
 }

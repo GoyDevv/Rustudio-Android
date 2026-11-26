@@ -41,6 +41,7 @@ pub fn set_portrait(portrait: bool) {
         match super::jni::set_requested_orientation(constant) {
             Ok(()) => {
                 LAST_PORTRAIT.store(desired, Ordering::Relaxed);
+                super::system_bars::hide();
             }
             Err(e) => {
                 log::warn!("orientation: setRequestedOrientation({constant}) failed: {e}");

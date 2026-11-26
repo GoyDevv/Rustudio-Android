@@ -282,7 +282,7 @@ impl<Tab> Node<Tab> {
         match self {
             Node::Leaf(leaf) => leaf.collapsed = collapsed,
             Node::Vertical(split) | Node::Horizontal(split) => split.fully_collapsed = collapsed,
-            Node::Empty => panic!("node was empty"),
+            Node::Empty => {}
         }
     }
 
@@ -382,8 +382,8 @@ impl<Tab> Node<Tab> {
                     Node::Leaf(LeafNode {
                         rect: *rect,
                         viewport: *viewport,
+                        active: TabIndex(active.0.min(tabs.len() - 1)),
                         tabs,
-                        active: *active,
                         scroll: *scroll,
                         collapsed: *collapsed,
                         tab_bar_hidden: *tab_bar_hidden,

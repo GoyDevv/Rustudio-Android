@@ -344,7 +344,9 @@ impl Editor {
                 let w = (ui.available_width() - 70.0).max(60.0);
                 let (r, _) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
                 ui.painter().rect(r, 4.0, theme::PANEL_DARK, Stroke::new(1.0, if self.toolbox.ui.search_focused { theme::SELECT } else { theme::DIVIDER }), StrokeKind::Inside);
-                icon(ui.painter(), Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), Vec2::splat(15.0)), "search", theme::TEXT_DIM);
+                let sr_icon = Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), Vec2::splat(22.0));
+                let sr_click = ui.interact(sr_icon, ui.id().with("tbsearch_go"), Sense::click());
+                icon(ui.painter(), sr_icon.shrink(3.5), "search", if sr_click.hovered() { theme::TEXT } else { theme::TEXT_DIM });
                 let text_r = Rect::from_min_max(Pos2::new(r.min.x + 26.0, r.min.y + 2.0), Pos2::new(r.max.x - 26.0, r.max.y - 2.0));
                 let te = egui::TextEdit::singleline(&mut self.toolbox.st.query).hint_text("Search").frame(egui::Frame::NONE).desired_width(text_r.width()).vertical_align(egui::Align::Center);
                 let resp = ui.put(text_r, te);
@@ -353,7 +355,7 @@ impl Editor {
                     let (cat, q) = (self.toolbox.current_cat(), self.toolbox.st.query.clone());
                     self.toolbox.want_suggestions(cat.as_deref(), &q);
                 }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if sr_click.clicked() || ((resp.lost_focus() || resp.has_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                     submit = Some(self.toolbox.st.query.clone());
                 }
                 if !self.toolbox.st.query.is_empty() {
@@ -1288,13 +1290,19 @@ impl Editor {
             let px = ui.ctx().pixels_per_point();
             self.toolbox.preview.show(id, [(r.width() * px) as u32, (r.height() * px) as u32]);
             let st = match self.toolbox.preview.state.get(&id) {
-                Some(PState::Installed { .. }) => Ok(true),
+                Some(PState::Installed { has_visible_3d: true, .. }) => Ok(Some(true)),
+                Some(PState::Installed { has_visible_3d: false, .. }) => Ok(None),
                 Some(PState::Failed(e)) => Err(e.clone()),
-                _ => Ok(false),
+                _ => Ok(Some(false)),
             };
             match (self.toolbox.preview.texture, st) {
-                (Some((tid, t, _)), Ok(true)) if tid == id => {
+                (Some((tid, t, _)), Ok(Some(true))) if tid == id => {
                     ui.painter().image(t, r.shrink(2.0), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                }
+                (_, Ok(None)) => {
+                    // Model has only 2D BillboardGui/Beam/Particle visuals (no opaque 3D mesh):
+                    // keep the crisp 2D thumbnail instead of showing an empty black box.
+                    self.paint_thumb(ui, id, r.shrink(r.width() * 0.08), 420);
                 }
                 (_, Err(e)) => {
                     self.paint_thumb(ui, id, r.shrink(r.width() * 0.08), 420);

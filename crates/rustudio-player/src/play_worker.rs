@@ -21,8 +21,27 @@ impl PlayWorker {
         init: impl FnOnce(&mut Game, &mut WorkerHost) + Send + 'static,
     ) -> io::Result<Self> {
         let (jobs, queue) = mpsc::channel::<Job>();
-        let thread = thread::Builder::new().name("rustudio-gameplay".into()).spawn(move || {
-            let mut game = Game::new(None);
+        let thread = thread::Builder::new()
+            .name("rustudio-gameplay".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+            #[cfg(unix)]
+            unsafe {
+                let size = 64 * 1024;
+                let stack = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if stack != libc::MAP_FAILED {
+                    let ss = libc::stack_t { ss_sp: stack, ss_flags: 0, ss_size: size };
+                    libc::sigaltstack(&ss, std::ptr::null_mut());
+                }
+            }
+            let mut game = Box::new(Game::new(None));
             let mut host = WorkerHost { hooks, end_test: None };
             init(&mut game, &mut host);
             loop {
@@ -995,7 +1014,8 @@ impl Game {
             Receive::Stopped => return,
         }
         let dt = (dt + std::mem::take(&mut threaded.deferred_dt)).min(rustudio_core::mech::MAX_FRAME_DT);
-        let wait_for_publication = std::mem::take(&mut threaded.follow_local_input) || textbox_edit;
+        let follow_input = std::mem::take(&mut threaded.follow_local_input);
+        let wait_for_publication = if cfg!(target_os = "android") { textbox_edit } else { follow_input || textbox_edit };
         let edits = threaded.queued_edits.take().expect("edits scanned at this boundary");
         let input = Input::take(self, keyboard, edits);
         let mut source = threaded.source.take().expect("last snapshot was applied");

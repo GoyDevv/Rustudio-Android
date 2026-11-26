@@ -135,6 +135,9 @@ pub struct Layout {
     /// Editor virtual joystick & touch camera rotation settings.
     #[serde(default)]
     pub joystick: Option<crate::editor_joystick::JoystickConfig>,
+    /// Minimized and closed panels kept in the bottom recovery tray across sessions.
+    #[serde(default)]
+    pub minimized: Vec<SavedTab>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -218,8 +221,42 @@ impl Layout {
     /// The saved dock, if it still has the 3D view (else the default is used).
     pub fn dock(&self) -> Option<DockState<Tab>> {
         let d = self.dock.as_ref()?;
-        let dock = d.map_tabs(|t| t.tab());
-        dock.find_tab(&Tab::Viewport).is_some().then_some(dock)
+        let mut dock = d.map_tabs(|t| t.tab());
+        // Heal any legacy layout.json where stripping Tab::Script left leaf.active out of bounds.
+        for (_, node) in dock.iter_all_nodes_mut() {
+            if let egui_dock::Node::Leaf(l) = node {
+                if !l.tabs.is_empty() && l.active.0 >= l.tabs.len() {
+                    l.active = egui_dock::TabIndex(l.tabs.len() - 1);
+                }
+            }
+        }
+        // Reject any legacy corrupted dock tree where a split node has an Empty child
+        // or a non-empty node has an Empty ancestor (prevents egui_dock tree panics).
+        let tree = dock.main_surface();
+        for (idx, node) in tree.iter().enumerate() {
+            let ni = egui_dock::NodeIndex(idx);
+            if !node.is_empty() {
+                let mut cur = ni.parent();
+                while let Some(p) = cur {
+                    if tree[p].is_empty() {
+                        log::warn!("layout_store: discarding corrupted dock layout (empty ancestor at {p:?})");
+                        return None;
+                    }
+                    cur = p.parent();
+                }
+            }
+            if node.is_parent() {
+                let l = ni.left();
+                let r = ni.right();
+                if l.0 >= tree.len() || r.0 >= tree.len() || tree[l].is_empty() || tree[r].is_empty() {
+                    log::warn!("layout_store: discarding corrupted dock layout (split {ni:?} has empty child)");
+                    return None;
+                }
+            }
+        }
+        let vp = dock.find_tab(&Tab::Viewport)?;
+        let _ = dock.set_active_tab(vp);
+        Some(dock)
     }
 
     /// The saved panel windows and homes. Tabs also in `main` (or in an
@@ -248,7 +285,7 @@ impl Layout {
         }
         if let Some(t) = &self.ribbon_tab {
             if let Some(t) = RibbonTab::ALL.into_iter().find(|r| format!("{r:?}") == *t) {
-                ed.ui.tab = t;
+                ed.ui.tab = if t == RibbonTab::Script { RibbonTab::Home } else { t };
             }
         }
         if let Some(t) = &self.run_type {
@@ -278,6 +315,13 @@ impl Layout {
         }
         if let Some(j) = self.joystick {
             ed.joystick_config = j.clamped();
+        }
+        ed.ui.minimized_tabs.clear();
+        for st in &self.minimized {
+            let tab = st.tab();
+            if !matches!(tab, Tab::Viewport | Tab::Script(_)) && !ed.ui.minimized_tabs.contains(&tab) {
+                ed.ui.minimized_tabs.push(tab);
+            }
         }
     }
 
@@ -315,6 +359,9 @@ pub fn saved_dock(dock: &DockState<Tab>) -> DockState<SavedTab> {
                 fix(&mut l.viewport);
                 if !l.scroll.is_finite() {
                     l.scroll = 0.0;
+                }
+                if !l.tabs.is_empty() && l.active.0 >= l.tabs.len() {
+                    l.active = egui_dock::TabIndex(l.tabs.len() - 1);
                 }
             }
             egui_dock::Node::Vertical(s) | egui_dock::Node::Horizontal(s) => {
@@ -466,6 +513,7 @@ impl Saver {
             }),
             floating_windows: mobile_windows.to_saved(),
             joystick: Some(ed.joystick_config),
+            minimized: ed.ui.minimized_tabs.iter().filter_map(SavedTab::from_tab).collect(),
         };
         serde_json::to_string_pretty(&layout).unwrap_or_default()
     }

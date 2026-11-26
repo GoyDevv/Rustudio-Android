@@ -28,7 +28,10 @@ const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// scene-copy, and PostFX memory bandwidth and keeps color+depth at 64 bits/px
 /// (half of Mali-G52's 128-bit tile buffer) with full HDR lighting & bloom.
 fn scene_hdr_format(device: &wgpu::Device) -> wgpu::TextureFormat {
-    if cfg!(target_os = "android") && device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE) {
+    if cfg!(target_os = "android")
+        && device.adapter_info().backend != wgpu::Backend::Gl
+        && device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE)
+    {
         wgpu::TextureFormat::Rg11b10Ufloat
     } else {
         HDR_FORMAT
@@ -575,7 +578,7 @@ pub mod gpu_check {
         // (a device that cannot sample multisampled textures never builds 4x)
         let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
         for &samples in sample_counts {
-            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
+            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, scene_hdr_format(&device), samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -2360,7 +2363,7 @@ impl ViewportPipelines {
             T::TriangleList,
             None,
             false,
-            C::Equal,
+            C::GreaterEqual,
             None,
         );
         let opaque = make(
@@ -2833,7 +2836,7 @@ impl ViewportPipelines {
 /// ARB_shader_texture_image_samples, which pre-Skylake Intel drivers lack),
 /// and an OpenGL device draws one sample anyway (gpu_caps::sampled_msaa).
 fn startup_samples(caps: &crate::gpu_caps::GpuCaps) -> u32 {
-    if caps.sampled_msaa() { SAMPLES } else { 1 }
+    if !cfg!(target_os = "android") && caps.sampled_msaa() { SAMPLES } else { 1 }
 }
 
 fn sample_slot(samples: u32) -> usize {
@@ -2906,6 +2909,7 @@ pub struct Renderer {
     gui_n_lights: u32,
     postfx: crate::postfx::PostFx,
     last_postfx: crate::postfx::PostFxParams,
+    pub defer_postfx: bool,
     shadow: wgpu::RenderPipeline,
     shadow_cutout: wgpu::RenderPipeline,
     /// Each sun cascade's static casters, kept between redraws (SunCache).
@@ -3345,7 +3349,7 @@ impl Renderer {
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
         // current slot, 21 the slot it blends to.
-        let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), scene_hdr_format(device), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
         let probe_globals_bg = Self::globals_group(
             device,
             &bgl,
@@ -3757,6 +3761,7 @@ impl Renderer {
             gui_n_lights: 0,
             postfx: crate::postfx::PostFx::new(device, queue, scene_hdr_format(device), DISPLAY_FORMAT),
             last_postfx: crate::postfx::PostFxParams::default(),
+            defer_postfx: false,
             world_gui: [None, None, None],
             highlight: [None, None, None],
             adorn: [None, None, None],
@@ -3859,11 +3864,13 @@ impl Renderer {
             || rustudio_core::rustudio_settings::performance_value("detail") == "low";
         // (not when the probe's set is the one-sample set already: OpenGL,
         // where it would be built twice)
-        if r.probe_samples != 1 && one_sample_likely && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
+        let prebuild_1x = (r.probe_samples != 1 && one_sample_likely) || cfg!(target_os = "android");
+        if prebuild_1x && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
             let (device, queue) = (device.clone(), queue.clone());
             let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
             let (tx, rx) = std::sync::mpsc::channel();
             let spawned = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
+                let _guard = crate::pipeline_cache::BuildGuard::enter();
                 let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced));
             });
             if spawned.is_ok() {
@@ -4899,39 +4906,86 @@ impl Renderer {
         self.pipelines[sample_slot(samples)].as_ref().expect("viewport pipelines made by ensure_pipelines")
     }
 
+    /// Returns `true` while background 1x viewport pipelines are compiling.
+    pub fn pipelines_compiling(&self) -> bool {
+        self.lower_pending.is_some()
+    }
+
     /// The viewport's passes for `samples` a pixel, built on first use.
-    fn ensure_pipelines(&mut self, rs: &egui_wgpu::RenderState, samples: u32) -> &ViewportPipelines {
+    /// On Android, never blocks the main UI thread (prevents ANR / SIGKILL during cold shader compile).
+    fn ensure_pipelines(&mut self, rs: &egui_wgpu::RenderState, samples: u32) -> bool {
         let slot = sample_slot(samples);
-        if self.pipelines[slot].is_none() {
-            if samples == 1 {
-                // (the worker's, when it was started: the same pipelines)
-                if let Some(rx) = self.lower_pending.take() {
+        if self.pipelines[slot].is_some() {
+            return true;
+        }
+        if samples == 1 {
+            if let Some(rx) = self.lower_pending.as_ref() {
+                if cfg!(target_os = "android") {
+                    match rx.try_recv() {
+                        Ok(p) => {
+                            self.lower_pending = None;
+                            self.pipelines[slot] = Some(p);
+                            return true;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            return false;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            self.lower_pending = None;
+                        }
+                    }
+                } else {
+                    let rx = self.lower_pending.take().unwrap();
                     let _p = rustudio_core::bench::scope("r_pipelines_wait");
                     if let Ok(p) = rx.recv() {
                         self.pipelines[slot] = Some(p);
+                        return true;
                     }
                 }
-            }
-            if self.pipelines[slot].is_none() {
-                let t0 = Instant::now();
-                let made = ViewportPipelines::new(
-                    &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
-                    &self.terrain_layout, samples, self.reduced,
+            } else if cfg!(target_os = "android") {
+                let (device, queue) = (rs.device.clone(), rs.queue.clone());
+                let (g, t, gl, tr, reduced) = (
+                    self.globals_layout.clone(),
+                    self.tex_layout.clone(),
+                    self.glass_layout.clone(),
+                    self.terrain_layout.clone(),
+                    self.reduced,
                 );
-                if rustudio_core::load_trace::startup_trace() {
-                    eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
+                let (tx, rx) = std::sync::mpsc::channel();
+                if std::thread::Builder::new()
+                    .name("rustudio-pipelines".into())
+                    .spawn(move || {
+                        let _guard = crate::pipeline_cache::BuildGuard::enter();
+                        let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced));
+                    })
+                    .is_ok()
+                {
+                    self.lower_pending = Some(rx);
+                    return false;
                 }
-                self.pipelines[slot] = Some(made);
             }
         }
-        self.pipelines[slot].as_ref().expect("just made")
+        if self.pipelines[slot].is_none() {
+            let t0 = Instant::now();
+            let made = ViewportPipelines::new(
+                &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
+                &self.terrain_layout, samples, self.reduced,
+            );
+            if rustudio_core::load_trace::startup_trace() {
+                eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
+            }
+            self.pipelines[slot] = Some(made);
+        }
+        true
     }
 
-    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], samples: u32) {
+    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], samples: u32) -> bool {
         if self.target.as_ref().is_some_and(|t| t.size == size && t.samples == samples) {
-            return;
+            return self.ensure_pipelines(rs, samples);
         }
-        self.ensure_pipelines(rs, samples);
+        if !self.ensure_pipelines(rs, samples) {
+            return false;
+        }
         let device = &rs.device;
         let viewport = self.pipelines(samples);
         let tex =
@@ -5086,6 +5140,7 @@ impl Renderer {
             display,
             display_view,
         });
+        true
     }
 
     /// World GUIs and effects enter the HDR scene before bloom, DoF and
@@ -5101,12 +5156,16 @@ impl Renderer {
     ) {
         let has_fx = fx.is_some_and(|f| !f.draws.is_empty());
         let has_gui = batches.iter().any(|b| !b.indices.is_empty());
+        let deferred = std::mem::take(&mut self.defer_postfx);
         if !has_fx && !has_gui {
+            if deferred {
+                self.finish_again(rs);
+            }
             return;
         }
         let Some(t) = self.target.as_ref() else { return };
         let pass = self.world_gui[sample_slot(t.samples)]
-            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
+            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_hdr_format(&rs.device), t.samples));
         pass.font_texture_update = Some(font_texture_update);
         pass.sun_atlas = self.sun.atlas_view.clone();
         pass.sun_grid = self.lightgrid_view.clone();
@@ -5116,7 +5175,8 @@ impl Renderer {
         // (effects light themselves from the frame's local lights)
         pass.lights = self.lights_buf.clone();
         pass.n_lights = self.gui_n_lights;
-        if pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1, self.gui_exposure) {
+        let drew = pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1, self.gui_exposure);
+        if drew || deferred {
             self.finish_again(rs);
         }
     }
@@ -5261,9 +5321,13 @@ impl Renderer {
         if !self.caps.sampled_msaa() {
             samples = 1;
         }
-        self.ensure_target(rs, size, samples);
+        if !self.ensure_target(rs, size, samples) {
+            return None;
+        }
         if frame.probe.as_ref().is_some_and(|pf| pf.tasks.iter().any(|t| matches!(t, env_probe_gpu::Task::Face(_)))) {
-            self.ensure_pipelines(rs, self.probe_samples);
+            if !self.ensure_pipelines(rs, self.probe_samples) {
+                return None;
+            }
         }
         let device = &rs.device;
         let queue = &rs.queue;
@@ -5545,7 +5609,15 @@ impl Renderer {
                     stats.lod_skipped += 1;
                     continue;
                 }
-                let raw = to_raw(d, item.bias);
+                // Give coplanar decals/textures (e.g. 2048-stud Baseplate Texture)
+                // a small positive reverse-Z depth bias over their host Part so
+                // diagonal float32 interpolation never z-fights into a grey wedge.
+                let draw_bias = if d.tex_mode == TexMode::Decal {
+                    item.bias + 2.5e-4
+                } else {
+                    item.bias
+                };
+                let raw = to_raw(d, draw_bias);
                 // (a skinned mesh's vertices can leave its box)
                 let see_bound = |b: &mut SeeBounds| {
                     if self.meshes.get(mesh_slot(d)).is_some_and(|m| m.storage) {
@@ -6772,14 +6844,16 @@ impl Renderer {
             }
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: ssao");
-        self.postfx.encode(
-            device,
-            queue,
-            &mut encoder,
-            &target.display_view,
-            &self.last_postfx,
-            true,
-        );
+        if !self.defer_postfx {
+            self.postfx.encode(
+                device,
+                queue,
+                &mut encoder,
+                &target.display_view,
+                &self.last_postfx,
+                true,
+            );
+        }
         self.probe.flush(queue);
         let r_scope = rustudio_core::bench::scope("r_finish");
         let commands = encoder.finish();

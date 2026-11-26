@@ -544,12 +544,14 @@ impl PostFx {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let black_bpp = hdr_format.block_copy_size(None).unwrap_or(8);
+        let black_zero = vec![0u8; black_bpp as usize];
         queue.write_texture(
             black_tex.as_image_copy(),
-            &[0u8; 8],
+            &black_zero,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(8),
+                bytes_per_row: Some(black_bpp),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {

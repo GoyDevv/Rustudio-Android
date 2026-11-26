@@ -182,6 +182,7 @@ enum Do {
     Refresh,
     More(ExperienceSource),
     Account,
+    Settings,
     Copy(String),
 }
 
@@ -719,6 +720,7 @@ impl Editor {
                     crate::studio_ui::save_recent(&self.ui);
                 }
                 Do::Account => self.game.account.open = true,
+                Do::Settings => self.ui.studio_settings.open_at("rustudio", false),
                 Do::Copy(s) => ctx.copy_text(s),
             }
         }
@@ -745,6 +747,14 @@ impl Editor {
                     .clicked()
                 {
                     todo.push(Do::Account);
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add(egui::Button::new(RichText::new("⚙ Settings").color(theme::TEXT)).fill(theme::PANEL_ALT))
+                    .on_hover_text("Studio Settings (Graphics API, Quality, UI Scale)")
+                    .clicked()
+                {
+                    todo.push(Do::Settings);
                 }
                 ui.add_space(8.0);
                 ui.add(

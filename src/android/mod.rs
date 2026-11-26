@@ -38,6 +38,7 @@ pub mod clipboard;
 pub mod crash_export;
 pub mod intent;
 pub mod jni;
+pub mod ime_bridge;
 pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
@@ -270,6 +271,7 @@ pub fn run(app: AndroidApp) {
             // (eframe gave up: a surface or device it couldn't make)
             log::error!("eframe: {e}");
             log::error!("rustudio: the editor's loop ended with an error, leaving the process");
+            crate::crash::record_fatal_message("eframe Error", &format!("{e}"));
             std::process::exit(2);
         }
         Err(payload) => {
@@ -289,8 +291,10 @@ pub fn run(app: AndroidApp) {
     // statics (APP, the folders, the destroy hook's context) belong to this
     // activity, and android-activity may run android_main again in the same
     // process otherwise.
-    log::info!("rustudio: editor closed, leaving the process");
-    std::process::exit(0);
+    crate::crash::begin_shutdown();
+    rustudio_core::crash::begin_shutdown();
+    log::info!("rustudio: editor closed, leaving the process cleanly");
+    unsafe { libc::_exit(0) };
 }
 
 /// GPU errors go to logcat instead of ending the process.
@@ -426,6 +430,7 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     log::error!("{line}");
     eprintln!("{line}");
     let _ = rustudio_core::crash::write_event(&why, &line);
+    crate::crash::record_fatal_message("GPU Watchdog", &line);
     if let Err(e) = jni::relaunch() {
         log::error!("rustudio: relaunch: {e}");
     }

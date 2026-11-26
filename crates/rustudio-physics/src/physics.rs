@@ -3602,7 +3602,7 @@ impl Physics {
         // Studio's cyclic executive caps this frame and remembers less
         // than four steps for the next. The worker and inline paths use
         // the same frame budget, including the opening fractional tick.
-        let max_steps = self.throttle.max_world_steps();
+        let max_steps = if cfg!(target_os = "android") { self.throttle.max_world_steps().min(6) } else { self.throttle.max_world_steps() };
         let wanted = self.accum + dt.max(0.0);
         self.accum = wanted.min(h * (max_steps as f32 + mech::PHYSICS_CARRY_MAX_STEPS));
         let owed = ((wanted - self.accum) * 60.0) as u32;
@@ -6596,7 +6596,7 @@ fn par_pool() -> Option<&'static rapier3d::rayon::ThreadPool> {
         let threads = std::env::var("RUSTUDIO_PHYSICS_THREADS").ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&count| count > 0)
-            .unwrap_or(4)
+            .unwrap_or(if cfg!(target_os = "android") { 2 } else { 4 })
             .min(available);
         rapier3d::rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
