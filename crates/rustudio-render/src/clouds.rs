@@ -319,7 +319,7 @@ pub struct CloudsGpu {
 impl CloudsGpu {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, shader_source: &str, hdr: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, samples: u32) -> Self {
         let src = format!("{shader_source}\n{}", include_str!("clouds.wgsl"));
-        let src = if samples == 1 { src.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { src };
+        let src = if samples == 1 { crate::render::single_sample_shader(src) } else { src };
         let src = crate::gpu_caps::shader_for(device, &src);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clouds"),

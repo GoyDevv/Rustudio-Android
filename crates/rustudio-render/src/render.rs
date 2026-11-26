@@ -594,7 +594,7 @@ pub mod gpu_check {
         // (a device that cannot sample multisampled textures never builds 4x)
         let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
         for &samples in sample_counts {
-            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, scene_hdr_format(&caps), samples));
+            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, scene_hdr_format(&caps), samples, caps.vertex_storage_buffers(3)));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -1420,6 +1420,8 @@ struct TerrainChunk {
 
 /// Layers with their own Studio material constants in `MaterialArrays::params`.
 const MAT_PARAM_LAYERS: usize = 256;
+/// Compact material-constants layer count for GPUs with 16 KiB UBO limits (e.g. PowerVR GE8320).
+const MAT_PARAM_LAYERS_COMPACT: usize = 128;
 
 /// Two RGBA8 texture arrays of material maps (layer = pack), mipmapped, and
 /// the part shader's per-layer material constants (shader `mat_params`):
@@ -1437,15 +1439,18 @@ struct MaterialArrays {
     capacity: u32,
     layers: std::collections::HashMap<u64, u32>,
     cpu: Vec<std::sync::Arc<crate::matpack::Maps>>,
+    max_param_layers: usize,
     params: Vec<[f32; 4]>,
     params_buf: wgpu::Buffer,
 }
 
 impl MaterialArrays {
     /// The default constants: no detail map, textureTiling 1, tiled; noise.
-    fn default_params() -> Vec<[f32; 4]> {
-        let mut p = Vec::with_capacity(MAT_PARAM_LAYERS * 5 + 256 + 1024);
-        for _ in 0..MAT_PARAM_LAYERS {
+    fn default_params(compact: bool) -> Vec<[f32; 4]> {
+        let layers = if compact { MAT_PARAM_LAYERS_COMPACT } else { MAT_PARAM_LAYERS };
+        let extra = if compact { 256 } else { 256 + 1024 };
+        let mut p = Vec::with_capacity(layers * 5 + extra);
+        for _ in 0..layers {
             p.push([-1.0, 0.0, 0.0, 1.0]);
             p.push([0.0, 0.0, 4.0, 1.0]);
             p.push([1.0, 1.0, 1.0, 0.0]);
@@ -1453,15 +1458,18 @@ impl MaterialArrays {
             p.push([1.0, 1.0, 1.0, 0.0]);
         }
         p.extend(crate::matpack::detile_noise().chunks(4).map(|c| [c[0], c[1], c[2], c[3]]));
-        p.extend(crate::matpack::wang_index());
+        if !compact {
+            p.extend(crate::matpack::wang_index());
+        }
         p
     }
 
-    fn new(device: &wgpu::Device, size: u32, capacity: u32) -> Self {
-        Self::with_params(device, size, capacity, Self::default_params())
+    fn new(device: &wgpu::Device, size: u32, capacity: u32, compact: bool) -> Self {
+        let max_param_layers = if compact { MAT_PARAM_LAYERS_COMPACT } else { MAT_PARAM_LAYERS };
+        Self::with_params(device, size, capacity, max_param_layers, Self::default_params(compact))
     }
 
-    fn with_params(device: &wgpu::Device, size: u32, capacity: u32, params: Vec<[f32; 4]>) -> Self {
+    fn with_params(device: &wgpu::Device, size: u32, capacity: u32, max_param_layers: usize, params: Vec<[f32; 4]>) -> Self {
         // (OpenGL: a one-layer array would be made a plain 2D texture)
         let layers = if crate::gpu_caps::single_layer_arrays_break(device) { capacity.max(2) } else { capacity };
         let make = |label, format| {
@@ -1506,6 +1514,7 @@ impl MaterialArrays {
             capacity,
             layers: Default::default(),
             cpu: Vec::new(),
+            max_param_layers,
             params,
             params_buf,
         }
@@ -2247,7 +2256,7 @@ impl ViewportPipelines {
         reduced: bool,
         caps: &crate::gpu_caps::GpuCaps,
     ) -> Self {
-        let mut source = shader_source(reduced, caps.storage_lights()).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
+        let mut source = shader_source(reduced, caps.storage_lights(), caps.compact_mat_params()).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
         if cfg!(target_os = "android") {
             source = source
                 .replace("const SSAO_STEPS: u32 = 7u;", "const SSAO_STEPS: u32 = 3u;")
@@ -2886,7 +2895,7 @@ fn supports_two_samples(rs: &egui_wgpu::RenderState, caps: &crate::gpu_caps::Gpu
 
 /// Single-sample textures take a mip level in place of the sample index.
 /// Depth readers that already use index zero need only the type change.
-fn single_sample_shader(source: String) -> String {
+pub(crate) fn single_sample_shader(source: String) -> String {
     source
         .replace("texture_depth_multisampled_2d", "texture_depth_2d")
         .replace("texture_multisampled_2d<f32>", "texture_2d<f32>")
@@ -3080,9 +3089,11 @@ impl Renderer {
     pub fn with_caps(device: &wgpu::Device, queue: &wgpu::Queue, caps: &crate::gpu_caps::GpuCaps) -> Self {
         let reduced = caps.reduced_bindings();
         let caps = caps.clone();
+        let base_src = shader_source(reduced, caps.storage_lights(), caps.compact_mat_params());
+        let base_src = if !caps.sampled_msaa() { single_sample_shader(base_src) } else { base_src };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rustudio viewport"),
-            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &shader_source(reduced, caps.storage_lights())).into()),
+            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &base_src).into()),
         });
         let uniform_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -3363,7 +3374,7 @@ impl Renderer {
             ..Default::default()
         });
         let studs_view = Self::studs_texture(device, queue, 1, 1, &[128, 128, 128, 255]);
-        let materials = MaterialArrays::new(device, 1, 1);
+        let materials = MaterialArrays::new(device, 1, 1, caps.compact_mat_params());
         let studs_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("studs"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -4684,7 +4695,7 @@ impl Renderer {
         if layer >= self.materials.capacity || self.materials.size != crate::matpack::LAYER_SIZE {
             let cap = (layer + 1).next_power_of_two().max(4);
             let params = std::mem::take(&mut self.materials.params);
-            let mut grown = MaterialArrays::with_params(device, crate::matpack::LAYER_SIZE, cap, params);
+            let mut grown = MaterialArrays::with_params(device, crate::matpack::LAYER_SIZE, cap, self.materials.max_param_layers, params);
             grown.layers = std::mem::take(&mut self.materials.layers);
             grown.cpu = std::mem::take(&mut self.materials.cpu);
             // The layers already there are copied on the GPU (their maps
@@ -4705,7 +4716,7 @@ impl Renderer {
         let Ok(l) = usize::try_from(layer) else {
             return;
         };
-        if l >= MAT_PARAM_LAYERS { return; }
+        if l >= self.materials.max_param_layers { return; }
         let mut full = [p[0], p[1], [1.0, 1.0, 1.0, 0.0], [0.0; 4], [1.0, 1.0, 1.0, 0.0]];
         full[1][2] = 4.0;
         full[1][3] = 1.0;
@@ -5209,7 +5220,7 @@ impl Renderer {
         }
         let Some(t) = self.target.as_ref() else { return };
         let pass = self.world_gui[sample_slot(t.samples)]
-            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_hdr_format(&self.caps), t.samples));
+            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_hdr_format(&self.caps), t.samples, self.caps.vertex_storage_buffers(3)));
         pass.font_texture_update = Some(font_texture_update);
         pass.sun_atlas = self.sun.atlas_view.clone();
         pass.sun_grid = self.lightgrid_view.clone();
@@ -5418,6 +5429,9 @@ impl Renderer {
             writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
         }
         self.update_sky_env(queue, &mut globals);
+        let mut globals = globals;
+        globals.low_outdoor[3] = self.sky_tex.mip_level_count().saturating_sub(1) as f32;
+        globals.fog_color[3] = (env_probe_gpu::LEVELS - 1) as f32;
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         self.vf.base = Some(globals);
         self.gui_fog = Self::gui_fog(&frame.globals);
@@ -5860,7 +5874,7 @@ impl Renderer {
                     None => (&self.globals_layout, &self.globals_bg),
                 };
                 let clouds = self.clouds[cloud_slot].get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced, self.caps.storage_lights()), scene_hdr_format(&self.caps), DEPTH_FORMAT, samples)
+                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced, self.caps.storage_lights(), self.caps.compact_mat_params()), scene_hdr_format(&self.caps), DEPTH_FORMAT, samples)
                 });
                 clouds.encode(device, queue, &mut encoder, globals_bg, look, -frame.globals.sun_dir[1], target.size);
             }
@@ -8256,13 +8270,14 @@ fn reduce_bindings<T>(reduced: bool, mut entries: Vec<T>, binding: impl Fn(&T) -
 /// shader.wgsl's `//#if FULL_BINDINGS` / `//#else` / `//#endif` blocks:
 /// the first branch for the full binding set, the second for the reduced
 /// one. The full source is shader.wgsl's code unchanged.
-fn select_bindings(src: &str, reduced: bool, storage_lights: bool) -> String {
+fn select_bindings(src: &str, reduced: bool, storage_lights: bool, compact_mat_params: bool) -> String {
     let mut out = String::with_capacity(src.len());
     let mut active: Option<bool> = None;
     for line in src.split_inclusive('\n') {
         match line.trim() {
             "//#if FULL_BINDINGS" => { assert!(active.is_none(), "nested //#if"); active = Some(!reduced); continue; }
             "//#if STORAGE_LIGHTS" => { assert!(active.is_none(), "nested //#if"); active = Some(storage_lights); continue; }
+            "//#if COMPACT_MAT_PARAMS" => { assert!(active.is_none(), "nested //#if"); active = Some(compact_mat_params); continue; }
             "//#else" => { active = active.map(|a| !a); continue; }
             "//#endif" => { active = None; continue; }
             _ => {}
@@ -8275,8 +8290,8 @@ fn select_bindings(src: &str, reduced: bool, storage_lights: bool) -> String {
     out
 }
 
-fn shader_source(reduced: bool, storage_lights: bool) -> String {
-    select_bindings(&shader_source_all(), reduced, storage_lights)
+fn shader_source(reduced: bool, storage_lights: bool, compact_mat_params: bool) -> String {
+    select_bindings(&shader_source_all(), reduced, storage_lights, compact_mat_params)
 }
 
 fn shader_source_all() -> String {

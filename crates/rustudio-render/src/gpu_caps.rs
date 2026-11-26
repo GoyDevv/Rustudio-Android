@@ -121,9 +121,24 @@ impl GpuCaps {
     }
 
     /// True when fragment/vertex stages support read-only storage buffers
-    /// (GLES 3.0 and some ES 3.1/3.2 drivers report 0).
+    /// (GLES 3.0 and some ES 3.1/3.2 drivers report 0; on OpenGL ES 3.2
+    /// drivers like PowerVR GE8320, fragment SSBOs are often buggy or slow,
+    /// so prefer the 64-light uniform path on OpenGL backends).
     pub fn storage_lights(&self) -> bool {
-        self.limits.max_storage_buffers_per_shader_stage > 0
+        self.backend != wgpu::Backend::Gl && self.limits.max_storage_buffers_per_shader_stage > 0
+    }
+
+    /// True when the uniform buffer binding limit cannot fit the full 40,960 B
+    /// `mat_params` table (e.g. PowerVR GE8320 GLES `GL_MAX_UNIFORM_BLOCK_SIZE = 16384`).
+    pub fn compact_mat_params(&self) -> bool {
+        self.limits.max_uniform_buffer_binding_size < 40_960
+    }
+
+    /// True when vertex shaders can safely bind `needed` read-only storage buffers.
+    pub fn vertex_storage_buffers(&self, needed: u32) -> bool {
+        self.backend != wgpu::Backend::Gl
+            && self.downlevel.contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
+            && self.limits.max_storage_buffers_per_shader_stage >= needed
     }
 
     /// Compute shaders (skinning, HBAO, light grid builds).

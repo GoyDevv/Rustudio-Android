@@ -9,8 +9,8 @@ icon: ../../assets/icons/rustudio-512.png
 android:
   manifest:
     package: com.logosforgestudios.rustudio
-    version_name: "v1.0.4r2"
-    version_code: 16842758
+    version_name: "v1.0.5"
+    version_code: 16842759
     sdk:
       # API 26: VibrationEffect (HapticService); 28: DisplayCutout
       # (ScreenGui.ScreenInsets); 30: WindowInsets.Type.ime (the keyboard's

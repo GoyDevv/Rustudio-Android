@@ -227,7 +227,7 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
 /// prefiltered cube at mip roughness × ENV_SPEC_LOD_SPAN; here that span
 /// ends at the skybox's coarsest mip.
 fn sky_rough(dir: vec3<f32>, rough: f32) -> vec3<f32> {
-    let top = f32(textureNumLevels(sky_tex)) - 1.0;
+    let top = g.low_outdoor.w;
     return sky_color_lod(dir, max(top - ENV_SPEC_LOD_SPAN * (1.0 - rough), 0.0));
 }
 
@@ -242,7 +242,7 @@ fn sky_color_lod(dir: vec3<f32>, lod: f32) -> vec3<f32> {
 /// sampling stays smooth across the horizon instead of dropping to haze at
 /// dir.y <= 0.
 fn env_sky_lod(dir: vec3<f32>, lod_from_base: f32) -> vec3<f32> {
-    let top = f32(textureNumLevels(sky_tex)) - 1.0;
+    let top = g.low_outdoor.w;
     let lod = min(max(top - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + lod_from_base, top);
     if (g.atmos_glare.w > 0.5 && g.params.w > 0.5) {
         let t = textureSampleLevel(sky_tex, sky_sampler, dir, lod).rgb;
@@ -437,8 +437,13 @@ struct PartOut {
 // Studio's PartMaterialConsts per material layer (render.rs MaterialArrays,
 // mech.rs PART_MATERIAL_FULL_*): five rows per layer; see render.rs.
 // Then the 32² detiling noise and packed 128² Wang indices.
+//#if COMPACT_MAT_PARAMS
+const MAT_PARAM_LAYERS: u32 = 128u;
+@group(0) @binding(18) var<uniform> mat_params: array<vec4<f32>, 896>;
+//#else
 const MAT_PARAM_LAYERS: u32 = 256u;
 @group(0) @binding(18) var<uniform> mat_params: array<vec4<f32>, 2560>;
+//#endif
 
 /// The detiling noise at `uv`, bilinear and wrapping like Studio's sampler.
 fn detile_noise(uv: vec2<f32>) -> f32 {
@@ -456,12 +461,16 @@ fn detile_noise(uv: vec2<f32>) -> f32 {
 
 // Point/wrap Wang index, DDS channels L and A exposed as RG by Studio.
 fn wang_uv(uv: vec2<f32>) -> vec2<f32> {
+//#if COMPACT_MAT_PARAMS
+    return uv;
+//#else
     let tile = uv * WANG_CELLS;
     let cell = vec2<i32>(floor(tile)) & vec2<i32>(127);
     let n = u32(cell.y * 128 + cell.x);
     let packed = u32(mat_params[5u * MAT_PARAM_LAYERS + 256u + n / 16u][(n / 4u) % 4u]);
     let index = (packed >> ((n % 4u) * 4u)) & 15u;
     return (vec2<f32>(f32(index & 3u), f32(index >> 2u)) + fract(tile)) / WANG_CELLS;
+//#endif
 }
 
 /// A normal map texel (Roblox maps: X right, Y up the image) as (x, y, z).
@@ -706,7 +715,7 @@ fn brdf_ab(rough: f32, nv: f32) -> vec2<f32> {
 /// the skylight (HQ part FS).
 fn env_reflect(r: vec3<f32>, rough: f32, sky: f32, sharp: bool) -> vec3<f32> {
     let m = select(rough * ENV_SPEC_MIP_PER_ROUGHNESS, 0.0, sharp);
-    let top_i = f32(textureNumLevels(indoor_tex)) - 1.0;
+    let top_i = g.fog_color.w;
     let lod_i = min(max(top_i - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + m, top_i);
     let tint = mix(g.sky_grad[1].rgb, g.sky_grad[0].rgb, clamp(r.y * ENV_REFLECT_UP_GAIN, 0.0, 1.0));
     let outside = env_sky_lod(r, m) * tint;

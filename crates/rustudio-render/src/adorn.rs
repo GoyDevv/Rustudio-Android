@@ -330,6 +330,7 @@ pub struct AdornPass {
 impl AdornPass {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, display: wgpu::TextureFormat, samples: u32) -> Self {
         let src = format!("{}{}", if samples > 1 { DEPTH_MSAA } else { DEPTH_SINGLE }, SHADER_BODY);
+        let src = crate::gpu_caps::shader_for(device, &src);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("adorn3d"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -351,7 +352,7 @@ impl AdornPass {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: samples > 1,
                     },

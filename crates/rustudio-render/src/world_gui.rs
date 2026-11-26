@@ -879,6 +879,7 @@ pub struct WorldGuiPass {
     pub sun_params: [f32; 4],
     pub sun_cascades: SunCascades,
     pipeline: wgpu::RenderPipeline,
+    has_vertex_ssbo: bool,
     depth_bgl: wgpu::BindGroupLayout,
     depth_binding: Option<DepthBinding>,
     tex_bgl: wgpu::BindGroupLayout,
@@ -1182,8 +1183,7 @@ fn mip_dirty_rect(rect: [u32; 4], source: [u32; 2], target: [u32; 2]) -> [u32; 4
 }
 
 impl WorldGuiPass {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, hdr_format: wgpu::TextureFormat, samples: u32) -> Self {
-        let has_vertex_ssbo = device.limits().max_storage_buffers_per_shader_stage >= 3;
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, hdr_format: wgpu::TextureFormat, samples: u32, has_vertex_ssbo: bool) -> Self {
         let mut source = if samples == 1 { SHADER.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { SHADER.to_owned() };
         if !has_vertex_ssbo {
             source = source
@@ -1578,6 +1578,7 @@ impl WorldGuiPass {
             tone_buf,
             staging: wgpu::util::StagingBelt::new(device.clone(), 64 << 10),
             pipeline,
+            has_vertex_ssbo,
             depth_bgl,
             depth_binding: None,
             tex_bgl,
@@ -1976,7 +1977,7 @@ impl WorldGuiPass {
                             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sun_sampler) },
                             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sun_grid) },
                         ];
-                        if device.limits().max_storage_buffers_per_shader_stage >= 3 {
+                        if self.has_vertex_ssbo {
                             entries.extend([
                                 wgpu::BindGroupEntry { binding: 5, resource: self.lights.as_entire_binding() },
                                 wgpu::BindGroupEntry { binding: 6, resource: g0.as_entire_binding() },

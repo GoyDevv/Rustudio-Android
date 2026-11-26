@@ -7,7 +7,7 @@ use egui_wgpu::wgpu;
 use glam::Vec3;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-const LEVELS: u32 = 8; // 128 .. 1
+pub(crate) const LEVELS: u32 = 8; // 128 .. 1
 const PARAM_STRIDE: u64 = 256;
 const PARAM_SLOTS: u64 = 128;
 

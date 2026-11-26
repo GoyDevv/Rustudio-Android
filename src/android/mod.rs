@@ -317,6 +317,7 @@ pub fn run(app: AndroidApp) {
 /// (`gpu_watch`).
 pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|e: egui_wgpu::wgpu::Error| {
+        rustudio_render::gpu_health::record_uncaptured(&e);
         let n = GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if matches!(e, egui_wgpu::wgpu::Error::OutOfMemory { .. }) {
             GPU_OOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
