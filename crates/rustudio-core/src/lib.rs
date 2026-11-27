@@ -41,6 +41,7 @@ pub mod diagnostics;
 pub mod default_scripts;
 pub mod core_scripts;
 pub mod doc;
+pub mod xml_repair;
 /// Server ↔ client instance maps (Play replication) and their readers:
 /// Fx-hashed, as every frame looks up thousands of parts in them.
 pub type RefMap = std::collections::HashMap<rbx_dom_weak::types::Ref, rbx_dom_weak::types::Ref, rustc_hash::FxBuildHasher>;
