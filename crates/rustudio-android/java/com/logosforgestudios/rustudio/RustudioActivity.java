@@ -50,6 +50,7 @@ public class RustudioActivity extends NativeActivity {
     private ImeProxyView imeView;
     private String pendingInstallApkPath = null;
     private BroadcastReceiver installReceiver = null;
+    private boolean imeListenerInstalled = false;
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -62,6 +63,7 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeImeDelete(int before, int after);
     static native void nativeImeKey(int keyCode, boolean down);
     static native void nativeImeAction(int action);
+    static native void nativeImeVisibility(boolean visible, int bottomInsetPx);
     static native void nativeOnLifecycle(int state);
     static native void nativeOnTrimMemory(int level);
     static native void nativeOnSafDocumentCreated(String uri);
@@ -104,6 +106,20 @@ public class RustudioActivity extends NativeActivity {
         if (decor != null) {
             decor.setBackgroundColor(darkBg);
             if (Build.VERSION.SDK_INT >= 30) {
+                if (!imeListenerInstalled) {
+                    imeListenerInstalled = true;
+                    decor.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+                        @Override
+                        public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+                            if (insets != null) {
+                                boolean visible = insets.isVisible(WindowInsets.Type.ime());
+                                int bottom = Math.max(0, insets.getInsets(WindowInsets.Type.ime()).bottom);
+                                nativeImeVisibility(visible, bottom);
+                            }
+                            return v.onApplyWindowInsets(insets);
+                        }
+                    });
+                }
                 WindowInsetsController ctrl = decor.getWindowInsetsController();
                 if (ctrl != null) {
                     ctrl.setSystemBarsAppearance(
@@ -347,6 +363,22 @@ public class RustudioActivity extends NativeActivity {
         // Use killProcess instead of Runtime.exit(0): exit(0) runs C/C++ atexit
         // and static destructors while background Rust/Vulkan/AAudio threads are
         // still alive, triggering Bionic FORTIFY destroyed-mutex SIGABRT.
+        android.os.Process.killProcess(android.os.Process.myPid());
+    }
+
+    /**
+     * Closes the app task cleanly and terminates the current process without
+     * running C/C++ atexit destructors while background threads are still alive.
+     */
+    public void exitApp() {
+        try {
+            if (Build.VERSION.SDK_INT >= 21) {
+                finishAndRemoveTask();
+            } else {
+                finishAffinity();
+            }
+        } catch (Throwable ignored) {
+        }
         android.os.Process.killProcess(android.os.Process.myPid());
     }
 

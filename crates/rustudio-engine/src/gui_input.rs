@@ -195,6 +195,16 @@ impl Gui {
         sh.focus_events.clear();
     }
 
+    /// Drops local TextBox focus without clearing shared `focus_events`
+    /// (used when Android keyboard dismissal already queued `FocusLost`).
+    pub fn clear_local_focus(&mut self) {
+        self.focus = None;
+        self.tb_cursor = -1;
+        self.tb_sel = -1;
+        self.tb_selecting = None;
+        self.tb_held_key = None;
+    }
+
     /// Keeps the list of SurfaceGuis / BillboardGuis under Workspace from the
     /// document's journal: scanning Place B's 116k instances for them was
     /// 8 ms a frame. Call before `draw`.
@@ -2721,6 +2731,9 @@ impl Gui {
                 self.tb_held_key = None;
             }
             self.focus = req;
+        }
+        if self.focus.is_some() && super::share().focus != self.focus {
+            self.clear_local_focus();
         }
         for (r, cur, sel) in script_sels {
             if self.focus == Some(r) {

@@ -21,6 +21,64 @@ pub const AXIS_COLORS: [Color32; 3] = [
 const HOVER_COLOR: Color32 = Color32::from_rgb(255, 214, 92);
 
 /// A gizmo handle: which axis, which end, which tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiHandle {
+    Move,
+    TL,
+    T,
+    TR,
+    R,
+    BR,
+    B,
+    BL,
+    L,
+}
+
+#[derive(Debug, Clone)]
+struct GuiDragState {
+    r: Ref,
+    handle: GuiHandle,
+    start_pointer: Pos2,
+    orig_pos: rbx_dom_weak::types::UDim2,
+    orig_size: rbx_dom_weak::types::UDim2,
+    parent_size: Vec2,
+    anchor: Vec2,
+    orig_rect: Rect,
+}
+
+thread_local! {
+    static GUI_DRAG: std::cell::RefCell<Option<GuiDragState>> = const { std::cell::RefCell::new(None) };
+}
+
+fn gui_drag_active() -> bool {
+    GUI_DRAG.with(|g| g.borrow().is_some())
+}
+
+fn gui_handle_centers(r: Rect) -> [(GuiHandle, Pos2); 8] {
+    [
+        (GuiHandle::TL, r.left_top()),
+        (GuiHandle::T, Pos2::new(r.center().x, r.top())),
+        (GuiHandle::TR, r.right_top()),
+        (GuiHandle::R, Pos2::new(r.right(), r.center().y)),
+        (GuiHandle::BR, r.right_bottom()),
+        (GuiHandle::B, Pos2::new(r.center().x, r.bottom())),
+        (GuiHandle::BL, r.left_bottom()),
+        (GuiHandle::L, Pos2::new(r.left(), r.center().y)),
+    ]
+}
+
+fn gui_handle_hit_radius() -> f32 {
+    if cfg!(target_os = "android") { 18.0 } else { 9.0 }
+}
+
+fn apply_udim_delta(orig: rbx_dom_weak::types::UDim, delta_px: f32, parent_px: f32) -> rbx_dom_weak::types::UDim {
+    if orig.scale.abs() > 1e-4 && orig.offset == 0 && parent_px > 1.0 {
+        rbx_dom_weak::types::UDim::new(orig.scale + delta_px / parent_px, 0)
+    } else {
+        rbx_dom_weak::types::UDim::new(orig.scale, orig.offset + delta_px.round() as i32)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Handle {
     pub tool: Tool,
@@ -688,8 +746,13 @@ impl Editor {
                     // Always deliver Move/End/Cancel to the finger that ALREADY owns the joystick,
                     // even if the thumb drifted onto a side/bottom panel or floating window.
                     let owns_joy = self.editor_joystick.active_touch() == Some(tid);
+                    let on_gui_handle = !owns_joy
+                        && (gui_drag_active()
+                            || (phase == egui::TouchPhase::Start
+                                && self.gui_overlay_handle_at(rect, pos).is_some()));
                     if !owns_joy
-                        && (self.game.touch.is_ui_touch(tid)
+                        && (on_gui_handle
+                            || self.game.touch.is_ui_touch(tid)
                             || self.mobile_window_rects.iter().any(|r| r.contains(pos))
                             || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background))
                     {
@@ -872,13 +935,12 @@ impl Editor {
             if driving {
                 ui.extend_from_slice(&self.mobile_window_rects);
             }
-            let mut direct_drag = if driving {
-                Vec::new()
-            } else {
-                std::mem::take(&mut self.game.touch.zones.direct_drag)
-            };
+            let mut direct_drag = Vec::new();
             if !driving {
                 direct_drag.extend_from_slice(&self.mobile_drag_rects);
+                if let Some((_, gui_rect)) = self.selected_gui_overlay_rect(rect) {
+                    direct_drag.push(gui_rect.expand(gui_handle_hit_radius()));
+                }
             }
             self.game.touch.zones = rustudio_engine::touch_input::Zones {
                 viewport: if menu_open { egui::Rect::NOTHING } else { visible },
@@ -960,10 +1022,7 @@ impl Editor {
             ctx.request_repaint();
         }
         self.hud.viewport_drawn |= self.game.viewport_drawn;
-        // Draw floating left-side virtual joystick in Edit mode (never during Play).
-        if !self.clean_view {
-            self.editor_joystick.draw(&painter, rect, driving, &joystick_cfg);
-        }
+
         if !self.clean_view && rustudio_core::rustudio_settings::perf_overlay_enabled() {
             self.perf_overlay.draw(&ctx, rect);
         }
@@ -1071,9 +1130,20 @@ impl Editor {
                 crate::part_drag::HOTKEY_HELP_HIDDEN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // -------------------------------------------------- 2D GUI editor drag
+        let gui_drag_took = if !playing && !self.clean_view && self.ui.show_gui && !in_game && !press_taken && !brushing && !pointer_on_mobile_win && !self.editor_joystick.is_active() {
+            self.update_gui_2d_drag(&ctx, rect, &resp, pointer)
+        } else {
+            if gui_drag_active() {
+                self.finish_gui_2d_drag();
+            }
+            false
+        };
+
         // -------------------------------------------------- select & gizmo
-        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win;
-        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win {
+        let pointer_on_overlay = pointer.is_some_and(|p| ctx.layer_id_at(p).is_some_and(|l| l.order != egui::Order::Background));
+        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay;
+        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
                 // A handle takes the press even with Alt held (Alt = scale all axes).
@@ -1126,7 +1196,7 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !pointer_on_joystick && !pointer_on_mobile_win {
+        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self.game
@@ -1273,7 +1343,13 @@ impl Editor {
         if !self.game.is_playing() && !self.clean_view {
             let _s = rustudio_core::bench::scope("vp_view_selector");
             self.draw_viewport_hud(ui, rect);
+            self.draw_gui_selection_overlay(&painter, rect);
             self.draw_drag_hotkeys(&painter, rect);
+        }
+        // Draw floating left-side virtual joystick AFTER StarterGui, 2D GUI selection
+        // overlay, and drag hotkeys so StarterGui elements never paint over it.
+        if !self.clean_view {
+            self.editor_joystick.draw(&painter, rect, driving, &joystick_cfg);
         }
         // A Toolbox card dragged here: preview and drop (src/toolbox/glue.rs).
         if !self.game.is_playing()
@@ -2763,6 +2839,213 @@ mod outline_tests {
         assert!(with_edges > 30, "most cases draw an outline ({with_edges})");
         for s in std::iter::once(&many).chain(&many_extra).chain(std::iter::once(&one)) {
             assert!(s.delta.iter().all(|d| *d == 0), "buffers are left clear");
+        }
+    }
+}
+
+impl Editor {
+    /// Returns the single selected `GuiObject` and its screen-space rect when
+    /// editing StarterGui in edit mode.
+    fn selected_gui_overlay_rect(&self, viewport: Rect) -> Option<(Ref, Rect)> {
+        if self.game.is_playing() || !self.ui.show_gui || self.game.doc.selection.len() != 1 {
+            return None;
+        }
+        let r = self.game.doc.selection[0];
+        let class = self.game.doc.class_of(r)?;
+        if !rustudio_core::doc::is_a(class.as_str(), "GuiObject") {
+            return None;
+        }
+        let gui_rect = self.game.gui.rect_of(r, viewport)?;
+        Some((r, gui_rect))
+    }
+
+    /// Returns which of the 8 resize handles (if any) contains `pos`.
+    fn gui_overlay_handle_at(&self, viewport: Rect, pos: Pos2) -> Option<GuiHandle> {
+        let (_, gui_rect) = self.selected_gui_overlay_rect(viewport)?;
+        let hit_r = gui_handle_hit_radius();
+        for (h, c) in gui_handle_centers(gui_rect) {
+            if (pos.x - c.x).abs() <= hit_r && (pos.y - c.y).abs() <= hit_r {
+                return Some(h);
+            }
+        }
+        None
+    }
+
+    /// Handles 2D move/resize dragging of the selected `GuiObject` in edit mode.
+    /// Returns true when the GUI overlay consumed the pointer interaction.
+    fn update_gui_2d_drag(
+        &mut self,
+        ctx: &egui::Context,
+        viewport: Rect,
+        resp: &egui::Response,
+        pointer: Option<Pos2>,
+    ) -> bool {
+        let down = ctx.input(|i| i.pointer.primary_down());
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let Some((r, gui_rect)) = self.selected_gui_overlay_rect(viewport) else {
+            if gui_drag_active() {
+                self.finish_gui_2d_drag();
+            }
+            return false;
+        };
+
+        if pressed || resp.drag_started_by(PointerButton::Primary) {
+            if let Some(p) = ctx.input(|i| i.pointer.press_origin()).or(pointer) {
+                let handle = self.gui_overlay_handle_at(viewport, p).or_else(|| {
+                    gui_rect.contains(p).then_some(GuiHandle::Move)
+                });
+                if let Some(handle) = handle {
+                    let orig_pos = match self.game.doc.prop(r, "Position") {
+                        Some(Variant::UDim2(u)) => u,
+                        _ => rbx_dom_weak::types::UDim2::new(
+                            rbx_dom_weak::types::UDim::new(0.0, 0),
+                            rbx_dom_weak::types::UDim::new(0.0, 0),
+                        ),
+                    };
+                    let orig_size = match self.game.doc.prop(r, "Size") {
+                        Some(Variant::UDim2(u)) => u,
+                        _ => rbx_dom_weak::types::UDim2::new(
+                            rbx_dom_weak::types::UDim::new(0.0, gui_rect.width().round() as i32),
+                            rbx_dom_weak::types::UDim::new(0.0, gui_rect.height().round() as i32),
+                        ),
+                    };
+                    let anchor = match self.game.doc.prop(r, "AnchorPoint") {
+                        Some(Variant::Vector2(v)) => Vec2::new(v.x, v.y),
+                        _ => Vec2::ZERO,
+                    };
+                    let parent_rect = self.game.gui.parent_rect_of(&self.game.doc, r, viewport);
+                    GUI_DRAG.with(|g| {
+                        *g.borrow_mut() = Some(GuiDragState {
+                            r,
+                            handle,
+                            start_pointer: p,
+                            orig_pos,
+                            orig_size,
+                            parent_size: parent_rect.size(),
+                            anchor,
+                            orig_rect: gui_rect,
+                        });
+                    });
+                    return true;
+                }
+            }
+        }
+
+        let active = GUI_DRAG.with(|g| g.borrow().clone());
+        if let Some(st) = active {
+            if st.r != r {
+                self.finish_gui_2d_drag();
+                return false;
+            }
+            if down {
+                if let Some(p) = ctx.input(|i| i.pointer.interact_pos()).or(pointer) {
+                    let d = p - st.start_pointer;
+                    if d.length_sq() > 0.25 {
+                        match st.handle {
+                            GuiHandle::Move => {
+                                let new_pos = rbx_dom_weak::types::UDim2::new(
+                                    apply_udim_delta(st.orig_pos.x, d.x, st.parent_size.x),
+                                    apply_udim_delta(st.orig_pos.y, d.y, st.parent_size.y),
+                                );
+                                self.game.doc.set_prop_live(r, ustr("Position"), Variant::UDim2(new_pos));
+                            }
+                            h => {
+                                let mut min_x = st.orig_rect.min.x;
+                                let mut max_x = st.orig_rect.max.x;
+                                let mut min_y = st.orig_rect.min.y;
+                                let mut max_y = st.orig_rect.max.y;
+                                const MIN_SZ: f32 = 4.0;
+                                match h {
+                                    GuiHandle::TL | GuiHandle::L | GuiHandle::BL => {
+                                        min_x = (min_x + d.x).min(max_x - MIN_SZ);
+                                    }
+                                    GuiHandle::TR | GuiHandle::R | GuiHandle::BR => {
+                                        max_x = (max_x + d.x).max(min_x + MIN_SZ);
+                                    }
+                                    _ => {}
+                                }
+                                match h {
+                                    GuiHandle::TL | GuiHandle::T | GuiHandle::TR => {
+                                        min_y = (min_y + d.y).min(max_y - MIN_SZ);
+                                    }
+                                    GuiHandle::BL | GuiHandle::B | GuiHandle::BR => {
+                                        max_y = (max_y + d.y).max(min_y + MIN_SZ);
+                                    }
+                                    _ => {}
+                                }
+                                let new_w = max_x - min_x;
+                                let new_h = max_y - min_y;
+                                let dw = new_w - st.orig_rect.width();
+                                let dh = new_h - st.orig_rect.height();
+                                let orig_anchor_pt = st.orig_rect.min
+                                    + Vec2::new(st.orig_rect.width() * st.anchor.x, st.orig_rect.height() * st.anchor.y);
+                                let new_anchor_pt = Pos2::new(
+                                    min_x + new_w * st.anchor.x,
+                                    min_y + new_h * st.anchor.y,
+                                );
+                                let dp = new_anchor_pt - orig_anchor_pt;
+                                let new_size = rbx_dom_weak::types::UDim2::new(
+                                    apply_udim_delta(st.orig_size.x, dw, st.parent_size.x),
+                                    apply_udim_delta(st.orig_size.y, dh, st.parent_size.y),
+                                );
+                                let new_pos = rbx_dom_weak::types::UDim2::new(
+                                    apply_udim_delta(st.orig_pos.x, dp.x, st.parent_size.x),
+                                    apply_udim_delta(st.orig_pos.y, dp.y, st.parent_size.y),
+                                );
+                                self.game.doc.set_prop_live(r, ustr("Size"), Variant::UDim2(new_size));
+                                self.game.doc.set_prop_live(r, ustr("Position"), Variant::UDim2(new_pos));
+                            }
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                return true;
+            } else {
+                self.finish_gui_2d_drag();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn finish_gui_2d_drag(&mut self) {
+        let Some(st) = GUI_DRAG.with(|g| g.borrow_mut().take()) else {
+            return;
+        };
+        let mut changes = Vec::new();
+        let pos_k = ustr("Position");
+        if let Some(new_pos) = self.game.doc.dom.get_by_ref(st.r).and_then(|i| i.properties.get(&pos_k)).cloned() {
+            let old = Variant::UDim2(st.orig_pos);
+            if new_pos != old {
+                changes.push((st.r, pos_k, Some(old), new_pos));
+            }
+        }
+        let size_k = ustr("Size");
+        if let Some(new_size) = self.game.doc.dom.get_by_ref(st.r).and_then(|i| i.properties.get(&size_k)).cloned() {
+            let old = Variant::UDim2(st.orig_size);
+            if new_size != old {
+                changes.push((st.r, size_k, Some(old), new_size));
+            }
+        }
+        if !changes.is_empty() {
+            let label = if st.handle == GuiHandle::Move { "Move GuiObject" } else { "Resize GuiObject" };
+            self.game.doc.record_props(label, changes);
+        }
+    }
+
+    /// Draws Roblox Studio's 2D blue selection box and 8 white touch-friendly
+    /// resize handles around the selected `GuiObject`.
+    fn draw_gui_selection_overlay(&self, painter: &egui::Painter, viewport: Rect) {
+        let Some((_, gui_rect)) = self.selected_gui_overlay_rect(viewport) else {
+            return;
+        };
+        let blue = Color32::from_rgb(0, 162, 255);
+        painter.rect_stroke(gui_rect, 0.0, Stroke::new(2.0, blue), egui::StrokeKind::Outside);
+        let handle_sz = if cfg!(target_os = "android") { 12.0 } else { 8.0 };
+        for (_, c) in gui_handle_centers(gui_rect) {
+            let hr = Rect::from_center_size(c, Vec2::splat(handle_sz));
+            painter.rect_filled(hr, 1.5, Color32::WHITE);
+            painter.rect_stroke(hr, 1.5, Stroke::new(1.5, blue), egui::StrokeKind::Outside);
         }
     }
 }

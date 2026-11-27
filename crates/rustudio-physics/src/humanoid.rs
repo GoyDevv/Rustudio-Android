@@ -274,6 +274,9 @@ pub struct Body {
     /// The character's contacts with other assemblies this step: (world
     /// point, normal pointing toward the character) (unstick's gather).
     pub contacts: Vec<(Vec3, Vec3)>,
+    /// Active velocity mover (`BodyVelocity` / `LinearVelocity`) with nonzero
+    /// horizontal `MaxForce` on the root assembly along world `[X, Z]`.
+    pub vel_mover_xz: [bool; 2],
 }
 
 /// One step's output: on the root assembly, and on the floor's assembly.
@@ -857,6 +860,9 @@ impl Humanoid {
                                 }
                             }
                         }
+                        if e < 0.0 && v.y > 0.0 {
+                            a = a.max(0.0);
+                        }
                         fpd = if !solid {
                             (a.min(ACCEL_MAX) * m).max(m / PD_REF_MASS * PD_SOFT_MIN).min(m / PD_REF_MASS * PD_SOFT_MAX)
                         } else {
@@ -887,8 +893,16 @@ impl Humanoid {
                 ay = ay.max(ACCEL_Y_MIN).min(ACCEL_MAX);
             }
             // Horizontal.
-            let mut ax = (self.v_des.x + self.floor_v.x - v.x) * VEL_GAIN - b.fext.x / m;
-            let mut az = (self.v_des.z + self.floor_v.z - v.z) * VEL_GAIN - b.fext.z / m;
+            let mut ax = if b.vel_mover_xz[0] {
+                0.0
+            } else {
+                (self.v_des.x + self.floor_v.x - v.x) * VEL_GAIN - b.fext.x / m
+            };
+            let mut az = if b.vel_mover_xz[1] {
+                0.0
+            } else {
+                (self.v_des.z + self.floor_v.z - v.z) * VEL_GAIN - b.fext.z / m
+            };
             let a2 = ax * ax + az * az;
             if max_a * max_a < a2 {
                 let l = a2.sqrt();
@@ -1007,8 +1021,8 @@ impl Humanoid {
         let push = self.unstick(b);
         let nh = Vec3::new(self.contact_n.x, 0.0, self.contact_n.z);
         self.v_air -= nh * self.v_air.dot(nh);
-        let mut ax = (self.v_air.x - b.v.x) * VEL_GAIN;
-        let mut az = (self.v_air.z - b.v.z) * VEL_GAIN;
+        let mut ax = if b.vel_mover_xz[0] { 0.0 } else { (self.v_air.x - b.v.x) * VEL_GAIN };
+        let mut az = if b.vel_mover_xz[1] { 0.0 } else { (self.v_air.z - b.v.z) * VEL_GAIN };
         let cap = AIR_ACCEL * 1.0;
         let a2 = ax * ax + az * az;
         if cap * cap < a2 {
@@ -1154,6 +1168,7 @@ mod tests {
             hrp_y: y,
             gravity: 196.2,
             contacts: Vec::new(),
+            vel_mover_xz: [false, false],
         }
     }
 
@@ -1282,5 +1297,40 @@ mod tests {
         assert!((v.length() - 16.0).abs() < 1e-3 && v.y > 0.0, "{v:?}");
         let v = off_slope(n, Vec3::new(-16.0, 0.0, 0.0));
         assert!(v.x.abs() < 1e-4, "{v:?}");
+    }
+
+    #[test]
+    fn altitude_pd_does_not_pull_down_during_upward_liftoff() {
+        let hip = 3.192423;
+        let mut hum = Humanoid { state: State::Running, floor_target_y: hip, ..Default::default() };
+        let inp = StepIn { floor: Some(floor(0.3)), full_hip: hip, cos_max_slope: 0.0175, ladder: false, jump_velocity: 50.0, accel_scale: 1.0, ceiling: false };
+        // Above floor_target_y (e < 0) and moving upward (v.y > 0): Altitude PD must not pull downward.
+        let f = hum.running_force(&body(Vec3::new(0.0, 40.0, 0.0), hip + 0.5), &inp, 1, H);
+        assert!(f.force.y >= 0.0, "upward lift-off must not be pulled downward: {:?}", f.force);
+    }
+
+    #[test]
+    fn vel_mover_xz_skips_horizontal_idle_braking() {
+        let hip = 3.19;
+        let inp = StepIn { floor: Some(floor(0.3)), full_hip: hip, cos_max_slope: 0.0175, ladder: false, jump_velocity: 50.0, accel_scale: 1.0, ceiling: false };
+
+        let mut hum = Humanoid { state: State::Running, floor_target_y: hip, ..Default::default() };
+        let b_normal = body(Vec3::new(0.0, 0.0, -50.0), hip);
+        let f_normal = hum.running_force(&b_normal, &inp, 1, H);
+        assert!(f_normal.force.z > 100.0, "idle ground braking should oppose -Z velocity: {:?}", f_normal.force);
+
+        let mut b_dash = body(Vec3::new(50.0, 0.0, -50.0), hip);
+        b_dash.vel_mover_xz = [false, true];
+        let f_dash = hum.running_force(&b_dash, &inp, 1, H);
+        assert!(f_dash.force.z.abs() < 1e-4, "driven Z axis must skip idle braking: {:?}", f_dash.force);
+        assert!(f_dash.force.x < -100.0, "undriven X axis must keep idle braking: {:?}", f_dash.force);
+
+        let mut hum_air = Humanoid { state: State::Freefall, ..Default::default() };
+        let f_air_normal = hum_air.freefall_force(&b_normal, 1, H);
+        assert!(f_air_normal.force.z > 0.0, "freefall should oppose -Z velocity when undriven: {:?}", f_air_normal.force);
+        let mut b_air_dash = body(Vec3::new(0.0, 0.0, -50.0), hip + 4.0);
+        b_air_dash.vel_mover_xz = [false, true];
+        let f_air_dash = hum_air.freefall_force(&b_air_dash, 1, H);
+        assert!(f_air_dash.force.z.abs() < 1e-4, "driven Z axis must skip freefall braking: {:?}", f_air_dash.force);
     }
 }

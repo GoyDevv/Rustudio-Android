@@ -314,10 +314,15 @@ fn sunken(p: &egui::Painter, rect: Rect) {
     p.line_segment([Pos2::new(rect.min.x, rect.max.y + 0.5), Pos2::new(rect.max.x + 1.0, rect.max.y + 0.5)], Stroke::new(1.0, EDGE_LIGHT));
 }
 
-/// Where the dialog's content (the 522 × 399 Qt client area) starts.
+/// Where the dialog's content (the 522 × 399 Qt client area) starts,
+/// clamped inside the screen rect so it stays reachable on mobile screens.
 pub fn dialog_origin(ctx: &egui::Context) -> Pos2 {
     let s = ctx.content_rect();
-    Pos2::new((s.center().x - DIALOG_SIZE.x * 0.5).round(), (s.center().y - (DIALOG_SIZE.y + TITLE_H) * 0.5).round() + TITLE_H)
+    let max_x = (s.max.x - DIALOG_SIZE.x).max(s.min.x);
+    let max_y = (s.max.y - DIALOG_SIZE.y).max(s.min.y + TITLE_H);
+    let x = (s.center().x - DIALOG_SIZE.x * 0.5).round().clamp(s.min.x, max_x);
+    let y = ((s.center().y - (DIALOG_SIZE.y + TITLE_H) * 0.5).round() + TITLE_H).clamp(s.min.y + TITLE_H, max_y);
+    Pos2::new(x, y)
 }
 
 /// Draws the Select Color dialog (modal); what changed.
@@ -357,6 +362,7 @@ pub fn color_dialog_ui(ctx: &egui::Context, d: &mut ColorDialog, custom: &mut [O
     }
     egui::Area::new(egui::Id::new("color_dialog"))
         .order(egui::Order::Foreground)
+        .constrain_to(ctx.content_rect())
         .fixed_pos(o - Vec2::new(0.0, TITLE_H))
         .show(ctx, |ui| {
             ui.ctx().move_to_top(ui.layer_id());

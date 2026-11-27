@@ -444,7 +444,7 @@ impl Editor {
         let max_h = (ui.clip_rect().max.y - anchor.y - 20.0).max(160.0).min(520.0);
         let area = toolbox_popup(ui, "tbham", anchor + Vec2::new(8.0, 0.0), |ui| {
             ui.set_width(w);
-            egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(max_h).scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() }).show(ui, |ui| {
                 for t in categories::TOP {
                     let open = self.toolbox.ui.expanded.contains(t.key) || t.key == "3d" && self.toolbox.ui.expanded.is_empty();
                     let kids = categories::children(t.key);
@@ -511,7 +511,7 @@ impl Editor {
     /// (across hiding and restarts) and reports when the end is near.
     fn scroll_view(&mut self, ui: &mut egui::Ui, add: impl FnOnce(&mut Self, &mut egui::Ui, Rect) -> ()) -> bool {
         let key = self.view_key();
-        let mut sa = egui::ScrollArea::vertical().id_salt(("tbscroll", key.clone())).auto_shrink([false, false]);
+        let mut sa = egui::ScrollArea::vertical().id_salt(("tbscroll", key.clone())).auto_shrink([false, false]).scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() });
         if self.toolbox.ui.scroll_to_top {
             sa = sa.vertical_scroll_offset(0.0);
             self.toolbox.ui.scroll_to_top = false;
@@ -1579,7 +1579,7 @@ impl Editor {
             let ui = &mut inner;
             egui::Frame::new().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::DIVIDER)).corner_radius(4.0).inner_margin(10.0).show(ui, |ui| {
                 ui.set_width(sheet.width() - 20.0);
-                egui::ScrollArea::vertical().max_height(sheet.height() - 20.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(sheet.height() - 20.0).scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() }).show(ui, |ui| {
                     ui.label(egui::RichText::new("Sort By").font(bold(13.0)).color(theme::TEXT));
                     ui.radio_value(&mut f.sort, Sort::Relevance, "Relevance");
                     ui.radio_value(&mut f.sort, Sort::Ratings, "Rating");

@@ -79,6 +79,8 @@ pub struct QuickView {
     stop: Arc<AtomicBool>,
     /// The browser was sent to the confirm page for this code.
     pub opened: bool,
+    /// The code was copied to the system clipboard.
+    pub copied: bool,
 }
 
 impl QuickView {
@@ -656,6 +658,16 @@ impl Account {
                 let _ = tx.send(Msg::Head(id, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())));
             }
         });
+    }
+
+    /// Returns the cached headshot texture for `id`, if already loaded.
+    pub fn head_texture(&self, id: u64) -> Option<&egui::TextureHandle> {
+        self.heads.get(&id)
+    }
+
+    /// Inserts a decoded headshot image into the texture cache on the next `heads()` poll.
+    pub fn push_head_image(&mut self, id: u64, img: egui::ColorImage) {
+        self.head_images.push((id, img));
     }
 
     /// The headshot (or an initial on a plate) painted into `r`.

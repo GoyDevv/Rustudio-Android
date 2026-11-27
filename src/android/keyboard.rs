@@ -80,7 +80,7 @@ use std::time::{Duration, Instant};
 
 use egui::{SafeAreaInsets, epaint::MarginF32};
 
-use super::jni::KeyboardAnswer;
+use super::jni::{KeyboardAnswer, KeyboardState};
 
 /// How often the height is read while it matters.
 const POLL: Duration = Duration::from_millis(100);
@@ -103,17 +103,29 @@ const HIDE_AFTER: Duration = Duration::from_millis(250);
 
 /// Set for the frame after the room for the keyboard changed (`reveal`).
 static CHANGED: AtomicBool = AtomicBool::new(false);
+/// Set when the user hides the soft keyboard while a Roblox TextBox has focus,
+/// so plugin / game GUIs immediately drop their local focus on the next frame.
+static TEXTBOX_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` once after the soft keyboard dismissed a focused Roblox TextBox.
+pub fn take_textbox_released() -> bool {
+    TEXTBOX_RELEASED.swap(false, Ordering::AcqRel)
+}
 
 #[derive(Default)]
 pub struct Keyboard {
     polled: Option<Instant>,
     /// The question out to the main thread, and when it was asked.
     asked: Option<(Instant, KeyboardAnswer)>,
+    /// Whether the soft keyboard is currently visible (including floating keyboards with height 0).
+    visible: bool,
     /// The height the panels make room for, in pixels (0: none).
     height_px: i32,
-    /// The last height read, and how many times running it was read.
-    last_read: Option<(i32, u32)>,
-    /// Since when the readings have been 0 while room is made.
+    /// The last state read, and how many times running it was read.
+    last_read: Option<(KeyboardState, u32)>,
+    /// Last `(visible, bottom_inset_px)` pushed by API 30+ `OnApplyWindowInsetsListener`.
+    last_pushed_ime: Option<(bool, i32)>,
+    /// Since when the readings have been down while visible / room is made.
     zero_since: Option<Instant>,
     /// What the keyboard is up for.
     up_for: Option<Want>,
@@ -123,6 +135,9 @@ pub struct Keyboard {
     shown: bool,
     /// The text field or TextBox that last held focus while the keyboard was shown.
     last_want: Option<Want>,
+    /// Suppress re-opening the keyboard for this focus target right after the
+    /// user dismissed it (prevents plugin TextBox infinite re-open loops).
+    suppress_reopen: Option<Want>,
     /// Since when nothing has wanted the keyboard, while `shown`.
     unwanted_since: Option<Instant>,
     /// The keyboard lies over the window (up for a game's TextBox): no
@@ -157,14 +172,15 @@ pub fn wanted(ctx: &egui::Context, textbox: bool) -> Option<Want> {
 /// Releases a focused TextBox as a click elsewhere would: the scripts fire
 /// FocusLost (`focus_events`), the GUI stops typing into it (`focus_req`).
 fn release_textbox() {
-    for ch in 0..2u8 {
+    for ch in 0..3u8 {
         let _c = rustudio_engine::gui::share_channel(ch);
         let mut sh = rustudio_engine::gui::share();
         if let Some(f) = sh.focus.take() {
             sh.focus_events.push((f, false, false, None));
-            sh.focus_req.push(None);
         }
+        sh.focus_req.push(None);
     }
+    TEXTBOX_RELEASED.store(true, Ordering::Release);
 }
 
 /// Asks the activity for the keyboard (what winit's `set_ime_allowed` does).
@@ -232,10 +248,22 @@ impl Keyboard {
         CHANGED.store(false, Ordering::Relaxed);
         if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false))) {
             self.shown = false;
+            self.visible = false;
             self.last_want = None;
+            self.suppress_reopen = None;
             self.unwanted_since = None;
             self.up_for = None;
             self.zero_since = None;
+        }
+        if let Some(pushed) = super::ime_bridge::ime_visibility() {
+            if self.last_pushed_ime != Some(pushed) {
+                self.last_pushed_ime = Some(pushed);
+                let st = KeyboardState {
+                    visible: pushed.0 || pushed.1 > 0,
+                    height_px: pushed.1.max(0),
+                };
+                self.record_read(st);
+            }
         }
         let want = wanted(ctx, textbox);
         if let Some(w) = want {
@@ -243,7 +271,10 @@ impl Keyboard {
             // box is typed into only while none is)
             self.over = w == Want::TextBox && game_box;
         }
-        let watching = want.is_some() || self.height_px > 0 || self.last_read.is_some_and(|(h, _)| h > 0);
+        let watching = want.is_some()
+            || self.visible
+            || self.height_px > 0
+            || self.last_read.is_some_and(|(s, _)| s.visible || s.height_px > 0);
         if watching {
             let now = Instant::now();
             match want {
@@ -273,6 +304,13 @@ impl Keyboard {
         raw.safe_area_insets = Some(SafeAreaInsets(MarginF32 { left: 0.0, right: 0.0, top: 0.0, bottom }));
     }
 
+    fn record_read(&mut self, state: KeyboardState) {
+        self.last_read = Some(match self.last_read {
+            Some((prev, n)) if prev == state => (prev, n.saturating_add(1)),
+            _ => (state, 1),
+        });
+    }
+
     /// The last question's answer, once it has come.
     fn take_answer(&mut self, now: Instant) {
         let Some((when, slot)) = &self.asked else { return };
@@ -281,17 +319,17 @@ impl Keyboard {
         match answer {
             Some(answer) => {
                 self.asked = None;
-                let height = match answer {
-                    Ok(h) => h.max(0),
+                let state = match answer {
+                    Ok(s) => KeyboardState {
+                        visible: s.visible || s.height_px > 0,
+                        height_px: s.height_px.max(0),
+                    },
                     Err(e) => {
-                        log::warn!("keyboard height: {e}");
+                        log::warn!("keyboard state: {e}");
                         return;
                     }
                 };
-                self.last_read = Some(match self.last_read {
-                    Some((h, n)) if h == height => (h, n.saturating_add(1)),
-                    _ => (height, 1),
-                });
+                self.record_read(state);
             }
             None if now.duration_since(when) >= GIVE_UP => self.asked = None,
             None => {}
@@ -302,26 +340,28 @@ impl Keyboard {
     fn follow(&mut self, ctx: &egui::Context, want: Option<Want>, now: Instant) {
         let Some((read, runs)) = self.last_read else { return };
         let since_focus = || self.focus_since.map_or(0, |t| now.duration_since(t).as_millis());
-        if read > 0 {
+        if read.visible {
             self.zero_since = None;
             if want.is_some() {
                 self.up_for = want;
             }
-            if self.height_px == 0 {
-                log::info!("soft keyboard up: {read} px, {} ms after the focus", since_focus());
-                self.set_height(read);
-            } else if read != self.height_px && runs >= STEADY_READS {
-                log::info!("soft keyboard now {read} px (was {})", self.height_px);
-                self.set_height(read);
+            if !self.visible {
+                log::info!("soft keyboard up: {} px, {} ms after the focus", read.height_px, since_focus());
+                self.visible = true;
+                self.set_height(read.height_px);
+            } else if read.height_px != self.height_px && runs >= STEADY_READS {
+                log::info!("soft keyboard now {} px (was {})", read.height_px, self.height_px);
+                self.set_height(read.height_px);
             }
             return;
         }
         // Read as down.
-        if self.height_px == 0 {
+        if !self.visible && self.height_px == 0 {
             return;
         }
         let Some(want) = want else {
             log::info!("soft keyboard down: nothing to type into");
+            self.visible = false;
             self.up_for = None;
             self.zero_since = None;
             self.set_height(0);
@@ -347,7 +387,9 @@ impl Keyboard {
             Want::TextBox => release_textbox(),
         }
         self.shown = false;
+        self.visible = false;
         self.last_want = None;
+        self.suppress_reopen = Some(want);
         self.up_for = None;
         self.zero_since = None;
         self.set_height(0);
@@ -359,6 +401,12 @@ impl Keyboard {
     pub fn end_frame(&mut self, ctx: &egui::Context, textbox: bool, keep_open: bool) {
         ctx.output_mut(|o| o.ime = None);
         let want = wanted(ctx, textbox);
+        if ctx.input(|i| i.pointer.any_pressed()) || want != self.suppress_reopen {
+            self.suppress_reopen = None;
+        }
+        if want.is_some() && want == self.suppress_reopen {
+            return;
+        }
         let now = Instant::now();
         if keep_open && self.shown {
             self.unwanted_since = None;

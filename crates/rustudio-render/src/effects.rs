@@ -2046,6 +2046,8 @@ pub struct Effects {
     /// it (dropped when the journal marks it).
     poses: FxHashMap<Ref, Pose>,
     pose_deps: FxHashMap<Ref, FxHashSet<Ref>>,
+    /// Reverse index of `pose_deps`: effect → instances that reference it.
+    pose_deps_rev: FxHashMap<Ref, Vec<Ref>>,
     /// Beams' kept strips (dropped with their pose).
     kept: FxHashMap<Ref, Kept>,
 }
@@ -2059,6 +2061,11 @@ fn is_effect(d: &Document, r: Ref) -> bool {
 fn light_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RUSTUDIO_FX_LIGHT_CHECK").is_some())
+}
+
+fn fx_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_FX_TRACE").is_some())
 }
 
 /// What a frame needs from the viewport.
@@ -2145,14 +2152,34 @@ impl Effects {
         }
     }
 
+    fn remove_pose_deps(&mut self, e: Ref) {
+        if let Some(deps) = self.pose_deps_rev.remove(&e) {
+            for dep in deps {
+                if let Some(set) = self.pose_deps.get_mut(&dep) {
+                    set.remove(&e);
+                    if set.is_empty() {
+                        self.pose_deps.remove(&dep);
+                    }
+                }
+            }
+        }
+    }
+
     /// Effect `r`'s pose, read from the document when not kept.
-    fn pose(poses: &mut FxHashMap<Ref, Pose>, pose_deps: &mut FxHashMap<Ref, FxHashSet<Ref>>, d: &Document, r: Ref, cfg: &Cfg) -> Pose {
+    fn pose(
+        poses: &mut FxHashMap<Ref, Pose>,
+        pose_deps: &mut FxHashMap<Ref, FxHashSet<Ref>>,
+        pose_deps_rev: &mut FxHashMap<Ref, Vec<Ref>>,
+        d: &Document,
+        r: Ref,
+        cfg: &Cfg,
+    ) -> Pose {
         if let Some(p) = poses.get(&r) {
             if pose_check() {
                 // (RUSTUDIO_FX_POSE_CHECK: the kept pose against a fresh read)
                 let kept = *p;
                 poses.remove(&r);
-                let fresh = Self::pose(poses, pose_deps, d, r, cfg);
+                let fresh = Self::pose(poses, pose_deps, pose_deps_rev, d, r, cfg);
                 if !kept.same(&fresh) {
                     let name = d.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
                     eprintln!("[fx pose check] {name} {r:?} kept a stale pose");
@@ -2223,10 +2250,26 @@ impl Effects {
             }
             Cfg::Constraint(_) => Pose::Ends(None, None),
         };
+        if let Some(old_deps) = pose_deps_rev.remove(&r) {
+            for dep in old_deps {
+                if let Some(set) = pose_deps.get_mut(&dep) {
+                    set.remove(&r);
+                    if set.is_empty() {
+                        pose_deps.remove(&dep);
+                    }
+                }
+            }
+        }
+        let mut rev = Vec::with_capacity(deps.len());
         for dep in deps {
             // (a set: thousands of Beams' Attachments can share one part,
             // and a list scanned per pose was quadratic in them)
-            pose_deps.entry(dep).or_default().insert(r);
+            if pose_deps.entry(dep).or_default().insert(r) {
+                rev.push(dep);
+            }
+        }
+        if !rev.is_empty() {
+            pose_deps_rev.insert(r, rev);
         }
         poses.insert(r, pose);
         pose
@@ -2237,7 +2280,7 @@ impl Effects {
         if let doc::Marks::Some(marks) = marks {
             if self.doc_id == d.id {
                 let ws = d.workspace();
-                let mut removed = false;
+                let mut removed = Vec::new();
                 for m in marks {
                     match m {
                         doc::Mark::Tree(t) => {
@@ -2249,7 +2292,7 @@ impl Effects {
                                 if keep && self.set.insert(r) {
                                     self.list.push(r);
                                 } else if !keep && self.set.remove(&r) {
-                                    removed = true;
+                                    removed.push(r);
                                 }
                             }
                         }
@@ -2261,19 +2304,21 @@ impl Effects {
                         }
                     }
                 }
-                if removed {
+                if !removed.is_empty() {
+                    for &r in &removed {
+                        if self.set.contains(&r) {
+                            continue;
+                        }
+                        self.kept.remove(&r);
+                        self.emitters.remove(&r);
+                        self.sparkles_extra.remove(&r);
+                        self.trails.remove(&r);
+                        self.poses.remove(&r);
+                        self.beam_phase.remove(&r);
+                        self.remove_pose_deps(r);
+                    }
                     let set = &self.set;
-                    self.kept.retain(|r, _| set.contains(r));
                     self.list.retain(|r| set.contains(r));
-                    self.emitters.retain(|r, _| set.contains(r));
-                    self.sparkles_extra.retain(|r, _| set.contains(r));
-                    self.trails.retain(|r, _| set.contains(r));
-                    self.poses.retain(|r, _| set.contains(r));
-                    self.beam_phase.retain(|r, _| set.contains(r));
-                    self.pose_deps.retain(|_, l| {
-                        l.retain(|r| set.contains(r));
-                        !l.is_empty()
-                    });
                 }
                 return;
             }
@@ -2293,6 +2338,7 @@ impl Effects {
         self.cfg.clear();
         self.poses.clear();
         self.pose_deps.clear();
+        self.pose_deps_rev.clear();
         self.kept.clear();
         self.emitters.clear();
         self.sparkles_extra.clear();
@@ -2414,7 +2460,7 @@ impl Effects {
             });
             let t1 = rustudio_core::bench::now();
             t_cfg += t1 - t0;
-            let pose = Self::pose(&mut self.poses, &mut self.pose_deps, d, r, cfg);
+            let pose = Self::pose(&mut self.poses, &mut self.pose_deps, &mut self.pose_deps_rev, d, r, cfg);
             t_pose += rustudio_core::bench::now() - t1;
             match cfg {
                 Cfg::Constraint(r) => {
@@ -2604,7 +2650,7 @@ impl Effects {
             }
         }
         rustudio_core::bench::add("fx_particles", 0.0, n_particles as u64);
-        if std::env::var_os("RUSTUDIO_FX_TRACE").is_some() && (now / 5.0).floor() != ((now - dt as f64) / 5.0).floor() {
+        if fx_trace() && (now / 5.0).floor() != ((now - dt as f64) / 5.0).floor() {
             eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim={:.3}", particle_budget - budget, t_sim);
         }
 

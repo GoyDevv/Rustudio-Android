@@ -30,6 +30,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, LazyLock, Mutex};
 use rustc_hash::FxHashSet;
 use rustudio_core::doc::{Mark, Marks, Reader};
 
@@ -64,6 +65,7 @@ const MIN_BLEND_WEIGHT: f64 = 0.001;
 /// The name of Part0 and Part1, or the parent Bone and child Bone names.
 type JointName = (Ustr, Ustr);
 type KeyframeJoints = rustc_hash::FxHashMap<JointName, Vec<Key>>;
+type CurveJoints = rustc_hash::FxHashMap<JointName, Table>;
 
 struct BoundJoint {
     name: JointName,
@@ -94,26 +96,36 @@ struct Frame {
 pub struct Seq {
     /// Native keyframes can be sampled without the Lua VM.
     keys: KeyframeJoints,
-    /// CurveAnimation channels are Lua tables and stay on the VM thread.
-    curves: rustc_hash::FxHashMap<JointName, Table>,
     /// CurveAnimation FaceControls FACS channels (control name -> FloatCurve keys).
     facs: rustc_hash::FxHashMap<Ustr, Vec<FloatKey>>,
     frames: Vec<Frame>,
     length: f64,
     looped: bool,
-    priority: Value,
+    /// AnimationPriority enum value (Core = 1000, Idle = 0, ..., Action4 = 5).
+    priority: u32,
     /// A CurveAnimation (GetTimeOfKeyframe refuses it, as Studio does).
     curve: bool,
     /// The clip's authoring rig (its AnimationRigData), for retargeting.
-    rig: Option<Rc<super::anim_retarget::Rig>>,
+    rig: Option<Arc<super::anim_retarget::Rig>>,
 }
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Seq>();
+};
+
+/// Process-wide cache of natively decoded KeyframeSequence assets by asset id,
+/// populated by background `PreloadAsync` workers (`predecode_kfs`) or on first
+/// load (`load`) without inserting temporary Models into the live World DOM.
+static SEQ_CACHE: LazyLock<Mutex<HashMap<u64, Arc<Seq>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct Track {
     me: Value,
     anim: Value,
     owner: Ref,
     rig: Ref,
-    seq: Option<Rc<Seq>>,
+    seq: Option<Arc<Seq>>,
     pending: Option<String>,
     playing: bool,
     active: bool,
@@ -145,7 +157,9 @@ pub struct Tracks {
     /// Load order (iteration order of the step).
     order: Vec<Ref>,
     all: HashMap<Ref, Track>,
-    seqs: HashMap<String, Rc<Seq>>,
+    seqs: HashMap<String, Arc<Seq>>,
+    /// Per-VM CurveAnimation channel Lua tables keyed by `Arc::as_ptr(&seq) as usize`.
+    seq_curves: HashMap<usize, Rc<CurveJoints>>,
     /// Rig → cached animation bindings, refreshed when its topology changes.
     animated: rustc_hash::FxHashMap<Ref, RigBindings>,
     /// The order in which rigs began posing.
@@ -188,9 +202,182 @@ fn xform_of(v: &Value) -> Option<Xform> {
     }
 }
 
-fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
+fn priority_value(lua: &Lua, val: u32) -> mlua::Result<Value> {
+    let item = LEnumItem::from_value("AnimationPriority", val)
+        .or_else(|| LEnumItem::from_name("AnimationPriority", "Core"));
+    match item {
+        Some(e) => crate::ltypes::enum_value(lua, e),
+        None => Ok(Value::Nil),
+    }
+}
+
+/// Decodes `.rbxm`/`.rbxmx` `KeyframeSequence` bytes directly from a scratch
+/// `WeakDom` without inserting a temporary `Model` into the live `World` DOM.
+/// Returns `None` for non-`KeyframeSequence` clips (e.g. `CurveAnimation`) so
+/// `load()` falls back to the Lua curve loader.
+pub fn decode_kfs_bytes(bytes: &[u8]) -> Option<Seq> {
+    let doc = rbx_dom_weak::with_scratch_refs(|| {
+        let dom = rustudio_core::doc::Document::decode(bytes).ok()?;
+        Some(rustudio_core::doc::Document::from_play_dom(dom, String::new()))
+    })?;
+    // Find the first KeyframeSequence descendant (breadth-first, matching FindFirstChildWhichIsA).
+    let mut queue = VecDeque::from([doc.dom.root_ref()]);
+    let mut kfs_ref = None;
+    while let Some(r) = queue.pop_front() {
+        let Some(inst) = doc.dom.get_by_ref(r) else { continue };
+        if r != doc.dom.root_ref() && rustudio_core::doc::is_a(&inst.class, "KeyframeSequence") {
+            kfs_ref = Some(r);
+            break;
+        }
+        queue.extend(inst.children().iter().copied());
+    }
+    let kfs_ref = kfs_ref?;
+
+    let enum_name = |v: Option<Variant>, e: &str, dflt: &str| match v {
+        Some(Variant::Enum(x)) => LEnumItem::from_value(e, x.to_u32())
+            .map(|i| i.name)
+            .unwrap_or_else(|| dflt.to_string()),
+        _ => dflt.to_string(),
+    };
+    let num = |v: Option<Variant>, dflt: f64| match v {
+        Some(Variant::Float32(f)) => f as f64,
+        Some(Variant::Float64(f)) => f,
+        Some(Variant::Int32(i)) => i as f64,
+        _ => dflt,
+    };
+
+    fn walk_poses(
+        d: &rustudio_core::doc::Document,
+        parent: Ref,
+        parent_name: &str,
+        t: f64,
+        keys: &mut KeyframeJoints,
+        enum_name: &dyn Fn(Option<Variant>, &str, &str) -> String,
+        num: &dyn Fn(Option<Variant>, f64) -> f64,
+    ) {
+        let Some(i) = d.dom.get_by_ref(parent) else { return };
+        for &c in i.children() {
+            let Some(ci) = d.dom.get_by_ref(c) else { continue };
+            if !rustudio_core::doc::is_a(&ci.class, "Pose") {
+                continue;
+            }
+            if num(d.prop(c, "Weight"), 1.0) > 0.0 {
+                let cf = match d.prop(c, "CFrame") {
+                    Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf),
+                    _ => super::anim_ik::ident(),
+                };
+                let style = enum_name(d.prop(c, "EasingStyle"), "PoseEasingStyle", "Linear");
+                let dir = enum_name(d.prop(c, "EasingDirection"), "PoseEasingDirection", "In");
+                keys.entry((ustr(parent_name), ustr(&ci.name)))
+                    .or_default()
+                    .push(Key {
+                        t,
+                        cf,
+                        rotation: Quat::from_mat3(&cf.rot),
+                        style,
+                        dir,
+                    });
+            }
+            walk_poses(d, c, &ci.name, t, keys, enum_name, num);
+        }
+    }
+
+    let mut keys = KeyframeJoints::default();
+    let mut frames = Vec::new();
+    let mut length = 0.0f64;
+
+    if let Some(ki) = doc.dom.get_by_ref(kfs_ref) {
+        for &k in ki.children() {
+            let Some(kk) = doc.dom.get_by_ref(k) else { continue };
+            if !rustudio_core::doc::is_a(&kk.class, "Keyframe") {
+                continue;
+            }
+            let t = num(doc.prop(k, "Time"), 0.0);
+            if t > length {
+                length = t;
+            }
+            walk_poses(&doc, k, "", t, &mut keys, &enum_name, &num);
+            let markers = kk
+                .children()
+                .iter()
+                .filter_map(|m| doc.dom.get_by_ref(*m))
+                .filter(|m| rustudio_core::doc::is_a(&m.class, "KeyframeMarker"))
+                .map(|m| {
+                    let v = match doc.prop(m.referent(), "Value") {
+                        Some(Variant::String(s)) => s,
+                        _ => String::new(),
+                    };
+                    (m.name.clone(), v)
+                })
+                .collect();
+            frames.push(Frame {
+                t,
+                name: kk.name.clone(),
+                markers,
+            });
+        }
+    }
+
+    for list in keys.values_mut() {
+        list.sort_by(|a, b| a.t.total_cmp(&b.t));
+    }
+    frames.sort_by(|a, b| a.t.total_cmp(&b.t));
+
+    let looped = match doc.prop(kfs_ref, "Loop") {
+        Some(Variant::Bool(b)) => b,
+        _ => true,
+    };
+    let priority = match doc.prop(kfs_ref, "Priority") {
+        Some(Variant::Enum(x)) => x.to_u32(),
+        _ => 1000,
+    };
+    let rig = doc
+        .dom
+        .get_by_ref(kfs_ref)
+        .and_then(|ki| {
+            ki.children().iter().copied().find(|&c| {
+                doc.dom
+                    .get_by_ref(c)
+                    .is_some_and(|ci| ci.class.as_str() == "AnimationRigData")
+            })
+        })
+        .and_then(|r| super::anim_retarget::clip_rig(&doc, r))
+        .map(Arc::new);
+
+    Some(Seq {
+        keys,
+        facs: rustc_hash::FxHashMap::default(),
+        frames,
+        length,
+        looped,
+        priority,
+        curve: false,
+        rig,
+    })
+}
+
+/// Pre-decodes a `KeyframeSequence` asset into `SEQ_CACHE` on a background
+/// worker thread so `LoadAnimation` serves it immediately without DOM leaks.
+pub fn predecode_kfs(asset_id: u64, bytes: &[u8]) {
+    if SEQ_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&asset_id)
+    {
+        return;
+    }
+    if let Some(seq) = decode_kfs_bytes(bytes) {
+        SEQ_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(asset_id)
+            .or_insert_with(|| Arc::new(seq));
+    }
+}
+
+fn convert(lua: &Lua, t: &Table) -> mlua::Result<(Seq, CurveJoints)> {
     let mut keyframes = KeyframeJoints::default();
-    let mut curves = rustc_hash::FxHashMap::default();
+    let mut curves = CurveJoints::default();
     let jt: Table = t.get("joints")?;
     for pair in jt.pairs::<String, Table>() {
         let (parent, children) = pair?;
@@ -251,28 +438,82 @@ fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
     let rig = match opt_inst(&t.get::<Value>("rig")?) {
         Some(r) => {
             let w = world(lua)?;
-            super::anim_retarget::clip_rig(w.d(), r).map(Rc::new)
+            super::anim_retarget::clip_rig(w.d(), r).map(Arc::new)
         }
         None => None,
     };
-    Ok(Seq {
-        rig,
-        keys: keyframes,
+    let priority = match t.get::<Value>("priority")? {
+        Value::UserData(u) => u.borrow::<LEnumItem>().map(|e| e.value).unwrap_or(1000),
+        _ => 1000,
+    };
+    Ok((
+        Seq {
+            rig,
+            keys: keyframes,
+            facs,
+            frames,
+            length: t.get::<Option<f64>>("length")?.unwrap_or(0.0),
+            looped: t.get::<Option<bool>>("loop")?.unwrap_or(false),
+            priority,
+            curve: t.get::<Option<bool>>("curve")?.unwrap_or(false),
+        },
         curves,
-        facs,
-        frames,
-        length: t.get::<Option<f64>>("length")?.unwrap_or(0.0),
-        looped: t.get::<Option<bool>>("loop")?.unwrap_or(false),
-        priority: t.get("priority")?,
-        curve: t.get::<Option<bool>>("curve")?.unwrap_or(false),
-    })
+    ))
 }
 
 /// The sequence for an id: (Some, _) loaded, (None, true) still
 /// downloading, (None, false) unavailable.
-fn load(lua: &Lua, id: &str) -> mlua::Result<(Option<Rc<Seq>>, bool)> {
+fn load(lua: &Lua, id: &str) -> mlua::Result<(Option<Arc<Seq>>, bool)> {
     if let Some(s) = tracks(lua).seqs.get(id) {
         return Ok((Some(s.clone()), false));
+    }
+    let is_registered = lua
+        .globals()
+        .get::<Function>("__rs_anim_registered")
+        .ok()
+        .and_then(|f| f.call::<Value>(id).ok())
+        .is_some_and(|v| !matches!(v, Value::Nil));
+    if !is_registered && !id.contains("rbxtemp") {
+        if let Some(a) = rustudio_core::assets::asset_ref(id) {
+            if let Some(s) = SEQ_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&a.id)
+                .cloned()
+            {
+                tracks(lua).seqs.insert(id.to_string(), s.clone());
+                return Ok((Some(s), false));
+            }
+            let mut fetch = rustudio_core::assets::public_prefetch(a.id);
+            if rbx_dom_weak::deterministic() {
+                let t0 = std::time::Instant::now();
+                while matches!(fetch, rustudio_core::assets::Fetch::Pending)
+                    && t0.elapsed() < std::time::Duration::from_secs(20)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    fetch = rustudio_core::assets::public_prefetch(a.id);
+                }
+            }
+            match fetch {
+                rustudio_core::assets::Fetch::Ready(bytes) => {
+                    if let Some(seq) = decode_kfs_bytes(&bytes) {
+                        let s = Arc::new(seq);
+                        SEQ_CACHE
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(a.id)
+                            .or_insert_with(|| s.clone());
+                        tracks(lua).seqs.insert(id.to_string(), s.clone());
+                        return Ok((Some(s), false));
+                    }
+                    // Not a KeyframeSequence (e.g. CurveAnimation): fall through to Lua.
+                }
+                rustudio_core::assets::Fetch::Pending => return Ok((None, true)),
+                rustudio_core::assets::Fetch::Unavailable(_) => {
+                    // Fall through to `__rs_anim_load` for Roblox-parity warning.
+                }
+            }
+        }
     }
     let f: Function = lua.globals().get("__rs_anim_load")?;
     let (mut seq, mut still): (Value, bool) = f.call(id)?;
@@ -286,8 +527,13 @@ fn load(lua: &Lua, id: &str) -> mlua::Result<(Option<Rc<Seq>>, bool)> {
         }
     }
     let Value::Table(t) = seq else { return Ok((None, still)) };
-    let s = Rc::new(convert(lua, &t)?);
-    tracks(lua).seqs.insert(id.to_string(), s.clone());
+    let (seq, curves) = convert(lua, &t)?;
+    let s = Arc::new(seq);
+    let mut tr = tracks(lua);
+    if !curves.is_empty() {
+        tr.seq_curves.insert(Arc::as_ptr(&s) as usize, Rc::new(curves));
+    }
+    tr.seqs.insert(id.to_string(), s.clone());
     Ok((Some(s), false))
 }
 
@@ -511,6 +757,10 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
     };
     if let Some(id) = pending {
         let (seq, still) = load(lua, &id)?;
+        let seq_prio = match &seq {
+            Some(seq) => Some(priority_value(lua, seq.priority)?),
+            None => None,
+        };
         if let Some(st) = tracks(lua).all.get_mut(&r) {
             if let Some(seq) = &seq {
                 st.seq = Some(seq.clone());
@@ -518,7 +768,9 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
                     st.looped = seq.looped;
                 }
                 if !st.priority_set {
-                    st.priority = seq.priority.clone();
+                    if let Some(p) = seq_prio {
+                        st.priority = p;
+                    }
                 }
                 if st.start_at_end {
                     st.time = seq.length;
@@ -817,9 +1069,9 @@ fn retargeting_enabled(lua: &Lua) -> mlua::Result<bool> {
 
 /// The retargeter for a clip on a rig: the clip carries an AnimationRigData
 /// and the rig is an R15 Humanoid character.
-fn retargeter_for(lua: &Lua, seq: &Rc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<super::anim_retarget::Retargeter>>> {
+fn retargeter_for(lua: &Lua, seq: &Arc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<super::anim_retarget::Retargeter>>> {
     let Some(src) = seq.rig.clone() else { return Ok(None) };
-    let key = (Rc::as_ptr(seq) as usize, rig);
+    let key = (Arc::as_ptr(seq) as usize, rig);
     if let Some(r) = tracks(lua).retargeters.get(&key) {
         return Ok(Some(r.clone()));
     }
@@ -1094,7 +1346,8 @@ fn write_facs(lua: &Lua, face_controls: &[Ref], tracks_list: &[PoseTrack]) -> ml
 }
 
 struct PoseTrack {
-    seq: Rc<Seq>,
+    seq: Arc<Seq>,
+    curves: Option<Rc<CurveJoints>>,
     weight: f64,
     rank: i64,
     time: f64,
@@ -1291,13 +1544,18 @@ fn step_filtered(lua: &Lua, only_owner: Option<Ref>, dt: f64) -> mlua::Result<()
             let t = tracks(lua);
             list.iter()
                 .filter_map(|r| t.all.get(r))
-                .filter_map(|s| Some(PoseTrack {
-                    seq: s.seq.clone()?,
-                    weight: s.weight,
-                    rank: rank(&s.priority),
-                    time: s.time,
-                    retargeter: None,
-                }))
+                .filter_map(|s| {
+                    let seq = s.seq.clone()?;
+                    let curves = t.seq_curves.get(&(Arc::as_ptr(&seq) as usize)).cloned();
+                    Some(PoseTrack {
+                        seq,
+                        curves,
+                        weight: s.weight,
+                        rank: rank(&s.priority),
+                        time: s.time,
+                        retargeter: None,
+                    })
+                })
                 .collect()
         };
         let retarget = match retarget_on {
@@ -1311,7 +1569,7 @@ fn step_filtered(lua: &Lua, only_owner: Option<Ref>, dt: f64) -> mlua::Result<()
         }
         rigs.push((joints, face_controls, posing));
     }
-    let keyframes_only = |tracks: &[PoseTrack]| tracks.iter().all(|t| t.seq.curves.is_empty());
+    let keyframes_only = |tracks: &[PoseTrack]| tracks.iter().all(|t| t.curves.is_none());
     let native_count = rigs.iter().filter(|(_, _, tracks)| keyframes_only(tracks)).count();
     let mut worker_poses = if let Some(pool) = crate::rig::character_pool(native_count) {
         let inputs: Vec<_> = rigs.iter().filter(|(_, _, tracks)| keyframes_only(tracks)).map(|(joints, _, tracks)| {
@@ -1353,7 +1611,7 @@ fn step_filtered(lua: &Lua, only_owner: Option<Ref>, dt: f64) -> mlua::Result<()
             for joint in joints.iter() {
                 contributions.clear();
                 for track in &tracks {
-                    let cf = if let Some(curves) = joint.channel(&track.seq.curves) {
+                    let cf = if let Some(curves) = track.curves.as_deref().and_then(|c| joint.channel(c)) {
                         let f: Function = lua.globals().get("__rs_anim_sample")?;
                         xform_of(&f.call::<Value>((curves.clone(), track.time))?)
                     } else {
@@ -1474,13 +1732,17 @@ fn new_track(lua: &Lua, (me, anim, owner, rig, id): (Value, Value, Value, Value,
         .map(|e| crate::ltypes::enum_value(lua, e))
         .transpose()?
         .unwrap_or(Value::Nil);
+    let priority = match &seq {
+        Some(s) => priority_value(lua, s.priority)?,
+        None => core,
+    };
     let st = Track {
         me: Value::Nil,
         anim,
         owner: me_ref(&owner).unwrap_or_else(Ref::none),
         rig: me_ref(&rig).unwrap_or_else(Ref::none),
         looped: seq.as_ref().is_some_and(|s| s.looped),
-        priority: seq.as_ref().map(|s| s.priority.clone()).unwrap_or(core),
+        priority,
         seq,
         pending: pending.then_some(id),
         playing: false,
@@ -1727,7 +1989,10 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "__rs_anim_forget",
         lua.create_function(|lua, id: String| {
-            tracks(lua).seqs.remove(&id);
+            let mut tr = tracks(lua);
+            if let Some(old) = tr.seqs.remove(&id) {
+                tr.seq_curves.remove(&(Arc::as_ptr(&old) as usize));
+            }
             Ok(())
         })?,
     )?;

@@ -3,7 +3,24 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Whether section timing (`bench::scope` / `bench::add`) is active for an
+/// ongoing `Bench` measurement window.
+static SECTIONS_ON: AtomicBool = AtomicBool::new(false);
+/// Reference count of `Bench` instances currently in their measurement window.
+static BENCH_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn sections_on() -> bool {
+    if SECTIONS_ON.load(Ordering::Relaxed) {
+        return true;
+    }
+    static ENV_ON: OnceLock<bool> = OnceLock::new();
+    *ENV_ON.get_or_init(|| totals_on() || instr_on())
+}
 
 thread_local! {
     static SECTIONS: RefCell<Vec<(&'static str, f64, u64)>> = const { RefCell::new(Vec::new()) };
@@ -14,18 +31,22 @@ thread_local! {
 /// the profiler records.
 pub struct Scope {
     name: &'static str,
-    t0: Instant,
+    t0: Option<Instant>,
     i0: u64,
     _prof: crate::profiler::Guard,
 }
 
 #[track_caller]
 pub fn scope(name: &'static str) -> Scope {
+    let _prof = crate::profiler::scope(name, crate::profiler::Cat::Auto);
+    if !sections_on() && name != "p3_physics_step" {
+        return Scope { name, t0: None, i0: 0, _prof };
+    }
     Scope {
         name,
-        t0: Instant::now(),
+        t0: Some(Instant::now()),
         i0: if instr_on() { instructions() } else { 0 },
-        _prof: crate::profiler::scope(name, crate::profiler::Cat::Auto),
+        _prof,
     }
 }
 
@@ -95,10 +116,11 @@ fn instr_note() -> Option<&'static str> {
 
 impl Drop for Scope {
     fn drop(&mut self) {
+        let Some(t0) = self.t0 else { return };
         let ms = if instr_on() {
             instructions().saturating_sub(self.i0) as f64 / 1e6
         } else {
-            self.t0.elapsed().as_secs_f64() * 1000.0
+            t0.elapsed().as_secs_f64() * 1000.0
         };
         SECTIONS.with(|s| {
             let mut s = s.borrow_mut();
@@ -365,6 +387,9 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, f64) {
 }
 
 pub fn add(name: &'static str, ms: f64, calls: u64) {
+    if !sections_on() && name != "p3_physics_step" {
+        return;
+    }
     SECTIONS.with(|s| {
         let mut s = s.borrow_mut();
         match s.iter_mut().find(|e| std::ptr::eq(e.0, name) || e.0 == name) {
@@ -471,6 +496,13 @@ pub struct Bench {
     /// bench's unit. Written beside the report as OUT.frames.json.
     per_frame: Vec<(f64, f32, Vec<(&'static str, f64)>)>,
     instr_last: u64,
+    sections_active: bool,
+}
+
+impl Drop for Bench {
+    fn drop(&mut self) {
+        self.stop_sections();
+    }
 }
 
 impl Bench {
@@ -500,6 +532,16 @@ impl Bench {
             cpu_ms: 0.0,
             per_frame: Vec::new(),
             instr_last: 0,
+            sections_active: false,
+        }
+    }
+
+    fn stop_sections(&mut self) {
+        if self.sections_active {
+            self.sections_active = false;
+            if BENCH_ACTIVE.fetch_sub(1, Ordering::AcqRel) == 1 {
+                SECTIONS_ON.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -530,6 +572,11 @@ impl Bench {
             self.cpu0 = thread_cpu_ms();
             if let Some(note) = instr_note() {
                 eprintln!("RUSTUDIO_BENCH_INSTR: sections are in {note}");
+            }
+            if !self.sections_active {
+                self.sections_active = true;
+                BENCH_ACTIVE.fetch_add(1, Ordering::AcqRel);
+                SECTIONS_ON.store(true, Ordering::Release);
             }
             self.measuring = Some(clock);
             self.last = Some(now);
@@ -601,6 +648,7 @@ impl Bench {
         self.last = Some(now);
         if clock.duration_since(self.measuring.unwrap()).as_secs_f32() >= self.seconds {
             self.done = true;
+            self.stop_sections();
             self.cpu_ms = thread_cpu_ms() - self.cpu0;
             LUA_ON.with(|c| c.set(false));
             self.lua = take_lua();

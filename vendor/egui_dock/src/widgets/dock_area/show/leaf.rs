@@ -24,6 +24,27 @@ fn tab_body_id(dock_area_id: Id, path: NodePath, tab_id: Id) -> Id {
     dock_area_id.with((path.surface, "surface")).with(tab_id)
 }
 
+#[cfg(target_os = "android")]
+fn clean_tab_button_click(ui: &Ui, res: &Response) -> bool {
+    if !res.clicked() {
+        return false;
+    }
+    ui.input(|i| {
+        let origin_in = i.pointer.press_origin().is_some_and(|p| res.rect.contains(p));
+        let pos_in = i.pointer.interact_pos().is_some_and(|p| res.rect.contains(p));
+        let clean_tap = match (i.pointer.press_origin(), i.pointer.interact_pos()) {
+            (Some(a), Some(b)) => a.distance(b) <= 10.0,
+            _ => true,
+        };
+        origin_in && pos_in && clean_tap && !i.pointer.is_decidedly_dragging()
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn clean_tab_button_click(_ui: &Ui, res: &Response) -> bool {
+    res.clicked()
+}
+
 impl<Tab> DockArea<'_, Tab> {
     pub(super) fn show_leaf(
         &mut self,
@@ -498,14 +519,35 @@ impl<Tab> DockArea<'_, Tab> {
                     fade,
                 );
                 let title_id = response.id;
-                let close_clicked = close_response.is_some_and(|res| res.clicked());
-                if min_response.is_some_and(|res| res.clicked()) {
+                let allow_action_click = !cfg!(target_os = "android") || is_active;
+                let close_clicked = allow_action_click
+                    && close_response
+                        .as_ref()
+                        .is_some_and(|res| clean_tab_button_click(tabs_ui, res));
+                if allow_action_click
+                    && min_response
+                        .as_ref()
+                        .is_some_and(|res| clean_tab_button_click(tabs_ui, res))
+                {
                     let leaf = self.dock_state[path]
                         .get_leaf_mut()
                         .expect("This node must be a leaf");
                     tab_viewer.on_minimize(&mut leaf.tabs[tab_index.0]);
                 }
-                if pop_response.is_some_and(|res| res.clicked()) {
+                if !allow_action_click
+                    && (close_response.as_ref().is_some_and(|res| res.clicked())
+                        || min_response.as_ref().is_some_and(|res| res.clicked()))
+                {
+                    let leaf = self.dock_state[path]
+                        .get_leaf_mut()
+                        .expect("This node must be a leaf");
+                    leaf.active = tab_index;
+                    self.new_focused = Some(path);
+                }
+                if pop_response
+                    .as_ref()
+                    .is_some_and(|res| clean_tab_button_click(tabs_ui, res))
+                {
                     let leaf = self.dock_state[path]
                         .get_leaf_mut()
                         .expect("This node must be a leaf");
@@ -809,7 +851,7 @@ impl<Tab> DockArea<'_, Tab> {
                     );
             }
 
-            if response.clicked() {
+            if clean_tab_button_click(ui, &response) {
                 if on_secondary_button {
                     if !close_window_disabled {
                         self.to_remove.push(TabRemoval::Window(path.surface));

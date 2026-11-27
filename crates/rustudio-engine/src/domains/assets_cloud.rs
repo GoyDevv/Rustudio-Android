@@ -281,21 +281,58 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.set_app_data(State {failure_seq:rustudio_core::assets::content_failures_since(u64::MAX).0,..State::default()});
     lua.globals().set(
         "__rs_asset_begin",
-        lua.create_function(|lua, (provider, ids): (Value, mlua::Table)| {
+        lua.create_function(|lua, (provider, ids, anim_ids): (Value, mlua::Table, Option<mlua::Table>)| {
             let r = opt_inst(&provider).ok_or_else(|| rt_err("Instance expected"))?;
-            let mut s = lua.app_data_mut::<State>().unwrap();
+            let anim_set: std::collections::HashSet<String> = anim_ids
+                .map(|t| {
+                    t.pairs::<String, bool>()
+                        .filter_map(|p| p.ok().filter(|(_, v)| *v).map(|(k, _)| k))
+                        .collect()
+                })
+                .unwrap_or_default();
             for id in ids.sequence_values::<String>() {
                 let id = id?;
-                if id.is_empty() || s.fetches.contains_key(&id) {
+                if id.is_empty() {
+                    continue;
+                }
+                let is_anim = anim_set.contains(&id);
+                // Fast-path already-cached assets: mark Success immediately
+                // without resetting to Loading or pushing onto SCHEDULER.
+                if rustudio_core::assets::is_content_cached(&id) {
+                    let prev = rustudio_core::assets::content_fetch_status(&id);
+                    rustudio_core::assets::content_track(&id, 2);
+                    {
+                        let mut s = lua.app_data_mut::<State>().unwrap();
+                        s.statuses.insert(id.clone(), "Success".into());
+                        s.watched.insert(id.clone(), (r, 2));
+                        s.status_gen = 0;
+                    }
+                    if prev != 2 {
+                        let v = Value::UserData(lua.create_userdata(
+                            LEnumItem::from_name("AssetFetchStatus", "Success").unwrap(),
+                        )?);
+                        world(lua)?.fire(r, &format!("AssetFetchStatus:{id}"), vec![v]);
+                        signal_timing::flush_immediate(lua);
+                    }
+                    continue;
+                }
+                let already_fetching = {
+                    let s = lua.app_data_ref::<State>().unwrap();
+                    s.fetches.contains_key(&id)
+                };
+                if already_fetching {
                     continue;
                 }
                 let result = Arc::new(Mutex::new(None));
-                s.fetches.insert(id.clone(), result.clone());
-                rustudio_core::assets::content_track(&id,1);
-                s.statuses.insert(id.clone(), "Loading".into());
-                s.providers.insert(id.clone(), r);
-                s.watched.insert(id.clone(),(r,1));
-                s.status_gen=0;
+                {
+                    let mut s = lua.app_data_mut::<State>().unwrap();
+                    s.fetches.insert(id.clone(), result.clone());
+                    rustudio_core::assets::content_track(&id, 1);
+                    s.statuses.insert(id.clone(), "Loading".into());
+                    s.providers.insert(id.clone(), r);
+                    s.watched.insert(id.clone(), (r, 1));
+                    s.status_gen = 0;
+                }
                 let v = Value::UserData(lua.create_userdata(
                     LEnumItem::from_name("AssetFetchStatus", "Loading").unwrap(),
                 )?);
@@ -305,7 +342,17 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 // thread per id put a place's 2000-asset preload lists on
                 // 2000 threads, all contending for the download slots with
                 // the map's own meshes and textures.
-                rustudio_core::assets::preload_content(&id, result);
+                let hook: Option<Box<dyn FnOnce(Arc<Vec<u8>>) + Send + 'static>> = if is_anim {
+                    rustudio_core::assets::asset_ref(&id).map(|a| {
+                        let asset_id = a.id;
+                        Box::new(move |bytes: Arc<Vec<u8>>| {
+                            super::anim::anim_tracks::predecode_kfs(asset_id, &bytes);
+                        }) as Box<dyn FnOnce(Arc<Vec<u8>>) + Send + 'static>
+                    })
+                } else {
+                    None
+                };
+                rustudio_core::assets::preload_content_with_hook(&id, result, hook);
             }
             Ok(())
         })?,
@@ -313,31 +360,74 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set("__ac_content_ids", lua.create_function(|lua, assets: mlua::Table| {
         let mut out = Vec::<String>::new();
         let mut seen = std::collections::HashSet::new();
-        let mut add = |id: String| { if !id.is_empty() && seen.insert(id.clone()) { out.push(id); } };
-        let mut w = world(lua)?;
-        let d = w.dm();
-        for value in assets.sequence_values::<Value>() {
-            let value = value?;
-            if let Value::String(s) = &value { add(s.to_string_lossy()); continue; }
-            let Some(root) = opt_inst(&value) else { continue };
-            let mut pending = vec![root];
-            while let Some(r) = pending.pop() {
-                let Some(i) = d.dom.get_by_ref(r) else { continue };
-                pending.extend_from_slice(i.children());
-                let db = rustudio_core::doc::db();
-                let Some(class) = db.classes.get(i.class.as_str()) else { continue };
-                for c in db.superclasses_iter(class) {
-                    for key in c.properties.keys() {
-                        match d.prop(r, key) {
-                            Some(Variant::ContentId(id)) => add(id.as_str().to_string()),
-                            Some(Variant::Content(content)) => { if let Some(uri) = content.as_uri() { add(uri.to_string()); } },
-                            _ => {},
+        let mut anim_set = std::collections::HashSet::new();
+        let mut add = |id: String, from_anim: bool| {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                return;
+            }
+            if from_anim {
+                anim_set.insert(id.clone());
+            }
+            if seen.insert(id.clone()) {
+                out.push(id);
+            }
+        };
+        {
+            let mut w = world(lua)?;
+            let d = w.dm();
+            let db = rustudio_core::doc::db();
+            for value in assets.sequence_values::<Value>() {
+                let value = value?;
+                if let Value::String(s) = &value {
+                    add(s.to_string_lossy(), false);
+                    continue;
+                }
+                let Some(root) = opt_inst(&value) else { continue };
+                let mut pending = vec![root];
+                while let Some(r) = pending.pop() {
+                    let Some(i) = d.dom.get_by_ref(r) else { continue };
+                    pending.extend_from_slice(i.children());
+                    let is_anim = rustudio_core::doc::is_a(&i.class, "Animation");
+                    if let Some(class) = db.classes.get(i.class.as_str()) {
+                        for c in db.superclasses_iter(class) {
+                            for (key, prop) in &c.properties {
+                                let is_content = matches!(
+                                    prop.data_type,
+                                    rbx_reflection::DataType::Value(
+                                        rbx_dom_weak::types::VariantType::ContentId
+                                            | rbx_dom_weak::types::VariantType::Content
+                                    )
+                                ) || rustudio_core::doc::content_twin(key).is_some();
+                                if !is_content {
+                                    continue;
+                                }
+                                if let Some(id) = rustudio_core::doc::content_string(d.prop(r, key)) {
+                                    let from_anim = is_anim
+                                        && matches!(key.as_ref(), "AnimationId" | "AnimationContent");
+                                    add(id, from_anim);
+                                }
+                            }
+                        }
+                    }
+                    for key in ["AnimationId", "AnimationContent", "SoundId", "TextureId", "MeshId", "Image"] {
+                        if let Some(v) = i.properties.get(&ustr(key)).cloned() {
+                            if let Some(id) = rustudio_core::doc::content_string(Some(v)) {
+                                let from_anim = is_anim
+                                    && matches!(key, "AnimationId" | "AnimationContent");
+                                add(id, from_anim);
+                            }
                         }
                     }
                 }
             }
         }
-        lua.create_sequence_from(out)
+        let ids_tbl = lua.create_sequence_from(out)?;
+        let anim_tbl = lua.create_table()?;
+        for id in anim_set {
+            anim_tbl.set(id, true)?;
+        }
+        Ok((ids_tbl, anim_tbl))
     })?)?;
     lua.globals().set(
         "__rs_preload_deadline",
@@ -356,8 +446,8 @@ local M = __rs_lua_methods
 -- bytes cached.
 function M.PreloadAsync(self, assets, callback)
     if type(assets) ~= 'table' then error('Unable to cast to Array', 2) end
-    local ids = __ac_content_ids(assets)
-    __rs_asset_begin(self,ids)
+    local ids, anim_ids = __ac_content_ids(assets)
+    __rs_asset_begin(self, ids, anim_ids)
     local deadline = os.clock() + __rs_preload_deadline()
     for _,id in ipairs(ids) do
         local s = self:GetAssetFetchStatus(id)

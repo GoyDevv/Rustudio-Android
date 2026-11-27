@@ -796,9 +796,13 @@ fn num(doc: &Document, r: Ref, name: &str, default: f32) -> f32 {
 }
 
 fn vec(doc: &Document, r: Ref, name: &str) -> Vec3 {
+    vec_or(doc, r, name, Vec3::ZERO)
+}
+
+fn vec_or(doc: &Document, r: Ref, name: &str, default: Vec3) -> Vec3 {
     vec3_of(doc.prop(r, name))
         .filter(|v| !v.is_nan())
-        .unwrap_or(Vec3::ZERO)
+        .unwrap_or(default)
 }
 
 fn rot_prop(doc: &Document, r: Ref, name: &str) -> Quat {
@@ -867,7 +871,7 @@ fn read_mover(doc: &Document, ws: Ref, r: Ref) -> Option<Mover> {
         },
         "BodyVelocity" => Law::BodyVelocity {
             vel: vec(doc, r, "Velocity"),
-            max: vec(doc, r, "MaxForce").abs(),
+            max: vec_or(doc, r, "MaxForce", Vec3::splat(4000.0)).abs(),
             p: num(doc, r, "P", 1250.0),
         },
         "LinearVelocity" => {
@@ -901,8 +905,8 @@ fn read_mover(doc: &Document, ws: Ref, r: Ref) -> Option<Mover> {
             }
         }
         "BodyPosition" => Law::BodyPosition {
-            pos: vec(doc, r, "Position"),
-            max: vec(doc, r, "MaxForce").abs(),
+            pos: vec_or(doc, r, "Position", Vec3::new(0.0, 50.0, 0.0)),
+            max: vec_or(doc, r, "MaxForce", Vec3::splat(4000.0)).abs(),
             p: num(doc, r, "P", 10000.0),
             d: num(doc, r, "D", 1250.0),
         },
@@ -2622,35 +2626,50 @@ impl Physics {
     }
 
     /// The world axes an unlimited LinearVelocity (ForceLimitsEnabled off, or
-    /// infinite MaxForce) holds rigidly; None for limited ones and others.
+    /// infinite MaxForce) or high-force BodyVelocity holds rigidly; None for
+    /// limited ones and others.
     fn unlimited_velocity_axes(&self, doc: &Document, m: &Mover, part: &Xform) -> Option<Vec<Vec3>> {
-        let Law::LinearVelocity {
-            mode,
-            line,
-            t1,
-            t2,
-            planar_max,
-            frame,
-            limit,
-            ..
-        } = m.law
-        else {
-            return None;
-        };
-        let unlimited = match limit {
-            Limit::None => true,
-            Limit::Magnitude(x) => x.is_infinite(),
-            Limit::PerAxis(v, _) => v.min_element().is_infinite(),
-        } && planar_max.is_none_or(|p| p[0].is_infinite() && p[1].is_infinite());
-        if !unlimited {
-            return None;
+        match m.law {
+            Law::BodyVelocity { max, .. } => {
+                let mut axes = Vec::new();
+                if max.x.is_infinite() || max.x >= 1e5 {
+                    axes.push(Vec3::X);
+                }
+                if max.y.is_infinite() || max.y >= 1e5 {
+                    axes.push(Vec3::Y);
+                }
+                if max.z.is_infinite() || max.z >= 1e5 {
+                    axes.push(Vec3::Z);
+                }
+                (!axes.is_empty()).then_some(axes)
+            }
+            Law::LinearVelocity {
+                mode,
+                line,
+                t1,
+                t2,
+                planar_max,
+                frame,
+                limit,
+                ..
+            } => {
+                let unlimited = match limit {
+                    Limit::None => true,
+                    Limit::Magnitude(x) => x.is_infinite(),
+                    Limit::PerAxis(v, _) => v.min_element().is_infinite(),
+                } && planar_max.is_none_or(|p| p[0].is_infinite() && p[1].is_infinite());
+                if !unlimited {
+                    return None;
+                }
+                let rot = self.frame_rot(doc, m, part, frame)?;
+                Some(match mode {
+                    0 => vec![rot * line],
+                    1 => vec![rot * t1, rot * t2],
+                    _ => vec![Vec3::X, Vec3::Y, Vec3::Z],
+                })
+            }
+            _ => None,
         }
-        let rot = self.frame_rot(doc, m, part, frame)?;
-        Some(match mode {
-            0 => vec![rot * line],
-            1 => vec![rot * t1, rot * t2],
-            _ => vec![Vec3::X, Vec3::Y, Vec3::Z],
-        })
     }
 
     /// After a solver step: each unlimited LinearVelocity body's velocity
@@ -2759,15 +2778,15 @@ impl Physics {
                 (Vec3::ZERO, self.frame_rot(doc, m, part, frame)? * torque)
             }
             Law::BodyVelocity { vel, max, p } => {
-                // Velocity servo: force P·(goal − v) (P scaled by
-                // BODY_MOVER_P_SCALE) solved implicitly, plus the weight it
-                // holds up; capped per world axis by MaxForce.
-                let p = p * mech::BODY_MOVER_P_SCALE;
-                if p <= 0.0 {
+                // Studio's BodyVelocity is a ConstraintLinearVelocity: closes
+                // CONSTRAINT_RIGID_FRACTION of the velocity error each step,
+                // holds up gravity, and clamps per world axis by MaxForce.
+                // Guard NaN and ±inf so P = math.huge never produces NaN.
+                if p.is_nan() || (!p.is_infinite() && p < 0.0) || (p.is_infinite() && p.is_sign_negative()) {
                     return None;
                 }
-                let v_new = (mass * st.v / h + p * vel) / (mass / h + p);
-                (clamp_axes(force_for(v_new), max), Vec3::ZERO)
+                let f = mass * mech::CONSTRAINT_RIGID_FRACTION * (vel - st.v) / h - mass * g;
+                (clamp_axes(f, max), Vec3::ZERO)
             }
             Law::LinearVelocity {
                 mode,
@@ -6304,6 +6323,178 @@ mod tests {
         run(&mut p, &mut doc, 20);
         assert_eq!(p.mover_count(), 0);
         assert!(vel_of(&p, a).y < -20.0, "falls: {:?}", vel_of(&p, a));
+    }
+
+    #[test]
+    fn body_velocity_infinite_p_does_not_produce_nan() {
+        let mut doc = Document::new_place();
+        let a = floating(&mut doc, Vec3::new(0.0, 30.0, 0.0));
+        doc.dom.insert(
+            a,
+            InstanceBuilder::new("BodyVelocity")
+                .with_property("Velocity", Vector3::new(0.0, 0.0, -50.0))
+                .with_property("MaxForce", Vector3::new(1e5, 0.0, 1e5))
+                .with_property("P", f32::INFINITY),
+        );
+        let mut p = Physics::new(&mut doc);
+        run(&mut p, &mut doc, 30);
+        let v = vel_of(&p, a);
+        assert!(v.is_finite(), "P = inf must not produce NaN velocity: {v:?}");
+        assert!((v.z - (-50.0)).abs() < 1.0, "P = inf should reach target velocity: {v:?}");
+        assert!(pos_of(&doc, a).is_finite(), "P = inf must keep finite position");
+    }
+
+    #[test]
+    fn body_velocity_front_dash_reaches_target_across_max_forces() {
+        use crate::humanoid::{Floor, Humanoid, StepIn};
+        use crate::physics::hum_body::HumCtl;
+        use rustudio_core::body::State;
+        for max_f in [4000.0_f32, 10000.0, 1e5, f32::INFINITY] {
+            let mut doc = Document::new_place();
+            let ws = doc.workspace().unwrap();
+            let floor_ref = doc.dom.insert(
+                ws,
+                part("Floor", Vec3::new(0.0, -1.0, 0.0), true)
+                    .with_property("Size", Vector3::new(400.0, 2.0, 400.0)),
+            );
+            let mut p = Physics::new(&mut doc);
+            let model = doc.dom.insert(ws, InstanceBuilder::new("Model"));
+            let hrp = doc.dom.insert(
+                model,
+                InstanceBuilder::new("Part")
+                    .with_name("HumanoidRootPart")
+                    .with_property("Size", Vector3::new(2.0, 2.0, 1.0))
+                    .with_property(
+                        "CFrame",
+                        CFrame::new(Vector3::new(0.0, 3.19, 0.0), CFrame::identity().orientation),
+                    )
+                    .with_property("Anchored", false),
+            );
+            let bv = doc.dom.insert(
+                hrp,
+                InstanceBuilder::new("BodyVelocity")
+                    .with_property("Velocity", Vector3::new(0.0, 0.0, -60.0))
+                    .with_property("MaxForce", Vector3::new(max_f, 0.0, max_f)),
+            );
+            p.skip.insert(hrp);
+            p.add_humanoid(
+                &doc,
+                model,
+                hrp,
+                &[(hrp, Xform { pos: Vec3::new(0.0, 3.19, 0.0), rot: Mat3::IDENTITY })],
+            );
+            p.set_humanoid_ctl(
+                model,
+                Some(HumCtl {
+                    hum: Humanoid { state: State::Running, floor_target_y: 3.19, ..Default::default() },
+                    step: StepIn {
+                        floor: Some(Floor {
+                            y: 0.0,
+                            point: Vec3::ZERO,
+                            normal: Vec3::Y,
+                            v: Vec3::ZERO,
+                            w: Vec3::ZERO,
+                            mu: 0.3,
+                            solid: true,
+                        }),
+                        full_hip: 3.19,
+                        cos_max_slope: 89f32.to_radians().cos(),
+                        ladder: false,
+                        jump_velocity: 50.0,
+                        accel_scale: 1.0,
+                        ceiling: false,
+                    },
+                    floor_part: Some(floor_ref),
+                    hrp,
+                    last: Default::default(),
+                    level: 1,
+                    swim: None,
+                }),
+            );
+            doc.mark_tree(bv);
+            run(&mut p, &mut doc, 30);
+            let b = p.humanoid_body(model).expect("humanoid body");
+            assert_eq!(b.vel_mover_xz, [true, true], "MaxForce={max_f} should mark XZ driven");
+            assert!(b.v.is_finite(), "MaxForce={max_f} velocity must be finite: {:?}", b.v);
+            assert!(
+                b.v.z < -55.0,
+                "MaxForce={max_f} front-dash should reach near -60 studs/s without idle braking overpowering it, got {:?}",
+                b.v
+            );
+        }
+    }
+
+    #[test]
+    fn body_velocity_upward_liftoff_clears_altitude_pd() {
+        use crate::humanoid::{Floor, Humanoid, StepIn};
+        use crate::physics::hum_body::HumCtl;
+        use rustudio_core::body::State;
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let floor_ref = doc.dom.insert(
+            ws,
+            part("Floor", Vec3::new(0.0, -1.0, 0.0), true)
+                .with_property("Size", Vector3::new(400.0, 2.0, 400.0)),
+        );
+        let mut p = Physics::new(&mut doc);
+        let model = doc.dom.insert(ws, InstanceBuilder::new("Model"));
+        let hrp = doc.dom.insert(
+            model,
+            InstanceBuilder::new("Part")
+                .with_name("HumanoidRootPart")
+                .with_property("Size", Vector3::new(2.0, 2.0, 1.0))
+                .with_property(
+                    "CFrame",
+                    CFrame::new(Vector3::new(0.0, 3.19, 0.0), CFrame::identity().orientation),
+                )
+                .with_property("Anchored", false),
+        );
+        let bv = doc.dom.insert(
+            hrp,
+            InstanceBuilder::new("BodyVelocity")
+                .with_property("Velocity", Vector3::new(0.0, 40.0, 0.0))
+                .with_property("MaxForce", Vector3::new(0.0, 1e5, 0.0)),
+        );
+        p.skip.insert(hrp);
+        p.add_humanoid(
+            &doc,
+            model,
+            hrp,
+            &[(hrp, Xform { pos: Vec3::new(0.0, 3.19, 0.0), rot: Mat3::IDENTITY })],
+        );
+        p.set_humanoid_ctl(
+            model,
+            Some(HumCtl {
+                hum: Humanoid { state: State::Running, floor_target_y: 3.19, ..Default::default() },
+                step: StepIn {
+                    floor: Some(Floor {
+                        y: 0.0,
+                        point: Vec3::ZERO,
+                        normal: Vec3::Y,
+                        v: Vec3::ZERO,
+                        w: Vec3::ZERO,
+                        mu: 0.3,
+                        solid: true,
+                    }),
+                    full_hip: 3.19,
+                    cos_max_slope: 89f32.to_radians().cos(),
+                    ladder: false,
+                    jump_velocity: 50.0,
+                    accel_scale: 1.0,
+                    ceiling: false,
+                },
+                floor_part: Some(floor_ref),
+                hrp,
+                last: Default::default(),
+                level: 1,
+                swim: None,
+            }),
+        );
+        doc.mark_tree(bv);
+        run(&mut p, &mut doc, 20);
+        let b = p.humanoid_body(model).expect("humanoid body");
+        assert_eq!(b.vel_mover_xz, [false, false], "vertical-only MaxForce must not mark XZ driven");
+        assert!(b.v.y > 30.0 && b.pos.y > 6.0, "upward BodyVelocity should lift off cleanly: pos={:?} v={:?}", b.pos, b.v);
     }
 
     #[test]

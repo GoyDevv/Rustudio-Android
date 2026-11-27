@@ -2323,6 +2323,51 @@ impl Gui {
         self.vf_size.get(&r).copied()
     }
 
+    /// Screen-space bounding rect of a laid-out `GuiObject` from the last draw,
+    /// using exact screen-space `hits` when present and falling back to `layout`.
+    pub fn rect_of(&self, r: Ref, viewport: Rect) -> Option<Rect> {
+        if let Some(h) = self.hits.iter().rev().find(|h| h.r == r) {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for pt in h.quad {
+                min_x = min_x.min(pt.x);
+                min_y = min_y.min(pt.y);
+                max_x = max_x.max(pt.x);
+                max_y = max_y.max(pt.y);
+            }
+            if min_x.is_finite() && max_x.is_finite() {
+                return Some(Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y)));
+            }
+        }
+        let b = self.layout.get(&r)?;
+        let min = Pos2::new(viewport.min.x + b.pos[0], viewport.min.y + b.pos[1]);
+        Some(Rect::from_min_size(min, egui::vec2(b.size[0], b.size[1])))
+    }
+
+    /// Screen-space bounding rect of `r`'s enclosing `GuiObject` parent (skipping
+    /// `Folder`s), or `viewport` when directly under a `LayerCollector`.
+    pub fn parent_rect_of(&self, d: &Document, r: Ref, viewport: Rect) -> Rect {
+        let mut cur = d.dom.get_by_ref(r).map(|i| i.parent());
+        while let Some(parent) = cur {
+            let Some(inst) = d.dom.get_by_ref(parent) else {
+                break;
+            };
+            if inst.class == "Folder" {
+                cur = Some(inst.parent());
+                continue;
+            }
+            if doc::is_a(inst.class.as_str(), "GuiObject") {
+                if let Some(pr) = self.rect_of(parent, viewport) {
+                    return pr;
+                }
+            }
+            break;
+        }
+        viewport
+    }
+
     /// What each ViewportFrame drawn this frame shows, read now: its size
     /// from the last walk, its CurrentCamera, Ambient, LightColor and
     /// LightDirection. Frames without a camera aren't drawn.

@@ -3,30 +3,51 @@
 //! data modules of tens of megabytes (a large ported place: 150 MB of
 //! Luau, one module 47 MB) spent seconds compiling the same text twice per
 //! Play and again on every run. Bytecode of sources over MIN_MEMORY is kept
-//! for the process; over MIN_DISK (on Android: 4 KB) also in
+//! for the process; over MIN_DISK (on Android: 1 KB) also in
 //! <cache>/bytecode/, keyed by the source and the compiler (settings and
 //! its output for a probe). RUSTUDIO_NO_BYTECODE_CACHE=1 turns it off.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// (1 KB: a Play compiles most ModuleScripts twice, once a side; below
-/// this the hash costs what the compiler does.)
-const MIN_MEMORY: usize = 1024;
+/// (Android: 512 B, desktop: 1 KB — a Play compiles most ModuleScripts twice,
+/// once a side; below this the hash costs what the compiler does.)
+const MIN_MEMORY: usize = if cfg!(target_os = "android") { 512 } else { 1024 };
 /// On a phone every launch is a cold process and the compiler is slower
 /// (a fighting game's 685 scripts, 7 MB of Luau, compiled again each
 /// launch otherwise): nearly everything the memory cache keeps goes to
 /// disk too (a few MB, one file a script, in the app's cache directory).
-const MIN_DISK: usize = if cfg!(target_os = "android") { 4 * 1024 } else { 256 * 1024 };
+const MIN_DISK: usize = if cfg!(target_os = "android") { 1024 } else { 256 * 1024 };
 /// Bytecode held in memory at most (later sources compile as before).
 const MEMORY_CAP: usize = if cfg!(target_os = "android") { 128 * 1024 * 1024 } else { 768 * 1024 * 1024 };
 
+/// Monotonic suffix for atomic `.tmp` writes so concurrent threads in the
+/// same process never race on the same temp file.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Generation counter for background prewarm jobs: opening a new place bumps
+/// this so stale prewarm threads exit promptly.
+static PREWARM_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn opt_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        if std::env::var_os("RUSTUDIO_LUAU_O1").is_some_and(|v| v == "1") {
+            1
+        } else {
+            2
+        }
+    })
+}
+
 /// The compiler every script runs through: Studio's options (runtime.rs
-/// Runtime::new explains each).
+/// Runtime::new explains each), with Luau -O2 by default (`RUSTUDIO_LUAU_O1=1`
+/// falls back to -O1).
 pub fn compiler() -> mlua::chunk::Compiler {
     mlua::chunk::Compiler::new()
-        .set_optimization_level(1)
+        .set_optimization_level(opt_level())
         .set_debug_level(1)
         .set_vector_ctor("Vector3.new")
         .set_vector_type("Vector3")
@@ -54,7 +75,12 @@ local function f(a, ...) local s = `{a}:{select("#", ...)}` for i, v in ipairs(t
 local v = Vector3.new(1, 2, 3) local g = game:GetService("Workspace") workspace.Name = script.Name
 return f(1, 2, 3), math.floor(v.X // 2) % 3, (if t[1] then 1 else 2) + bit32.band(7, 3), string.format("%d", 4)"##;
         let mut h = blake3::Hasher::new();
-        h.update(b"rustudio bytecode 2|O1 D1 Vector3.new Vector3 mutable globals _G|");
+        let tag = if opt_level() == 1 {
+            b"rustudio bytecode 3|O1 D1 Vector3.new Vector3 mutable globals _G|".as_slice()
+        } else {
+            b"rustudio bytecode 3|O2 D1 Vector3.new Vector3 mutable globals _G|".as_slice()
+        };
+        h.update(tag);
         h.update(&compiler().compile(PROBE).unwrap_or_default());
         h.finalize().as_bytes().to_vec()
     })
@@ -101,9 +127,12 @@ pub fn get(source: &str) -> Option<Arc<Vec<u8>>> {
             let b = compiler().compile(source).ok().filter(|b| b.first().is_some_and(|v| *v != 0))?;
             if disk {
                 let _ = std::fs::create_dir_all(dir());
-                let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+                let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let tmp = file.with_extension(format!("tmp.{}.{seq}", std::process::id()));
                 if std::fs::write(&tmp, &b).is_ok() {
-                    let _ = std::fs::rename(&tmp, &file);
+                    if std::fs::rename(&tmp, &file).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
                 }
             }
             b
@@ -117,4 +146,79 @@ pub fn get(source: &str) -> Option<Arc<Vec<u8>>> {
         }
     }
     Some(b)
+}
+
+/// Collects all cache-eligible script `Source` strings from a `Document` for
+/// background bytecode pre-compilation.
+pub fn collect_script_sources(doc: &rustudio_core::doc::Document) -> Vec<String> {
+    if !enabled() {
+        return Vec::new();
+    }
+    let source_key = rbx_dom_weak::ustr("Source");
+    let mut out = Vec::new();
+    for inst in doc.dom.descendants() {
+        if !matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+            continue;
+        }
+        if let Some(rbx_dom_weak::types::Variant::String(s)) = inst.properties.get(&source_key) {
+            if s.len() >= MIN_MEMORY && s.as_bytes()[0] >= 0x09 {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Pre-compiles `sources` into the bytecode cache on up to 2 low-priority
+/// background threads, deduplicating and compiling the largest scripts first.
+/// Calling `prewarm` again (e.g., when opening another place) cancels any
+/// in-flight prewarm from a prior generation.
+pub fn prewarm(sources: Vec<String>) {
+    let gen = PREWARM_GEN.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    if !enabled() || sources.is_empty() {
+        return;
+    }
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut work: Vec<String> = Vec::with_capacity(sources.len());
+    for s in sources {
+        if s.len() < MIN_MEMORY || s.as_bytes()[0] < 0x09 {
+            continue;
+        }
+        let hash = *blake3::hash(s.as_bytes()).as_bytes();
+        if seen.insert(hash) {
+            work.push(s);
+        }
+    }
+    if work.is_empty() {
+        return;
+    }
+    work.sort_unstable_by(|a, b| b.len().cmp(&a.len()));
+
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let threads = avail.saturating_sub(1).clamp(1, 2).min(work.len());
+    let queue = Arc::new(work);
+    let cursor = Arc::new(AtomicUsize::new(0));
+
+    for t in 0..threads {
+        let queue = Arc::clone(&queue);
+        let cursor = Arc::clone(&cursor);
+        let _ = std::thread::Builder::new()
+            .name(format!("luau-prewarm-{t}"))
+            .spawn(move || {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                }
+                loop {
+                    if PREWARM_GEN.load(Ordering::Acquire) != gen {
+                        break;
+                    }
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    if idx >= queue.len() {
+                        break;
+                    }
+                    let _ = get(&queue[idx]);
+                }
+            });
+    }
 }

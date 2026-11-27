@@ -4,9 +4,91 @@
 //! over a channel and are polled each frame. The cookie never reaches this
 //! module: it stays inside rustudio_account's Session.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
 use egui::RichText;
 use rustudio_account::{CookieSource, SavedAccount};
 use rustudio_engine::theme;
+
+struct AvatarHeadshotCache {
+    requested: HashSet<u64>,
+    pending: Vec<(u64, egui::ColorImage)>,
+    textures: HashMap<u64, egui::TextureHandle>,
+}
+
+fn avatar_headshot_cache() -> &'static Mutex<AvatarHeadshotCache> {
+    static CACHE: OnceLock<Mutex<AvatarHeadshotCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(AvatarHeadshotCache {
+            requested: HashSet::new(),
+            pending: Vec::new(),
+            textures: HashMap::new(),
+        })
+    })
+}
+
+fn request_circular_headshot(id: u64) {
+    {
+        let mut c = avatar_headshot_cache().lock().unwrap();
+        if !c.requested.insert(id) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let url = format!(
+            "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={id}&size=150x150&format=Png&isCircular=true"
+        );
+        let agent = ureq::Agent::new_with_defaults();
+        let Ok(mut resp) = agent.get(&url).call() else { return };
+        let Ok(text) = resp.body_mut().read_to_string() else { return };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+        let Some(img_url) = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|t| t.get("imageUrl"))
+            .and_then(|u| u.as_str())
+        else {
+            return;
+        };
+        let Ok(mut img_resp) = agent.get(img_url).call() else { return };
+        if img_resp.status().as_u16() != 200 {
+            return;
+        }
+        let Ok(bytes) = img_resp.body_mut().with_config().limit(4 << 20).read_to_vec() else { return };
+        let Ok(img) = image::load_from_memory(&bytes) else { return };
+        let rgba = img.thumbnail(150, 150).to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        if let Ok(mut c) = avatar_headshot_cache().lock() {
+            c.pending.push((id, color_img));
+        }
+    });
+}
+
+fn poll_circular_headshot(ctx: &egui::Context, id: u64) -> Option<egui::TextureHandle> {
+    let mut c = avatar_headshot_cache().lock().ok()?;
+    for (pid, img) in std::mem::take(&mut c.pending) {
+        let tex = ctx.load_texture(format!("account-circular-head-{pid}"), img, egui::TextureOptions::LINEAR);
+        c.textures.insert(pid, tex);
+    }
+    if let Some(tex) = c.textures.get(&id) {
+        return Some(tex.clone());
+    }
+    let need = !c.requested.contains(&id);
+    drop(c);
+    if need {
+        request_circular_headshot(id);
+    }
+    None
+}
+
+fn copy_login_code(ctx: &egui::Context, code: &str) {
+    #[cfg(target_os = "android")]
+    crate::android::clipboard::set(code.to_string());
+    ctx.copy_text(code.to_string());
+}
 
 use crate::app::Editor;
 use crate::account::client_snapshot;
@@ -25,8 +107,13 @@ impl Editor {
             self.cloud.forget_lists();
             self.start.forget_lists();
         }
-        if self.game.account.open {
+        if self.game.account.signed_in() || self.game.account.open {
             self.game.account.heads(ctx);
+            if let Some(id) = self.game.account.user_id() {
+                let _ = poll_circular_headshot(ctx, id);
+            }
+        }
+        if self.game.account.open {
             self.account_popover(ctx);
         }
         self.roblox_destination_window(ctx);
@@ -191,10 +278,27 @@ impl Editor {
                                         ui.label(RichText::new("Enter this code on Roblox").size(12.0).color(theme::TEXT_DIM));
                                         ui.add_space(4.0);
                                         ui.label(RichText::new(c).size(26.0).monospace().strong().color(theme::TEXT));
-                                        ui.add_space(4.0);
-                                        if ui.link(RichText::new("Open the page again").size(11.5)).clicked() {
-                                            q.opened = false;
+                                        if q.copied {
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new("Code copied to clipboard — just paste it on Roblox!")
+                                                    .size(11.5)
+                                                    .color(egui::Color32::from_rgb(98, 204, 92)),
+                                            );
                                         }
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("Copy code").clicked() {
+                                                copy_login_code(ui.ctx(), c);
+                                                q.copied = true;
+                                            }
+                                            ui.add_space(8.0);
+                                            if ui.link(RichText::new("Open the page again").size(11.5)).clicked() {
+                                                copy_login_code(ui.ctx(), c);
+                                                q.copied = true;
+                                                q.opened = false;
+                                            }
+                                        });
                                     }
                                     None => {
                                         ui.add(egui::Spinner::new().size(14.0).color(theme::TEXT_DIM));
@@ -204,7 +308,11 @@ impl Editor {
                                 ui.label(RichText::new(note).size(11.5).color(theme::TEXT_DIM));
                             });
                         });
-                    if code.is_some() && !q.opened {
+                    if let Some(c) = code.as_deref().filter(|_| !q.opened) {
+                        // Synchronously copy the device code to Android ClipboardManager
+                        // BEFORE launching the browser so the user can paste immediately.
+                        copy_login_code(ui.ctx(), c);
+                        q.copied = true;
                         q.opened = true;
                         crate::browser::open_url(ui.ctx(), rustudio_account::quick_login::CONFIRM_URL);
                     }
@@ -358,6 +466,23 @@ impl Editor {
             Some(Do::BrowserSignIn) => a.browser_sign_in(),
             None => {}
         }
+    }
+
+    /// Paints the top-right account profile circle with the signed-in user's
+    /// circular avatar headshot (falling back to the default user icon).
+    pub(crate) fn paint_account_avatar(&mut self, ui: &egui::Ui, r: egui::Rect) {
+        let signed = self.game.account.signed_in();
+        let fill = if signed { theme::ACCENT.gamma_multiply(0.8) } else { theme::PANEL_ALT };
+        ui.painter().circle_filled(r.center(), r.width() * 0.5, fill);
+        if let Some(id) = self.game.account.user_id() {
+            if let Some(tex) = poll_circular_headshot(ui.ctx(), id)
+                .or_else(|| self.game.account.head_texture(id).cloned())
+            {
+                egui::Image::new(&tex).corner_radius(r.width() * 0.5).paint_at(ui, r);
+                return;
+            }
+        }
+        rustudio_engine::ti::paint(ui.painter(), r.shrink(5.0), "user", theme::TEXT);
     }
 
 }

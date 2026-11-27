@@ -8072,7 +8072,12 @@ impl Renderer {
         self.items_generation = self.items_generation.wrapping_add(1);
         // Studio seeds material offsets from an allocation address. A DOM
         // referent supplies the equivalent stable per-instance identity here.
-        let identity = u64::from_str_radix(&r.to_string()[16..], 16).unwrap_or(0);
+        let identity = {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            r.hash(&mut h);
+            h.finish()
+        };
         for d in &mut draws {
             if d.mat_layer >= 0 && d.custom_mesh.is_none() && d.tex_mode == TexMode::None {
                 // Studio returns no offset for a MaterialVariant.
@@ -8361,7 +8366,8 @@ impl Renderer {
     /// Re-sorts every settled part into the static buffer.
     fn rebuild_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if std::env::var_os("RUSTUDIO_STATIC_CHECK").is_some() {
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CHECK.get_or_init(|| std::env::var_os("RUSTUDIO_STATIC_CHECK").is_some()) {
             // (a check: the merge's layout against the full rebuild's)
             let merged = self.static_merge();
             self.rebuild_static_full(device, queue);

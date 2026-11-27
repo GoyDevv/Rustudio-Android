@@ -691,6 +691,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
     let mut widest = index.width;
     egui::ScrollArea::both()
         .auto_shrink([false, false])
+        .scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() })
         .stick_to_bottom(true)
         .show_viewport(ui, |ui, viewport| {
             let total = *tops.last().unwrap_or(&0.0);

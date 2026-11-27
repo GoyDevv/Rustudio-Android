@@ -606,7 +606,7 @@ local function load_sequence(id)
     if sequences[id] ~= nil then return sequences[id] or nil end
     local kfs = registered[id]
     local temporary = string.find(id, "rbxtemp", 1, true)
-    local n = tonumber(string.match(id, "(%d+)%s*$"))
+    local n = tonumber(string.match(id, "://(%d+)") or string.match(id, "[?&][iI][dD]=(%d+)") or string.match(id, "(%d+)"))
     if not kfs and not temporary then
         if n then
             local state = __rs_asset_ready(n)

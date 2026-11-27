@@ -12,7 +12,12 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use glam::Vec3;
-use rbx_dom_weak::types::{Attributes, BrickColor, Color3, Color3uint8, CustomPhysicalProperties, Enum, PhysicalProperties, Ref, Tags, Variant, Vector2, Vector3};
+use rbx_dom_weak::types::{
+    Attributes, Axes, BrickColor, CFrame, Color3, Color3uint8, ColorSequence, ColorSequenceKeypoint,
+    CustomPhysicalProperties, Enum, Faces, Font, FontStyle, FontWeight, Matrix3, NumberRange,
+    NumberSequence, NumberSequenceKeypoint, PhysicalProperties, Rect as RbxRect, Ref, Tags, UDim,
+    UDim2, Variant, Vector2, Vector2int16, Vector3, Vector3int16,
+};
 use rbx_dom_weak::ustr;
 
 use crate::app::Editor;
@@ -25,7 +30,7 @@ pub(crate) const CAT_H: f32 = 25.0;
 pub(crate) const INDENT: f32 = 25.0;
 pub(crate) const DIVIDER: f32 = 0.48;
 pub const TEXT: Color32 = Color32::from_rgb(188, 190, 200);
-pub const READ_ONLY: Color32 = Color32::from_rgb(73, 77, 90);
+pub const READ_ONLY: Color32 = Color32::from_rgb(108, 113, 128);
 pub const BAND: Color32 = Color32::from_rgb(32, 34, 39);
 const BOX_OFF: Color32 = Color32::from_rgb(40, 41, 49);
 const MIXED_LABEL: &str = "<mixed>";
@@ -74,6 +79,14 @@ pub struct PropertiesState {
     pub row_rects: HashMap<String, Rect>,
     /// Inline "Add Attribute" editor state when the Attributes `+` button is active.
     adding_attr: Option<AddingAttr>,
+    /// Searchable modal picker for `Variant::Ref` properties (including `Parent`).
+    ref_picker: Option<RefPicker>,
+}
+
+struct RefPicker {
+    prop: String,
+    search: String,
+    focus_search: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,11 +169,7 @@ fn color_variant(like: &Variant, c: [u8; 3]) -> Variant {
 }
 
 fn has_prop(class: &str, name: &str) -> bool {
-    let db = doc::db();
-    let Some(desc) = db.classes.get(class) else {
-        return false;
-    };
-    db.superclasses_iter(desc).any(|c| c.properties.contains_key(name))
+    doc::has_prop(class, name)
 }
 
 /// The filter field's id (Ctrl+Shift+P focuses it, as in Studio).
@@ -199,10 +208,10 @@ fn parse_nums(s: &str, n: usize) -> Option<Vec<f32>> {
 }
 
 /// The run of non-separator characters around char index `c` (a whole
-/// number like "-2840.53" in "1, -2840.53, 3").
+/// number like "-2840.53" in "1, -2840.53, 3" or "{0.5, 0}, {0, 50}").
 fn word_bounds(text: &str, c: usize) -> (usize, usize) {
     let chars: Vec<char> = text.chars().collect();
-    let sep = |ch: char| ch == ',' || ch.is_whitespace();
+    let sep = |ch: char| matches!(ch, ',' | '{' | '}' | '[' | ']' | '(' | ')') || ch.is_whitespace();
     let c = c.min(chars.len());
     let mut a = c;
     while a > 0 && !sep(chars[a - 1]) {
@@ -213,6 +222,139 @@ fn word_bounds(text: &str, c: usize) -> (usize, usize) {
         b += 1;
     }
     (a, b)
+}
+
+/// Extracts all floating-point tokens from leniently formatted input
+/// (stripping `{ } [ ] ( )` and splitting on commas or whitespace).
+fn parse_lenient_nums(s: &str) -> Option<Vec<f32>> {
+    let cleaned = s.replace(['{', '}', '[', ']', '(', ')'], " ");
+    let mut out = Vec::new();
+    for tok in cleaned.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+        out.push(tok.parse::<f32>().ok()?);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn parse_udim(s: &str) -> Option<UDim> {
+    let nums = parse_lenient_nums(s)?;
+    match nums.len() {
+        1 => Some(UDim::new(0.0, nums[0].round() as i32)),
+        2 => Some(UDim::new(nums[0], nums[1].round() as i32)),
+        _ => None,
+    }
+}
+
+fn parse_udim2(s: &str) -> Option<UDim2> {
+    let nums = parse_lenient_nums(s)?;
+    match nums.len() {
+        1 => {
+            let o = nums[0].round() as i32;
+            Some(UDim2::new(UDim::new(0.0, o), UDim::new(0.0, o)))
+        }
+        2 => Some(UDim2::new(UDim::new(nums[0], 0), UDim::new(nums[1], 0))),
+        4 => Some(UDim2::new(
+            UDim::new(nums[0], nums[1].round() as i32),
+            UDim::new(nums[2], nums[3].round() as i32),
+        )),
+        _ => None,
+    }
+}
+
+fn strip_rich_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+const FONT_FAMILIES: &[(&str, &str)] = &[
+    ("BuilderSans", "Builder Sans"),
+    ("SourceSansPro", "Source Sans Pro"),
+    ("GothamSSm", "Montserrat"),
+    ("LegacyArial", "Legacy"),
+    ("Arial", "Arial"),
+    ("FredokaOne", "Fredoka One"),
+    ("HighwayGothic", "Highway Gothic"),
+    ("Nunito", "Nunito"),
+    ("Oswald", "Oswald"),
+    ("Roboto", "Roboto"),
+    ("RobotoCondensed", "Roboto Condensed"),
+    ("RobotoMono", "Roboto Mono"),
+    ("Ubuntu", "Ubuntu"),
+    ("Merriweather", "Merriweather"),
+    ("Kalam", "Kalam"),
+    ("Bangers", "Bangers"),
+    ("Cartoon", "Cartoon"),
+    ("Code", "Code"),
+    ("Creepster", "Creepster"),
+    ("LuckiestGuy", "Luckiest Guy"),
+    ("PermanentMarker", "Permanent Marker"),
+    ("PressStart2P", "Press Start 2P"),
+    ("Sarpanch", "Sarpanch"),
+    ("SpecialElite", "Special Elite"),
+    ("TitilliumWeb", "Titillium Web"),
+    ("Zekton", "Zekton"),
+];
+
+const FONT_WEIGHTS: &[(&str, FontWeight)] = &[
+    ("Thin", FontWeight::Thin),
+    ("ExtraLight", FontWeight::ExtraLight),
+    ("Light", FontWeight::Light),
+    ("Regular", FontWeight::Regular),
+    ("Medium", FontWeight::Medium),
+    ("SemiBold", FontWeight::SemiBold),
+    ("Bold", FontWeight::Bold),
+    ("ExtraBold", FontWeight::ExtraBold),
+    ("Heavy", FontWeight::Heavy),
+];
+
+const FONT_STYLES: &[(&str, FontStyle)] = &[
+    ("Normal", FontStyle::Normal),
+    ("Italic", FontStyle::Italic),
+];
+
+fn font_weight_name(w: FontWeight) -> &'static str {
+    FONT_WEIGHTS.iter().find(|(_, fw)| *fw == w).map(|(n, _)| *n).unwrap_or("Regular")
+}
+
+fn font_style_name(st: FontStyle) -> &'static str {
+    FONT_STYLES.iter().find(|(_, fs)| *fs == st).map(|(n, _)| *n).unwrap_or("Normal")
+}
+
+fn fmt_faces(f: Faces) -> String {
+    let names: Vec<&str> = [
+        ("Right", Faces::RIGHT),
+        ("Top", Faces::TOP),
+        ("Back", Faces::BACK),
+        ("Left", Faces::LEFT),
+        ("Bottom", Faces::BOTTOM),
+        ("Front", Faces::FRONT),
+    ]
+    .into_iter()
+    .filter(|(_, bit)| f.contains(*bit))
+    .map(|(n, _)| n)
+    .collect();
+    names.join(", ")
+}
+
+fn fmt_axes(a: Axes) -> String {
+    let names: Vec<&str> = [("X", Axes::X), ("Y", Axes::Y), ("Z", Axes::Z)]
+        .into_iter()
+        .filter(|(_, bit)| a.contains(*bit))
+        .map(|(n, _)| n)
+        .collect();
+    names.join(", ")
 }
 
 fn parse_v3(s: &str) -> Option<Vec3> {
@@ -271,15 +413,71 @@ fn value_text(doc: &doc::Document, v: &Variant) -> String {
             u.y.offset
         ),
         Variant::NumberRange(r) => format!("{} {}", fmt_num(r.min as f64), fmt_num(r.max as f64)),
+        Variant::Rect(r) => format!(
+            "{}, {}, {}, {}",
+            fmt_num(r.min.x as f64),
+            fmt_num(r.min.y as f64),
+            fmt_num(r.max.x as f64),
+            fmt_num(r.max.y as f64),
+        ),
+        Variant::NumberSequence(ns) => {
+            if ns.keypoints.len() == 2
+                && (ns.keypoints[0].value - ns.keypoints[1].value).abs() <= 1e-5
+                && ns.keypoints[0].envelope.abs() <= 1e-5
+                && ns.keypoints[1].envelope.abs() <= 1e-5
+            {
+                fmt_num(ns.keypoints[0].value as f64)
+            } else {
+                ns.keypoints
+                    .iter()
+                    .map(|k| {
+                        if k.envelope.abs() > 1e-5 {
+                            format!("{} {} {}", fmt_num(k.time as f64), fmt_num(k.value as f64), fmt_num(k.envelope as f64))
+                        } else {
+                            format!("{} {}", fmt_num(k.time as f64), fmt_num(k.value as f64))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+        Variant::ColorSequence(cs) => {
+            if cs.keypoints.len() == 2 && cs.keypoints[0].color == cs.keypoints[1].color {
+                let c = cs.keypoints[0].color;
+                format!(
+                    "[{}, {}, {}]",
+                    (c.r * 255.0).round() as u8,
+                    (c.g * 255.0).round() as u8,
+                    (c.b * 255.0).round() as u8
+                )
+            } else {
+                cs.keypoints
+                    .iter()
+                    .map(|k| {
+                        let c = k.color;
+                        format!(
+                            "{} [{}, {}, {}]",
+                            fmt_num(k.time as f64),
+                            (c.r * 255.0).round() as u8,
+                            (c.g * 255.0).round() as u8,
+                            (c.b * 255.0).round() as u8
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
         Variant::Ref(r) => doc.dom.get_by_ref(*r).map(|i| i.name.clone()).unwrap_or_default(),
         Variant::ContentId(c) => c.as_str().to_string(),
         Variant::Content(c) => c.as_uri().unwrap_or_default().to_string(),
         Variant::Font(f) => f.family.rsplit('/').next().unwrap_or("").trim_end_matches(".json").to_string(),
-        Variant::Faces(f) => format!("{f:?}"),
-        Variant::Axes(a) => format!("{a:?}"),
+        Variant::Faces(f) => fmt_faces(*f),
+        Variant::Axes(a) => fmt_axes(*a),
         Variant::UniqueId(u) => u.to_string(),
         Variant::PhysicalProperties(_) => String::new(),
         Variant::CFrame(cf) => fmt_v3(rustudio_core::math::v3(cf.position)),
+        Variant::OptionalCFrame(Some(cf)) => fmt_v3(rustudio_core::math::v3(cf.position)),
+        Variant::OptionalCFrame(None) => String::new(),
         other => format!("{:?}", other.ty()),
     }
 }
@@ -309,6 +507,7 @@ enum Edit {
     Prop(String, Variant),
     PropAxis(String, usize, f32),
     Frame(Frame, Option<Vec3>, Option<Vec3>),
+    Reparent(Ref),
     AddTag(String),
     RemoveTag(String),
     SetAttr(String, Variant),
@@ -336,6 +535,7 @@ impl Editor {
             || self.props.brick_popup.is_some()
             || self.props.color_dialog.is_some()
             || self.props.adding_attr.is_some()
+            || self.props.ref_picker.is_some()
     }
 
     pub fn properties_ui(&mut self, ui: &mut egui::Ui) {
@@ -462,6 +662,7 @@ impl Editor {
         let mut edits: Vec<Edit> = Vec::new();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() })
             .id_salt("props_scroll")
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -508,6 +709,7 @@ impl Editor {
         self.hud.property_rows = self.props.drawn.len();
         let ctx = ui.ctx().clone();
         self.color_editors_ui(&ctx, &mut edits);
+        self.ref_picker_ui(&ctx, &sel, &mut edits);
         self.apply_prop_edits(&sel, first, edits);
     }
 
@@ -651,7 +853,19 @@ impl Editor {
                                 .map_or(c, |r| usize::from(r.secondary.index));
                             (anchor, c)
                         }
-                        1 => (c, c),
+                        1 => {
+                            if cfg!(target_os = "android") {
+                                let (wa, wb) = word_bounds(&text, c);
+                                let tok: String = text.chars().skip(wa).take(wb.saturating_sub(wa)).collect();
+                                if !tok.is_empty() && tok.parse::<f64>().is_ok() {
+                                    (wa, wb)
+                                } else {
+                                    (c, c)
+                                }
+                            } else {
+                                (c, c)
+                            }
+                        }
                         2 => word_bounds(&text, c),
                         _ => (0, n),
                     };
@@ -691,7 +905,9 @@ impl Editor {
         // being typed into scrolls into the room left above it.
         #[cfg(target_os = "android")]
         crate::android::keyboard::reveal_cursor(p.ui, &out);
-        // Sits over the edit box so egui's own click handling never runs.
+        // Desktop-only overlay so egui's own click handling never runs;
+        // omitted on Android so touch taps reach TextEdit and IME cleanly.
+        #[cfg(not(target_os = "android"))]
         p.ui.interact(resp.rect, eid.with("mouse"), egui::Sense::CLICK | egui::Sense::DRAG).on_hover_cursor(egui::CursorIcon::Text);
         self.props.edit_layout = Some((key.to_string(), out.galley.clone(), out.galley_pos, resp.rect));
         // Asked only while lacking, and not back from a loss (which ends
@@ -763,11 +979,44 @@ impl Editor {
                 !matches!(self.game.doc.prop(r, "Disabled"), Some(Variant::Bool(true)))
                     && !matches!(self.game.doc.prop(r, "Enabled"), Some(Variant::Bool(false))),
             )),
-            // A ScreenGui's AbsoluteSize is the view's size (Studio: 863, 675
-            // for its 863×675 viewport).
-            "AbsoluteSize" if doc::is_a(class, "LayerCollector") => {
-                let s = self.game.viewport_rect.size();
-                Some(Variant::Vector2(Vector2::new(s.x.round(), s.y.round())))
+            // Live computed GuiBase2d layout metrics from gui.layout
+            // (keeping LayerCollector viewport-size fallback).
+            "AbsolutePosition" if doc::is_a(class, "GuiBase2d") => {
+                if let Some(b) = self.game.gui.layout.get(&r) {
+                    Some(Variant::Vector2(Vector2::new(b.pos[0], b.pos[1])))
+                } else {
+                    Some(Variant::Vector2(Vector2::new(0.0, 0.0)))
+                }
+            }
+            "AbsoluteSize" if doc::is_a(class, "GuiBase2d") => {
+                if let Some(b) = self.game.gui.layout.get(&r) {
+                    Some(Variant::Vector2(Vector2::new(b.size[0], b.size[1])))
+                } else if doc::is_a(class, "LayerCollector") {
+                    let s = self.game.viewport_rect.size();
+                    Some(Variant::Vector2(Vector2::new(s.x.round(), s.y.round())))
+                } else {
+                    Some(Variant::Vector2(Vector2::new(0.0, 0.0)))
+                }
+            }
+            "AbsoluteRotation" if doc::is_a(class, "GuiBase2d") => {
+                let rot = self.game.gui.layout.get(&r).map(|b| b.rot).unwrap_or(0.0);
+                Some(Variant::Float32(rot))
+            }
+            "TextBounds" if matches!(class, "TextLabel" | "TextButton" | "TextBox") => {
+                let tb = self.game.gui.layout.get(&r).and_then(|b| b.text).unwrap_or([0.0, 0.0]);
+                Some(Variant::Vector2(Vector2::new(tb[0], tb[1])))
+            }
+            "TextFits" if matches!(class, "TextLabel" | "TextButton" | "TextBox") => {
+                let fits = self.game.gui.layout.get(&r).map(|b| b.text_fits).unwrap_or(true);
+                Some(Variant::Bool(fits))
+            }
+            "ContentText" if matches!(class, "TextLabel" | "TextButton" | "TextBox") => {
+                let raw = match self.game.doc.prop(r, "Text") {
+                    Some(Variant::String(t)) => t,
+                    _ => String::new(),
+                };
+                let rich = matches!(self.game.doc.prop(r, "RichText"), Some(Variant::Bool(true)));
+                Some(Variant::String(if rich { strip_rich_text(&raw) } else { raw }))
             }
             // Every instance has a UniqueId in Studio; one not saved yet shows
             // its session id.
@@ -833,7 +1082,19 @@ impl Editor {
             || matches!(name, "ClassName" | "UniqueId" | "IsInSandbox")
             || (name == "Parent" && any_parent_is_root);
         let color = if ro { READ_ONLY } else { TEXT };
-        let vec_like = matches!(value, Some(Variant::Vector3(_)) | Some(Variant::Vector2(_)));
+        let custom_set = name == "CustomPhysicalProperties" && matches!(value, Some(Variant::Bool(true)));
+        let foldable = matches!(
+            value,
+            Some(Variant::Vector3(_))
+                | Some(Variant::Vector2(_))
+                | Some(Variant::UDim2(_))
+                | Some(Variant::UDim(_))
+                | Some(Variant::Font(_))
+                | Some(Variant::CFrame(_))
+                | Some(Variant::OptionalCFrame(_))
+                | Some(Variant::Faces(_))
+                | Some(Variant::Axes(_))
+        ) || custom_set;
         let audio_content_row = name == "AudioContent" && matches!(class, "Sound" | "AudioPlayer");
         let audio_folded = self.props.open_rows.contains("fold:AudioContent");
         let open = self.props.open_rows.contains(name);
@@ -844,13 +1105,12 @@ impl Editor {
             let div = r.min.x + (r.width() * DIVIDER).round();
             p.ui.painter().rect_filled(Rect::from_min_max(r.min, Pos2::new(div, r.max.y - 1.0)), 0.0, Color32::from_rgb(19, 35, 93));
         }
-        let custom_set = name == "CustomPhysicalProperties" && matches!(value, Some(Variant::Bool(true)));
         let arrow = if audio_content_row {
             Some(!audio_folded)
         } else {
-            vec_like
+            foldable
                 .then_some(open)
-                .or((matches!(value, Some(Variant::Faces(_))) || matches!(name, "ResizeableFaces" | "CurrentPhysicalProperties") || custom_set).then_some(false))
+                .or(matches!(name, "ResizeableFaces" | "CurrentPhysicalProperties").then_some(false))
         };
         Self::name_text(p, r, 0.0, name, color, arrow);
         self.props.drawn.push(name.to_string());
@@ -860,7 +1120,7 @@ impl Editor {
                 if !self.props.open_rows.remove("fold:AudioContent") {
                     self.props.open_rows.insert("fold:AudioContent".to_string());
                 }
-            } else if vec_like {
+            } else if foldable {
                 if !self.props.open_rows.remove(name) {
                     self.props.open_rows.insert(name.to_string());
                 }
@@ -895,6 +1155,39 @@ impl Editor {
                 }
                 if clicked_value && !ro {
                     edits.push(Edit::Prop(name.to_string(), Variant::Bool(if mixed { true } else { !b })));
+                }
+                if custom_set && open {
+                    let cur_pp = match self.game.doc.prop(first, "CustomPhysicalProperties") {
+                        Some(Variant::PhysicalProperties(PhysicalProperties::Custom(c))) => c,
+                        _ => CustomPhysicalProperties::new(0.7, 0.3, 0.5, 1.0, 1.0, 1.0),
+                    };
+                    let fields: [(&str, f32); 5] = [
+                        ("Density", cur_pp.density()),
+                        ("Friction", cur_pp.friction()),
+                        ("Elasticity", cur_pp.elasticity()),
+                        ("FrictionWeight", cur_pp.friction_weight()),
+                        ("ElasticityWeight", cur_pp.elasticity_weight()),
+                    ];
+                    for (idx, (fname, fval)) in fields.iter().enumerate() {
+                        let key = format!("{name}.{fname}");
+                        let (sr, sv, sresp) = Self::cells(p, &key);
+                        Self::name_text(p, sr, 1.0, fname, color, None);
+                        let fshown = fmt_num(*fval as f64);
+                        if let Some(t) = self.text_cell_ex(p, &key, sv, &fshown, &fshown, color, ro, sresp.clicked()) {
+                            if let Ok(nv) = t.trim().parse::<f32>() {
+                                let d = if idx == 0 { nv.clamp(0.01, 100.0) } else { cur_pp.density() };
+                                let fr = if idx == 1 { nv.clamp(0.0, 2.0) } else { cur_pp.friction() };
+                                let el = if idx == 2 { nv.clamp(0.0, 1.0) } else { cur_pp.elasticity() };
+                                let fw = if idx == 3 { nv.clamp(0.0, 100.0) } else { cur_pp.friction_weight() };
+                                let ew = if idx == 4 { nv.clamp(0.0, 100.0) } else { cur_pp.elasticity_weight() };
+                                let updated = CustomPhysicalProperties::new(d, fr, el, fw, ew, cur_pp.acoustic_absorption());
+                                edits.push(Edit::Prop(
+                                    "CustomPhysicalProperties".into(),
+                                    Variant::PhysicalProperties(PhysicalProperties::Custom(updated)),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             Variant::Color3(_) | Variant::Color3uint8(_) | Variant::BrickColor(_) => {
@@ -1128,6 +1421,342 @@ impl Editor {
                     }
                 }
             }
+            Variant::UDim2(u2) => {
+                let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, &value) };
+                let init = if mixed { "" } else { shown.as_str() };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                if let Some(t) = self.text_cell_ex(p, name, v, &shown, init, col, ro, clicked_value) {
+                    if let Some(nu) = parse_udim2(&t) {
+                        edits.push(Edit::Prop(name.to_string(), Variant::UDim2(nu)));
+                    }
+                }
+                if open {
+                    for (axis_idx, (axis_name, u)) in [("X", u2.x), ("Y", u2.y)].into_iter().enumerate() {
+                        let akey = format!("{name}.{axis_name}");
+                        let aopen = self.props.open_rows.contains(&akey);
+                        let (ar, av, aresp) = Self::cells(p, &akey);
+                        Self::name_text(p, ar, 1.0, axis_name, color, Some(aopen));
+                        let a_on_name = aresp.interact_pointer_pos().is_some_and(|q| q.x < av.min.x);
+                        if aresp.clicked() && a_on_name {
+                            if !self.props.open_rows.remove(&akey) {
+                                self.props.open_rows.insert(akey.clone());
+                            }
+                        }
+                        let ashown = format!("{}, {}", fmt_num(u.scale as f64), u.offset);
+                        if let Some(t) = self.text_cell_ex(p, &akey, av, &ashown, &ashown, color, ro, aresp.clicked() && !a_on_name) {
+                            if let Some(nu) = parse_udim(&t) {
+                                let mut next = *u2;
+                                if axis_idx == 0 { next.x = nu; } else { next.y = nu; }
+                                edits.push(Edit::Prop(name.to_string(), Variant::UDim2(next)));
+                            }
+                        }
+                        if aopen {
+                            let skey = format!("{akey}.Scale");
+                            let (sr, sv, sresp) = Self::cells(p, &skey);
+                            Self::name_text(p, sr, 2.0, "Scale", color, None);
+                            let sshown = fmt_num(u.scale as f64);
+                            if let Some(t) = self.text_cell_ex(p, &skey, sv, &sshown, &sshown, color, ro, sresp.clicked()) {
+                                if let Ok(ns) = t.trim().parse::<f32>() {
+                                    let mut next = *u2;
+                                    if axis_idx == 0 { next.x.scale = ns; } else { next.y.scale = ns; }
+                                    edits.push(Edit::Prop(name.to_string(), Variant::UDim2(next)));
+                                }
+                            }
+                            let okey = format!("{akey}.Offset");
+                            let (or, ov, oresp) = Self::cells(p, &okey);
+                            Self::name_text(p, or, 2.0, "Offset", color, None);
+                            let oshown = u.offset.to_string();
+                            if let Some(t) = self.text_cell_ex(p, &okey, ov, &oshown, &oshown, color, ro, oresp.clicked()) {
+                                if let Ok(no) = t.trim().parse::<f64>() {
+                                    let mut next = *u2;
+                                    if axis_idx == 0 { next.x.offset = no.round() as i32; } else { next.y.offset = no.round() as i32; }
+                                    edits.push(Edit::Prop(name.to_string(), Variant::UDim2(next)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Variant::UDim(u) => {
+                let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, &value) };
+                let init = if mixed { "" } else { shown.as_str() };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                if let Some(t) = self.text_cell_ex(p, name, v, &shown, init, col, ro, clicked_value) {
+                    if let Some(nu) = parse_udim(&t) {
+                        edits.push(Edit::Prop(name.to_string(), Variant::UDim(nu)));
+                    }
+                }
+                if open {
+                    let skey = format!("{name}.Scale");
+                    let (sr, sv, sresp) = Self::cells(p, &skey);
+                    Self::name_text(p, sr, 1.0, "Scale", color, None);
+                    let sshown = fmt_num(u.scale as f64);
+                    if let Some(t) = self.text_cell_ex(p, &skey, sv, &sshown, &sshown, color, ro, sresp.clicked()) {
+                        if let Ok(ns) = t.trim().parse::<f32>() {
+                            edits.push(Edit::Prop(name.to_string(), Variant::UDim(UDim::new(ns, u.offset))));
+                        }
+                    }
+                    let okey = format!("{name}.Offset");
+                    let (or, ov, oresp) = Self::cells(p, &okey);
+                    Self::name_text(p, or, 1.0, "Offset", color, None);
+                    let oshown = u.offset.to_string();
+                    if let Some(t) = self.text_cell_ex(p, &okey, ov, &oshown, &oshown, color, ro, oresp.clicked()) {
+                        if let Ok(no) = t.trim().parse::<f64>() {
+                            edits.push(Edit::Prop(name.to_string(), Variant::UDim(UDim::new(u.scale, no.round() as i32))));
+                        }
+                    }
+                }
+            }
+            Variant::Font(font) => {
+                let cur_id = font.family.rsplit('/').next().unwrap_or("").trim_end_matches(".json");
+                let cur_label = if mixed {
+                    MIXED_LABEL.to_string()
+                } else {
+                    FONT_FAMILIES
+                        .iter()
+                        .find(|(id, _)| *id == cur_id)
+                        .map(|(_, lbl)| (*lbl).to_string())
+                        .unwrap_or_else(|| if cur_id.is_empty() { font.family.clone() } else { cur_id.to_string() })
+                };
+                Self::value_label(p, v, &cur_label, if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { color });
+                if !ro {
+                    let id = egui::Id::new(("font_family_popup", name));
+                    if clicked_value {
+                        egui::Popup::open_id(p.ui.ctx(), id);
+                    }
+                    let mut picked_fam: Option<&str> = None;
+                    const ITEM_H: f32 = 19.0;
+                    let width = v.width().max(150.0);
+                    egui::Popup::new(id, p.ui.ctx().clone(), egui::PopupAnchor::Position(v.left_bottom()), p.ui.layer_id())
+                        .kind(egui::PopupKind::Menu)
+                        .open_memory(None)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                        .width(width)
+                        .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                        .show(|ui| {
+                            ui.set_width(width - 4.0);
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(ITEM_H * 12.0)
+                                .auto_shrink([false, true])
+                                .scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() })
+                                .show(ui, |ui| {
+                                    for (fid, flabel) in FONT_FAMILIES {
+                                        let (ir, iresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ITEM_H), Sense::click());
+                                        let is_cur = !mixed && *fid == cur_id;
+                                        if is_cur || iresp.hovered() {
+                                            let bg = if is_cur { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                            ui.painter().rect_filled(ir, 0.0, bg);
+                                        }
+                                        ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, *flabel, FontId::proportional(FONT), TEXT);
+                                        if iresp.clicked() {
+                                            picked_fam = Some(*fid);
+                                        }
+                                    }
+                                });
+                        });
+                    if let Some(fid) = picked_fam {
+                        let mut nf = font.clone();
+                        nf.family = format!("rbxasset://fonts/families/{fid}.json");
+                        nf.cached_face_id = None;
+                        edits.push(Edit::Prop(name.to_string(), Variant::Font(nf)));
+                    }
+                }
+                if open {
+                    // Weight enum dropdown sub-row
+                    let wkey = format!("{name}.Weight");
+                    let (wr, wv, wresp) = Self::cells(p, &wkey);
+                    Self::name_text(p, wr, 1.0, "Weight", color, None);
+                    let w_on_val = wresp.clicked() && wresp.interact_pointer_pos().is_some_and(|q| q.x >= wv.min.x);
+                    Self::value_label(p, wv, font_weight_name(font.weight), color);
+                    if !ro {
+                        let wid = egui::Id::new(("font_weight_popup", name));
+                        if w_on_val {
+                            egui::Popup::open_id(p.ui.ctx(), wid);
+                        }
+                        let mut picked_w: Option<FontWeight> = None;
+                        let width = wv.width().max(120.0);
+                        egui::Popup::new(wid, p.ui.ctx().clone(), egui::PopupAnchor::Position(wv.left_bottom()), p.ui.layer_id())
+                            .kind(egui::PopupKind::Menu)
+                            .open_memory(None)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                            .width(width)
+                            .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                            .show(|ui| {
+                                ui.set_width(width - 4.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                for (wlabel, fw) in FONT_WEIGHTS {
+                                    let (ir, iresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), Sense::click());
+                                    let is_cur = *fw == font.weight;
+                                    if is_cur || iresp.hovered() {
+                                        let bg = if is_cur { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                        ui.painter().rect_filled(ir, 0.0, bg);
+                                    }
+                                    ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, *wlabel, FontId::proportional(FONT), TEXT);
+                                    if iresp.clicked() {
+                                        picked_w = Some(*fw);
+                                    }
+                                }
+                            });
+                        if let Some(fw) = picked_w.filter(|w| *w != font.weight) {
+                            let mut nf = font.clone();
+                            nf.weight = fw;
+                            nf.cached_face_id = None;
+                            edits.push(Edit::Prop(name.to_string(), Variant::Font(nf)));
+                        }
+                    }
+                    // Style enum dropdown sub-row
+                    let skey = format!("{name}.Style");
+                    let (sr, sv, sresp) = Self::cells(p, &skey);
+                    Self::name_text(p, sr, 1.0, "Style", color, None);
+                    let s_on_val = sresp.clicked() && sresp.interact_pointer_pos().is_some_and(|q| q.x >= sv.min.x);
+                    Self::value_label(p, sv, font_style_name(font.style), color);
+                    if !ro {
+                        let sid = egui::Id::new(("font_style_popup", name));
+                        if s_on_val {
+                            egui::Popup::open_id(p.ui.ctx(), sid);
+                        }
+                        let mut picked_s: Option<FontStyle> = None;
+                        let width = sv.width().max(110.0);
+                        egui::Popup::new(sid, p.ui.ctx().clone(), egui::PopupAnchor::Position(sv.left_bottom()), p.ui.layer_id())
+                            .kind(egui::PopupKind::Menu)
+                            .open_memory(None)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                            .width(width)
+                            .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                            .show(|ui| {
+                                ui.set_width(width - 4.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                for (slabel, fs) in FONT_STYLES {
+                                    let (ir, iresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), Sense::click());
+                                    let is_cur = *fs == font.style;
+                                    if is_cur || iresp.hovered() {
+                                        let bg = if is_cur { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                        ui.painter().rect_filled(ir, 0.0, bg);
+                                    }
+                                    ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, *slabel, FontId::proportional(FONT), TEXT);
+                                    if iresp.clicked() {
+                                        picked_s = Some(*fs);
+                                    }
+                                }
+                            });
+                        if let Some(fs) = picked_s.filter(|st| *st != font.style) {
+                            let mut nf = font.clone();
+                            nf.style = fs;
+                            nf.cached_face_id = None;
+                            edits.push(Edit::Prop(name.to_string(), Variant::Font(nf)));
+                        }
+                    }
+                }
+            }
+            Variant::Ref(target_ref) => {
+                let shown = if mixed {
+                    MIXED_LABEL.to_string()
+                } else {
+                    self.game
+                        .doc
+                        .dom
+                        .get_by_ref(*target_ref)
+                        .map(|i| i.name.clone())
+                        .unwrap_or_default()
+                };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                Self::value_label(p, v, &shown, col);
+                if clicked_value && !ro {
+                    self.props.ref_picker = Some(RefPicker {
+                        prop: name.to_string(),
+                        search: String::new(),
+                        focus_search: true,
+                    });
+                }
+            }
+            Variant::CFrame(_) | Variant::OptionalCFrame(_) => {
+                let is_opt = matches!(value, Variant::OptionalCFrame(_));
+                let cur_xf = cf_of(Some(value.clone())).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+                let shown = if mixed {
+                    MIXED_LABEL.to_string()
+                } else if matches!(value, Variant::OptionalCFrame(None)) {
+                    String::new()
+                } else {
+                    fmt_v3(cur_xf.pos)
+                };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                Self::value_label(p, v, &shown, col);
+                if open {
+                    let cur_ori = cur_xf.orientation_deg();
+                    for (part, vec_val) in [("Position", cur_xf.pos), ("Orientation", cur_ori)] {
+                        let ckey = format!("{name}.{part}");
+                        let (cr, cv, cresp) = Self::cells(p, &ckey);
+                        Self::name_text(p, cr, 1.0, part, color, None);
+                        let pshown = fmt_v3(vec_val);
+                        if let Some(t) = self.text_cell_ex(p, &ckey, cv, &pshown, &pshown, color, ro, cresp.clicked()) {
+                            if let Some(nv) = parse_v3(&t) {
+                                let (np, no) = if part == "Position" { (nv, cur_ori) } else { (cur_xf.pos, nv) };
+                                let ncf = Xform::from_orientation_deg(np, no).to_cframe();
+                                let variant = if is_opt { Variant::OptionalCFrame(Some(ncf)) } else { Variant::CFrame(ncf) };
+                                edits.push(Edit::Prop(name.to_string(), variant));
+                            }
+                        }
+                    }
+                }
+            }
+            Variant::Faces(faces) => {
+                let shown = if mixed { MIXED_LABEL.to_string() } else { fmt_faces(*faces) };
+                Self::value_label(p, v, &shown, if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { color });
+                if open {
+                    for (fname, bit) in [
+                        ("Right", Faces::RIGHT),
+                        ("Top", Faces::TOP),
+                        ("Back", Faces::BACK),
+                        ("Left", Faces::LEFT),
+                        ("Bottom", Faces::BOTTOM),
+                        ("Front", Faces::FRONT),
+                    ] {
+                        let fkey = format!("{name}.{fname}");
+                        let (fr, fv, fresp) = Self::cells(p, &fkey);
+                        Self::name_text(p, fr, 1.0, fname, color, None);
+                        let checked = faces.contains(bit);
+                        let br = Rect::from_min_size(Pos2::new(fv.min.x + 2.0, fv.center().y - 7.0), Vec2::splat(14.0));
+                        let painter = p.ui.painter();
+                        if checked {
+                            painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(230, 231, 233) });
+                            rustudio_engine::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
+                        } else {
+                            painter.rect_filled(br, 2.0, BOX_OFF);
+                        }
+                        let on_val = fresp.clicked() && fresp.interact_pointer_pos().is_some_and(|q| q.x >= fv.min.x);
+                        if on_val && !ro {
+                            let next = Faces::from_bits(faces.bits() ^ bit.bits()).unwrap_or(Faces::empty());
+                            edits.push(Edit::Prop(name.to_string(), Variant::Faces(next)));
+                        }
+                    }
+                }
+            }
+            Variant::Axes(axes) => {
+                let shown = if mixed { MIXED_LABEL.to_string() } else { fmt_axes(*axes) };
+                Self::value_label(p, v, &shown, if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { color });
+                if open {
+                    for (aname, bit) in [("X", Axes::X), ("Y", Axes::Y), ("Z", Axes::Z)] {
+                        let akey = format!("{name}.{aname}");
+                        let (ar, av, aresp) = Self::cells(p, &akey);
+                        Self::name_text(p, ar, 1.0, aname, color, None);
+                        let checked = axes.contains(bit);
+                        let br = Rect::from_min_size(Pos2::new(av.min.x + 2.0, av.center().y - 7.0), Vec2::splat(14.0));
+                        let painter = p.ui.painter();
+                        if checked {
+                            painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(230, 231, 233) });
+                            rustudio_engine::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
+                        } else {
+                            painter.rect_filled(br, 2.0, BOX_OFF);
+                        }
+                        let on_val = aresp.clicked() && aresp.interact_pointer_pos().is_some_and(|q| q.x >= av.min.x);
+                        if on_val && !ro {
+                            let next = Axes::from_bits(axes.bits() ^ bit.bits()).unwrap_or(Axes::empty());
+                            edits.push(Edit::Prop(name.to_string(), Variant::Axes(next)));
+                        }
+                    }
+                }
+            }
             Variant::Tags(_) | Variant::Attributes(_) => {}
             other if !ro && number_of(other).is_some() && crate::prop_slider::spec_for(class, name).is_some() => {
                 let spec = crate::prop_slider::spec_for(class, name).unwrap_or(crate::prop_slider::SliderSpec { min: 0.0, max: 1.0, ticks: 20.0, square: false });
@@ -1135,10 +1764,32 @@ impl Editor {
             }
             other => {
                 let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, other) };
-                let init = if mixed { "" } else { shown.as_str() };
+                let init = if mixed {
+                    ""
+                } else if let Variant::String(raw) = other {
+                    raw.as_str()
+                } else {
+                    shown.as_str()
+                };
                 let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
                 let editable = !ro
-                    && matches!(other, Variant::String(_) | Variant::Int32(_) | Variant::Int64(_) | Variant::Float32(_) | Variant::Float64(_) | Variant::Vector2(_) | Variant::ContentId(_) | Variant::Content(_));
+                    && matches!(
+                        other,
+                        Variant::String(_)
+                            | Variant::Int32(_)
+                            | Variant::Int64(_)
+                            | Variant::Float32(_)
+                            | Variant::Float64(_)
+                            | Variant::Vector2(_)
+                            | Variant::Vector2int16(_)
+                            | Variant::Vector3int16(_)
+                            | Variant::NumberRange(_)
+                            | Variant::Rect(_)
+                            | Variant::NumberSequence(_)
+                            | Variant::ColorSequence(_)
+                            | Variant::ContentId(_)
+                            | Variant::Content(_)
+                    );
                 if let Some(t) = self.text_cell_ex(p, name, v, &shown, init, col, ro, clicked_value && editable) {
                     if let Some(nv) = parse_like(other, &t) {
                         if name == "Name" {
@@ -1409,6 +2060,129 @@ impl Editor {
                     }
                 }
             }
+        }
+    }
+
+    /// Searchable `Order::Foreground` modal picker for `Variant::Ref` properties
+    /// (including `Parent`, preventing self/descendant reparenting).
+    fn ref_picker_ui(&mut self, ctx: &egui::Context, sel: &[Ref], edits: &mut Vec<Edit>) {
+        let Some(mut picker) = self.props.ref_picker.take() else {
+            return;
+        };
+        let is_parent = picker.prop == "Parent";
+        let mut forbidden: HashSet<Ref> = HashSet::new();
+        if is_parent {
+            for &r in sel {
+                forbidden.insert(r);
+                for desc in self.game.doc.dom.descendants_of(r) {
+                    forbidden.insert(desc.referent());
+                }
+            }
+        }
+        let screen = ctx.content_rect();
+        let w = 320.0_f32.min(screen.width() - 24.0).max(200.0);
+        let h = 360.0_f32.min(screen.height() - 48.0).max(180.0);
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut picked: Option<Ref> = None;
+
+        egui::Area::new(egui::Id::new("prop_ref_picker_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (_, bresp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(110));
+                if bresp.clicked() {
+                    close = true;
+                }
+            });
+
+        let origin = Pos2::new(
+            (screen.center().x - w * 0.5).round().max(screen.min.x + 8.0),
+            (screen.center().y - h * 0.5).round().max(screen.min.y + 8.0),
+        );
+        egui::Area::new(egui::Id::new("prop_ref_picker"))
+            .order(egui::Order::Foreground)
+            .constrain_to(screen)
+            .fixed_pos(origin)
+            .show(ctx, |ui| {
+                ui.ctx().move_to_top(ui.layer_id());
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(28, 30, 36))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(60, 64, 76)))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(w - 20.0);
+                        ui.set_height(h - 20.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("Select {}", picker.prop)).strong().color(TEXT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Close").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        let te = ui.add(
+                            egui::TextEdit::singleline(&mut picker.search)
+                                .hint_text("Search instances...")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if picker.focus_search && !cfg!(target_os = "android") {
+                            te.request_focus();
+                            picker.focus_search = false;
+                        }
+                        ui.add_space(6.0);
+                        if !is_parent && ui.button("(None)").clicked() {
+                            picked = Some(Ref::none());
+                            close = true;
+                        }
+                        ui.add_space(4.0);
+                        let q = picker.search.trim().to_lowercase();
+                        let root = self.game.doc.dom.root_ref();
+                        let mut candidates: Vec<(Ref, String, String)> = Vec::new();
+                        for inst in self.game.doc.dom.descendants_of(root) {
+                            let r = inst.referent();
+                            if is_parent && forbidden.contains(&r) {
+                                continue;
+                            }
+                            if !q.is_empty()
+                                && !inst.name.to_lowercase().contains(&q)
+                                && !inst.class.to_lowercase().contains(&q)
+                            {
+                                continue;
+                            }
+                            candidates.push((r, inst.name.clone(), inst.class.to_string()));
+                            if candidates.len() >= 250 {
+                                break;
+                            }
+                        }
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() })
+                            .show(ui, |ui| {
+                                for (r, iname, iclass) in &candidates {
+                                    let label = format!("{iname} ({iclass})");
+                                    if ui.selectable_label(false, label).clicked() {
+                                        picked = Some(*r);
+                                        close = true;
+                                    }
+                                }
+                            });
+                    });
+            });
+
+        if let Some(target) = picked {
+            if is_parent {
+                if target.is_some() {
+                    edits.push(Edit::Reparent(target));
+                }
+            } else {
+                edits.push(Edit::Prop(picker.prop.clone(), Variant::Ref(target)));
+            }
+        }
+        if !close {
+            self.props.ref_picker = Some(picker);
         }
     }
 
@@ -1912,6 +2686,9 @@ impl Editor {
                     }
                 }
                 Edit::Frame(f, pos, ori) => self.set_frame(sel, f, pos, ori),
+                Edit::Reparent(target) => {
+                    self.game.doc.reparent(sel, target);
+                }
                 Edit::AddTag(t) => self.edit_tags(sel, |tags| {
                     if !tags.contains(&t) {
                         tags.push(t.clone());
@@ -2051,6 +2828,29 @@ fn typed_empty(class: &str, prop: &str) -> Option<Variant> {
         T::String => Variant::String(String::new()),
         T::Vector2 => Variant::Vector2(Vector2::new(0.0, 0.0)),
         T::Vector3 => Variant::Vector3(rbx_dom_weak::types::Vector3::new(0.0, 0.0, 0.0)),
+        T::Vector2int16 => Variant::Vector2int16(Vector2int16::new(0, 0)),
+        T::Vector3int16 => Variant::Vector3int16(Vector3int16::new(0, 0, 0)),
+        T::UDim => Variant::UDim(UDim::new(0.0, 0)),
+        T::UDim2 => Variant::UDim2(UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0))),
+        T::NumberRange => Variant::NumberRange(NumberRange::new(0.0, 0.0)),
+        T::Rect => Variant::Rect(RbxRect::new(Vector2::new(0.0, 0.0), Vector2::new(0.0, 0.0))),
+        T::CFrame => Variant::CFrame(CFrame::new(Vector3::new(0.0, 0.0, 0.0), Matrix3::identity())),
+        T::OptionalCFrame => Variant::OptionalCFrame(None),
+        T::NumberSequence => Variant::NumberSequence(NumberSequence {
+            keypoints: vec![
+                NumberSequenceKeypoint::new(0.0, 0.0, 0.0),
+                NumberSequenceKeypoint::new(1.0, 0.0, 0.0),
+            ],
+        }),
+        T::ColorSequence => Variant::ColorSequence(ColorSequence {
+            keypoints: vec![
+                ColorSequenceKeypoint::new(0.0, Color3::new(1.0, 1.0, 1.0)),
+                ColorSequenceKeypoint::new(1.0, Color3::new(1.0, 1.0, 1.0)),
+            ],
+        }),
+        T::Faces => Variant::Faces(Faces::empty()),
+        T::Axes => Variant::Axes(Axes::empty()),
+        T::Font => Variant::Font(Font::new("rbxasset://fonts/families/SourceSansPro.json", FontWeight::Regular, FontStyle::Normal)),
         T::Ref => Variant::Ref(Ref::none()),
         T::Content => Variant::Content(rbx_dom_weak::types::Content::from(String::new())),
         T::ContentId => Variant::ContentId(String::new().into()),
@@ -2069,10 +2869,12 @@ fn enum_type_of(class: &str, prop: &str) -> Option<String> {
 }
 
 /// Parses typed text back into a value of the same kind.
-fn parse_like(old: &Variant, t: &str) -> Option<Variant> {
-    let t = t.trim();
+fn parse_like(old: &Variant, raw: &str) -> Option<Variant> {
+    if let Variant::String(_) = old {
+        return Some(Variant::String(raw.to_string()));
+    }
+    let t = raw.trim();
     Some(match old {
-        Variant::String(_) => Variant::String(t.to_string()),
         Variant::Int32(_) => Variant::Int32(t.parse::<f64>().ok()?.round() as i32),
         Variant::Int64(_) => Variant::Int64(t.parse::<f64>().ok()?.round() as i64),
         Variant::Float32(_) => Variant::Float32(t.parse().ok()?),
@@ -2080,6 +2882,87 @@ fn parse_like(old: &Variant, t: &str) -> Option<Variant> {
         Variant::Vector2(_) => {
             let p = parse_nums(t, 2)?;
             Variant::Vector2(Vector2::new(p[0], p[1]))
+        }
+        Variant::Vector2int16(_) => {
+            let p = parse_nums(t, 2)?;
+            Variant::Vector2int16(Vector2int16::new(p[0].round() as i16, p[1].round() as i16))
+        }
+        Variant::Vector3int16(_) => {
+            let p = parse_nums(t, 3)?;
+            Variant::Vector3int16(Vector3int16::new(p[0].round() as i16, p[1].round() as i16, p[2].round() as i16))
+        }
+        Variant::UDim(_) => Variant::UDim(parse_udim(t)?),
+        Variant::UDim2(_) => Variant::UDim2(parse_udim2(t)?),
+        Variant::NumberRange(_) => {
+            let p = parse_lenient_nums(t)?;
+            match p.len() {
+                1 => Variant::NumberRange(NumberRange::new(p[0], p[0])),
+                2 => Variant::NumberRange(NumberRange::new(p[0], p[1].max(p[0]))),
+                _ => return None,
+            }
+        }
+        Variant::Rect(_) => {
+            let p = parse_lenient_nums(t)?;
+            if p.len() != 4 {
+                return None;
+            }
+            Variant::Rect(RbxRect::new(Vector2::new(p[0], p[1]), Vector2::new(p[2], p[3])))
+        }
+        Variant::NumberSequence(_) => {
+            if let Ok(v) = t.parse::<f32>() {
+                Variant::NumberSequence(NumberSequence {
+                    keypoints: vec![
+                        NumberSequenceKeypoint::new(0.0, v, 0.0),
+                        NumberSequenceKeypoint::new(1.0, v, 0.0),
+                    ],
+                })
+            } else {
+                let mut kps = Vec::new();
+                for seg in t.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                    let nums = parse_lenient_nums(seg)?;
+                    match nums.len() {
+                        2 => kps.push(NumberSequenceKeypoint::new(nums[0].clamp(0.0, 1.0), nums[1], 0.0)),
+                        3 => kps.push(NumberSequenceKeypoint::new(nums[0].clamp(0.0, 1.0), nums[1], nums[2].max(0.0))),
+                        _ => return None,
+                    }
+                }
+                if kps.len() < 2 {
+                    return None;
+                }
+                kps.sort_by(|a, b| a.time.total_cmp(&b.time));
+                Variant::NumberSequence(NumberSequence { keypoints: kps })
+            }
+        }
+        Variant::ColorSequence(_) => {
+            if let Some(rgb) = parse_nums(t, 3) {
+                let c = Color3::new(
+                    rgb[0].clamp(0.0, 255.0) / 255.0,
+                    rgb[1].clamp(0.0, 255.0) / 255.0,
+                    rgb[2].clamp(0.0, 255.0) / 255.0,
+                );
+                Variant::ColorSequence(ColorSequence {
+                    keypoints: vec![
+                        ColorSequenceKeypoint::new(0.0, c),
+                        ColorSequenceKeypoint::new(1.0, c),
+                    ],
+                })
+            } else {
+                let nums = parse_lenient_nums(t)?;
+                if nums.len() < 8 || nums.len() % 4 != 0 {
+                    return None;
+                }
+                let mut kps = Vec::new();
+                for chunk in nums.chunks_exact(4) {
+                    let c = Color3::new(
+                        chunk[1].clamp(0.0, 255.0) / 255.0,
+                        chunk[2].clamp(0.0, 255.0) / 255.0,
+                        chunk[3].clamp(0.0, 255.0) / 255.0,
+                    );
+                    kps.push(ColorSequenceKeypoint::new(chunk[0].clamp(0.0, 1.0), c));
+                }
+                kps.sort_by(|a, b| a.time.total_cmp(&b.time));
+                Variant::ColorSequence(ColorSequence { keypoints: kps })
+            }
         }
         Variant::ContentId(_) => Variant::ContentId(t.to_string().into()),
         Variant::Content(_) => Variant::Content(rbx_dom_weak::types::Content::from(t.to_string())),

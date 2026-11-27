@@ -1222,7 +1222,7 @@ impl Inst {
                 (pp - *position).length_squared() > POS2
             }
             // BodyVelocity Studio / BodyAngularVelocity Studio: no target test.
-            Class::BodyVelocity { velocity, max_force, p } => velocity.length_squared() >= EPS2 && max_force.length_squared() >= EPS2 && *p >= EPS,
+            Class::BodyVelocity { velocity, max_force, .. } => velocity.length_squared() >= EPS2 && max_force.length_squared() >= EPS2,
             Class::BodyAngularVelocity { ang_vel, max_torque, p } => ang_vel.length_squared() >= EPS2 && max_torque.length_squared() >= EPS2 && *p >= EPS,
             // BodyForce / BodyThrust / Rocket: base slot Studio with KJ = 0; BallSocket,
             // Universal, Plane, Rod, Spring, TorsionSpring, VectorForce, Torque, LineForce, Rigid:

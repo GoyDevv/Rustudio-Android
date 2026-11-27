@@ -196,6 +196,11 @@ impl Build {
             config.define("NDEBUG", None);
             // this flag allows compiler to lower sqrt() into a single CPU instruction
             config.flag_if_supported("-fno-math-errno");
+            if !target.contains("msvc") {
+                config.flag_if_supported("-O3");
+                config.flag_if_supported("-ffp-contract=fast");
+                config.flag_if_supported("-fomit-frame-pointer");
+            }
         }
 
         config.include(&common_include_dir);

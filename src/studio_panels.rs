@@ -348,6 +348,7 @@ impl Editor {
                             .desired_width((popup_w - 10.0).max(120.0)),
                     );
                     self.ui_rects.insert("insert.search", r.rect);
+                    #[cfg(not(target_os = "android"))]
                     if pop.opened_frame + 1 >= self.game.frame_no {
                         r.request_focus();
                     }

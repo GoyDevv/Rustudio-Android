@@ -453,6 +453,16 @@ impl PluginUi {
         self.text_focus.is_some() || self.core.focus.is_some()
     }
 
+    /// Clears local TextBox focus across CoreGui and all plugin widget slots
+    /// (preserving `focus_events` already queued by Android keyboard dismissal).
+    pub fn release_all_text_focus(&mut self) {
+        self.core.clear_local_focus();
+        for s in &mut self.slots {
+            s.gui.clear_local_focus();
+        }
+        self.text_focus = None;
+    }
+
     /// ViewportFrames drawn inside edit plugin widgets or CoreGui.
     pub fn collect_viewport_frames(&self, out: &mut HashSet<Ref>) {
         out.extend(self.core.viewport_frames().iter().copied());
@@ -953,6 +963,10 @@ impl Editor {
 
     /// Which plugin panels the dock holds now (after its requests ran).
     pub fn plugin_ui_note_open(&mut self, is_open: impl Fn(&Tab) -> bool) {
+        #[cfg(target_os = "android")]
+        if crate::android::keyboard::take_textbox_released() {
+            self.plugin_ui.release_all_text_focus();
+        }
         for (i, s) in self.plugin_ui.slots.iter_mut().enumerate() {
             let open = is_open(&Tab::Plugin(i as u32));
             if open != s.open || s.asked == Some(open) {
@@ -1021,6 +1035,11 @@ impl Editor {
             game: Game { cam, assets, render_state, fixed_dt, .. },
             ..
         } = self;
+        #[cfg(target_os = "android")]
+        if crate::android::keyboard::take_textbox_released() {
+            plugin_ui.release_all_text_focus();
+            resp.surrender_focus();
+        }
         let slot = &mut plugin_ui.slots[n];
         slot.gui.draw(
             &ctx,
@@ -1134,6 +1153,10 @@ impl Editor {
                     roots: Roots::CoreGui,
                 },
             );
+        }
+        #[cfg(target_os = "android")]
+        if crate::android::keyboard::take_textbox_released() {
+            plugin_ui.release_all_text_focus();
         }
         let gui_took = plugin_ui.core.input(ctx, resp, rect);
         plugin_ui.core.keyboard(ctx, doc);

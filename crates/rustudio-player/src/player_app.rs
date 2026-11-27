@@ -61,6 +61,9 @@ impl PlayerApp {
                 Ok(doc) => {
                     let n = doc.dom.descendants().count();
                     game.doc = doc;
+                    rustudio_engine::bytecode_cache::prewarm(
+                        rustudio_engine::bytecode_cache::collect_script_sources(&game.doc),
+                    );
                     if !game.use_saved_camera() {
                         game.frame_all();
                     }

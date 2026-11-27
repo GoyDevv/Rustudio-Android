@@ -950,7 +950,7 @@ impl Physics {
             },
             // I.15 [J2]: the per-step update (vt slot 78) — BodyVelocity Studio (connector =
             // Velocity, = clampF(MaxForce)), BodyForce Studio (F = Force, world)
-            "BodyVelocity" => SClass::BodyVelocity { velocity: v("Velocity"), max_force: vec3_of(doc.prop(r, "MaxForce")).unwrap_or(Vec3::splat(4000.0)), p: n("P", 1250.0) },
+            "BodyVelocity" => SClass::BodyVelocity { velocity: v("Velocity"), max_force: vec3_of(doc.prop(r, "MaxForce")).filter(|v| !v.is_nan()).unwrap_or(Vec3::splat(4000.0)).abs(), p: n("P", 1250.0) },
             "BodyForce" => SClass::BodyForce { force: v("Force") },
             // [J3] slot 78: BodyThrust Studio, BodyAngularVelocity Studio, BodyPosition Studio
             "BodyGyro" => SClass::BodyGyro {
@@ -961,7 +961,7 @@ impl Physics {
             },
             "BodyThrust" => SClass::BodyThrust { force: v("Force"), location: v("Location") },
             "BodyAngularVelocity" => SClass::BodyAngularVelocity { ang_vel: vec3_of(doc.prop(r, "AngularVelocity")).unwrap_or(Vec3::new(0.0, 2.0, 0.0)), max_torque: vec3_of(doc.prop(r, "MaxTorque")).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)), p: n("P", 1250.0) },
-            "BodyPosition" => SClass::BodyPosition { position: vec3_of(doc.prop(r, "Position")).unwrap_or(Vec3::new(0.0, 50.0, 0.0)), max_force: vec3_of(doc.prop(r, "MaxForce")).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)), p: n("P", 10000.0), d: n("D", 1250.0) },
+            "BodyPosition" => SClass::BodyPosition { position: vec3_of(doc.prop(r, "Position")).filter(|v| !v.is_nan()).unwrap_or(Vec3::new(0.0, 50.0, 0.0)), max_force: vec3_of(doc.prop(r, "MaxForce")).filter(|v| !v.is_nan()).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)).abs(), p: n("P", 10000.0), d: n("D", 1250.0) },
             c if c.starts_with("Body") || c == "RocketPropulsion" => {
                 if c == "RocketPropulsion" {
                     uncovered_once(&UNCOVERED_ROCKET, "RocketPropulsion");

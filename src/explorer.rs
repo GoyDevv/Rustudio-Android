@@ -394,6 +394,7 @@ impl Editor {
         let dragging = egui::DragAndDrop::has_payload_of_type::<DragRefs>(ui.ctx());
         let mut scroll = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() })
             .id_salt("explorer_scroll");
         if let Some(target) = self.explorer.scroll_to.take() {
             if let Some(idx) = rows.iter().position(|(r, _)| *r == target) {

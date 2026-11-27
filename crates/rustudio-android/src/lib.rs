@@ -96,6 +96,17 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeIme
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeVisibility(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    visible: u8,
+    bottom_inset_px: i32,
+) {
+    rustudio::android::ime_bridge::on_ime_visibility(visible != 0, bottom_inset_px);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
 pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnLifecycle(
     _env: *mut c_void,
     _class: *mut c_void,

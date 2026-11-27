@@ -2,6 +2,7 @@
 //! into RusTudio's real egui text fields (Script Editor, Properties, etc.) with
 //! zero fake EditText overlay.
 
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 
 use egui::{Event, Key, Modifiers};
@@ -74,6 +75,29 @@ pub fn on_key(code: i32, down: bool) {
 /// Called from JNI `RustudioActivity.nativeImeAction`.
 pub fn on_action(action: i32) {
     push_op(ImeOp::Action(action));
+}
+
+static IME_VISIBILITY_KNOWN: AtomicBool = AtomicBool::new(false);
+static IME_VISIBLE: AtomicBool = AtomicBool::new(false);
+static IME_BOTTOM_INSET_PX: AtomicI32 = AtomicI32::new(0);
+
+/// Called from JNI `RustudioActivity.nativeImeVisibility` (API 30+ `OnApplyWindowInsetsListener`).
+pub fn on_ime_visibility(visible: bool, bottom_inset_px: i32) {
+    IME_VISIBLE.store(visible, Ordering::Relaxed);
+    IME_BOTTOM_INSET_PX.store(bottom_inset_px.max(0), Ordering::Relaxed);
+    IME_VISIBILITY_KNOWN.store(true, Ordering::Relaxed);
+    super::lifecycle::wake();
+}
+
+/// Latest `(visible, bottom_inset_px)` pushed by `OnApplyWindowInsetsListener`
+/// on API 30+, if at least one callback has arrived.
+pub fn ime_visibility() -> Option<(bool, i32)> {
+    IME_VISIBILITY_KNOWN.load(Ordering::Relaxed).then(|| {
+        (
+            IME_VISIBLE.load(Ordering::Relaxed),
+            IME_BOTTOM_INSET_PX.load(Ordering::Relaxed),
+        )
+    })
 }
 
 /// Asks `RustudioActivity.setNativeImeOpen(open)` to attach or detach the soft

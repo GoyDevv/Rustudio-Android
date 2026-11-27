@@ -2331,6 +2331,213 @@ impl Physics {
         self.humanoid_body_input(model, false)
     }
 
+    /// Whether an active `BodyVelocity` or `LinearVelocity` mover drives this
+    /// character's root assembly along world `[X, Z]` with nonzero horizontal `MaxForce`.
+    fn humanoid_vel_mover_xz(&self, body: rp::RigidBodyHandle) -> [bool; 2] {
+        let mut xz = [false, false];
+        let eps = crate::humanoid::EPS;
+        let eps2 = eps * eps;
+        let mark_law = |law: &Law, xz: &mut [bool; 2]| match law {
+            Law::BodyVelocity { max, .. } => {
+                if max.x.abs() > eps {
+                    xz[0] = true;
+                }
+                if max.z.abs() > eps {
+                    xz[1] = true;
+                }
+            }
+            Law::LinearVelocity { mode, line, t1, t2, planar_max, frame, limit, .. } => {
+                let world = matches!(frame, Frame::World);
+                let (has_x, has_z) = match limit {
+                    Limit::None => (true, true),
+                    Limit::Magnitude(f) => {
+                        let on = f.abs() > eps;
+                        (on, on)
+                    }
+                    Limit::PerAxis(v, _) => {
+                        if world {
+                            (v.x.abs() > eps, v.z.abs() > eps)
+                        } else {
+                            let on = v.x.abs() > eps || v.y.abs() > eps || v.z.abs() > eps;
+                            (on, on)
+                        }
+                    }
+                };
+                match mode {
+                    0 => {
+                        if has_x || has_z {
+                            if world {
+                                if line.x.abs() > eps {
+                                    xz[0] = true;
+                                }
+                                if line.z.abs() > eps {
+                                    xz[1] = true;
+                                }
+                            } else if line.length_squared() > eps2 {
+                                xz[0] = true;
+                                xz[1] = true;
+                            }
+                        }
+                    }
+                    1 => {
+                        let on = match planar_max {
+                            Some(pm) => pm[0].abs() > eps || pm[1].abs() > eps,
+                            None => has_x || has_z,
+                        };
+                        if on {
+                            if world {
+                                if t1.x.abs() > eps || t2.x.abs() > eps {
+                                    xz[0] = true;
+                                }
+                                if t1.z.abs() > eps || t2.z.abs() > eps {
+                                    xz[1] = true;
+                                }
+                            } else {
+                                xz[0] = true;
+                                xz[1] = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        if has_x {
+                            xz[0] = true;
+                        }
+                        if has_z {
+                            xz[1] = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        };
+        let mark_desc = |d: &crate::solver::joints::instance::Desc, xz: &mut [bool; 2]| {
+            if !d.in_world || (d.a.body != Some(body) && d.b.body != Some(body)) {
+                return;
+            }
+            use crate::solver::joints::instance::Class as SClass;
+            match &d.class {
+                SClass::BodyVelocity { max_force, .. } => {
+                    if max_force.x.abs() > eps {
+                        xz[0] = true;
+                    }
+                    if max_force.z.abs() > eps {
+                        xz[1] = true;
+                    }
+                }
+                SClass::LinearVelocity {
+                    mode,
+                    relative_to,
+                    force_limit_mode,
+                    limits,
+                    max_force,
+                    max_axes_force,
+                    line_direction,
+                    max_planar_axes_force,
+                    primary_tangent,
+                    secondary_tangent,
+                    ..
+                } => {
+                    let world = *relative_to == 2;
+                    let (has_x, has_z) = if !*limits {
+                        (true, true)
+                    } else if *force_limit_mode == 0 {
+                        let on = max_force.abs() > eps;
+                        (on, on)
+                    } else if world {
+                        (max_axes_force.x.abs() > eps, max_axes_force.z.abs() > eps)
+                    } else {
+                        let on = max_axes_force.x.abs() > eps
+                            || max_axes_force.y.abs() > eps
+                            || max_axes_force.z.abs() > eps;
+                        (on, on)
+                    };
+                    match mode {
+                        0 => {
+                            if has_x || has_z {
+                                if world {
+                                    if line_direction.x.abs() > eps {
+                                        xz[0] = true;
+                                    }
+                                    if line_direction.z.abs() > eps {
+                                        xz[1] = true;
+                                    }
+                                } else if line_direction.length_squared() > eps2 {
+                                    xz[0] = true;
+                                    xz[1] = true;
+                                }
+                            }
+                        }
+                        1 => {
+                            let on = if !*limits {
+                                true
+                            } else if *force_limit_mode == 1 {
+                                max_planar_axes_force[0].abs() > eps
+                                    || max_planar_axes_force[1].abs() > eps
+                            } else {
+                                max_force.abs() > eps
+                            };
+                            if on {
+                                if world {
+                                    if primary_tangent.x.abs() > eps || secondary_tangent.x.abs() > eps {
+                                        xz[0] = true;
+                                    }
+                                    if primary_tangent.z.abs() > eps || secondary_tangent.z.abs() > eps {
+                                        xz[1] = true;
+                                    }
+                                } else {
+                                    xz[0] = true;
+                                    xz[1] = true;
+                                }
+                            }
+                        }
+                        _ => {
+                            if has_x {
+                                xz[0] = true;
+                            }
+                            if has_z {
+                                xz[1] = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        };
+
+        for (r, m) in &self.movers {
+            if self.hums.owned_descs.contains_key(r) {
+                continue;
+            }
+            if self.body_of(m.part) == Some(body) {
+                mark_law(&m.law, &mut xz);
+                if xz == [true, true] {
+                    return xz;
+                }
+            }
+        }
+        for m in self.hums.foreign.values() {
+            if self.body_of(m.part) == Some(body) {
+                mark_law(&m.law, &mut xz);
+                if xz == [true, true] {
+                    return xz;
+                }
+            }
+        }
+        for (_, d) in &self.hums.foreign_descs {
+            mark_desc(d, &mut xz);
+            if xz == [true, true] {
+                return xz;
+            }
+        }
+        for d in self.hums.owned_descs.values() {
+            mark_desc(d, &mut xz);
+            if xz == [true, true] {
+                return xz;
+            }
+        }
+        xz
+    }
+
     /// What Studio's force functions read off the root assembly.
     fn humanoid_body_input(&self, model: Ref, force: bool) -> Option<Body> {
         let h = self.hums.by_model.get(&model)?;
@@ -2366,6 +2573,7 @@ impl Physics {
             } else {
                 Vec::new()
             },
+            vel_mover_xz: self.humanoid_vel_mover_xz(h.body),
         })
     }
 

@@ -274,10 +274,7 @@ impl Editor {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
                 // The account: a round button and its menu (Add Account, Log Out).
                 let (r, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-                let signed = self.game.account.signed_in();
-                let fill = if signed { theme::ACCENT.gamma_multiply(0.8) } else { theme::PANEL_ALT };
-                ui.painter().circle_filled(r.center(), 12.0, fill);
-                rustudio_engine::ti::paint(ui.painter(), r.shrink(5.0), "user", theme::TEXT);
+                self.paint_account_avatar(ui, r);
                 self.ui_rects.insert("account", r);
                 let resp = resp.on_hover_text(self.game.account.status_short());
                 if resp.clicked() {
@@ -466,6 +463,13 @@ impl Editor {
         self.ribbon_color_popup(&ctx);
         if let Some(a) = act {
             self.ui_action(&ctx, &a);
+            if let Some(class) = a.strip_prefix("class:") {
+                if let Some(&r) = self.game.doc.selection.first() {
+                    if self.game.doc.class_of(r).as_deref() == Some(class) {
+                        apply_gui_visible_defaults(&mut self.game.doc, r, class);
+                    }
+                }
+            }
         }
     }
 
@@ -890,5 +894,26 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "icons not in Tabler: {missing:?}");
+    }
+}
+
+/// Applies Roblox Studio visible defaults to newly inserted GUI objects
+/// (200x50 for text objects, 100x100 for frames/images/containers).
+fn apply_gui_visible_defaults(doc: &mut rustudio_core::doc::Document, r: rbx_dom_weak::types::Ref, class: &str) {
+    use rbx_dom_weak::types::{Color3, UDim, UDim2, Variant};
+    use rbx_dom_weak::ustr;
+    let size = match class {
+        "TextLabel" | "TextButton" | "TextBox" => Some((200, 50)),
+        "Frame" | "ImageLabel" | "ImageButton" | "ScrollingFrame" | "CanvasGroup" | "ViewportFrame" => Some((100, 100)),
+        _ => None,
+    };
+    let Some((w, h)) = size else { return };
+    if let Some(inst) = doc.dom.get_by_ref_mut(r) {
+        if !inst.properties.contains_key(&ustr("Size")) {
+            inst.properties.insert(ustr("Size"), Variant::UDim2(UDim2::new(UDim::new(0.0, w), UDim::new(0.0, h))));
+        }
+        if !inst.properties.contains_key(&ustr("BackgroundColor3")) {
+            inst.properties.insert(ustr("BackgroundColor3"), Variant::Color3(Color3::new(1.0, 1.0, 1.0)));
+        }
     }
 }

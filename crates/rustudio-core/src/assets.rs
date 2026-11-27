@@ -554,10 +554,19 @@ fn note_refused(id: u64, why: &str) {
     }
 }
 
+/// Tracks in-flight and completed `public_prefetch_inner` fetches by asset id.
+static PUBLIC_PREFETCH_STATES: Mutex<Option<HashMap<u64, Option<Result<(), String>>>>> =
+    Mutex::new(None);
+
 /// A session arrived (or changed): what was private may be served now.
 pub fn forget_refusals() {
     if let Ok(mut g) = REFUSED.lock() {
         *g = None;
+    }
+    if let Ok(mut g) = PUBLIC_PREFETCH_STATES.lock() {
+        if let Some(map) = g.as_mut() {
+            map.retain(|_, v| !matches!(v, Some(Err(_))));
+        }
     }
 }
 
@@ -640,9 +649,15 @@ pub enum Priority {
     Preload,
 }
 
-/// Preloads downloading at once, out of [`MAX_ASSET_DOWNLOADS`]: the rest
-/// of the slots stay free for what is needed now.
+/// Preloads downloading at once while `Needed` jobs are queued, out of
+/// [`MAX_ASSET_DOWNLOADS`]: the rest of the slots stay free for what is needed now.
 pub const MAX_PRELOAD_DOWNLOADS: usize = 4;
+
+/// Preloads downloading at once when no `Needed` jobs are queued.
+pub const MAX_PRELOAD_DOWNLOADS_IDLE: usize = 6;
+
+/// Number of `Needed` jobs popped before granting one `Preload` slot under contention.
+const NEEDED_PER_PRELOAD: usize = 3;
 
 struct Scheduler {
     state: Mutex<Queues>,
@@ -654,6 +669,7 @@ struct Queues {
     needed: std::collections::VecDeque<DownloadJob>,
     preload: std::collections::VecDeque<DownloadJob>,
     preload_active: usize,
+    needed_streak: usize,
 }
 
 impl Scheduler {
@@ -667,17 +683,36 @@ impl Scheduler {
         self.changed.notify_one();
     }
 
-    /// The next job: a needed one, else a preload while fewer than
-    /// [`MAX_PRELOAD_DOWNLOADS`] run.
+    /// The next job: weighted fair scheduling pops 1 `Preload` every 3 `Needed`
+    /// while under [`MAX_PRELOAD_DOWNLOADS`] (4), and allows up to
+    /// [`MAX_PRELOAD_DOWNLOADS_IDLE`] (6) concurrent preloads when `q.needed` is empty.
     fn next(&self) -> (DownloadJob, Priority) {
         let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(job) = q.needed.pop_front() {
-                return (job, Priority::Needed);
+            if !q.needed.is_empty() {
+                if q.needed_streak >= NEEDED_PER_PRELOAD
+                    && q.preload_active < MAX_PRELOAD_DOWNLOADS
+                {
+                    if let Some(job) = q.preload.pop_front() {
+                        q.preload_active += 1;
+                        q.needed_streak = 0;
+                        return (job, Priority::Preload);
+                    }
+                }
+                if let Some(job) = q.needed.pop_front() {
+                    q.needed_streak = q.needed_streak.saturating_add(1);
+                    return (job, Priority::Needed);
+                }
             }
-            if q.preload_active < MAX_PRELOAD_DOWNLOADS {
+            let cap = if q.needed.is_empty() {
+                MAX_PRELOAD_DOWNLOADS_IDLE
+            } else {
+                MAX_PRELOAD_DOWNLOADS
+            };
+            if q.preload_active < cap {
                 if let Some(job) = q.preload.pop_front() {
                     q.preload_active += 1;
+                    q.needed_streak = 0;
                     return (job, Priority::Preload);
                 }
             }
@@ -748,33 +783,93 @@ impl DownloadHold {
     }
 }
 
+/// Whether `id`'s bytes are already available locally (generated content,
+/// disk cache, upload ledger, `rbxasset://` file, or opted-in local file)
+/// without needing a network download.
+pub fn is_content_cached(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() {
+        return false;
+    }
+    if generated(id).is_some() {
+        return true;
+    }
+    if let Some(a) = asset_ref(id) {
+        return cache_path(AssetRef { id: a.id, version: None }).is_file()
+            || ledger_path(a.id).is_some();
+    }
+    if id.starts_with("rbxasset://") {
+        return resolve(id, None).is_some_and(|p| p.is_file());
+    }
+    if is_local_path(id) {
+        return opted_in_file(id).is_some();
+    }
+    false
+}
+
 /// ContentProvider:PreloadAsync's fetch of one content id, after what the
 /// scene and the scripts need now; `done` gets true once the bytes are
 /// cached (false: can't be had). One queued download serves every asker
 /// of the same id (the server's preload, then the client's).
 pub fn preload_content(id: &str, done: Arc<Mutex<Option<bool>>>) {
-    static WAITERS: Mutex<Option<HashMap<String, Vec<Arc<Mutex<Option<bool>>>>>>> = Mutex::new(None);
+    preload_content_with_hook(id, done, None);
+}
+
+/// Like [`preload_content`], with an optional callback invoked on the worker
+/// thread with the fetched bytes once ready (e.g. background animation decode).
+/// Already-cached assets fast-path immediately without resetting status to
+/// `Loading` or pushing onto `SCHEDULER`.
+pub fn preload_content_with_hook(
+    id: &str,
+    done: Arc<Mutex<Option<bool>>>,
+    on_ready: Option<Box<dyn FnOnce(Arc<Vec<u8>>) + Send + 'static>>,
+) {
+    if is_content_cached(id) {
+        content_track(id, 2);
+        if let Some(hook) = on_ready {
+            if let Ok(bytes) = script_content_blocking(id) {
+                hook(bytes);
+            }
+        }
+        *done.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+        return;
+    }
+    type Waiter = (
+        Arc<Mutex<Option<bool>>>,
+        Option<Box<dyn FnOnce(Arc<Vec<u8>>) + Send + 'static>>,
+    );
+    static WAITERS: Mutex<Option<HashMap<String, Vec<Waiter>>>> = Mutex::new(None);
     let key = content_key(id);
     {
         let mut g = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
         let map = g.get_or_insert_with(HashMap::new);
         if let Some(list) = map.get_mut(&key) {
-            list.push(done);
+            list.push((done, on_ready));
             return;
         }
-        map.insert(key.clone(), vec![done]);
+        map.insert(key.clone(), vec![(done, on_ready)]);
     }
     let id = id.to_string();
     schedule(Priority::Preload, move || {
-        let ok = script_content_blocking(&id).is_ok();
+        let res = script_content_blocking(&id);
+        let ok = res.is_ok();
         let waiters = WAITERS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
             .and_then(|m| m.remove(&key))
             .unwrap_or_default();
-        for w in waiters {
-            *w.lock().unwrap_or_else(|e| e.into_inner()) = Some(ok);
+        if let Ok(bytes) = &res {
+            for (w, hook) in waiters {
+                if let Some(hook) = hook {
+                    hook(bytes.clone());
+                }
+                *w.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+            }
+        } else {
+            for (w, _) in waiters {
+                *w.lock().unwrap_or_else(|e| e.into_inner()) = Some(ok);
+            }
         }
     });
 }
@@ -851,13 +946,35 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     }
 }
 
-/// Saves downloaded bytes under the asset's cache path.
-fn write_cache(a: AssetRef, bytes: &[u8]) {
+/// Atomically saves downloaded bytes under the asset's cache path via a
+/// unique temp file `{id}_v{v}.bin.tmp.<pid>.<seq>` + `std::fs::rename`.
+fn write_cache_result(a: AssetRef, bytes: &[u8]) -> std::io::Result<()> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let path = cache_path(a);
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
-    let _ = std::fs::write(&path, bytes);
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("asset.bin");
+    let tmp = path.with_file_name(format!("{fname}.tmp.{pid}.{seq}"));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Saves downloaded bytes under the asset's cache path.
+fn write_cache(a: AssetRef, bytes: &[u8]) {
+    let _ = write_cache_result(a, bytes);
 }
 
 const MAX_ASSET_DOWNLOADS: usize = 12;
@@ -1030,18 +1147,19 @@ impl AssetDownloads {
 fn download_asset_bytes(id: u64) -> Result<Vec<u8>, String> {
     // Prefer Studio's login session. Its downloader preserves Roblox-Place-Id,
     // which asset delivery requires for assets private to the current place.
-    let public = || ASSET_DOWNLOADS.retry(|| public_asset_typed(id));
+    // Route through `editor_download` for public fallback parity with `AssetStore`.
     let result = if let Some(c) = session_client() {
         let downloader = {
             let guard = c.lock().map_err(|_| "account busy".to_string())?;
             guard.as_ref().map(|c| c.session.downloader())
         };
-        match downloader {
-            Some(d) => ASSET_DOWNLOADS.retry(|| d.download_asset_typed(id, None)),
-            None => public(),
-        }
+        ASSET_DOWNLOADS.editor_download(
+            None,
+            downloader.map(|d| move || d.download_asset_typed(id, None)),
+            || public_asset_typed(id),
+        )
     } else {
-        match public() {
+        match ASSET_DOWNLOADS.retry(|| public_asset_typed(id)) {
             Err(error @ (AssetDownloadError::Refused(_) | AssetDownloadError::Other(_))) => {
                 let session = wait_for_session(Duration::from_secs(30))
                     .then(session_client)
@@ -1056,7 +1174,11 @@ fn download_asset_bytes(id: u64) -> Result<Vec<u8>, String> {
                         None => return Err(download_error(id, error)),
                     }
                 };
-                ASSET_DOWNLOADS.retry(|| d.download_asset_typed(id, None))
+                ASSET_DOWNLOADS.editor_download(
+                    None,
+                    Some(move || d.download_asset_typed(id, None)),
+                    || public_asset_typed(id),
+                )
             }
             result => result,
         }
@@ -1222,8 +1344,6 @@ pub fn public_prefetch(id: u64) -> Fetch {
     result
 }
 fn public_prefetch_inner(id: u64) -> Fetch {
-    use std::sync::Mutex;
-    static STATES: Mutex<Option<HashMap<u64, Option<Result<(), String>>>>> = Mutex::new(None);
     let a = AssetRef { id, version: None };
     // (a local store file isn't "on disk" here: Roblox's copy comes first)
     if cache_path(a).exists() || ledger_path(id).is_some() {
@@ -1232,7 +1352,7 @@ fn public_prefetch_inner(id: u64) -> Fetch {
             Err(e) => Fetch::Unavailable(e),
         };
     }
-    let mut g = STATES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PUBLIC_PREFETCH_STATES.lock().unwrap_or_else(|e| e.into_inner());
     let map = g.get_or_insert_with(HashMap::new);
     match map.get(&id) {
         Some(Some(Err(e))) => return Fetch::Unavailable(e.clone()),
@@ -1251,7 +1371,7 @@ fn public_prefetch_inner(id: u64) -> Fetch {
         drop(g);
         let r = public_cached(id);
         content_track(&format!("rbxassetid://{id}"), if r.is_ok() { 2 } else { 3 });
-        if let Ok(mut g) = STATES.lock() {
+        if let Ok(mut g) = PUBLIC_PREFETCH_STATES.lock() {
             g.get_or_insert_with(HashMap::new).insert(id, Some(r.as_ref().map(|_| ()).map_err(|e| e.clone())));
         }
         return match r {
@@ -1267,7 +1387,7 @@ fn public_prefetch_inner(id: u64) -> Fetch {
     schedule(Priority::Needed, move || {
         let r = public_cached(id).map(|_| ());
         content_track(&format!("rbxassetid://{id}"),if r.is_ok(){2}else{3});
-        if let Ok(mut g) = STATES.lock() {
+        if let Ok(mut g) = PUBLIC_PREFETCH_STATES.lock() {
             g.get_or_insert_with(HashMap::new).insert(id, Some(r));
         }
     });
@@ -1559,11 +1679,7 @@ impl AssetStore {
                         || public_asset_typed(a.id),
                     )
                     .map_err(|error| download_error(a.id, error))?;
-                let path = cache_path(a);
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                }
-                std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+                write_cache_result(a, &bytes).map_err(|e| e.to_string())?;
                 Ok(bytes)
             })
             .map(|_| ());
@@ -3209,17 +3325,32 @@ mod tests {
             let order = order.clone();
             Box::new(move || order.lock().unwrap().push(what)) as DownloadJob
         };
-        for _ in 0..MAX_PRELOAD_DOWNLOADS + 1 {
+        // Weighted fairness: 1 Preload after every 3 Needed under cap 4.
+        for _ in 0..4 {
+            scheduler.push(Priority::Needed, note("needed"));
+        }
+        for _ in 0..MAX_PRELOAD_DOWNLOADS_IDLE + 2 {
             scheduler.push(Priority::Preload, note("preload"));
         }
-        scheduler.push(Priority::Needed, note("needed"));
-        assert_eq!(scheduler.queued(), (1, MAX_PRELOAD_DOWNLOADS + 1));
-        let (job, priority) = scheduler.next();
-        assert_eq!(priority, Priority::Needed);
-        job();
-        assert_eq!(*order.lock().unwrap(), ["needed"]);
-        // Preloads take at most MAX_PRELOAD_DOWNLOADS slots while running.
-        for _ in 0..MAX_PRELOAD_DOWNLOADS {
+        let mut first_five = Vec::new();
+        for _ in 0..5 {
+            let (job, priority) = scheduler.next();
+            job();
+            first_five.push(priority);
+        }
+        assert_eq!(
+            first_five,
+            vec![
+                Priority::Needed,
+                Priority::Needed,
+                Priority::Needed,
+                Priority::Preload,
+                Priority::Needed,
+            ]
+        );
+        // With `needed` now empty, preloads can fill up to MAX_PRELOAD_DOWNLOADS_IDLE (6)
+        // (1 is already active from the weighted pop above, so 5 more start immediately).
+        for _ in 1..MAX_PRELOAD_DOWNLOADS_IDLE {
             let (job, priority) = scheduler.next();
             assert_eq!(priority, Priority::Preload);
             job();
@@ -3234,7 +3365,7 @@ mod tests {
             });
             assert!(
                 receive.recv_timeout(Duration::from_millis(200)).is_err(),
-                "a fifth preload started while four were running"
+                "a seventh preload started while six were running"
             );
             // A needed download still goes through at once.
             scheduler.push(Priority::Needed, note("needed-late"));
@@ -3244,7 +3375,7 @@ mod tests {
             scheduler.finished(Priority::Preload);
             assert_eq!(receive.recv_timeout(Duration::from_secs(5)).unwrap(), Priority::Preload);
         });
-        assert_eq!(order.lock().unwrap().len(), MAX_PRELOAD_DOWNLOADS + 3);
+        assert_eq!(order.lock().unwrap().len(), MAX_PRELOAD_DOWNLOADS_IDLE + 6);
     }
 
     /// Until a second asker holds the in-flight slot (the map's, the
@@ -3335,18 +3466,19 @@ mod tests {
     #[test]
     fn preloads_wait_while_the_preload_slots_are_busy() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..MAX_PRELOAD_DOWNLOADS {
+        for _ in 0..MAX_PRELOAD_DOWNLOADS_IDLE {
             let gate = gate.clone();
             schedule(Priority::Preload, move || {
                 let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
             });
         }
         let id = "rbxtemp://rustudio/preload-slots-test";
-        register_generated(id, vec![1]);
+        unregister_generated(id);
         let done = Arc::new(Mutex::new(None));
         preload_content(id, done.clone());
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(*done.lock().unwrap(), None, "a preload ran on a busy slot: {:?}", SCHEDULER.queued());
+        register_generated(id, vec![1]);
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
         let t0 = Instant::now();

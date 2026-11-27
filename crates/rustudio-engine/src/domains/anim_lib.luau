@@ -504,7 +504,7 @@ function ACP.GetAnimationClipAsync(self, id)
     id = tostring(id)
     local clip = __rs_anim_registered(id)
     if clip then return clip end
-    local n = tonumber(string.match(id, "(%d+)%s*$"))
+    local n = tonumber(string.match(id, "://(%d+)") or string.match(id, "[?&][iI][dD]=(%d+)") or string.match(id, "(%d+)"))
     local fail = "Animation failed to load, assetId: https://assetdelivery.roblox.com/v1/asset?id=" .. tostring(n or id) .. "&serverplaceid=0"
     if not n then error(fail, 0) end
     local state = __rs_asset_ready(n)

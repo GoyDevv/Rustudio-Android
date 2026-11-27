@@ -946,6 +946,9 @@ impl Editor {
         self.ui.restore_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
         self.ui.anim = Default::default();
         self.game.doc = doc;
+        rustudio_engine::bytecode_cache::prewarm(
+            rustudio_engine::bytecode_cache::collect_script_sources(&self.game.doc),
+        );
         self.game.edit_audio.reset();
         self.game.gui.on_document_changed();
         self.game.scene = Scene::default();
@@ -2090,6 +2093,17 @@ impl Editor {
             };
             b = b.with_property("Source", src.to_string());
         }
+        match class {
+            "TextLabel" | "TextButton" | "TextBox" => {
+                use rbx_dom_weak::types::{UDim, UDim2};
+                b = b.with_property("Size", UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)));
+            }
+            "Frame" | "ImageLabel" | "ImageButton" | "ScrollingFrame" | "ViewportFrame" | "CanvasGroup" => {
+                use rbx_dom_weak::types::{UDim, UDim2};
+                b = b.with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)));
+            }
+            _ => {}
+        }
         let r = self.game.doc.insert(parent, b);
         self.select(vec![r]);
     }
@@ -2468,6 +2482,14 @@ impl Editor {
             PendingAction::Quit => {
                 crate::studio_settings::flush();
                 rustudio_core::rustudio_settings::flush();
+                #[cfg(target_os = "android")]
+                {
+                    crate::crash::begin_shutdown();
+                    rustudio_core::crash::begin_shutdown();
+                    crate::android::jni::exit_app();
+                    return;
+                }
+                #[cfg(not(target_os = "android"))]
                 std::process::exit(0)
             }
             PendingAction::Restart => self.restart(),
@@ -3394,11 +3416,10 @@ impl RustudioApp {
             self.ed.keyboard_cover = self.keyboard.cover(&ctx);
             self.keyboard.shrink(ui);
         }
-        let ed = &mut self.ed;
         // Files opened from Finder (double-click, Open With, the Dock icon).
         #[cfg(target_os = "macos")]
         for p in crate::macos::take_opened() {
-            ed.request(PendingAction::Open(Some(p)));
+            self.ed.request(PendingAction::Open(Some(p)));
         }
         // Files handed over by a file manager while the editor runs (a
         // second activity's VIEW intent: src/android/intent.rs), and the
@@ -3407,9 +3428,10 @@ impl RustudioApp {
         {
             for p in crate::android::storage::take_opened() {
                 if Editor::is_model_file(&p) {
-                    ed.insert_model_file_into(p, Some(ed.game.doc.default_parent()));
+                    let parent = self.ed.game.doc.default_parent();
+                    self.ed.insert_model_file_into(p, Some(parent));
                 } else {
-                    ed.request(PendingAction::Open(Some(p)));
+                    self.ed.request(PendingAction::Open(Some(p)));
                 }
             }
             crate::android::storage::settle();
@@ -3422,12 +3444,15 @@ impl RustudioApp {
         {
             let focus_kick = ctx.data(|d| d.get_temp::<Instant>(egui::Id::new("android_focus_kick_until")))
                 .is_some_and(|until| Instant::now() < until);
-            if ed.harness.run.started.elapsed() < std::time::Duration::from_secs(3) || focus_kick {
+            if self.ed.harness.run.started.elapsed() < std::time::Duration::from_secs(3) || focus_kick {
                 ctx.request_repaint();
             }
-            crate::android::touch::auto_zoom(ed, &ctx);
+            if !self.play_fills_screen() {
+                crate::android::touch::auto_zoom(&mut self.ed, &ctx);
+            }
             // Native Android graphics driver path (no Turnip/PanVK activation).
         }
+        let ed = &mut self.ed;
         ed.poll_file_dialogs();
         self.crash_dialog.show(&ctx);
         if let crate::update::Action::Restart = self.updater.show(&ctx) {
@@ -3714,6 +3739,13 @@ impl RustudioApp {
             self.watchdog.complete();
             return;
         }
+        #[cfg(target_os = "android")]
+        let hide_ribbon_for_kb = {
+            let screen = ctx.viewport_rect();
+            screen.width() > screen.height() && self.keyboard.height(&ctx) > 0.0
+        };
+        #[cfg(not(target_os = "android"))]
+        let hide_ribbon_for_kb = false;
         let ed = &mut self.ed;
 
         {
@@ -3738,16 +3770,18 @@ impl RustudioApp {
                     let _p = rustudio_core::bench::scope("test_toolbar");
                     ed.studio_top_row(ui);
                 });
-            egui::Panel::top("toolbar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL)
-                        .inner_margin(egui::Margin::symmetric(6, 4)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("ribbon");
-                    ed.studio_ribbon(ui);
-                });
+            if !hide_ribbon_for_kb {
+                egui::Panel::top("toolbar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL)
+                            .inner_margin(egui::Margin::symmetric(6, 4)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("ribbon");
+                        ed.studio_ribbon(ui);
+                    });
+            }
             egui::Panel::bottom("status")
                 .frame(
                     egui::Frame::new()

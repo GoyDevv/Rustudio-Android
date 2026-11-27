@@ -447,6 +447,10 @@ pub struct Scene {
     /// ViewportFrame's parts only in the frame, wherever it is (a SurfaceGui
     /// on a Workspace part too).
     vf_roots: Option<HashSet<Ref>>,
+    scratch_full: rustc_hash::FxHashSet<Ref>,
+    scratch_moved: rustc_hash::FxHashSet<Ref>,
+    scratch_restyled: rustc_hash::FxHashSet<Ref>,
+    scratch_retinted: rustc_hash::FxHashSet<Ref>,
 }
 
 /// A colour channel in linear light the way Studio's shaders take it:
@@ -625,7 +629,22 @@ impl Scene {
         self.changes.changed.clear();
     }
 
+    fn remove_owners(&mut self, r: Ref, deps: &[Ref]) {
+        for d in deps {
+            if let Some(o) = self.owners.get_mut(d) {
+                o.retain(|&owner| owner != r);
+                if o.is_empty() {
+                    self.owners.remove(d);
+                }
+            }
+        }
+    }
+
     fn insert(&mut self, p: ScenePart) {
+        if let Some(&i) = self.index.get(&p.r) {
+            let old_deps = std::mem::take(&mut self.parts[i].deps);
+            self.remove_owners(p.r, &old_deps);
+        }
         for d in &p.deps {
             let o = self.owners.entry(*d).or_default();
             if !o.contains(&p.r) {
@@ -655,7 +674,8 @@ impl Scene {
         };
         // A swap changes the indices held by the effects glass list.
         self.glass_generation = self.glass_generation.wrapping_add(1);
-        self.parts.swap_remove(i);
+        let removed = self.parts.swap_remove(i);
+        self.remove_owners(r, &removed.deps);
         self.bounds.swap_remove(i);
         if let Some(moved) = self.parts.get(i) {
             self.index.insert(moved.r, i);
@@ -669,11 +689,15 @@ impl Scene {
         if root.is_none() && self.vf_roots.is_none() {
             return;
         }
-        let mut full: std::collections::HashSet<Ref> = Default::default();
-        let mut moved: std::collections::HashSet<Ref> = Default::default();
-        let mut restyled: std::collections::HashSet<Ref> = Default::default();
+        let mut full = std::mem::take(&mut self.scratch_full);
+        let mut moved = std::mem::take(&mut self.scratch_moved);
+        let mut restyled = std::mem::take(&mut self.scratch_restyled);
         // Parts whose SurfaceAppearance Color changed: only the tint is re-read.
-        let mut retinted: std::collections::HashSet<Ref> = Default::default();
+        let mut retinted = std::mem::take(&mut self.scratch_retinted);
+        full.clear();
+        moved.clear();
+        restyled.clear();
+        retinted.clear();
         let cframe = rbx_dom_weak::ustr("CFrame");
         // A Bone / joint / FaceControls added, removed, renamed or re-pointed:
         // skinned parts look their Bones up again and are redrawn.
@@ -815,7 +839,7 @@ impl Scene {
                 }
             }
         }
-        for r in retinted {
+        for r in retinted.iter().copied() {
             if full.contains(&r) || restyled.contains(&r) {
                 continue;
             }
@@ -827,7 +851,7 @@ impl Scene {
                 self.changes.restyled.push(r);
             }
         }
-        for r in moved {
+        for r in moved.iter().copied() {
             if full.contains(&r) {
                 continue;
             }
@@ -846,6 +870,14 @@ impl Scene {
             self.bounds[i] = bound_of(p);
             self.changes.moved.push(r);
         }
+        full.clear();
+        moved.clear();
+        restyled.clear();
+        retinted.clear();
+        self.scratch_full = full;
+        self.scratch_moved = moved;
+        self.scratch_restyled = restyled;
+        self.scratch_retinted = retinted;
     }
 
     pub fn get(&self, r: Ref) -> Option<&ScenePart> {

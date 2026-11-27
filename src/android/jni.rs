@@ -398,13 +398,22 @@ pub fn window_insets() -> Result<Insets> {
     })
 }
 
-/// Where [`keyboard_height_later`]'s answer arrives (`None` until it has).
-pub type KeyboardAnswer = std::sync::Arc<std::sync::Mutex<Option<Result<i32>>>>;
+/// Soft keyboard visibility and bottom inset height (in window pixels).
+/// On API 30+, floating keyboards report `visible = true` with `height_px = 0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyboardState {
+    pub visible: bool,
+    pub height_px: i32,
+}
 
-/// The soft keyboard's height in window pixels (0 while it is down),
-/// read on the Java main thread (a View's insets belong to it): API 30+
-/// `getInsets(Type.ime()).bottom`; before that the system window inset,
-/// which counts the keyboard, less the stable inset (the navigation bar).
+/// Where [`keyboard_height_later`]'s answer arrives (`None` until it has).
+pub type KeyboardAnswer = std::sync::Arc<std::sync::Mutex<Option<Result<KeyboardState>>>>;
+
+/// The soft keyboard's visibility and height in window pixels (0 while it is
+/// down or floating), read on the Java main thread (a View's insets belong to
+/// it): API 30+ `isVisible(Type.ime())` + `getInsets(Type.ime()).bottom`;
+/// before that the system window inset, which counts the keyboard, less the
+/// stable inset (the navigation bar).
 /// The editor's thread doesn't wait for it (the main thread may itself be
 /// waiting on the editor's, as it does around a pause or a configuration
 /// change): the answer lands in the returned slot when the main thread
@@ -415,14 +424,14 @@ pub fn keyboard_height_later() -> KeyboardAnswer {
     match super::app() {
         None => *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err("no AndroidApp yet".to_string())),
         Some(app) => app.run_on_java_main_thread(Box::new(move || {
-            let height = read_keyboard_height();
-            *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(height);
+            let state = read_keyboard_state();
+            *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
         })),
     }
     slot
 }
 
-fn read_keyboard_height() -> Result<i32> {
+fn read_keyboard_state() -> Result<KeyboardState> {
     with_activity(|env, activity| {
         let window = env.call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[])?.l()?;
         let decor = env.call_method(&window, jni_str!("getDecorView"), jni_sig!("()Landroid/view/View;"), &[])?.l()?;
@@ -430,15 +439,21 @@ fn read_keyboard_height() -> Result<i32> {
             .call_method(&decor, jni_str!("getRootWindowInsets"), jni_sig!("()Landroid/view/WindowInsets;"), &[])?
             .l()?;
         if insets.is_null() {
-            return Ok(0);
+            return Ok(KeyboardState::default());
         }
         if sdk_int() >= 30 {
             let ime = env.call_static_method(jni_str!("android/view/WindowInsets$Type"), jni_str!("ime"), jni_sig!("()I"), &[])?.i()?;
-            Ok(read_insets(env, &insets, ime)?.3.max(0))
+            let height_px = read_insets(env, &insets, ime)?.3.max(0);
+            let visible = env
+                .call_method(&insets, jni_str!("isVisible"), jni_sig!("(I)Z"), &[JValue::Int(ime)])?
+                .z()?
+                || height_px > 0;
+            Ok(KeyboardState { visible, height_px })
         } else {
             let system = env.call_method(&insets, jni_str!("getSystemWindowInsetBottom"), jni_sig!("()I"), &[])?.i()?;
             let stable = env.call_method(&insets, jni_str!("getStableInsetBottom"), jni_sig!("()I"), &[])?.i()?;
-            Ok((system - stable).max(0))
+            let height_px = (system - stable).max(0);
+            Ok(KeyboardState { visible: height_px > 0, height_px })
         }
     })
 }
@@ -1064,6 +1079,15 @@ pub fn install_apk(apk_path: &std::path::Path) -> Result<String> {
 pub fn restart_app() {
     let _ = with_activity(|env, activity| {
         env.call_method(activity, jni_str!("restartApp"), jni_sig!("()V"), &[])?;
+        Ok(())
+    });
+}
+
+/// Closes the app task cleanly and terminates the process via
+/// `RustudioActivity.exitApp()`.
+pub fn exit_app() {
+    let _ = with_activity(|env, activity| {
+        env.call_method(activity, jni_str!("exitApp"), jni_sig!("()V"), &[])?;
         Ok(())
     });
 }

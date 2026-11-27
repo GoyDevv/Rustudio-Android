@@ -557,6 +557,9 @@ pub struct MobileWindowManager {
     next_z: u64,
     touch_mode: bool,
     title_press: HashMap<String, TitlePressState>,
+    /// Preserves each window's preferred expanded height across transient
+    /// viewport shrinks (e.g. Android soft keyboard open/close).
+    preferred_height: HashMap<String, f32>,
 }
 
 impl Default for MobileWindowManager {
@@ -574,6 +577,7 @@ impl MobileWindowManager {
             next_z: 1,
             touch_mode: cfg!(target_os = "android"),
             title_press: HashMap::new(),
+            preferred_height: HashMap::new(),
         }
     }
 
@@ -684,6 +688,7 @@ impl MobileWindowManager {
             z_order: z,
         };
         win.clamp_to_bounds(bounds, title_h);
+        self.preferred_height.insert(win.id.clone(), win.size[1]);
         self.windows.push(win);
     }
 
@@ -693,6 +698,7 @@ impl MobileWindowManager {
         let idx = self.find_index(key)?;
         let removed = self.windows.remove(idx);
         self.title_press.remove(&removed.id);
+        self.preferred_height.remove(&removed.id);
         Some(removed.tab)
     }
 
@@ -709,6 +715,13 @@ impl MobileWindowManager {
     pub fn clamp_all(&mut self, bounds: Rect) {
         let title_h = self.current_title_bar_height();
         for w in &mut self.windows {
+            if let Some(&pref_h) = self.preferred_height.get(&w.id) {
+                if bounds.height() > w.size[1] && w.size[1] < pref_h {
+                    w.size[1] = pref_h.min(bounds.height());
+                }
+            } else {
+                self.preferred_height.insert(w.id.clone(), w.size[1]);
+            }
             w.clamp_to_bounds(bounds, title_h);
         }
     }
@@ -848,6 +861,7 @@ impl MobileWindowManager {
                 minimized: entry.minimized,
                 z_order: entry.z_order,
             });
+            mgr.preferred_height.insert(entry.id.clone(), size_h);
         }
         mgr.next_z = max_z.saturating_add(1).max(1);
         mgr
@@ -1214,6 +1228,7 @@ impl MobileWindowManager {
                         if corner_resp.drag_started() || corner_resp.dragged() {
                             to_focus = Some(win_id.clone());
                             self.windows[idx].resize_by(corner_resp.drag_delta(), bounds, title_h);
+                            self.preferred_height.insert(win_id.clone(), self.windows[idx].size[1]);
                         }
 
                         // Right edge resize strip outside body_rect.
@@ -1261,6 +1276,7 @@ impl MobileWindowManager {
                                     bounds,
                                     title_h,
                                 );
+                                self.preferred_height.insert(win_id.clone(), self.windows[idx].size[1]);
                             }
                         }
 

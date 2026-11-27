@@ -83,6 +83,7 @@ pub fn report_test_run(value: &str, log: &[crate::app::LogLine]) {
         .collect();
     let j = serde_json::json!({ "ended": "EndTest", "value": value, "output": output });
     let _ = std::fs::write(&path, serde_json::to_string_pretty(&j).unwrap_or_default());
+    #[cfg(not(target_os = "android"))]
     std::process::exit(0);
 }
 

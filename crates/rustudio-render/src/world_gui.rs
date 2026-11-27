@@ -1900,7 +1900,7 @@ impl WorldGuiPass {
             // time it is drawn; until it is, it draws as an image still
             // loading does: not at all. Fixed-step runs make it here.)
             let mut mipped = mipped;
-            if mipped && revision == TextureRevision::Static && !this.mips.contains_key(&tex) && !rustudio_core::sim_clock::on() {
+            if !cfg!(target_os = "android") && mipped && revision == TextureRevision::Static && !this.mips.contains_key(&tex) && !rustudio_core::sim_clock::on() {
                 let size = tex.size();
                 if this.mip_refused(&tex) {
                     mipped = false;

@@ -135,6 +135,24 @@ impl EditSync {
     /// keeps the parent map current with them. Returns whether any of them
     /// was in the DataModel (a plugin edited the place), not only on
     /// plugin-owned instances outside it.
+    fn was_in_unsaved_service(&self, d: &Document, r: Ref) -> bool {
+        let root = d.dom.root_ref();
+        let mut cur = r;
+        for _ in 0..256 {
+            let Some(&parent) = self.parents.get(&cur) else {
+                break;
+            };
+            if parent == root {
+                return rustudio_core::doc::in_unsaved_service(d, cur);
+            }
+            if rustudio_core::doc::in_unsaved_service(d, parent) {
+                return true;
+            }
+            cur = parent;
+        }
+        false
+    }
+
     pub fn after_frame(&mut self, d: &mut Document) -> bool {
         let root = d.dom.root_ref();
         let mut touched = false;
@@ -147,8 +165,11 @@ impl EditSync {
                         if seen.insert(r) {
                             let before = sink.trees.len();
                             let was_in = self.parents.contains_key(&r);
+                            let old_unsaved = self.was_in_unsaved_service(d, r);
                             self.tree_change(d, r, &mut sink);
-                            let t = (was_in || sink.trees.len() > before) && !rustudio_core::doc::in_unsaved_service(d, r);
+                            let t = (was_in || sink.trees.len() > before)
+                                && !old_unsaved
+                                && !rustudio_core::doc::in_unsaved_service(d, r);
                             if t && std::env::var_os("RUSTUDIO_PLUGIN_DEBUG_MARKS").is_some() {
                                 eprintln!("plugin touched tree {:?} {:?}", d.class_of(r), d.dom.get_by_ref(r).map(|i| i.name.clone()));
                             }
@@ -156,7 +177,9 @@ impl EditSync {
                         }
                     }
                     Mark::Prop(r, name) => {
-                        let t = (r == root || self.parents.contains_key(&r)) && !rustudio_core::doc::in_unsaved_service(d, r);
+                        let t = (r == root || self.parents.contains_key(&r))
+                            && !self.was_in_unsaved_service(d, r)
+                            && !rustudio_core::doc::in_unsaved_service(d, r);
                         if t && std::env::var_os("RUSTUDIO_PLUGIN_DEBUG_MARKS").is_some() {
                             eprintln!("plugin touched {:?}.{name}", d.class_of(r));
                         }

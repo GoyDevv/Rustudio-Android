@@ -5521,19 +5521,18 @@ fn call_method_routed(
             // Descendants with Archivable = false aren't copied (Roblox).
             {
                 let mut w = world(lua)?;
-                let skip: Vec<Ref> = w
-                    .d()
-                    .dom
-                    .descendants_of(r)
-                    .filter(|i| {
-                        i.referent() != r
-                            && matches!(
-                                i.properties.get(&ustr("Archivable")),
-                                Some(Variant::Bool(false))
-                            )
-                    })
-                    .map(|i| i.referent())
-                    .collect();
+                let archivable_key = ustr("Archivable");
+                let mut skip: Vec<Ref> = Vec::new();
+                for i in w.d().dom.descendants_of(r) {
+                    if i.referent() != r
+                        && matches!(
+                            i.properties.get(&archivable_key),
+                            Some(Variant::Bool(false))
+                        )
+                    {
+                        skip.push(i.referent());
+                    }
+                }
                 for x in skip {
                     if w.d().dom.get_by_ref(x).is_some() {
                         w.dm().dom.destroy(x);

@@ -1221,12 +1221,12 @@ impl Game {
             } else {
                 self.info("No character: Players.CharacterAutoLoads is false (a script's Player:LoadCharacter spawns one)");
             }
-            // Studio shows the client's view while playing.
-            if self.play_shows_client {
-                self.show_play_side(Side::Client, host);
-            }
         }
         self.start_autoplay_sounds();
+        // Studio shows the client's view while playing.
+        if two && self.play_shows_client {
+            self.show_play_side(Side::Client, host);
+        }
         rustudio_core::load_trace::mark("play: DataModels running");
     }
 

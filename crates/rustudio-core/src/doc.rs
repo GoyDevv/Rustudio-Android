@@ -3069,6 +3069,11 @@ pub fn content_twin(name: &str) -> Option<&'static str> {
         "PantsTemplate" => "PantsTemplateContent",
         "Graphic" => "GraphicContent",
         "Image" => "ImageContent",
+        "HoverImage" => "HoverImageContent",
+        "PressedImage" => "PressedImageContent",
+        "TopImage" => "TopImageContent",
+        "MidImage" => "MidImageContent",
+        "BottomImage" => "BottomImageContent",
         "ColorMap" => "ColorMapContent",
         "NormalMap" => "NormalMapContent",
         "MetalnessMap" => "MetalnessMapContent",
@@ -3095,13 +3100,31 @@ pub fn content_twin(name: &str) -> Option<&'static str> {
 /// The legacy names whose Content twin is `twin` (TextureContent → Texture,
 /// TextureID, TextureId).
 pub fn content_legacy_names(twin: &str) -> Vec<&'static str> {
-    const LEGACY: [&str; 23] = [
+    const LEGACY: [&str; 28] = [
         "MeshId", "TextureID", "TextureId", "Texture", "ShirtTemplate", "PantsTemplate", "Graphic",
-        "Image", "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "SoundId", "Asset", "AnimationId",
+        "Image", "HoverImage", "PressedImage", "TopImage", "MidImage", "BottomImage",
+        "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "SoundId", "Asset", "AnimationId",
         "SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp", "SunTextureId",
         "MoonTextureId",
     ];
     LEGACY.into_iter().filter(|l| content_twin(l) == Some(twin)).collect()
+}
+
+/// True if `class` (or any superclass) has a property named `name` in either
+/// `rbx_reflection_database` or Studio's `api-dump.json`.
+pub fn has_prop(class: &str, name: &str) -> bool {
+    let db = db();
+    if let Some(desc) = db.classes.get(class) {
+        if db.superclasses_iter(desc).any(|c| c.properties.contains_key(name)) {
+            return true;
+        }
+    }
+    if let Some(api) = crate::api::get() {
+        if let Some((_, m)) = api.lookup(class, name) {
+            return m.kind == crate::api::Kind::Property;
+        }
+    }
+    false
 }
 
 /// The instances of some classes, kept current from a document's change
