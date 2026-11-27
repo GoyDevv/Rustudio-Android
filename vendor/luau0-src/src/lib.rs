@@ -198,8 +198,6 @@ impl Build {
             config.flag_if_supported("-fno-math-errno");
             if !target.contains("msvc") {
                 config.flag_if_supported("-O3");
-                config.flag_if_supported("-ffp-contract=fast");
-                config.flag_if_supported("-fomit-frame-pointer");
             }
         }
 

@@ -127,15 +127,43 @@ impl WindowState {
     //the 'static in this case means that the `open` field is always `None`
     pub(crate) fn create_window(&mut self, id: Id, bounds: Rect) -> egui::Window<'static> {
         let new = self.new;
+        let valid_bounds = bounds.is_finite() && bounds.width() > 0.0 && bounds.height() > 0.0;
+        let min_size = Vec2::new(260.0, 220.0);
         let mut window_constructor = egui::Window::new("")
             .id(id)
             .constrain_to(bounds)
+            .min_size(min_size)
             .title_bar(false);
 
-        if let Some(position) = self.next_position() {
+        let clamped_size = self.next_size().map(|size| {
+            if valid_bounds {
+                Vec2::new(
+                    size.x.clamp(min_size.x.min(bounds.width()), bounds.width()),
+                    size.y.clamp(min_size.y.min(bounds.height()), bounds.height()),
+                )
+            } else {
+                size
+            }
+        });
+        let clamped_pos = self.next_position().map(|position| {
+            if valid_bounds {
+                let win_size = clamped_size
+                    .or_else(|| self.screen_rect.map(|r| r.size()))
+                    .unwrap_or(Vec2::ZERO);
+                let max_x = (bounds.max.x - win_size.x).max(bounds.min.x);
+                let max_y = (bounds.max.y - win_size.y).max(bounds.min.y);
+                Pos2::new(
+                    position.x.clamp(bounds.min.x, max_x),
+                    position.y.clamp(bounds.min.y, max_y),
+                )
+            } else {
+                position
+            }
+        });
+        if let Some(position) = clamped_pos {
             window_constructor = window_constructor.current_pos(position);
         }
-        if let Some(size) = self.next_size() {
+        if let Some(size) = clamped_size {
             window_constructor = window_constructor.fixed_size(size);
         }
         // Reset the height of the window if it is now expanded

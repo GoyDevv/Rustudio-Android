@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://discord.gg/8EX6cpgsRx"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Join the rustudio Discord"></a>
+  <a href="https://discord.gg/3wAZfTq89t"><img src="https://img.shields.io/badge/Discord-PC%20VERSION-5865F2?logo=discord&logoColor=white" alt="Join the rustudio PC Version Discord"></a>
 </p>
 
 **A native Android Roblox Studio, written in Rust.** Open, edit and save
@@ -23,7 +24,7 @@ Rustudio is very much a beta/prototype on Android, but provides a portable Roblo
 
 ![Playing a test place in rustudio](docs/images/play.png)
 
-> Contributions are super welcome — **please read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing** so your PR follows our architecture, mobile rules, and test checklist. Come hang out, ask for help or report bugs on the [Discord](https://discord.gg/8EX6cpgsRx).
+> Contributions are super welcome — **please read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing** so your PR follows our architecture, mobile rules, and test checklist. Come hang out, ask for help or report bugs on the [Discord](https://discord.gg/8EX6cpgsRx) (or the [PC Version Discord](https://discord.gg/3wAZfTq89t)).
 
 ## Features
 

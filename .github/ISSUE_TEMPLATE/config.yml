@@ -6,6 +6,9 @@ contact_links:
   - name: rustudio Discord
     url: https://discord.gg/8EX6cpgsRx
     about: Join the community to chat, ask questions, or discuss mobile features!
+  - name: rustudio Discord (PC Version)
+    url: https://discord.gg/3wAZfTq89t
+    about: Join the PC Version Discord community for Linux, Windows, and macOS discussion and support.
   - name: Contributing Guide
     url: https://github.com/GoyDevv/Rustudio-Android/blob/main/CONTRIBUTING.md
     about: Review our Android coding standards, mobile engineering rules, and verification checklist.

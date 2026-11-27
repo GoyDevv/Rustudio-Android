@@ -180,6 +180,14 @@ impl PluginManager {
             for p in self.store.enabled().into_iter().filter(|p| p.kind == PluginKind::Installed) {
                 self.startup.push_back(p);
             }
+            if user_id != 0 {
+                let loaded = self.runtime.loaded();
+                for p in self.store.enabled().into_iter().filter(|p| p.kind == PluginKind::Local && loaded.contains(&p.id)) {
+                    if let Err(e) = self.runtime.reload(&p) {
+                        self.error(format!("Plugin {} failed to reload: {e}", p.id));
+                    }
+                }
+            }
         }
     }
 
@@ -559,6 +567,67 @@ impl PluginManager {
         }
         self.info(format!("Saved local plugin {} ({})", p.name, path.display()));
         Ok(p)
+    }
+
+    /// Imports a local plugin file (`.rbxm`, `.rbxmx`, `.lua`, or `.luau`) into
+    /// the local Plugins folder, ensures it is enabled, and loads/reloads it
+    /// immediately. Returns `(plugin, updated)`.
+    pub fn import_local_file(&mut self, src_path: &std::path::Path) -> Result<(PluginSource, bool), String> {
+        let raw_ext = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let target_ext = match raw_ext.as_str() {
+            "rbxm" => "rbxm",
+            "rbxmx" => "rbxmx",
+            "lua" | "luau" => "lua",
+            _ => {
+                return Err(format!(
+                    "Unsupported plugin file type '.{raw_ext}' (expected .rbxm, .rbxmx, .lua, or .luau)"
+                ));
+            }
+        };
+        let bytes = std::fs::read(src_path).map_err(|e| format!("{}: {e}", src_path.display()))?;
+        if matches!(target_ext, "rbxm" | "rbxmx") {
+            super::check_model_bytes(&bytes)?;
+        }
+        self.store.ensure_plugins_dir().map_err(|e| format!("Plugins folder: {e}"))?;
+        let stem = src_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Plugin".to_string());
+        let dest = self.store.local_save_path(&stem, target_ext);
+        let updated = dest.exists();
+        let tmp = dest.with_extension(format!("{target_ext}.tmp"));
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e}", dest.display()));
+        }
+        let id = super::local_id(&self.store.plugins_dir, &dest);
+        if self.store.meta.local.remove(&id).is_some() {
+            let _ = self.store.save();
+        }
+        let p = self
+            .store
+            .get(&id)
+            .ok_or_else(|| format!("{} is not in the Plugins folder", dest.display()))?;
+        if let Some(w) = self.watcher.as_mut() {
+            let _ = w.poll();
+            let _ = w.poll();
+        }
+        if p.enabled && self.loading_on() {
+            let r = if self.runtime.loaded().contains(&p.id) {
+                self.runtime.reload(&p)
+            } else {
+                self.runtime.load(&p)
+            };
+            r.map_err(|e| format!("imported, but it failed to load: {e}"))?;
+        }
+        let verb = if updated { "Updated" } else { "Imported" };
+        self.info(format!("{verb} local plugin {} ({})", p.name, dest.display()));
+        Ok((p, updated))
     }
 }
 

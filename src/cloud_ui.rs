@@ -936,8 +936,13 @@ impl Editor {
                     self.cloud.open_error = Some(e);
                 }
                 Msg::Status(u, st) => {
-                    if self.game.doc.cloud.as_ref().is_some_and(|o| o.universe_id == u) {
-                        let line = st.describe();
+                    let already_live = self.live_team_create_ids().is_some_and(|(lu, _)| lu == u);
+                    if already_live {
+                        if st.can_edit() == Some(false) {
+                            self.warn(self.describe_team_create_status(u, &st));
+                        }
+                    } else if self.game.doc.cloud.as_ref().is_some_and(|o| o.universe_id == u) {
+                        let line = self.describe_team_create_status(u, &st);
                         if st.enabled == Some(true) || st.can_edit() == Some(false) {
                             self.warn(line);
                         } else {
@@ -1188,6 +1193,20 @@ impl Editor {
         }
     }
 
+    pub(crate) fn describe_team_create_status(&self, u: u64, st: &TeamCreateStatus) -> String {
+        let is_live = self.live_team_create_ids().is_some_and(|(lu, _)| lu == u);
+        if is_live && st.enabled == Some(true) {
+            let base = "Team Create is on (connected to live session).";
+            if st.can_edit() == Some(false) {
+                format!("{base} This account can't edit this experience, so Roblox will refuse a save")
+            } else {
+                base.to_string()
+            }
+        } else {
+            st.describe()
+        }
+    }
+
     fn set_cloud_document(&mut self, o: Opened) {
         let Opened { origin, bytes, offline, cache_file } = o;
         let title = if origin.local_copy {
@@ -1197,18 +1216,7 @@ impl Editor {
         };
         match Document::from_place_bytes(&bytes, title) {
             Ok(mut d) => {
-                let root = d.dom.root_ref();
-                if let Some(i) = d.dom.get_by_ref_mut(root) {
-                    use rbx_dom_weak::{types::{Enum, Variant}, ustr};
-                    i.properties.insert(ustr("PlaceId"), Variant::Int64(origin.place_id as i64));
-                    i.properties.insert(ustr("GameId"), Variant::Int64(origin.universe_id as i64));
-                    i.properties.insert(ustr("CreatorId"), Variant::Int64(origin.creator_id as i64));
-                    i.properties.insert(
-                        ustr("CreatorType"),
-                        Variant::Enum(Enum::from_u32(origin.creator_type.enum_value())),
-                    );
-                    i.properties.insert(ustr("PlaceVersion"), Variant::Int32(origin.version as i32));
-                }
+                apply_cloud_ids(&mut d, Some(&origin), origin.place_id, origin.universe_id);
                 d.cloud = Some(origin.clone());
                 let n = d.dom.descendants().count();
                 self.set_document(d);
@@ -1831,6 +1839,7 @@ impl Editor {
                             .unwrap_or_else(|| format!("Place {}", live.place));
                         let mut document = Document::from_play_dom(dom, format!("{title} (Live)"));
                         document.cloud = live.origin.clone();
+                        apply_cloud_ids(&mut document, live.origin.as_ref(), live.place, live.universe);
                         document.ensure_current_camera(); // Studio's own, never sent (live_sync::local_camera)
                         self.set_document(document);
                         // A test run's --camera holds for the live document too.
@@ -2318,7 +2327,14 @@ impl Editor {
                 }
                 if current {
                     if job.relink && self.live_team_create_ids().is_none() {
-                        if let Some(origin) = job.origin {
+                        if let Some(mut origin) = job.origin {
+                            origin.version = version;
+                            apply_cloud_ids(
+                                &mut self.game.doc,
+                                Some(&origin),
+                                job.place,
+                                job.universe,
+                            );
                             self.game.doc.title.clone_from(&origin.name);
                             self.game.doc.cloud = Some(origin);
                             self.cloud.status = None;
@@ -2328,6 +2344,13 @@ impl Editor {
                         (origin.universe_id, origin.place_id) == (job.universe, job.place))
                     {
                         origin.version = version;
+                        let root = self.game.doc.dom.root_ref();
+                        if let Some(inst) = self.game.doc.dom.get_by_ref_mut(root) {
+                            inst.properties.insert(
+                                rbx_dom_weak::ustr("PlaceVersion"),
+                                rbx_dom_weak::types::Variant::Int32(version as i32),
+                            );
+                        }
                         self.game.doc.mark_saved_at(job.revision);
                     }
                     crate::autosave::clear_for_doc(&self.game.doc);
@@ -2524,6 +2547,31 @@ impl Editor {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+                if let Some((ok, msg)) = &self.cloud.collab_manage.feedback {
+                    let (fill, stroke, col) = if *ok {
+                        (
+                            egui::Color32::from_rgb(24, 46, 34),
+                            egui::Color32::from_rgb(60, 145, 92),
+                            egui::Color32::from_rgb(115, 230, 155),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(52, 26, 28),
+                            egui::Color32::from_rgb(165, 68, 72),
+                            egui::Color32::from_rgb(245, 135, 135),
+                        )
+                    };
+                    egui::Frame::new()
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, stroke))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(egui::RichText::new(msg).small().color(col));
+                        });
+                    ui.add_space(6.0);
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("live_collaborators_scroll")
                     .auto_shrink([false, false])
@@ -2583,6 +2631,7 @@ impl Editor {
                             .corner_radius(8.0)
                             .inner_margin(egui::Margin::symmetric(10, 8))
                             .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.horizontal_wrapped(|ui| {
                                     let (dot_col, status_txt) = match tc_enabled {
                                         Some(true) => (
@@ -2655,11 +2704,12 @@ impl Editor {
                             .corner_radius(8.0)
                             .inner_margin(egui::Margin::same(10))
                             .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.label(egui::RichText::new("Add Collaborator").strong());
                                 ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     let busy = self.cloud.collab_manage.busy;
-                                    let input_w = (ui.available_width() - 175.0).max(150.0);
+                                    let input_w = (ui.available_width() - 200.0).max(150.0);
                                     let resp = ui.add_enabled(
                                         signed_in && !busy,
                                         egui::TextEdit::singleline(
@@ -2758,11 +2808,13 @@ impl Editor {
                                             .corner_radius(6.0)
                                             .inner_margin(egui::Margin::symmetric(8, 5))
                                             .show(ui, |ui| {
+                                                ui.set_min_width(ui.available_width());
                                                 let busy = self.cloud.collab_manage.busy;
                                                 for hit in &suggestions {
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(egui::Align::Center),
-                                                        |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(egui::Align::Center),
+                                                            |ui| {
                                                             ui.spacing_mut().button_padding =
                                                                 egui::vec2(7.0, 2.5);
                                                             if ui
@@ -2837,7 +2889,8 @@ impl Editor {
                                                                 },
                                                             );
                                                         },
-                                                    );
+                                                        );
+                                                    });
                                                 }
                                             });
                                     }
@@ -2851,16 +2904,6 @@ impl Editor {
                                     .small()
                                     .weak(),
                                 );
-
-                                if let Some((ok, msg)) = &self.cloud.collab_manage.feedback {
-                                    ui.add_space(4.0);
-                                    let col = if *ok {
-                                        egui::Color32::from_rgb(90, 215, 135)
-                                    } else {
-                                        egui::Color32::from_rgb(240, 110, 110)
-                                    };
-                                    ui.label(egui::RichText::new(msg).small().color(col));
-                                }
                             });
 
                         ui.add_space(8.0);
@@ -2872,6 +2915,7 @@ impl Editor {
                             .corner_radius(8.0)
                             .inner_margin(egui::Margin::same(10))
                             .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("Collaborators").strong());
                                     ui.with_layout(
@@ -2880,13 +2924,15 @@ impl Editor {
                                             if ui
                                                 .add_enabled(
                                                     signed_in && !self.cloud.collab_manage.loading,
-                                                    egui::Button::new("Refresh").small(),
+                                                    egui::Button::new("Refresh"),
                                                 )
                                                 .clicked()
                                             {
                                                 want_refresh = Some(u);
                                             }
-                                            if self.cloud.collab_manage.loading {
+                                            if self.cloud.collab_manage.loading
+                                                || self.cloud.collab_manage.busy
+                                            {
                                                 ui.spinner();
                                             }
                                         },
@@ -2905,41 +2951,43 @@ impl Editor {
                                 } else {
                                     let busy = self.cloud.collab_manage.busy;
                                     for c in &self.cloud.collab_manage.collaborators {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui
-                                                    .add_enabled(
-                                                        signed_in && !busy,
-                                                        egui::Button::new("Remove").small(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    want_remove = Some((
-                                                        u,
-                                                        c.subject_type.clone(),
-                                                        c.subject_id,
-                                                        c.action.clone(),
-                                                    ));
-                                                }
-                                                ui.with_layout(
-                                                    egui::Layout::left_to_right(egui::Align::Center),
-                                                    |ui| {
-                                                        ui.add(egui::Label::new(&c.name).truncate());
-                                                        let badge_col = if c.action.eq_ignore_ascii_case("Edit") {
-                                                            egui::Color32::from_rgb(110, 175, 255)
-                                                        } else {
-                                                            egui::Color32::from_rgb(100, 215, 190)
-                                                        };
-                                                        ui.label(
-                                                            egui::RichText::new(format!("[{}]", c.action))
-                                                                .small()
-                                                                .color(badge_col),
-                                                        );
-                                                    },
-                                                );
-                                            },
-                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add_enabled(
+                                                            signed_in && !busy,
+                                                            egui::Button::new("Remove"),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        want_remove = Some((
+                                                            u,
+                                                            c.subject_type.clone(),
+                                                            c.subject_id,
+                                                            c.action.clone(),
+                                                        ));
+                                                    }
+                                                    ui.with_layout(
+                                                        egui::Layout::left_to_right(egui::Align::Center),
+                                                        |ui| {
+                                                            ui.add(egui::Label::new(&c.name).truncate());
+                                                            let badge_col = if c.action.eq_ignore_ascii_case("Edit") {
+                                                                egui::Color32::from_rgb(110, 175, 255)
+                                                            } else {
+                                                                egui::Color32::from_rgb(100, 215, 190)
+                                                            };
+                                                            ui.label(
+                                                                egui::RichText::new(format!("[{}]", c.action))
+                                                                    .small()
+                                                                    .color(badge_col),
+                                                            );
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                        });
                                     }
                                 }
                             });
@@ -2953,6 +3001,7 @@ impl Editor {
                                 .corner_radius(8.0)
                                 .inner_margin(egui::Margin::same(10))
                                 .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
                                     ui.label(egui::RichText::new("Live Session Peers").strong());
                                     ui.add_space(4.0);
                                     for (name, own, frame, idle, guid, line) in peers {
@@ -3706,7 +3755,7 @@ impl Editor {
                                                 ui.add_space(4.0);
                                                 match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
                                                     Some((_, st)) => {
-                                                        ui.label(st.describe());
+                                                        ui.label(self.describe_team_create_status(o.universe_id, st));
                                                         let yn = |b: Option<bool>| match b {
                                                             Some(true) => "yes",
                                                             Some(false) => "no",
@@ -4742,6 +4791,41 @@ fn apply_live_terrain(
     });
     grid.set_raw_many(cells);
     applied
+}
+
+fn apply_cloud_ids(
+    doc: &mut Document,
+    origin: Option<&CloudOrigin>,
+    place_id: u64,
+    universe_id: u64,
+) {
+    let root = doc.dom.root_ref();
+    let Some(inst) = doc.dom.get_by_ref_mut(root) else {
+        return;
+    };
+    use rbx_dom_weak::{types::{Enum, Variant}, ustr};
+    let pid = origin
+        .map(|o| o.place_id)
+        .filter(|&id| id != 0)
+        .unwrap_or(place_id);
+    let uid = origin
+        .map(|o| o.universe_id)
+        .filter(|&id| id != 0)
+        .unwrap_or(universe_id);
+    if pid != 0 || origin.is_some() {
+        inst.properties.insert(ustr("PlaceId"), Variant::Int64(pid as i64));
+    }
+    if uid != 0 || origin.is_some() {
+        inst.properties.insert(ustr("GameId"), Variant::Int64(uid as i64));
+    }
+    if let Some(o) = origin {
+        inst.properties.insert(ustr("CreatorId"), Variant::Int64(o.creator_id as i64));
+        inst.properties.insert(
+            ustr("CreatorType"),
+            Variant::Enum(Enum::from_u32(o.creator_type.enum_value())),
+        );
+        inst.properties.insert(ustr("PlaceVersion"), Variant::Int32(o.version as i32));
+    }
 }
 
 /// Workspace.Terrain when it has no voxels yet (no SmoothGrid, or an empty one).

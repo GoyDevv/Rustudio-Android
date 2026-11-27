@@ -167,7 +167,7 @@ fn run(req: Request) -> Result<Response, String> {
     let req_https = req.url.starts_with("https://");
     let agent: ureq::Agent = rustudio_account::http::agent(
         ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_global(Some(Duration::from_secs(120)))
             .timeout_connect(Some(Duration::from_secs(10)))
             .http_status_as_error(false)
             .user_agent("RobloxStudio/WinInet RobloxApp/0.746.0.7461269 (GlobalDist; RobloxDirectDownload)")

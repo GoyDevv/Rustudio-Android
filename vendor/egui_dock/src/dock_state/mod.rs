@@ -350,9 +350,9 @@ impl<Tab> DockState<Tab> {
         let state = self.get_window_state_mut(surface_index).unwrap();
         state.set_position(window_rect.min);
         if src.surface.is_main() {
-            state.set_size(window_rect.size() * 0.8);
+            state.set_size((window_rect.size() * 0.8).max(egui::vec2(340.0, 320.0)));
         } else {
-            state.set_size(window_rect.size());
+            state.set_size(window_rect.size().max(egui::vec2(260.0, 220.0)));
         }
 
         // Clean up any empty leaves and surfaces which may be left behind from the detachment.

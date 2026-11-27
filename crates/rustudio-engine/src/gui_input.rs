@@ -1989,10 +1989,15 @@ impl Gui {
                         .cloned();
                     let top_sink = under.iter().rev().find(|h| h.textbox || h.active || h.drag).cloned();
                     let top_press = under.iter().rev().find(|h| h.textbox || h.active || h.button || h.drag).cloned();
-                    // A finger anywhere else ends text editing.
-                    if let Some(f) = self.focus.filter(|f| sb_hit.is_some() || top_press.as_ref().is_none_or(|t| t.r != *f)) {
+                    // A finger anywhere else ends text editing. When the finger
+                    // lands on a GuiButton (e.g. ExperienceChat's SendButton),
+                    // defer the blur until TouchState::End | Cancel so button
+                    // click/Activated handlers still see the focused TextBox.
+                    if let Some(f) = self.focus.filter(|f| {
+                        sb_hit.is_some() || top_press.as_ref().is_none_or(|t| t.r != *f && !t.button)
+                    }) {
                         let mut sh = super::share();
-                        sh.focus_events.push((f, false, false, Some((1, x, y))));
+                        sh.focus_events.push((f, false, false, Some((3, x, y))));
                         sh.focus = None;
                         sh.tb_cursor.insert(f, -1);
                         sh.tb_sel.insert(f, -1);
@@ -2002,6 +2007,11 @@ impl Gui {
                         self.tb_selecting = None;
                         self.tb_held_key = None;
                     }
+                    let blur_on_end = if sb_hit.is_none() && top_press.as_ref().is_some_and(|t| t.button) {
+                        self.focus
+                    } else {
+                        None
+                    };
                     let now_t = std::time::Instant::now();
                     if let Some(ref sh_hit) = sb_hit {
                         if let Some(sb) = sh_hit.scrollbar {
@@ -2016,6 +2026,7 @@ impl Gui {
                                     since: now_t,
                                     sunk: true,
                                     pressed: None,
+                                    blur_on_end: None,
                                     under: HashSet::new(),
                                     began_on: Vec::new(),
                                     scroll: None,
@@ -2039,6 +2050,7 @@ impl Gui {
                             self.events.push(GuiEvent::Fire(top.r, "MouseButton1Down", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
                             pressed = Some(top.r);
                             super::share().pressed = Some(top.r);
+                            self.events.push(GuiEvent::GuiStateChanged(top.r));
                         }
                         if top.textbox {
                             let caret = self.textbox_pos_from_screen(top.r, t.pos);
@@ -2085,6 +2097,7 @@ impl Gui {
                             since: now_t,
                             sunk,
                             pressed,
+                            blur_on_end,
                             under: now,
                             began_on: began_on.clone(),
                             scroll,
@@ -2173,21 +2186,34 @@ impl Gui {
                     if let Some(pr) = f.pressed {
                         if super::share().pressed == Some(pr) {
                             super::share().pressed = None;
+                            self.events.push(GuiEvent::GuiStateChanged(pr));
                         }
                         if t.state == TouchState::End {
-                            if let Some(h) = self.hits.iter().find(|h| h.r == pr && h.button).cloned() {
+                            if self.hits.iter().any(|h| h.r == pr && h.button) {
                                 self.events.push(GuiEvent::Fire(pr, "MouseButton1Up", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
                                 let top = under.iter().rev().find(|h| h.textbox || h.active || h.button || h.drag);
                                 // (a finger that scrolled the list the button
                                 // is in was scrolling, not clicking)
                                 if top.is_some_and(|t| t.r == pr) && !f.scrolled {
                                     self.events.push(GuiEvent::Fire(pr, "MouseButton1Click", vec![]));
-                                    if h.active {
-                                        self.events.push(GuiEvent::Fire(pr, "Activated", vec![input(TouchState::End, dx, dy), GuiArg::Num(1.0)]));
-                                    }
+                                    self.events.push(GuiEvent::Fire(pr, "Activated", vec![input(TouchState::End, dx, dy), GuiArg::Num(1.0)]));
                                     self.last_click = Some(pr);
                                 }
                             }
+                        }
+                    }
+                    if let Some(blur_ref) = f.blur_on_end {
+                        if self.focus == Some(blur_ref) {
+                            let mut sh = super::share();
+                            sh.focus_events.push((blur_ref, false, false, Some((3, x, y))));
+                            sh.focus = None;
+                            sh.tb_cursor.insert(blur_ref, -1);
+                            sh.tb_sel.insert(blur_ref, -1);
+                            self.focus = None;
+                            self.tb_cursor = -1;
+                            self.tb_sel = -1;
+                            self.tb_selecting = None;
+                            self.tb_held_key = None;
                         }
                     }
                     // A quick, still finger: GuiObject.TouchTap(touchPositions).

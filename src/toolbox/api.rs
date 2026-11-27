@@ -347,7 +347,7 @@ pub fn list_url(r: &ListReq, user_id: u64, cursor: Option<&str>) -> String {
                 Some(g) => format!("group/{g}"),
                 None => format!("user/{user_id}"),
             };
-            let mut u = format!("{tb}/v1/inventory/{owner}/{}?keyword={q}&sortType=Relevance&limit={PAGE_SIZE}&includeOnlyVerifiedCreators=true&querySource=0&tags=&uiSortIntent=Relevance&excludeGroupCreations=true&originalUserQuery={q}&originalCorrection=", r.kind.api());
+            let mut u = format!("{tb}/v1/inventory/{owner}/{}?keyword={q}&sortType=Relevance&limit={PAGE_SIZE}&includeOnlyVerifiedCreators=false&querySource=0&tags=&uiSortIntent=Relevance&excludeGroupCreations=true&originalUserQuery={q}&originalCorrection=", r.kind.api());
             push_cursor(&mut u, cursor);
             u
         }

@@ -462,7 +462,13 @@ pub fn default_placement_for(
             );
             (pos, Vec2::new(w, h))
         }
-        "toolbox" | "terrain_editor" => {
+        "toolbox" => {
+            let w = (bounds.width() * 0.42).clamp(320.0, 440.0).min(w_avail);
+            let h = (h_avail * 0.72).clamp(260.0, 440.0).min(h_avail);
+            let pos = Pos2::new(bounds.min.x + PLACEMENT_MARGIN, bounds.min.y + PLACEMENT_MARGIN);
+            (pos, Vec2::new(w, h))
+        }
+        "terrain_editor" => {
             // Top-left, leaving vertical room for Output at bottom-left.
             let max_top_h = (h_avail - bottom_h - PLACEMENT_GAP).max(DEFAULT_MIN_SIZE[1].min(h_avail));
             let h = (h_avail * 0.56).clamp(180.0, 380.0).min(max_top_h).min(h_avail);

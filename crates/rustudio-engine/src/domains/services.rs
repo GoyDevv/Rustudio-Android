@@ -1775,8 +1775,16 @@ end
 local function simple(self, method, url, body, ct, compress, headers)
 	if headers ~= nil and type(headers) ~= "table" then fail("Unable to cast " .. cast_name(headers) .. " to Dictionary") end
 	local h = {}
-	if headers then for k, v in headers do h[k] = v end end
-	if method == "POST" and h["Content-Type"] == nil then h["Content-Type"] = content_type(ct) end
+	local has_ct = false
+	if headers then
+		for k, v in headers do
+			h[k] = v
+			if type(k) == "string" and string.lower(k) == "content-type" then
+				has_ct = true
+			end
+		end
+	end
+	if method == "POST" and not has_ct then h["Content-Type"] = content_type(ct) end
 	local id, err = begin(self, method, url, h, body)
 	if not id then fail(err) end
 	local okk, status, msg, _, resp = wait_for(id)

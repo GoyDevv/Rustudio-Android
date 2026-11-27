@@ -580,7 +580,11 @@ impl RustudioApp {
             project_export: None,
             project_settings: None,
             plugin_store: crate::plugin_store::manager::PluginManager::new(
-                crate::plugin_store::Store::open(crate::plugin_store::default_root(), crate::plugin_store::default_plugins_dir(), 0),
+                crate::plugin_store::Store::open(
+                    crate::plugin_store::default_root(),
+                    crate::plugin_store::default_plugins_dir(),
+                    crate::plugin_store::current_user_id(),
+                ),
                 Box::new(crate::plugin_store::runtime::HostBridge::default()),
             ),
             ui: crate::studio_ui::UiState::default(),
@@ -910,6 +914,9 @@ impl Editor {
     pub fn plugins_ui(&mut self, ctx: &egui::Context) {
         let client = self.game.account.shared_client();
         crate::plugin_store::ui::show(ctx, &mut self.plugin_store, client);
+        if std::mem::take(&mut self.plugin_store.ui.request_import_file) {
+            self.import_local_plugin();
+        }
         // Plugin menus (ShowAsync), Customize Shortcuts, bound plugin keys.
         self.plugin_popups(ctx);
         self.customize_shortcuts_window(ctx);
@@ -1162,8 +1169,12 @@ impl Editor {
     pub fn poll_file_dialogs(&mut self) {
         use crate::file_dialog::Purpose;
         if let Some((purpose, paths)) = self.dialogs.poll_multi() {
-            if !paths.is_empty() && purpose == Purpose::AssetManagerImport {
-                self.asset_manager_import_files(paths);
+            if !paths.is_empty() {
+                match purpose {
+                    Purpose::AssetManagerImport => self.asset_manager_import_files(paths),
+                    Purpose::ImportLocalPlugin => self.import_local_plugins_from(paths),
+                    _ => {}
+                }
             }
         }
         let Some((purpose, path)) = self.dialogs.poll() else {
@@ -1191,6 +1202,7 @@ impl Editor {
                 self.game.doc.selection = sel;
                 self.save_local_plugin_to(path);
             }
+            Purpose::ImportLocalPlugin => self.import_local_plugins_from(vec![path]),
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
             Purpose::FileSyncProject => self.file_sync.pick = path.display().to_string(),
             Purpose::ProjectParent => {
@@ -2934,29 +2946,31 @@ impl Editor {
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("Save As…").strong().color(egui::Color32::WHITE))
-                                        .fill(egui::Color32::from_rgb(0, 110, 230))
-                                        .min_size(egui::vec2(76.0, 28.0)),
-                                )
-                                .clicked()
-                            {
-                                self.save_as();
-                            }
-                            if ui
-                                .add(egui::Button::new("Close anyway").min_size(egui::vec2(88.0, 28.0)))
-                                .clicked()
-                            {
-                                decided = Some(true);
-                            }
-                            if ui
-                                .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
-                                .clicked()
-                            {
-                                decided = Some(false);
-                            }
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("Save As…").strong().color(egui::Color32::WHITE))
+                                            .fill(egui::Color32::from_rgb(0, 110, 230))
+                                            .min_size(egui::vec2(76.0, 28.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.save_as();
+                                }
+                                if ui
+                                    .add(egui::Button::new("Close anyway").min_size(egui::vec2(88.0, 28.0)))
+                                    .clicked()
+                                {
+                                    decided = Some(true);
+                                }
+                                if ui
+                                    .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                                    .clicked()
+                                {
+                                    decided = Some(false);
+                                }
+                            });
                         });
                         return;
                     }
@@ -2970,30 +2984,32 @@ impl Editor {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Save first").strong().color(egui::Color32::WHITE))
-                                .fill(egui::Color32::from_rgb(0, 110, 230))
-                                .min_size(egui::vec2(76.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        self.save();
-                        decided = Some(!self.game.doc.dirty());
-                    }
-                    if ui
-                        .add(egui::Button::new("Discard").min_size(egui::vec2(72.0, 28.0)))
-                        .clicked()
-                    {
-                        decided = Some(true);
-                    }
-                    if ui
-                        .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
-                        .clicked()
-                    {
-                        decided = Some(false);
-                    }
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Save first").strong().color(egui::Color32::WHITE))
+                                    .fill(egui::Color32::from_rgb(0, 110, 230))
+                                    .min_size(egui::vec2(76.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            self.save();
+                            decided = Some(!self.game.doc.dirty());
+                        }
+                        if ui
+                            .add(egui::Button::new("Discard").min_size(egui::vec2(72.0, 28.0)))
+                            .clicked()
+                        {
+                            decided = Some(true);
+                        }
+                        if ui
+                            .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                            .clicked()
+                        {
+                            decided = Some(false);
+                        }
+                    });
                 });
             });
         if let Some(go) = decided {
@@ -3325,7 +3341,8 @@ impl RustudioApp {
                     } else {
                         let surface = self.dock.add_window(vec![tab]);
                         if let Some(w) = self.dock.get_window_state_mut(surface) {
-                            let size = egui::vec2(420.0, 320.0);
+                            let size = egui::vec2(420.0, 320.0)
+                                .min((dock_rect.size() - egui::vec2(16.0, 16.0)).max(egui::vec2(260.0, 220.0)));
                             w.set_position(dock_rect.center() - size * 0.5).set_size(size);
                         }
                     }

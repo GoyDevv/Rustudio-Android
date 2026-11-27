@@ -34,6 +34,8 @@ pub enum Purpose {
     SaveSelection(Vec<Ref>),
     /// Plugins > Save as Local Plugin: the selection when the dialog opened.
     SaveLocalPlugin(Vec<Ref>),
+    /// Plugins > Import Plugin...: one or more local plugin files (.rbxm/.rbxmx/.lua/.luau).
+    ImportLocalPlugin,
     /// Save as Project Folder: the "Create in" folder.
     ProjectParent,
     /// Terrain Editor > Import: a heightmap (true) or colormap image.

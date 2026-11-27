@@ -1397,6 +1397,10 @@ impl AssetPicker {
 
                 match self.tab {
                     PickerTab::PasteId => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("asset_picker_paste_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         ui.label(
                             RichText::new(format!(
                                 "Property: {}.{} ({})",
@@ -1561,10 +1565,9 @@ impl AssetPicker {
                             ui.horizontal_top(|ui| {
                                 let left_w = (avail_w - preview_card_w - 14.0).max(160.0);
                                 ui.allocate_ui_with_layout(
-                                    Vec2::new(left_w, 136.0),
+                                    Vec2::new(left_w, 0.0),
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
-                                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                         draw_paste_controls(
                                             ui,
                                             &mut self.input_uri,
@@ -1577,10 +1580,9 @@ impl AssetPicker {
                                 );
                                 ui.add_space(6.0);
                                 ui.allocate_ui_with_layout(
-                                    Vec2::new(preview_card_w, 136.0),
+                                    Vec2::new(preview_card_w, 0.0),
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
-                                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                         draw_paste_preview_card(
                                             ui,
                                             self.paste_preview_id,
@@ -1609,6 +1611,7 @@ impl AssetPicker {
                                 is_audio_cat,
                             );
                         }
+                            });
                     }
 
                     PickerTab::Upload => {

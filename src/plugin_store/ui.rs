@@ -29,6 +29,7 @@ pub struct ManageUi {
     pub confirm_remove: Option<u64>,
     pub import_open: bool,
     pub import_report: Option<String>,
+    pub request_import_file: bool,
     pub publish: Option<PublishDialog>,
     icons: std::collections::HashMap<u64, egui::TextureHandle>,
 }
@@ -172,6 +173,9 @@ fn header(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>
             }
             if ui.small_button("Import from Studio…").clicked() {
                 m.ui.import_open = true;
+            }
+            if ui.small_button("Import Plugin…").clicked() {
+                m.ui.request_import_file = true;
             }
         });
     });
@@ -527,6 +531,13 @@ fn import_window(ctx: &egui::Context, m: &mut PluginManager) {
                 });
             });
         }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Import Plugin…").clicked() {
+                m.ui.request_import_file = true;
+            }
+            ui.label(RichText::new("Import a local .rbxm, .rbxmx, .lua, or .luau file.").small().color(theme::TEXT_DIM));
+        });
         if let Some(r) = &m.ui.import_report {
             ui.separator();
             ui.label(r);

@@ -99,7 +99,30 @@ pub fn wire_name(name: &str) -> &str {
         "CollisionGroup" => "CollisionGroupReplicate",
         "RenderFidelity" => "RenderFidelityReplicate",
         "MeshId" => "MeshContent",
-        "TextureID" => "TextureContent",
+        "Image" => "ImageContent",
+        "TextureID" | "TextureId" | "Texture" => "TextureContent",
+        "ShirtTemplate" => "ShirtTemplateContent",
+        "PantsTemplate" => "PantsTemplateContent",
+        "Graphic" => "GraphicContent",
+        "HoverImage" => "HoverImageContent",
+        "PressedImage" => "PressedImageContent",
+        "TopImage" => "TopImageContent",
+        "MidImage" => "MidImageContent",
+        "BottomImage" => "BottomImageContent",
+        "ColorMap" => "ColorMapContent",
+        "NormalMap" => "NormalMapContent",
+        "MetalnessMap" => "MetalnessMapContent",
+        "RoughnessMap" => "RoughnessMapContent",
+        "SoundId" | "Asset" => "AudioContent",
+        "AnimationId" => "AnimationContent",
+        "SkyboxBk" => "SkyboxBkContent",
+        "SkyboxDn" => "SkyboxDnContent",
+        "SkyboxFt" => "SkyboxFtContent",
+        "SkyboxLf" => "SkyboxLfContent",
+        "SkyboxRt" => "SkyboxRtContent",
+        "SkyboxUp" => "SkyboxUpContent",
+        "SunTextureId" => "SunTextureContent",
+        "MoonTextureId" => "MoonTextureContent",
         // Script capabilities: the reflection DB's canonical Sandboxed is
         // DefinesCapabilities in files and on the wire (the server's own
         // NewObject carries DefinesCapabilities = true).
@@ -398,7 +421,7 @@ pub fn create_partial_with(
     let mut out = vec![0x83, 2];
     put_reference(&mut out, id);
     out.extend_from_slice(&ci.to_le_bytes());
-    let mut encoded=Vec::new();
+    let mut encoded: Vec<(u8, u8, PropValue, bool)> = Vec::new();
     let mut skipped=Vec::new();
     for (name,value) in props {
         let find=|n: &str| cls.props.iter().enumerate().find(|(_,p)| p.name==n);
@@ -415,7 +438,17 @@ pub fn create_partial_with(
         // Encode once here so a value without a wire form drops only itself.
         let value=match prepare_value(prop.ty,value) {Ok(v)=>v,Err(e)=>{skipped.push((name.clone(),e));continue;}};
         if let Err(e)=encode_value(&mut Vec::new(),schema,prop.ty,&value,false) {skipped.push((name.clone(),format!("{class}.{name}: {e}")));continue;}
-        encoded.push((pi as u8,prop.ty,value));
+        // Deduplicate by schema property index `pi`, preferring the canonical
+        // property name (`prop.name == *name`) over a legacy alias so we never
+        // emit the same index twice in one NewObject frame.
+        let canonical = prop.name == *name;
+        if let Some(existing) = encoded.iter_mut().find(|(epi, _, _, _)| *epi == pi as u8) {
+            if canonical && !existing.3 {
+                *existing = (pi as u8, prop.ty, value, true);
+            }
+        } else {
+            encoded.push((pi as u8, prop.ty, value, canonical));
+        }
     }
     // Each group goes in ascending schema index, as the server's own
     // NewObject items do. The CloudEdit server drops the session ("Error
@@ -425,17 +458,17 @@ pub fn create_partial_with(
     // LocalScript with Disabled / RunContext reset Place A's session (verified
     // live on a test place, 2026-11-20: Name alone is accepted, Name + any of them
     // resets).
-    encoded.sort_by_key(|(pi,_,_)| *pi);
+    encoded.sort_by_key(|(pi,_,_,_)| *pi);
     // Protected source is serialized in NewObject's early group.
-    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06) {
+    for &(pi,ty,ref value,_) in encoded.iter().filter(|(_,ty,_,_)| *ty==0x06) {
         out.push(pi);encode_value(&mut out,schema,ty,value,true)?;
     }
     out.push(0xff);
-    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty!=0x06) {
+    for &(pi,ty,ref value,_) in encoded.iter().filter(|(_,ty,_,_)| *ty!=0x06) {
         out.push(pi);encode_value(&mut out,schema,ty,value,false)?;
     }
     out.push(0xff);
-    for (_,_,value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06).chain(encoded.iter().filter(|(_,ty,_)| *ty!=0x06)) {
+    for (_,_,value,_) in encoded.iter().filter(|(_,ty,_,_)| *ty==0x06).chain(encoded.iter().filter(|(_,ty,_,_)| *ty!=0x06)) {
         append_shared(&mut out,value,sent);
     }
     put_reference(&mut out, parent);
@@ -1328,6 +1361,94 @@ mod tests {
                 schema.decode_value_bytes(bad_ty, &[0u8; 32], true).is_err(),
                 "type {bad_ty:#x} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn wire_name_maps_legacy_content_properties() {
+        let cases = [
+            ("Image", "ImageContent"),
+            ("TextureID", "TextureContent"),
+            ("TextureId", "TextureContent"),
+            ("Texture", "TextureContent"),
+            ("ShirtTemplate", "ShirtTemplateContent"),
+            ("PantsTemplate", "PantsTemplateContent"),
+            ("Graphic", "GraphicContent"),
+            ("HoverImage", "HoverImageContent"),
+            ("PressedImage", "PressedImageContent"),
+            ("TopImage", "TopImageContent"),
+            ("MidImage", "MidImageContent"),
+            ("BottomImage", "BottomImageContent"),
+            ("ColorMap", "ColorMapContent"),
+            ("NormalMap", "NormalMapContent"),
+            ("MetalnessMap", "MetalnessMapContent"),
+            ("RoughnessMap", "RoughnessMapContent"),
+            ("SoundId", "AudioContent"),
+            ("Asset", "AudioContent"),
+            ("AnimationId", "AnimationContent"),
+            ("SkyboxBk", "SkyboxBkContent"),
+            ("SkyboxDn", "SkyboxDnContent"),
+            ("SkyboxFt", "SkyboxFtContent"),
+            ("SkyboxLf", "SkyboxLfContent"),
+            ("SkyboxRt", "SkyboxRtContent"),
+            ("SkyboxUp", "SkyboxUpContent"),
+            ("SunTextureId", "SunTextureContent"),
+            ("MoonTextureId", "MoonTextureContent"),
+        ];
+        for (legacy, canonical) in cases {
+            assert_eq!(wire_name(legacy), canonical, "legacy property {legacy}");
+        }
+    }
+
+    #[test]
+    fn create_partial_with_deduplicates_pi_preferring_canonical() {
+        let schema = Schema {
+            classes: vec![SchemaClass {
+                name: "Decal".into(),
+                props: vec![
+                    SchemaProp { name: "Name".into(), ty: 0x31 },
+                    SchemaProp { name: "TextureContent".into(), ty: 0x3d },
+                ],
+                events: vec![],
+            }],
+            global_props: vec![(0, 0), (0, 1)],
+            ..Default::default()
+        };
+
+        let orders = [
+            vec![
+                ("Texture".into(), PropValue::String("rbxassetid://111".into())),
+                ("TextureContent".into(), PropValue::String("rbxassetid://222".into())),
+                ("Name".into(), PropValue::String("Poster".into())),
+            ],
+            vec![
+                ("TextureContent".into(), PropValue::String("rbxassetid://222".into())),
+                ("Texture".into(), PropValue::String("rbxassetid://111".into())),
+                ("Name".into(), PropValue::String("Poster".into())),
+            ],
+        ];
+
+        for props in orders {
+            let mut sent = SharedSent::default();
+            let (frame, skipped) =
+                create_partial_with(&schema, 9, "Decal", 1, &props, &mut sent).unwrap();
+            assert!(skipped.is_empty(), "unexpected skipped: {skipped:?}");
+            let mut dec = Decoder::new();
+            dec.schema = Some(schema.clone());
+            let ops = dec.decode_frame(frame[0], &frame[1..]);
+            assert!(dec.errors.is_empty(), "decode errors: {:?}", dec.errors);
+            assert_eq!(ops.len(), 1);
+            match &ops[0] {
+                RepOp::NewInstance { props, .. } => {
+                    let tex: Vec<_> = props
+                        .iter()
+                        .filter(|(k, _)| k == "TextureContent")
+                        .collect();
+                    assert_eq!(tex.len(), 1, "expected deduplicated TextureContent");
+                    assert_eq!(tex[0].1, PropValue::String("rbxassetid://222".into()));
+                }
+                other => panic!("expected NewInstance, got {other:?}"),
+            }
         }
     }
 }

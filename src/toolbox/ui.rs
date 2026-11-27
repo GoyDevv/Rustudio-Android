@@ -99,15 +99,17 @@ const TILE_MIN: f32 = 120.0;
 /// Swimlane cards: 3 a row at ~280 px (NOTES.md), more as it widens.
 const LANE_MIN: f32 = 76.0;
 
-/// Tiles a row at width `w` (never fewer than Studio's 2) and their width.
+/// Tiles a row at width `w` (2 at Studio's ~280 px panel, 1 when narrow) and their width.
 pub fn tile_cols(w: f32) -> (usize, f32) {
-    let n = grid(w, TILE_MIN).0.max(2);
-    (n, (w - GAP * (n as f32 - 1.0)) / n as f32)
+    let min_cols = if w < 200.0 { 1 } else { 2 };
+    let n = grid(w, TILE_MIN).0.max(min_cols);
+    (n, ((w - GAP * (n as f32 - 1.0)) / n as f32).max(40.0))
 }
 
-/// Cards in a swimlane row at width `w` (never fewer than Studio's 3).
+/// Cards in a swimlane row at width `w` (3 at Studio's ~280 px panel, 2 when narrow).
 pub fn lane_cards(w: f32) -> (usize, f32) {
-    let n = grid(w, LANE_MIN).0.max(3);
+    let min_cards = if w < 220.0 { 2 } else { 3 };
+    let n = grid(w, LANE_MIN).0.max(min_cards);
     (n, ((w - GAP * (n as f32 - 1.0)) / n as f32).max(40.0))
 }
 
@@ -341,7 +343,7 @@ impl Editor {
         let search_rect = ui
             .horizontal(|ui| {
                 ui.add_space(4.0);
-                let w = (ui.available_width() - 70.0).max(60.0);
+                let w = (ui.available_width() - 82.0).max(60.0);
                 let (r, _) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
                 ui.painter().rect(r, 4.0, theme::PANEL_DARK, Stroke::new(1.0, if self.toolbox.ui.search_focused { theme::SELECT } else { theme::DIVIDER }), StrokeKind::Inside);
                 let sr_icon = Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), Vec2::splat(22.0));
@@ -542,7 +544,9 @@ impl Editor {
                         let (r, resp) = ui.allocate_exact_size(Vec2::new(cw, 46.0), Sense::click());
                         ui.painter().rect_filled(r, 4.0, if resp.hovered() { TILE_HOVER } else { TILE });
                         icon(ui.painter(), Rect::from_center_size(Pos2::new(r.center().x, r.min.y + 15.0), Vec2::splat(15.0)), cat_icon(c.icon), theme::TEXT);
-                        ui.painter().text(Pos2::new(r.center().x, r.max.y - 12.0), Align2::CENTER_CENTER, c.label, FontId::proportional(13.0), theme::TEXT);
+                        let g = clipped(ui, c.label, FontId::proportional(13.0), theme::TEXT, (r.width() - 8.0).max(10.0), 1);
+                        let text_pos = Pos2::new(r.center().x - g.size().x * 0.5, r.max.y - 12.0 - g.size().y * 0.5);
+                        ui.painter().with_clip_rect(ui.clip_rect().intersect(r.shrink2(Vec2::new(4.0, 0.0)))).galley(text_pos, g, theme::TEXT);
                         if resp.clicked() {
                             cmds.push(Cmd::Nav(Nav::Category(c.key.into())));
                         }
@@ -615,7 +619,9 @@ impl Editor {
                     for k in row {
                         let (r, resp) = ui.allocate_exact_size(Vec2::new(cw, 28.0), Sense::click());
                         ui.painter().rect_filled(r, 4.0, if resp.hovered() { TILE_HOVER } else { TILE });
-                        ui.painter().text(r.center(), Align2::CENTER_CENTER, k.label, FontId::proportional(13.0), theme::TEXT);
+                        let g = clipped(ui, k.label, FontId::proportional(13.0), theme::TEXT, (r.width() - 8.0).max(10.0), 1);
+                        let text_pos = r.center() - g.size() * 0.5;
+                        ui.painter().with_clip_rect(ui.clip_rect().intersect(r.shrink2(Vec2::new(4.0, 0.0)))).galley(text_pos, g, theme::TEXT);
                         if resp.clicked() {
                             cmds.push(Cmd::Nav(Nav::Results { cat: k.key.into(), query: String::new(), tile: None }));
                         }
@@ -1376,19 +1382,31 @@ impl Editor {
             *sel = 0;
         }
         let mut cur = *sel;
+        let stack_inv = tab == Tab::Inventory && ui.available_width() < 240.0;
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            let w = if tab == Tab::Inventory { (ui.available_width() * 0.45).max(110.0) } else { ui.available_width() - 10.0 };
+            let w = if tab == Tab::Inventory && !stack_inv {
+                (ui.available_width() * 0.45).max(110.0)
+            } else {
+                (ui.available_width() - 10.0).max(60.0)
+            };
             egui::ComboBox::from_id_salt(("tblistcat", tab as u8)).width(w).selected_text(cats[cur].label).show_ui(ui, |ui| {
                 for (i, c) in cats.iter().enumerate() {
                     ui.selectable_value(&mut cur, i, c.label);
                 }
             });
-            if tab == Tab::Inventory {
-                let te = egui::TextEdit::singleline(&mut self.toolbox.st.inv_query).hint_text("Search").desired_width(ui.available_width() - 8.0);
+            if tab == Tab::Inventory && !stack_inv {
+                let te = egui::TextEdit::singleline(&mut self.toolbox.st.inv_query).hint_text("Search").desired_width((ui.available_width() - 8.0).max(40.0));
                 ui.add(te);
             }
         });
+        if stack_inv {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                let te = egui::TextEdit::singleline(&mut self.toolbox.st.inv_query).hint_text("Search").desired_width((ui.available_width() - 10.0).max(60.0));
+                ui.add(te);
+            });
+        }
         match tab {
             Tab::Inventory => self.toolbox.st.inv_cat = cur,
             Tab::Recent => self.toolbox.st.recent_cat = cur,
@@ -1415,22 +1433,6 @@ impl Editor {
             });
             self.toolbox.st.group = g;
         }
-        if !self.toolbox.st.banner_closed {
-            egui::Frame::new().fill(Color32::from_rgb(72, 62, 30)).inner_margin(8.0).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width() - 24.0);
-                        ui.add(egui::Label::new(egui::RichText::new("⚠ Toolbox inventory will be deprecated soon. Manage your inventory using the new Asset Manager.").size(12.5)).wrap());
-                        if ui.add(egui::Label::new(egui::RichText::new("Read more").underline().size(12.5)).sense(Sense::click())).clicked() {
-                            cmds.push(Cmd::Url("https://devforum.roblox.com/c/updates/announcements".into()));
-                        }
-                    });
-                    if icon_button(ui, "x", 20.0, false, "").clicked() {
-                        self.toolbox.st.banner_closed = true;
-                    }
-                });
-            });
-        }
         let Some(req) = self.toolbox.tab_req(tab) else {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| ui.label(egui::RichText::new("You aren't in a group that can create assets.").color(theme::TEXT_DIM)));
@@ -1455,7 +1457,26 @@ impl Editor {
             l.ids = ids;
         }
         let kind = req.kind;
-        let near_end = self.scroll_view(ui, |ed, ui, vp| ed.small_grid(ui, &req, &l, kind, vp, cmds));
+        let near_end = self.scroll_view(ui, |ed, ui, vp| {
+            if tab == Tab::Inventory && !ed.toolbox.st.banner_closed {
+                egui::Frame::new().fill(Color32::from_rgb(72, 62, 30)).inner_margin(8.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width((ui.available_width() - 24.0).max(40.0));
+                            ui.add(egui::Label::new(egui::RichText::new("⚠ Toolbox inventory will be deprecated soon. Manage your inventory using the new Asset Manager.").size(12.5)).wrap());
+                            if ui.add(egui::Label::new(egui::RichText::new("Read more").underline().size(12.5)).sense(Sense::click())).clicked() {
+                                cmds.push(Cmd::Url("https://devforum.roblox.com/c/updates/announcements".into()));
+                            }
+                        });
+                        if icon_button(ui, "x", 20.0, false, "").clicked() {
+                            ed.toolbox.st.banner_closed = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            }
+            ed.small_grid(ui, &req, &l, kind, vp, cmds);
+        });
         if near_end && l.can_load_more() && l.pages > 0 {
             cmds.push(Cmd::LoadMore(req));
         }
@@ -1562,8 +1583,16 @@ impl Editor {
 
     fn filter_sheet(&mut self, ui: &mut egui::Ui, top: f32) {
         let clip = ui.clip_rect();
-        let full = Rect::from_min_max(Pos2::new(clip.min.x, top), clip.max);
-        let sheet = Rect::from_min_max(full.min + Vec2::new(12.0, 6.0), full.max - Vec2::new(10.0, 10.0));
+        let full = Rect::from_min_max(
+            Pos2::new(clip.min.x, top),
+            Pos2::new(clip.max.x.max(clip.min.x + 140.0), clip.max.y.max(top + 100.0)),
+        );
+        let sheet_min = full.min + Vec2::new(12.0, 6.0);
+        let sheet_max = Pos2::new(
+            (full.max.x - 10.0).max(sheet_min.x + 120.0),
+            (full.max.y - 10.0).max(sheet_min.y + 80.0),
+        );
+        let sheet = Rect::from_min_max(sheet_min, sheet_max);
         let mut close = false;
         let mut f = self.toolbox.st.filters.clone();
         let kind = self.toolbox.current_cat().and_then(|c| categories::find(&c)).map(|c| c.kind).unwrap_or(Kind::Model);
@@ -1578,8 +1607,8 @@ impl Editor {
             let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(sheet));
             let ui = &mut inner;
             egui::Frame::new().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::DIVIDER)).corner_radius(4.0).inner_margin(10.0).show(ui, |ui| {
-                ui.set_width(sheet.width() - 20.0);
-                egui::ScrollArea::vertical().max_height(sheet.height() - 20.0).scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() }).show(ui, |ui| {
+                ui.set_width((sheet.width() - 20.0).max(120.0));
+                egui::ScrollArea::vertical().max_height((sheet.height() - 20.0).max(80.0)).scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() }).show(ui, |ui| {
                     ui.label(egui::RichText::new("Sort By").font(bold(13.0)).color(theme::TEXT));
                     ui.radio_value(&mut f.sort, Sort::Relevance, "Relevance");
                     ui.radio_value(&mut f.sort, Sort::Ratings, "Rating");
@@ -1916,9 +1945,9 @@ mod tests {
         assert_eq!(super::tile_cols(260.0).0, 2);
         assert_eq!(super::lane_cards(260.0).0, 3);
         assert_eq!(super::grid(260.0, 88.0).0, 2);
-        // Narrower never drops below those.
-        assert_eq!(super::tile_cols(150.0).0, 2);
-        assert_eq!(super::lane_cards(150.0).0, 3);
+        // Narrow panels drop to 1 tile / 2 swimlane cards so labels stay readable.
+        assert_eq!(super::tile_cols(150.0).0, 1);
+        assert_eq!(super::lane_cards(150.0).0, 2);
         // Wider: more of each, at about the same size.
         assert_eq!(super::tile_cols(600.0).0, 4);
         assert_eq!(super::lane_cards(600.0).0, 7);

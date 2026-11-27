@@ -283,7 +283,9 @@ impl Editor {
                 }
                 top_icon(ui, "bell", theme::TEXT, false).on_hover_text("Notifications: not in rustudio yet");
                 let tc = match (&self.game.doc.cloud, &self.cloud.status) {
-                    (Some(o), Some((u, s))) if *u == o.universe_id => s.describe(),
+                    (Some(o), Some((u, s))) if *u == o.universe_id => {
+                        self.describe_team_create_status(*u, s)
+                    }
                     _ => "Open a Team Create place to see its live collaborators".into(),
                 };
                 if top_icon(ui, "users-group", theme::TEXT, false).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
@@ -465,7 +467,11 @@ impl Editor {
                 }
                 // Only plugin toolbars, as Studio's (Manage Plugins and
                 // Plugins Folder are in the Plugins menu): src/plugin_host/ui_ribbon.rs.
-                RibbonTab::Plugins => self.plugins_ribbon(ui),
+                RibbonTab::Plugins => {
+                    self.rb(ui, "file-import", "Import Plugin", "import_local_plugin", false, a);
+                    divider(ui);
+                    self.plugins_ribbon(ui);
+                }
             }
         });
         });
