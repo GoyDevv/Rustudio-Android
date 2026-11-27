@@ -93,7 +93,7 @@ pub const ROTATE_SNAP_DEG: f32 = 45.0; // Studio Home toolbar rotate increment
 pub const MIN_PART_SIZE: f32 = 0.001;
 pub const GIZMO_ARROW_PX: f32 = 90.0;
 pub const GIZMO_RING_PX: f32 = 80.0;
-pub const GIZMO_HIT_PX: f32 = 10.0;
+pub const GIZMO_HIT_PX: f32 = if cfg!(target_os = "android") { 22.0 } else { 10.0 };
 /// Box select starts once the mouse is 3 px from the press
 /// (DraggerFramework DragSelector.updateDrag: `(location - start).Magnitude < 3`).
 pub const DRAG_SELECT_MIN_PX: f32 = 3.0;

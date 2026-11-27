@@ -146,7 +146,9 @@ impl GpuCaps {
 
     /// Compute shaders (skinning, HBAO, light grid builds).
     pub fn compute(&self) -> bool {
-        self.downlevel.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        self.backend != wgpu::Backend::Gl
+            && !self.is_powervr()
+            && self.downlevel.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
             && self.limits.max_compute_workgroups_per_dimension > 0
             && self.limits.max_compute_invocations_per_workgroup >= 64
     }

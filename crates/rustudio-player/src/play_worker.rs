@@ -1113,6 +1113,13 @@ impl ThreadedPlay {
         if let Some(pending) = self.pending.as_ref() {
             let result = if wait {
                 let _join = rustudio_core::bench::scope("gameplay_publish_wait");
+                #[cfg(target_os = "android")]
+                match pending.recv_timeout(std::time::Duration::from_millis(16)) {
+                    Ok(frame) => Some(frame),
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Receive::Pending,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+                #[cfg(not(target_os = "android"))]
                 pending.recv().ok()
             } else {
                 match pending.try_recv() {

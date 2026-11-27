@@ -203,6 +203,15 @@ pub struct VersionInfo {
 }
 
 /// Team Create, as Studio's Start Page finds it for a universe.
+/// A collaborator entry returned by Roblox Develop API v2 universe permissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniverseCollaborator {
+    pub subject_type: String,
+    pub subject_id: u64,
+    pub name: String,
+    pub action: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TeamCreateStatus {
     /// develop `universes/multiget/teamcreate` (None: Roblox shows it only
@@ -845,6 +854,228 @@ impl CloudApi {
             st.can_cloud_edit = v.get("canCloudEdit").and_then(|b| b.as_bool());
         }
         st
+    }
+
+    /// Enables or disables Team Create for a universe via Develop API v1
+    /// (`PATCH /v1/universes/{universeId}/teamcreate`).
+    pub fn set_team_create(&self, universe_id: u64, enabled: bool) -> Result<bool> {
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
+        let url = format!("{}/v1/universes/{universe_id}/teamcreate", self.ep.develop);
+        let body = serde_json::json!({ "isEnabled": enabled }).to_string();
+        let (status, text) = self
+            .session
+            .send_csrf("PATCH", &url, "application/json", body.as_bytes())?;
+        if (200..300).contains(&status) {
+            Ok(enabled)
+        } else {
+            let msg = parse_roblox_error_msg(&text)
+                .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
+            Err(Error(format!("Could not update Team Create: {msg}")))
+        }
+    }
+
+    /// Lists collaborators / permissions on a universe (`GET /v2/universes/{universeId}/permissions`).
+    pub fn list_collaborators(&self, universe_id: u64) -> Result<Vec<UniverseCollaborator>> {
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
+        let url = format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop);
+        let v = self.get_json(&url, "universe permissions")?;
+        let mut out = Vec::new();
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for item in arr {
+                let get_str = |keys: &[&str]| -> String {
+                    for k in keys {
+                        if let Some(val) = item.get(*k) {
+                            if let Some(s) = val.as_str() {
+                                if !s.is_empty() {
+                                    return s.to_string();
+                                }
+                            } else if let Some(n) = val.as_u64() {
+                                return n.to_string();
+                            }
+                        }
+                    }
+                    String::new()
+                };
+                let subject_type = {
+                    let s = get_str(&["subjectType", "SubjectType"]);
+                    if s.is_empty() {
+                        if item.get("groupId").is_some() {
+                            "Group".to_string()
+                        } else if item.get("rolesetId").is_some() {
+                            "Roleset".to_string()
+                        } else {
+                            "User".to_string()
+                        }
+                    } else {
+                        s
+                    }
+                };
+                let id_str = get_str(&[
+                    "userId", "subjectId", "SubjectId", "groupId", "rolesetId",
+                ]);
+                let subject_id = id_str.parse::<u64>().unwrap_or(0);
+                let name = {
+                    let s = get_str(&[
+                        "userName",
+                        "username",
+                        "subjectName",
+                        "SubjectName",
+                        "groupName",
+                        "rolesetName",
+                        "name",
+                    ]);
+                    if s.is_empty() {
+                        format!("{subject_type} #{subject_id}")
+                    } else {
+                        s
+                    }
+                };
+                let action = {
+                    let s = get_str(&["action", "Action"]);
+                    if s.is_empty() { "Edit".to_string() } else { s }
+                };
+                if subject_id != 0 || !name.is_empty() {
+                    out.push(UniverseCollaborator {
+                        subject_type,
+                        subject_id,
+                        name,
+                        action,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolves a Roblox username or numeric User ID to `(user_id, username)`.
+    pub fn resolve_user(&self, query: &str) -> Result<(u64, String)> {
+        let q = query.trim().trim_start_matches('@');
+        if q.is_empty() {
+            return Err(Error::new("Enter a Roblox username or User ID"));
+        }
+        if let Ok(uid) = q.parse::<u64>() {
+            let url = format!("https://users.roblox.com/v1/users/{uid}");
+            if let Ok(v) = self.get_json(&url, "user lookup") {
+                if let Some(name) = v.get("name").and_then(|s| s.as_str()) {
+                    return Ok((uid, name.to_string()));
+                }
+            }
+            return Ok((uid, format!("User {uid}")));
+        }
+        let body = serde_json::json!({
+            "usernames": [q],
+            "excludeBannedUsers": true
+        })
+        .to_string();
+        let (status, text) = self.session.post_csrf(
+            "https://users.roblox.com/v1/usernames/users",
+            "application/json",
+            body.as_bytes(),
+        )?;
+        if !(200..300).contains(&status) {
+            let msg = parse_roblox_error_msg(&text).unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(Error(format!("User lookup failed: {msg}")));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|_| Error::new("Invalid response from Roblox Users API"))?;
+        let first = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .ok_or_else(|| Error(format!("Roblox user '{q}' not found")))?;
+        let uid = first
+            .get("id")
+            .and_then(|i| i.as_u64())
+            .ok_or_else(|| Error(format!("Roblox user '{q}' missing ID")))?;
+        let name = first
+            .get("name")
+            .and_then(|s| s.as_str())
+            .unwrap_or(q)
+            .to_string();
+        Ok((uid, name))
+    }
+
+    /// Invites a Roblox user (by username or User ID) to a universe with `"Edit"` or `"Play"` access.
+    pub fn invite_collaborator(
+        &self,
+        universe_id: u64,
+        username_or_id: &str,
+        action: &str,
+    ) -> Result<UniverseCollaborator> {
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
+        let (user_id, username) = self.resolve_user(username_or_id)?;
+        let url = format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop);
+        let body = serde_json::json!([{
+            "subjectType": "User",
+            "subjectId": user_id.to_string(),
+            "action": action,
+        }])
+        .to_string();
+        let (status, text) = self
+            .session
+            .send_csrf("POST", &url, "application/json", body.as_bytes())?;
+        if (200..300).contains(&status) {
+            Ok(UniverseCollaborator {
+                subject_type: "User".into(),
+                subject_id: user_id,
+                name: username,
+                action: action.into(),
+            })
+        } else {
+            let msg = parse_roblox_error_msg(&text)
+                .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
+            Err(Error(format!("Could not invite {username}: {msg}")))
+        }
+    }
+
+    /// Removes a collaborator's permission from a universe.
+    pub fn remove_collaborator(
+        &self,
+        universe_id: u64,
+        subject_type: &str,
+        subject_id: u64,
+        action: &str,
+    ) -> Result<()> {
+        if universe_id == 0 {
+            return Err(Error::new("Missing universe ID"));
+        }
+        let url = format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop);
+        let body = serde_json::json!([{
+            "subjectType": subject_type,
+            "subjectId": subject_id.to_string(),
+            "action": action,
+        }])
+        .to_string();
+        let (status, text) = self
+            .session
+            .send_csrf("DELETE", &url, "application/json", body.as_bytes())?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        if subject_type == "User" {
+            let fb_url = format!(
+                "{}/v1/universes/{universe_id}/teamcreate/memberships",
+                self.ep.develop
+            );
+            let fb_body = serde_json::json!({ "userId": subject_id }).to_string();
+            if let Ok((st2, _)) = self
+                .session
+                .send_csrf("DELETE", &fb_url, "application/json", fb_body.as_bytes())
+            {
+                if (200..300).contains(&st2) {
+                    return Ok(());
+                }
+            }
+        }
+        let msg = parse_roblox_error_msg(&text)
+            .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
+        Err(Error(format!("Could not remove collaborator: {msg}")))
     }
 
     /// Saves (Saved) or publishes (Published) the place as a new version.
@@ -1923,4 +2154,22 @@ mod live {
             println!("{} team create: {:?}", e.name, a.team_create(e.id));
         }
     }
+}
+
+fn parse_roblox_error_msg(text: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if let Some(msg) = v
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| {
+            e.get("userFacingMessage")
+                .and_then(|m| m.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| e.get("message").and_then(|m| m.as_str()))
+        })
+    {
+        return Some(msg.to_string());
+    }
+    v.get("message").and_then(|m| m.as_str()).map(str::to_string)
 }

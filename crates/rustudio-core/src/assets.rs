@@ -1357,10 +1357,16 @@ fn public_prefetch_inner(id: u64) -> Fetch {
     match map.get(&id) {
         Some(Some(Err(e))) => return Fetch::Unavailable(e.clone()),
         Some(Some(Ok(()))) => {
-            return match public_cached(id) {
-                Ok(b) => Fetch::Ready(b),
-                Err(e) => Fetch::Unavailable(e),
-            }
+            map.insert(id, None);
+            drop(g);
+            schedule(Priority::Needed, move || {
+                let r = public_cached(id).map(|_| ());
+                content_track(&format!("rbxassetid://{id}"), if r.is_ok() { 2 } else { 3 });
+                if let Ok(mut g) = PUBLIC_PREFETCH_STATES.lock() {
+                    g.get_or_insert_with(HashMap::new).insert(id, Some(r));
+                }
+            });
+            return Fetch::Pending;
         }
         Some(None) => return Fetch::Pending,
         None => {}

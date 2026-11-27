@@ -30,6 +30,9 @@ use rodio::{ChannelCount, Decoder, Player, SampleRate, Source};
 
 /// How long the first `play()` waits for the output device to open. Later calls never wait;
 /// sounds started before the device is ready are timed silently.
+#[cfg(target_os = "android")]
+const OPEN_WAIT: Duration = Duration::ZERO;
+#[cfg(not(target_os = "android"))]
 const OPEN_WAIT: Duration = Duration::from_millis(1500);
 /// With a device, the clock only declares a sound ended this long after its nominal end, so
 /// the player draining (the real end) normally wins.
@@ -466,9 +469,12 @@ impl Drop for Audio {
         self.routes.clear();
         self.out = Output::Unopened;
         self.hold.take();
+        #[cfg(not(target_os = "android"))]
         if let Some(t) = self.output_thread.take() {
             let _ = t.join();
         }
+        #[cfg(target_os = "android")]
+        let _ = self.output_thread.take();
         if let Some(t) = self.capture_thread.take() {
             let _ = t.join();
         }

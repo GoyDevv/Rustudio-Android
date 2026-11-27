@@ -617,7 +617,7 @@ struct LocalPreviewState {
 // ---------------------------------------------------------------------------
 
 fn paint_checkerboard(painter: &egui::Painter, rect: Rect, cell: f32) {
-    let clipped = painter.with_clip_rect(rect);
+    let clipped = painter.with_clip_rect(painter.clip_rect().intersect(rect));
     let c0 = Color32::from_rgb(28, 30, 36);
     let c1 = Color32::from_rgb(38, 41, 49);
     clipped.rect_filled(rect, 4.0, c0);
@@ -1564,7 +1564,7 @@ impl AssetPicker {
                                     Vec2::new(left_w, 136.0),
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
-                                        ui.set_clip_rect(ui.max_rect());
+                                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                         draw_paste_controls(
                                             ui,
                                             &mut self.input_uri,
@@ -1580,7 +1580,7 @@ impl AssetPicker {
                                     Vec2::new(preview_card_w, 136.0),
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
-                                        ui.set_clip_rect(ui.max_rect());
+                                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                         draw_paste_preview_card(
                                             ui,
                                             self.paste_preview_id,
@@ -1612,6 +1612,10 @@ impl AssetPicker {
                     }
 
                     PickerTab::Upload => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("asset_picker_upload_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         ui.label(
                             RichText::new(format!(
                                 "Upload {} to Roblox ({})",
@@ -1625,7 +1629,7 @@ impl AssetPicker {
                                 .small()
                                 .weak(),
                         );
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
 
                         if session.is_none() {
                             ui.label(
@@ -1647,7 +1651,7 @@ impl AssetPicker {
                             }
                         });
 
-                        ui.add_space(10.0);
+                        ui.add_space(6.0);
 
                         // Godot-style local file preview card
                         if let Some(path) = &self.selected_file {
@@ -1669,13 +1673,13 @@ impl AssetPicker {
                                 .show(ui, |ui| {
                                     ui.horizontal_top(|ui| {
                                         let card_avail_w = ui.available_width().max(220.0);
-                                        let preview_side = if card_avail_w < 340.0 { 88.0 } else { 112.0 };
+                                        let preview_side = if card_avail_w < 340.0 { 80.0 } else { 96.0 };
                                         // Left column: Preview box
                                         ui.allocate_ui_with_layout(
                                             Vec2::splat(preview_side),
                                             egui::Layout::top_down(egui::Align::LEFT),
                                             |ui| {
-                                                ui.set_clip_rect(ui.max_rect());
+                                                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                                 let (rect, _) = ui.allocate_exact_size(
                                                     Vec2::splat(preview_side),
                                                     Sense::hover(),
@@ -1744,11 +1748,8 @@ impl AssetPicker {
 
                                         // Right column: Metadata + editable Asset Name + Upload button
                                         let right_w = (card_avail_w - preview_side - 14.0).max(120.0);
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(right_w, preview_side.max(120.0)),
-                                            egui::Layout::top_down(egui::Align::LEFT),
-                                            |ui| {
-                                                ui.set_clip_rect(ui.max_rect());
+                                        ui.vertical(|ui| {
+                                                ui.set_width(right_w);
                                                 ui.add(
                                                     egui::Label::new(RichText::new(fname).strong())
                                                         .truncate(),
@@ -1811,8 +1812,7 @@ impl AssetPicker {
                                                         ui.label("Uploading...");
                                                     }
                                                 });
-                                            },
-                                        );
+                                        });
                                     });
                                 });
                         } else {
@@ -1839,6 +1839,7 @@ impl AssetPicker {
                             ui.add_space(8.0);
                             ui.label(RichText::new(err).color(Color32::from_rgb(235, 95, 95)));
                         }
+                            });
                     }
 
                     PickerTab::Browse => {
@@ -2003,7 +2004,7 @@ impl AssetPicker {
                                                         Vec2::new(card_w, 170.0),
                                                         egui::Layout::top_down(egui::Align::LEFT),
                                                         |ui| {
-                                                            ui.set_clip_rect(ui.max_rect());
+                                                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                                             egui::Frame::new()
                                                                 .fill(fill)
                                                                 .stroke(border)
@@ -2083,51 +2084,56 @@ impl AssetPicker {
                                                                 }
 
                                                                 ui.add_space(4.0);
-                                                                ui.horizontal(|ui| {
-                                                                    ui.add(
-                                                                        egui::Label::new(
-                                                                            RichText::new(format!(
-                                                                                "#{}",
-                                                                                item.id
-                                                                            ))
-                                                                            .size(10.0)
-                                                                            .monospace()
-                                                                            .weak(),
-                                                                        )
-                                                                        .truncate(),
-                                                                    );
-                                                                    ui.with_layout(
-                                                                        egui::Layout::right_to_left(
-                                                                            egui::Align::Center,
-                                                                        ),
-                                                                        |ui| {
-                                                                            ui.spacing_mut()
-                                                                                .button_padding =
-                                                                                Vec2::new(7.0, 2.5);
-                                                                            if ui
-                                                                                .add(
-                                                                                    egui::Button::new(
-                                                                                        RichText::new("Use")
-                                                                                            .size(11.0)
-                                                                                            .strong()
-                                                                                            .color(Color32::WHITE),
-                                                                                    )
-                                                                                    .fill(Color32::from_rgb(
-                                                                                        38, 108, 224,
-                                                                                    )),
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.spacing_mut()
+                                                                            .button_padding =
+                                                                            Vec2::new(7.0, 2.5);
+                                                                        if ui
+                                                                            .add(
+                                                                                egui::Button::new(
+                                                                                    RichText::new("Use")
+                                                                                        .size(11.0)
+                                                                                        .strong()
+                                                                                        .color(Color32::WHITE),
                                                                                 )
-                                                                                .clicked()
-                                                                            {
-                                                                                commit_uri = Some(
-                                                                                    format!(
-                                                                                        "rbxassetid://{}",
-                                                                                        item.id
-                                                                                    ),
+                                                                                .fill(Color32::from_rgb(
+                                                                                    38, 108, 224,
+                                                                                )),
+                                                                            )
+                                                                            .clicked()
+                                                                        {
+                                                                            commit_uri = Some(
+                                                                                format!(
+                                                                                    "rbxassetid://{}",
+                                                                                    item.id
+                                                                                ),
+                                                                            );
+                                                                        }
+                                                                        ui.with_layout(
+                                                                            egui::Layout::left_to_right(
+                                                                                egui::Align::Center,
+                                                                            ),
+                                                                            |ui| {
+                                                                                ui.add(
+                                                                                    egui::Label::new(
+                                                                                        RichText::new(format!(
+                                                                                            "#{}",
+                                                                                            item.id
+                                                                                        ))
+                                                                                        .size(10.0)
+                                                                                        .monospace()
+                                                                                        .weak(),
+                                                                                    )
+                                                                                    .truncate(),
                                                                                 );
-                                                                            }
-                                                                        },
-                                                                    );
-                                                                });
+                                                                            },
+                                                                        );
+                                                                    },
+                                                                );
                                                                     });
                                                                 });
                                                         },
@@ -2188,7 +2194,7 @@ impl AssetPicker {
                                                                         Vec2::new(text_w, 40.0),
                                                                         egui::Layout::top_down(egui::Align::LEFT),
                                                                         |ui| {
-                                                                            ui.set_clip_rect(ui.max_rect());
+                                                                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                                                             ui.add(
                                                                                 egui::Label::new(
                                                                                     RichText::new(
@@ -2306,7 +2312,7 @@ impl AssetPicker {
                                             Vec2::new(mid_w, 40.0),
                                             egui::Layout::top_down(egui::Align::LEFT),
                                             |ui| {
-                                                ui.set_clip_rect(ui.max_rect());
+                                                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                                 ui.add(
                                                     egui::Label::new(
                                                         RichText::new(&sel.name).strong(),

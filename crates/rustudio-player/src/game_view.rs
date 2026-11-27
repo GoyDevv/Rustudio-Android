@@ -538,7 +538,7 @@ impl Game {
                         }
                     }
                     let done = match (rustudio_render::skin::patch_base(&id, &colors, &uvs), self.renderer.as_mut(), &queue) {
-                        (Some(b), Some(r), Some(q)) if !rustudio_render::skin::cpu_skinning() => {
+                        (Some(b), Some(r), Some(q)) if !rustudio_render::skin::cpu_skinning() && r.caps().compute() => {
                             let plane = b.extent.extend(0.0).to_array();
                             let shared = self.meshes.loaded(&id).is_none_or(|m| {
                                 r.rewrite_mesh(q, m.index, &b.positions, &b.normals, &b.uvs, &b.colors, plane)
@@ -853,7 +853,7 @@ impl Game {
                                     refresh_skin_deps.push(sp.r);
                                 }
                                 skin_base = Some((asset.id.clone(), base.clone()));
-                                if rustudio_render::skin::cpu_skinning() {
+                                if rustudio_render::skin::cpu_skinning() || !renderer.caps().compute() {
                                     if let Some((palette, scale, origin)) = rustudio_render::skin::pose(&self.doc, sp.r, &base) {
                                         skin_pose = Some(Some((palette.clone(), scale, origin)));
                                         let (p, n) = rustudio_render::skin::deform(&base, &palette, scale, origin);
@@ -1283,7 +1283,7 @@ impl Game {
                                 let tag = rustudio_render::skin::R15_CLOTHING_TAG;
                                 let corners = cb.positions.len();
                                 let have = rustudio_render::skin::slot_of_tag(sp.r, tag, corners);
-                                let idx = if rustudio_render::skin::cpu_skinning() {
+                                let idx = if rustudio_render::skin::cpu_skinning() || !renderer.caps().compute() {
                                     let (p, n) = rustudio_render::skin::deform(&cb, palette, *scale, *origin);
                                     renderer.set_mesh(&device, &queue, have, &p, &n, &cb.uvs, &cb.colors)
                                 } else {
@@ -1437,7 +1437,7 @@ impl Game {
                     let index = match pose {
                         Some((palette, scale, origin)) => {
                             let have = rustudio_render::skin::slot_of_tag(sp.r, tag, corners);
-                            let idx = if rustudio_render::skin::cpu_skinning() {
+                            let idx = if rustudio_render::skin::cpu_skinning() || !renderer.caps().compute() {
                                 let (p, n) = rustudio_render::skin::deform(&db, palette, *scale, *origin);
                                 renderer.set_mesh(&device, &queue, have, &p, &n, &db.uvs, &[])
                             } else {
@@ -1631,7 +1631,7 @@ impl Game {
                             let corners = gm.base.positions.len();
                             let slot_key = gm.handle;
                             let have = rustudio_render::skin::slot_of(slot_key, corners);
-                            let mesh = if rustudio_render::skin::cpu_skinning() {
+                            let mesh = if rustudio_render::skin::cpu_skinning() || !renderer.caps().compute() {
                                 let (p, n) = rustudio_render::skin::deform(&gm.base, &palette, Vec3::ONE, Vec3::ZERO);
                                 renderer.set_mesh(&device, &queue, have, &p, &n, &gm.base.uvs, &[])
                             } else {
@@ -2291,19 +2291,19 @@ impl Game {
         // On Android fullscreen Playtest (e.g. 2388x1080 = 2.58 Mpx on FHD+ phones),
         // cap default 3D render target to ~1.25 Mpx (~720p-class, matching Roblox Mobile)
         // while keeping 2D UI/HUD crisp at native FHD+.
-        if cfg!(target_os = "android") && self.is_playing() && scale >= 0.999 {
+        if is_powervr && scale >= 0.999 {
+            // On PowerVR (both Edit and Play), cap 3D render target to ~600k px (~540p-class)
+            // while keeping 2D egui UI at full native resolution and avoiding Play reallocation stalls.
+            let px = (size[0] as f32) * (size[1] as f32);
+            const POWERVR_MAX_PX: f32 = 600_000.0;
+            if px > POWERVR_MAX_PX {
+                scale = (POWERVR_MAX_PX / px).sqrt().clamp(0.35, 1.0);
+            }
+        } else if cfg!(target_os = "android") && self.is_playing() && scale >= 0.999 {
             let px = (size[0] as f32) * (size[1] as f32);
             const MOBILE_PLAY_MAX_PX: f32 = 1_250_000.0;
             if px > MOBILE_PLAY_MAX_PX {
                 scale = (MOBILE_PLAY_MAX_PX / px).sqrt().clamp(0.55, 1.0);
-            }
-        } else if is_powervr && !self.is_playing() && scale >= 0.999 {
-            // On PowerVR Edit mode, cap 3D render target to ~600k px (~540p-class)
-            // while keeping 2D egui UI at full native resolution.
-            let px = (size[0] as f32) * (size[1] as f32);
-            const POWERVR_EDIT_MAX_PX: f32 = 600_000.0;
-            if px > POWERVR_EDIT_MAX_PX {
-                scale = (POWERVR_EDIT_MAX_PX / px).sqrt().clamp(0.35, 1.0);
             }
         }
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);

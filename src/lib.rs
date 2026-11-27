@@ -527,6 +527,8 @@ mod android_gpu_guard {
             "ge8300",
             "ge8100",
             "gm9446",
+            "bxm",
+            "dxt",
             "imagination",
         ];
         for prop in PROPS {

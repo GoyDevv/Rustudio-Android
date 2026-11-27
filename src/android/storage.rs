@@ -706,7 +706,7 @@ impl Picker {
                     egui::vec2(inner_w, 30.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.set_clip_rect(ui.max_rect());
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                         ui.spacing_mut().item_spacing.x = 4.0;
 
                         let up = self.listing.dir.parent().map(Path::to_path_buf);
@@ -756,7 +756,7 @@ impl Picker {
                         ui.painter().rect_stroke(path_rect, 5.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
                         let max_path_chars = ((path_w - 14.0) / 6.5).floor().max(6.0) as usize;
                         let path_text = truncate_middle(&shorten(&self.listing.dir), max_path_chars);
-                        ui.painter().with_clip_rect(path_rect.shrink2(Vec2::new(6.0, 2.0))).text(
+                        ui.painter().with_clip_rect(ui.clip_rect().intersect(path_rect.shrink2(Vec2::new(6.0, 2.0)))).text(
                             Pos2::new(path_rect.left() + 6.0, path_rect.center().y),
                             Align2::LEFT_CENTER,
                             path_text,
@@ -832,14 +832,14 @@ impl Picker {
                                 egui::vec2(strip_w, 22.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.set_clip_rect(ui.max_rect());
+                                    ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                     let btn_reserve = 112.0;
                                     let msg_w = (strip_w - btn_reserve - 6.0).max(80.0);
                                     ui.allocate_ui_with_layout(
                                         egui::vec2(msg_w, 22.0),
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
-                                            ui.set_clip_rect(ui.max_rect());
+                                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new(
@@ -888,7 +888,7 @@ impl Picker {
                                 egui::vec2(bar_w, 24.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.set_clip_rect(ui.max_rect());
+                                    ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                     ui.label(RichText::new("New folder:").size(11.5).color(TEXT_MUTED));
                                     let edit_w = (bar_w - 200.0).clamp(80.0, 200.0);
                                     let r = ui.add(egui::TextEdit::singleline(nf).desired_width(edit_w));
@@ -924,7 +924,7 @@ impl Picker {
                         egui::vec2(inner_w, 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.set_clip_rect(ui.max_rect());
+                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                             ui.label(RichText::new("Waiting for Android System Picker…").size(11.0).color(ACCENT));
                             if ui.small_button("Dismiss").clicked() {
                                 self.waiting_system_picker = false;
@@ -952,7 +952,7 @@ impl Picker {
                         egui::vec2(sidebar_w, body_h),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
-                            ui.set_clip_rect(ui.max_rect());
+                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                             egui::Frame::new()
                                 .fill(BG_PANEL)
                                 .stroke(Stroke::new(1.0, BORDER))
@@ -993,7 +993,7 @@ impl Picker {
                                                 } else if resp.hovered() {
                                                     ui.painter().rect_filled(rect, 5.0, BG_HOVER);
                                                 }
-                                                ui.painter().with_clip_rect(rect.shrink2(Vec2::new(6.0, 2.0))).text(
+                                                ui.painter().with_clip_rect(ui.clip_rect().intersect(rect.shrink2(Vec2::new(6.0, 2.0)))).text(
                                                     Pos2::new(rect.left() + 8.0, rect.center().y),
                                                     Align2::LEFT_CENTER,
                                                     r.label,
@@ -1014,7 +1014,7 @@ impl Picker {
                         egui::vec2(center_w, body_h),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
-                            ui.set_clip_rect(ui.max_rect());
+                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                             egui::Frame::new()
                                 .fill(BG_BROWSER)
                                 .stroke(Stroke::new(1.0, BORDER))
@@ -1067,7 +1067,7 @@ Use System Picker or copy files into this folder.".to_string()
                                 egui::vec2(preview_w, body_h),
                                 egui::Layout::top_down(egui::Align::LEFT),
                                 |ui| {
-                                    ui.set_clip_rect(ui.max_rect());
+                                    ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                     self.render_preview_panel(ui, ctx, p, preview_w, body_h, &mut result);
                                 },
                             );
@@ -1081,7 +1081,7 @@ Use System Picker or copy files into this folder.".to_string()
                         egui::vec2(inner_w, 18.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.set_clip_rect(ui.max_rect());
+                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(e).size(11.0).color(ui.visuals().error_fg_color),
@@ -1097,7 +1097,7 @@ Use System Picker or copy files into this folder.".to_string()
                     egui::vec2(inner_w, footer_h),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.set_clip_rect(ui.max_rect());
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                         ui.spacing_mut().item_spacing.x = 5.0;
 
                         let right_reserve = if self.multi { 168.0 } else { 148.0 };
@@ -1108,7 +1108,7 @@ Use System Picker or copy files into this folder.".to_string()
                             egui::vec2(left_w, footer_h),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                ui.set_clip_rect(ui.max_rect());
+                                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                                 if self.kind == Kind::SaveFile {
                                     ui.label(RichText::new("Name:").size(11.5).color(TEXT_MUTED));
                                     let name_w = (left_w - 130.0).clamp(80.0, 210.0);
@@ -1287,7 +1287,7 @@ Use System Picker or copy files into this folder.".to_string()
                     Pos2::new(rect.left() + 38.0, rect.top()),
                     Pos2::new((rect.right() - 24.0).max(rect.left() + 48.0), rect.bottom()),
                 );
-                ui.painter().with_clip_rect(text_clip).text(
+                ui.painter().with_clip_rect(ui.clip_rect().intersect(text_clip)).text(
                     Pos2::new(text_clip.left(), rect.center().y),
                     Align2::LEFT_CENTER,
                     &name,
@@ -1381,7 +1381,7 @@ Use System Picker or copy files into this folder.".to_string()
                     Pos2::new(x, rect.top()),
                     Pos2::new((rect.right() - size_reserve).max(x + 24.0), rect.bottom()),
                 );
-                ui.painter().with_clip_rect(text_clip).text(
+                ui.painter().with_clip_rect(ui.clip_rect().intersect(text_clip)).text(
                     Pos2::new(x, rect.center().y),
                     Align2::LEFT_CENTER,
                     &name,
@@ -1469,7 +1469,7 @@ Use System Picker or copy files into this folder.".to_string()
                                     Pos2::new(rect.left() + 6.0, rect.top() + 68.0),
                                     Pos2::new(rect.right() - 6.0, rect.bottom() - 6.0),
                                 );
-                                ui.painter().with_clip_rect(name_clip).text(
+                                ui.painter().with_clip_rect(ui.clip_rect().intersect(name_clip)).text(
                                     Pos2::new(rect.center().x, rect.top() + 84.0),
                                     Align2::CENTER_CENTER,
                                     truncate_middle(&name, 14),
@@ -1539,7 +1539,7 @@ Use System Picker or copy files into this folder.".to_string()
                                     Pos2::new(rect.left() + 6.0, rect.top() + 75.0),
                                     Pos2::new(rect.right() - 6.0, rect.top() + 94.0),
                                 );
-                                ui.painter().with_clip_rect(label_clip).text(
+                                ui.painter().with_clip_rect(ui.clip_rect().intersect(label_clip)).text(
                                     Pos2::new(label_clip.left(), label_clip.center().y),
                                     Align2::LEFT_CENTER,
                                     truncate_middle(&name, 14),
@@ -1617,7 +1617,7 @@ Use System Picker or copy files into this folder.".to_string()
                 let inner_h = (body_h - 12.0).max(80.0);
                 ui.set_min_size(Vec2::new(inner_w, inner_h));
                 ui.set_max_width(inner_w);
-                ui.set_clip_rect(ui.max_rect());
+                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
 
                 ui.label(RichText::new("PREVIEW").size(10.0).strong().color(TEXT_MUTED));
                 ui.add_space(3.0);

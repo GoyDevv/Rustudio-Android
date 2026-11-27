@@ -894,74 +894,72 @@ impl Editor {
         act: &mut Option<String>,
     ) {
         let (enabled, _) = self.action_state(id);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            let resp = ribbon_button(ui, icon, label, false, enabled);
-            let arrow_sense = if enabled { Sense::click() } else { Sense::hover() };
-            let (arrow_rect, ar) = ui.allocate_exact_size(Vec2::new(16.0, 50.0), arrow_sense);
-            if enabled && ar.hovered() {
-                ui.painter().rect_filled(arrow_rect, 4.0, theme::HOVER_BG);
-            }
-            let chevron_r = Rect::from_center_size(
-                arrow_rect.center() - Vec2::new(0.0, 4.0),
-                Vec2::splat(12.0),
-            );
-            let chevron_col = if enabled {
-                theme::TEXT_DIM
-            } else {
-                theme::TEXT_DIM.gamma_multiply(0.55)
-            };
-            rustudio_engine::ti::paint(ui.painter(), chevron_r, "chevron-down", chevron_col);
+        let resp = ribbon_button(ui, icon, label, false, enabled);
+        let arrow_sense = if enabled { Sense::click() } else { Sense::hover() };
+        let (arrow_rect, ar) = ui.allocate_exact_size(Vec2::new(18.0, resp.rect.height()), arrow_sense);
+        if enabled && ar.hovered() {
+            ui.painter().rect_filled(arrow_rect, 4.0, theme::HOVER_BG);
+        }
+        let chevron_r = Rect::from_center_size(
+            arrow_rect.center() - Vec2::new(0.0, 4.0),
+            Vec2::splat(12.0),
+        );
+        let chevron_col = if enabled {
+            theme::TEXT_DIM
+        } else {
+            theme::TEXT_DIM.gamma_multiply(0.55)
+        };
+        rustudio_engine::ti::paint(ui.painter(), chevron_r, "chevron-down", chevron_col);
+        ui.add_space(2.0);
 
-            if !enabled {
-                let tip = format!("{label}: select where it goes first");
-                resp.on_hover_text(tip.as_str());
-                ar.on_hover_text(tip);
-                return;
-            }
+        if !enabled {
+            let tip = format!("{label}: select where it goes first");
+            resp.on_hover_text(tip.as_str());
+            ar.on_hover_text(tip);
+            return;
+        }
 
-            if resp
-                .on_hover_text(format!("Insert {primary_class}"))
-                .clicked()
-            {
-                *act = Some(format!("class:{primary_class}"));
-            }
+        if resp
+            .on_hover_text(format!("Insert {primary_class}"))
+            .clicked()
+        {
+            *act = Some(format!("class:{primary_class}"));
+        }
 
-            let ar = ar.on_hover_text(format!("More {label} classes…"));
-            egui::Popup::menu(&ar)
-                .id(egui::Id::new(("class_split_menu", id)))
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show(|ui| {
-                    ui.set_min_width(156.0);
-                    for c in variants {
-                        let (row_r, row_resp) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width().max(156.0), 28.0),
-                            Sense::click(),
-                        );
-                        if row_resp.hovered() {
-                            ui.painter().rect_filled(row_r, 4.0, theme::HOVER_BG);
-                        }
-                        let icon_r = Rect::from_center_size(
-                            egui::Pos2::new(row_r.left() + 14.0, row_r.center().y),
-                            Vec2::splat(16.0),
-                        );
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(icon_r), |ui| {
-                            crate::icons::class_icon(ui, c, 16.0);
-                        });
-                        ui.painter().text(
-                            egui::Pos2::new(row_r.left() + 28.0, row_r.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            *c,
-                            egui::FontId::proportional(13.0),
-                            theme::TEXT,
-                        );
-                        if row_resp.clicked() {
-                            *act = Some(format!("class:{c}"));
-                            ui.close();
-                        }
+        let ar = ar.on_hover_text(format!("More {label} classes…"));
+        egui::Popup::menu(&ar)
+            .id(egui::Id::new(("class_split_menu", id)))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(156.0);
+                for c in variants {
+                    let (row_r, row_resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width().max(156.0), 28.0),
+                        Sense::click(),
+                    );
+                    if row_resp.hovered() {
+                        ui.painter().rect_filled(row_r, 4.0, theme::HOVER_BG);
                     }
-                });
-        });
+                    let icon_r = Rect::from_center_size(
+                        egui::Pos2::new(row_r.left() + 14.0, row_r.center().y),
+                        Vec2::splat(16.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(icon_r), |ui| {
+                        crate::icons::class_icon(ui, c, 16.0);
+                    });
+                    ui.painter().text(
+                        egui::Pos2::new(row_r.left() + 28.0, row_r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        *c,
+                        egui::FontId::proportional(13.0),
+                        theme::TEXT,
+                    );
+                    if row_resp.clicked() {
+                        *act = Some(format!("class:{c}"));
+                        ui.close();
+                    }
+                }
+            });
     }
 
     /// A ribbon button whose drop-down inserts one of `classes` into the selection.

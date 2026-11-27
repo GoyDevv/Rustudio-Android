@@ -395,6 +395,10 @@ pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
             _ => {}
         }
     }
+    #[cfg(target_os = "android")]
+    if is_android_powervr_gles() {
+        return PresentMode::Fifo;
+    }
     if no_vsync || cfg!(target_os = "android") {
         return PresentMode::AutoNoVsync;
     }
@@ -448,6 +452,7 @@ fn is_android_powervr_gles() -> bool {
     ];
     const TOKENS: &[&str] = &[
         "powervr", "rogue", "imagination", "ge8320", "ge8300", "ge8100", "gm9446",
+        "bxm", "dxt",
         "mt6765", "mt6762", "mt6761", "mt6739", "mt8766", "mt8768",
     ];
     for prop in PROPS {

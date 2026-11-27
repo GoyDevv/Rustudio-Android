@@ -74,7 +74,7 @@ pub struct LightShadows {
 
 impl LightShadows {
     fn new(device: &wgpu::Device, caps: &crate::gpu_caps::GpuCaps) -> Self {
-        let side = if caps.is_powervr() && !caps.hdr_float_rt {
+        let side = if caps.is_powervr() {
             1
         } else {
             rustudio_core::mech::LSHADOW_ATLAS
@@ -3775,7 +3775,7 @@ impl Renderer {
             },
             mapped_at_creation: false,
         });
-        let skip_shadow_atlases = caps.is_powervr() && !caps.hdr_float_rt;
+        let skip_shadow_atlases = caps.is_powervr();
         let shadow_side = if skip_shadow_atlases { 1 } else { SHADOW_SIZE };
         let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sun shadow map"),
@@ -6058,7 +6058,7 @@ impl Renderer {
             let mut f=std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/frames.jsonl")).unwrap();
             writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
         }
-        let shadows_on = frame.shadows && self.caps.hdr_float_rt;
+        let shadows_on = frame.shadows && self.caps.hdr_float_rt && !self.caps.is_powervr();
         let max_lights = if self.caps.storage_lights() { rustudio_core::mech::MAX_LIGHTS } else { 64 };
         let n_lights = frame.lights.len().min(max_lights);
         self.update_sky_env(queue, &mut globals);
@@ -6772,7 +6772,7 @@ impl Renderer {
                 h.finish()
             };
             // (the reduced binding set has no light shadow atlas to read)
-            if !self.reduced && !(self.caps.is_powervr() && !self.caps.hdr_float_rt) && !slots.is_empty() && self.lshadow.key != Some(key) {
+            if !self.reduced && !self.caps.is_powervr() && !slots.is_empty() && self.lshadow.key != Some(key) {
                 self.lshadow.key = Some(key);
                 let n = rustudio_core::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];

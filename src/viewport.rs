@@ -418,16 +418,25 @@ impl Editor {
     }
 
     fn handle_at(&self, handles: &[(Handle, Vec<Pos2>)], p: Pos2) -> Option<Handle> {
+        let hit_px = if cfg!(target_os = "android") {
+            22.0
+        } else {
+            mech::GIZMO_HIT_PX
+        };
         let mut best: Option<(f32, Handle)> = None;
         for (h, pts) in handles {
             let d = match h.tool {
-                Tool::Scale => (pts[1] - p).length() - 4.0,
+                Tool::Scale => {
+                    let tip = (pts[1] - p).length() - 4.0;
+                    let stem = dist_to_segment(p, pts[0], pts[1]);
+                    tip.min(stem)
+                }
                 _ => pts
                     .windows(2)
                     .map(|w| dist_to_segment(p, w[0], w[1]))
                     .fold(f32::MAX, f32::min),
             };
-            if d < mech::GIZMO_HIT_PX && best.is_none_or(|(bd, _)| d < bd) {
+            if d < hit_px && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, *h));
             }
         }
@@ -1166,7 +1175,7 @@ impl Editor {
 
         // -------------------------------------------------- select & gizmo
         let pointer_on_overlay = pointer.is_some_and(|p| ctx.layer_id_at(p).is_some_and(|l| l.order != egui::Order::Background));
-        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay;
+        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing && !gui_drag_took && (self.drag.is_some() || (!joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay));
         if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
@@ -1222,22 +1231,24 @@ impl Editor {
         }
         if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
             if let Some(p) = pointer {
-                // A GUI object under the cursor is picked first, as in Studio.
-                let hit = self.game
-                    .gui
-                    .object_at(p)
-                    .or_else(|| self.pick(rect, p, ctx.input(|i| i.modifiers.alt)));
-                match (hit, ctrl || shift) {
-                    (Some(r), true) => {
-                        if let Some(pos) = self.game.doc.selection.iter().position(|s| *s == r) {
-                            self.game.doc.selection.remove(pos);
-                        } else {
-                            self.game.doc.selection.push(r);
+                if hover_handle.is_none() && self.handle_at(&handles, p).is_none() {
+                    // A GUI object under the cursor is picked first, as in Studio.
+                    let hit = self.game
+                        .gui
+                        .object_at(p)
+                        .or_else(|| self.pick(rect, p, ctx.input(|i| i.modifiers.alt)));
+                    match (hit, ctrl || shift) {
+                        (Some(r), true) => {
+                            if let Some(pos) = self.game.doc.selection.iter().position(|s| *s == r) {
+                                self.game.doc.selection.remove(pos);
+                            } else {
+                                self.game.doc.selection.push(r);
+                            }
                         }
+                        (Some(r), false) => self.select(vec![r]),
+                        (None, false) => self.game.doc.selection.clear(),
+                        (None, true) => {}
                     }
-                    (Some(r), false) => self.select(vec![r]),
-                    (None, false) => self.game.doc.selection.clear(),
-                    (None, true) => {}
                 }
             }
         }

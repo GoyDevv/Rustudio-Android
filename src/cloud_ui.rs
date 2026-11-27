@@ -14,7 +14,7 @@ use egui::RichText;
 use rustudio_account::cloud::{CloudPlace, GroupInfo, RecentPlace, VersionInfo};
 use rustudio_account::{
     open_mode, parse_place_ref, CloudApi, CloudOrigin, OpenMode, Endpoints, Experience, ExperienceSource, PlaceCache,
-    SaveOutcome, TeamCreateStatus, VersionType,
+    SaveOutcome, TeamCreateStatus, UniverseCollaborator, VersionType,
 };
 
 use crate::app::{Editor, Level, PendingAction};
@@ -196,6 +196,24 @@ enum Msg {
         from_version: u64,
         result: Result<u64, String>,
     },
+    TeamCreateToggled {
+        universe_id: u64,
+        result: Result<bool, String>,
+    },
+    CollaboratorsLoaded {
+        universe_id: u64,
+        result: Result<Vec<UniverseCollaborator>, String>,
+    },
+    CollaboratorInvited {
+        universe_id: u64,
+        result: Result<UniverseCollaborator, String>,
+    },
+    CollaboratorRemoved {
+        universe_id: u64,
+        subject_type: String,
+        subject_id: u64,
+        result: Result<(), String>,
+    },
     Done,
 }
 
@@ -281,10 +299,22 @@ struct LiveView {
     terrain_lods: HashMap<[i32; 3], u8>,
 }
 
+#[derive(Default)]
+struct CollabManageState {
+    loaded_universe: Option<u64>,
+    loading: bool,
+    busy: bool,
+    collaborators: Vec<UniverseCollaborator>,
+    invite_input: String,
+    invite_edit: bool,
+    feedback: Option<(bool, String)>,
+}
+
 pub struct CloudUi {
     /// File > Open from Roblox.
     pub open: bool,
     pub live_collaborators_open: bool,
+    collab_manage: CollabManageState,
     /// Projected 2D name labels for active Team Create collaborators (drawn in `viewport.rs`).
     pub collaborator_labels: Vec<(glam::Vec3, String)>,
     /// File > Experience Settings (the place's info).
@@ -401,6 +431,10 @@ impl CloudUi {
         CloudUi {
             open: false,
             live_collaborators_open: false,
+            collab_manage: CollabManageState {
+                invite_edit: true,
+                ..Default::default()
+            },
             collaborator_labels: Vec::new(),
             settings_open: false,
             tab: PickerTab::Recent,
@@ -498,6 +532,10 @@ impl CloudUi {
         self.versions_of = None;
         self.confirm_revert = None;
         self.exp_settings = ExperienceSettingsState::default();
+        self.collab_manage = CollabManageState {
+            invite_edit: true,
+            ..Default::default()
+        };
         self.expanded.clear();
     }
 
@@ -990,6 +1028,104 @@ impl Editor {
                             self.error(format!(
                                 "Could not revert \"{place_name}\" (place {place_id}) to version {from_version}: {e}"
                             ));
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Msg::TeamCreateToggled { universe_id, result } => {
+                    self.cloud.collab_manage.busy = false;
+                    match result {
+                        Ok(enabled) => {
+                            let st = self
+                                .cloud
+                                .status
+                                .take()
+                                .filter(|(u, _)| *u == universe_id)
+                                .map(|(_, mut s)| {
+                                    s.enabled = Some(enabled);
+                                    s
+                                })
+                                .unwrap_or_else(|| TeamCreateStatus {
+                                    enabled: Some(enabled),
+                                    ..Default::default()
+                                });
+                            self.cloud.status = Some((universe_id, st));
+                            if let Some(o) = self.game.doc.cloud.as_mut().filter(|o| o.universe_id == universe_id) {
+                                o.team_create = Some(enabled);
+                            }
+                            let label = if enabled { "enabled" } else { "disabled" };
+                            self.cloud.collab_manage.feedback = Some((
+                                true,
+                                format!("Team Create {label}!"),
+                            ));
+                            self.info(format!("Team Create {label} for experience {universe_id}"));
+                        }
+                        Err(e) => {
+                            self.cloud.collab_manage.feedback = Some((false, e.clone()));
+                            self.error(e);
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Msg::CollaboratorsLoaded { universe_id, result } => {
+                    if self.cloud.collab_manage.loaded_universe == Some(universe_id) {
+                        self.cloud.collab_manage.loading = false;
+                        match result {
+                            Ok(list) => {
+                                self.cloud.collab_manage.collaborators = list;
+                            }
+                            Err(e) => {
+                                self.cloud.collab_manage.feedback = Some((false, e));
+                            }
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Msg::CollaboratorInvited { universe_id, result } => {
+                    self.cloud.collab_manage.busy = false;
+                    match result {
+                        Ok(c) => {
+                            self.cloud.collab_manage.invite_input.clear();
+                            self.cloud.collab_manage.feedback = Some((
+                                true,
+                                format!("Invited {} ({} access)", c.name, c.action),
+                            ));
+                            self.info(format!("Invited {} to experience {universe_id} ({})", c.name, c.action));
+                            // Refresh collaborators list
+                            self.cloud.collab_manage.loading = true;
+                            let api = self.cloud.factory(self.game.account.shared_client());
+                            self.cloud.spawn(api, move |a, tx| {
+                                let result = if let Some(a) = a {
+                                    a.list_collaborators(universe_id).map_err(|e| e.to_string())
+                                } else {
+                                    Err("Sign in to Roblox first.".into())
+                                };
+                                let _ = tx.send(Msg::CollaboratorsLoaded {
+                                    universe_id,
+                                    result,
+                                });
+                            });
+                        }
+                        Err(e) => {
+                            self.cloud.collab_manage.feedback = Some((false, e.clone()));
+                            self.error(e);
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Msg::CollaboratorRemoved { universe_id, subject_type, subject_id, result } => {
+                    self.cloud.collab_manage.busy = false;
+                    match result {
+                        Ok(()) => {
+                            self.cloud.collab_manage.collaborators.retain(|c| {
+                                !(c.subject_type == subject_type && c.subject_id == subject_id)
+                            });
+                            self.cloud.collab_manage.feedback = Some((true, "Collaborator removed.".into()));
+                            self.info(format!("Removed collaborator {subject_type} {subject_id} from experience {universe_id}"));
+                        }
+                        Err(e) => {
+                            self.cloud.collab_manage.feedback = Some((false, e.clone()));
+                            self.error(e);
                         }
                     }
                     ctx.request_repaint();
@@ -2238,69 +2374,476 @@ impl Editor {
         self.join_modal(ctx);
     }
 
-    fn live_collaborators_window(&mut self,ctx:&egui::Context) {
-        if !self.cloud.live_collaborators_open {return;}
-        let mut fly=None;
-        let mut open_guid=None;
-        let live=self.cloud.live.as_ref();
-        let peers:Vec<_>=live.into_iter().flat_map(|live|live.collaborators.iter().filter_map(|r| {
-            let inst=self.game.doc.dom.get_by_ref(*r)?;
-            let user=match inst.properties.get(&"UserId".into()) {Some(rbx_types::Variant::Int64(v))=>*v as u64,_=>0};
-            let own=Some(user)==live.owner_user;
-            let name=match inst.properties.get(&"Username".into()) {Some(rbx_types::Variant::String(v))=>v.clone(),_=>inst.name.clone()};
-            let frame=match inst.properties.get(&"CFrame".into()) {Some(rbx_types::Variant::CFrame(v))=>Some(*v),_=>None};
-            let idle=matches!(inst.properties.get(&"IsIdle".into()),Some(rbx_types::Variant::Bool(true)));
-            let guid=match inst.properties.get(&"CurDocGUID".into()) {Some(rbx_types::Variant::String(v))=>v.clone(),_=>String::new()};
-            let line=match inst.properties.get(&"CurScriptLineNumber".into()) {Some(rbx_types::Variant::Int64(v))=>*v,_=>0};
-            Some((name,own,frame,idle,guid,line))
-        })).collect();
-        let universe=live.map(|l|l.universe).or_else(||self.game.doc.cloud.as_ref().map(|o|o.universe_id));
+    fn live_collaborators_window(&mut self, ctx: &egui::Context) {
+        if !self.cloud.live_collaborators_open {
+            return;
+        }
+        let mut fly = None;
+        let mut open_guid = None;
+        let mut want_toggle_tc: Option<(u64, bool)> = None;
+        let mut want_join_tc: Option<(u64, u64)> = None;
+        let mut want_refresh: Option<u64> = None;
+        let mut want_invite: Option<(u64, String, String)> = None;
+        let mut want_remove: Option<(u64, String, u64, String)> = None;
+        let mut want_publish = false;
+
+        let live = self.cloud.live.as_ref();
+        let peers: Vec<_> = live
+            .into_iter()
+            .flat_map(|live| {
+                live.collaborators.iter().filter_map(|r| {
+                    let inst = self.game.doc.dom.get_by_ref(*r)?;
+                    let user = match inst.properties.get(&"UserId".into()) {
+                        Some(rbx_types::Variant::Int64(v)) => *v as u64,
+                        _ => 0,
+                    };
+                    let own = Some(user) == live.owner_user;
+                    let name = match inst.properties.get(&"Username".into()) {
+                        Some(rbx_types::Variant::String(v)) => v.clone(),
+                        _ => inst.name.clone(),
+                    };
+                    let frame = match inst.properties.get(&"CFrame".into()) {
+                        Some(rbx_types::Variant::CFrame(v)) => Some(*v),
+                        _ => None,
+                    };
+                    let idle = matches!(
+                        inst.properties.get(&"IsIdle".into()),
+                        Some(rbx_types::Variant::Bool(true))
+                    );
+                    let guid = match inst.properties.get(&"CurDocGUID".into()) {
+                        Some(rbx_types::Variant::String(v)) => v.clone(),
+                        _ => String::new(),
+                    };
+                    let line = match inst.properties.get(&"CurScriptLineNumber".into()) {
+                        Some(rbx_types::Variant::Int64(v)) => *v,
+                        _ => 0,
+                    };
+                    Some((name, own, frame, idle, guid, line))
+                })
+            })
+            .collect();
+
+        let universe = live
+            .map(|l| l.universe)
+            .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.universe_id));
+        let place_id = live
+            .map(|l| l.place)
+            .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.place_id));
+        let is_live = self.cloud.live.is_some();
+        let signed_in = self.game.account.signed_in();
+
+        // Auto-fetch Team Create status + collaborators list when opening for a universe
+        if signed_in {
+            if let Some(u) = universe {
+                if self.cloud.collab_manage.loaded_universe != Some(u) {
+                    self.cloud.collab_manage.loaded_universe = Some(u);
+                    self.cloud.collab_manage.loading = true;
+                    self.cloud.collab_manage.collaborators.clear();
+                    self.cloud.collab_manage.feedback = None;
+                    want_refresh = Some(u);
+                }
+            }
+        }
+
+        let tc_enabled = universe.and_then(|u| {
+            self.cloud
+                .status
+                .as_ref()
+                .filter(|(su, _)| *su == u)
+                .and_then(|(_, st)| st.enabled)
+                .or_else(|| {
+                    self.game
+                        .doc
+                        .cloud
+                        .as_ref()
+                        .filter(|o| o.universe_id == u)
+                        .and_then(|o| o.team_create)
+                })
+        });
+
         let screen = ctx.content_rect();
-        let max_w = (screen.width() - 24.0).max(280.0);
-        let max_h = (screen.height() - 24.0).max(200.0);
-        egui::Window::new("Live Collaborators")
+        let win_w = (screen.width() - 24.0).clamp(300.0, 480.0);
+        let win_h = (screen.height() - 24.0).clamp(240.0, 420.0);
+        let win_size = egui::vec2(win_w, win_h);
+
+        egui::Window::new("Collaborate — Team Create")
             .id(egui::Id::new("live_collaborators_window"))
             .open(&mut self.cloud.live_collaborators_open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(win_size)
+            .min_size(win_size)
+            .max_size(win_size)
             .collapsible(false)
+            .resizable(false)
             .constrain_to(screen.shrink(8.0))
-            .max_width(max_w)
-            .max_height(max_h)
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("live_collaborators_scroll")
-                    .max_height((max_h - 48.0).max(120.0))
-                    .auto_shrink([false, true])
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.cloud.live.is_none() {
-                            ui.label("Open a Team Create place to join its live session.");
-                        }
-                        for (name, own, frame, idle, guid, line) in peers {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{name}{}{}", if own { " (you)" } else { "" }, if idle { " · idle" } else { "" }));
-                                if !own && frame.is_some() && ui.small_button("Fly to").clicked() {
-                                    fly = frame;
-                                }
-                                if !guid.is_empty() && ui.small_button(format!("Script · line {line}")).clicked() {
-                                    open_guid = Some(guid);
-                                }
-                            });
-                        }
-                        if let Some(universe) = universe {
-                            ui.hyperlink_to(
-                                "Manage collaborators",
-                                format!("https://create.roblox.com/dashboard/creations/experiences/{universe}/collaborators"),
+                        let Some(u) = universe else {
+                            ui.label(
+                                egui::RichText::new("Publish this place to Roblox first to enable Team Create and invite collaborators.")
+                                    .color(egui::Color32::from_rgb(215, 220, 232)),
                             );
+                            ui.add_space(8.0);
+                            if ui.button("Publish to Roblox…").clicked() {
+                                want_publish = true;
+                            }
+                            return;
+                        };
+
+                        if !signed_in {
+                            ui.label(
+                                egui::RichText::new("Sign in to your Roblox account first to manage Team Create and collaborators.")
+                                    .color(egui::Color32::from_rgb(235, 175, 70)),
+                            );
+                            ui.add_space(6.0);
                         }
+
+                        // ── Team Create Status & Toggle ──
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(32, 35, 43))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(52, 56, 68)))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new("Team Create:").strong());
+                                    match tc_enabled {
+                                        Some(true) => {
+                                            ui.label(
+                                                egui::RichText::new("ON")
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(80, 215, 130)),
+                                            );
+                                        }
+                                        Some(false) => {
+                                            ui.label(
+                                                egui::RichText::new("OFF")
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(170, 176, 190)),
+                                            );
+                                        }
+                                        None => {
+                                            ui.label(egui::RichText::new("Checking…").weak());
+                                        }
+                                    }
+
+                                    let busy = self.cloud.collab_manage.busy;
+                                    if signed_in {
+                                        let next_state = !tc_enabled.unwrap_or(false);
+                                        let btn_text = if next_state {
+                                            "Turn On Team Create"
+                                        } else {
+                                            "Turn Off Team Create"
+                                        };
+                                        if ui
+                                            .add_enabled(!busy, egui::Button::new(btn_text))
+                                            .clicked()
+                                        {
+                                            want_toggle_tc = Some((u, next_state));
+                                        }
+                                    }
+
+                                    if tc_enabled == Some(true) && !is_live {
+                                        if let Some(p) = place_id {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("Join Live Session")
+                                                            .strong()
+                                                            .color(egui::Color32::WHITE),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(38, 108, 224)),
+                                                )
+                                                .clicked()
+                                            {
+                                                want_join_tc = Some((u, p));
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+
+                        ui.add_space(8.0);
+
+                        // ── Invite Collaborator ──
+                        ui.label(egui::RichText::new("Invite Collaborator").strong());
+                        ui.label(
+                            egui::RichText::new(
+                                "Enter a Roblox username or User ID. For personal games, Roblox requires friends for Edit access.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let busy = self.cloud.collab_manage.busy;
+                            let resp = ui.add_enabled(
+                                signed_in && !busy,
+                                egui::TextEdit::singleline(&mut self.cloud.collab_manage.invite_input)
+                                    .desired_width(180.0)
+                                    .hint_text("Username or User ID"),
+                            );
+                            ui.selectable_value(
+                                &mut self.cloud.collab_manage.invite_edit,
+                                true,
+                                "Edit",
+                            );
+                            ui.selectable_value(
+                                &mut self.cloud.collab_manage.invite_edit,
+                                false,
+                                "Play",
+                            );
+                            let action = if self.cloud.collab_manage.invite_edit {
+                                "Edit"
+                            } else {
+                                "Play"
+                            };
+                            let enter = resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let clicked = ui
+                                .add_enabled(
+                                    signed_in
+                                        && !busy
+                                        && !self.cloud.collab_manage.invite_input.trim().is_empty(),
+                                    egui::Button::new(
+                                        egui::RichText::new("Invite")
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(38, 108, 224)),
+                                )
+                                .clicked();
+                            if (clicked || enter)
+                                && signed_in
+                                && !busy
+                                && !self.cloud.collab_manage.invite_input.trim().is_empty()
+                            {
+                                want_invite = Some((
+                                    u,
+                                    self.cloud.collab_manage.invite_input.trim().to_string(),
+                                    action.to_string(),
+                                ));
+                            }
+                            if busy {
+                                ui.spinner();
+                            }
+                        });
+
+                        if let Some((ok, msg)) = &self.cloud.collab_manage.feedback {
+                            ui.add_space(4.0);
+                            let col = if *ok {
+                                egui::Color32::from_rgb(90, 215, 135)
+                            } else {
+                                egui::Color32::from_rgb(235, 105, 105)
+                            };
+                            ui.label(egui::RichText::new(msg).small().color(col));
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+
+                        // ── Collaborators with Access ──
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Collaborators").strong());
+                            if ui
+                                .add_enabled(
+                                    signed_in && !self.cloud.collab_manage.loading,
+                                    egui::Button::new("Refresh").small(),
+                                )
+                                .clicked()
+                            {
+                                want_refresh = Some(u);
+                            }
+                            if self.cloud.collab_manage.loading {
+                                ui.spinner();
+                            }
+                        });
+
+                        if self.cloud.collab_manage.collaborators.is_empty()
+                            && !self.cloud.collab_manage.loading
+                        {
+                            ui.label(
+                                egui::RichText::new("No collaborators added yet.").small().weak(),
+                            );
+                        } else {
+                            let busy = self.cloud.collab_manage.busy;
+                            for c in &self.cloud.collab_manage.collaborators {
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    signed_in && !busy,
+                                                    egui::Button::new("Remove").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                want_remove = Some((
+                                                    u,
+                                                    c.subject_type.clone(),
+                                                    c.subject_id,
+                                                    c.action.clone(),
+                                                ));
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(egui::Label::new(&c.name).truncate());
+                                                    ui.label(
+                                                        egui::RichText::new(format!("[{}]", c.action))
+                                                            .small()
+                                                            .color(egui::Color32::from_rgb(130, 180, 250)),
+                                                    );
+                                                },
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        }
+
+                        // ── Live Session Peers ──
+                        if is_live {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(egui::RichText::new("Live Session Peers").strong());
+                            for (name, own, frame, idle, guid, line) in peers {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "{name}{}{}",
+                                        if own { " (you)" } else { "" },
+                                        if idle { " · idle" } else { "" }
+                                    ));
+                                    if !own && frame.is_some() && ui.small_button("Fly to").clicked() {
+                                        fly = frame;
+                                    }
+                                    if !guid.is_empty()
+                                        && ui.small_button(format!("Script · line {line}")).clicked()
+                                    {
+                                        open_guid = Some(guid);
+                                    }
+                                });
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.hyperlink_to(
+                            "Open in Roblox Creator Hub ↗",
+                            format!(
+                                "https://create.roblox.com/dashboard/creations/experiences/{u}/collaborators"
+                            ),
+                        );
                     });
             });
-        if let Some(frame)=fly {
-            self.game.cam.pos=glam::Vec3::new(frame.position.x,frame.position.y,frame.position.z);
-            let m=frame.orientation;
-            self.game.cam.set_rotation(glam::Mat3::from_cols_array(&[m.x.x,m.y.x,m.z.x,m.x.y,m.y.y,m.z.y,m.x.z,m.y.z,m.z.z]));
-            self.game.cam.focus=self.game.cam.pos+self.game.cam.forward()*32.0;
+
+        if want_publish {
+            self.cloud.live_collaborators_open = false;
+            self.open_roblox_destination(VersionType::Published);
         }
-        if let Some(guid)=open_guid {
-            if let Some(reference)=self.game.doc.dom.descendants().find(|i| matches!(i.properties.get(&"ScriptGuid".into()),Some(rbx_types::Variant::String(g)) if *g==guid)).map(|i|i.referent()) {self.open_script.push(reference);}
+        if let Some((u, enabled)) = want_toggle_tc {
+            self.cloud.collab_manage.busy = true;
+            self.cloud.collab_manage.feedback = None;
+            let api = self.cloud.factory(self.game.account.shared_client());
+            self.cloud.spawn(api, move |a, tx| {
+                let result = if let Some(a) = a {
+                    a.set_team_create(u, enabled).map_err(|e| e.to_string())
+                } else {
+                    Err("Sign in to Roblox first.".into())
+                };
+                let _ = tx.send(Msg::TeamCreateToggled {
+                    universe_id: u,
+                    result,
+                });
+            });
+        }
+        if let Some((u, p)) = want_join_tc {
+            self.cloud.live_collaborators_open = false;
+            self.open_team_create(u, p);
+        }
+        if let Some(u) = want_refresh {
+            self.cloud.collab_manage.loading = true;
+            let api = self.cloud.factory(self.game.account.shared_client());
+            self.cloud.spawn(api, move |a, tx| {
+                if let Some(a) = a {
+                    let _ = tx.send(Msg::Status(u, a.team_create(u)));
+                    let _ = tx.send(Msg::CollaboratorsLoaded {
+                        universe_id: u,
+                        result: a.list_collaborators(u).map_err(|e| e.to_string()),
+                    });
+                } else {
+                    let _ = tx.send(Msg::CollaboratorsLoaded {
+                        universe_id: u,
+                        result: Err("Sign in to Roblox first.".into()),
+                    });
+                }
+            });
+        }
+        if let Some((u, who, action)) = want_invite {
+            self.cloud.collab_manage.busy = true;
+            self.cloud.collab_manage.feedback = None;
+            let api = self.cloud.factory(self.game.account.shared_client());
+            self.cloud.spawn(api, move |a, tx| {
+                let result = if let Some(a) = a {
+                    a.invite_collaborator(u, &who, &action)
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("Sign in to Roblox first.".into())
+                };
+                let _ = tx.send(Msg::CollaboratorInvited {
+                    universe_id: u,
+                    result,
+                });
+            });
+        }
+        if let Some((u, stype, sid, action)) = want_remove {
+            self.cloud.collab_manage.busy = true;
+            self.cloud.collab_manage.feedback = None;
+            let api = self.cloud.factory(self.game.account.shared_client());
+            self.cloud.spawn(api, move |a, tx| {
+                let result = if let Some(a) = a {
+                    a.remove_collaborator(u, &stype, sid, &action)
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("Sign in to Roblox first.".into())
+                };
+                let _ = tx.send(Msg::CollaboratorRemoved {
+                    universe_id: u,
+                    subject_type: stype,
+                    subject_id: sid,
+                    result,
+                });
+            });
+        }
+        if let Some(frame) = fly {
+            self.game.cam.pos =
+                glam::Vec3::new(frame.position.x, frame.position.y, frame.position.z);
+            let m = frame.orientation;
+            self.game.cam.set_rotation(glam::Mat3::from_cols_array(&[
+                m.x.x, m.y.x, m.z.x, m.x.y, m.y.y, m.z.y, m.x.z, m.y.z, m.z.z,
+            ]));
+            self.game.cam.focus = self.game.cam.pos + self.game.cam.forward() * 32.0;
+        }
+        if let Some(guid) = open_guid {
+            if let Some(reference) = self
+                .game
+                .doc
+                .dom
+                .descendants()
+                .find(|i| {
+                    matches!(
+                        i.properties.get(&"ScriptGuid".into()),
+                        Some(rbx_types::Variant::String(g)) if *g == guid
+                    )
+                })
+                .map(|i| i.referent())
+            {
+                self.open_script.push(reference);
+            }
         }
     }
 

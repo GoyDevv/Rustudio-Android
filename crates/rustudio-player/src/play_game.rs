@@ -2136,7 +2136,6 @@ impl Game {
                         self.audio_listener(),
                     )
                 });
-                let len = Audio::length(&bytes);
                 let Some(s) = self.play.as_mut() else { return };
                 let audio = s.game.audio.get_or_insert_with(Audio::new);
                 if let Some((groups, settings)) = graph {
@@ -2158,11 +2157,6 @@ impl Game {
                     None => false,
                 };
                 self.log_audio_start(key, &id);
-                if let Some(len) = len {
-                    self.set_sound_info(server, client, |inp, r| {
-                        inp.sound_len.insert(r, len);
-                    });
-                }
                 if !detached {
                     // The TimePosition a script set is used up: the next
                     // Play() starts at 0 unless one is set again (Studio).
