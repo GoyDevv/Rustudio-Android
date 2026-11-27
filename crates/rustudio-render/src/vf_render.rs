@@ -566,7 +566,7 @@ impl Renderer {
                 &self.lights_buf,
                 &self.sky_view,
                 &self.sky_sampler,
-                &self.sun.atlas_view,
+                &self.sun_atlas_view,
                 &self.lightgrid_view,
                 &self.lightocc_view,
                 &self.localgrid_view,

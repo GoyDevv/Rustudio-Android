@@ -879,6 +879,7 @@ pub fn has_storage_access() -> bool {
         .unwrap_or(false)
     } else {
         has_permission("android.permission.READ_EXTERNAL_STORAGE")
+            && has_permission("android.permission.WRITE_EXTERNAL_STORAGE")
     }
 }
 

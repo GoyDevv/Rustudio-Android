@@ -261,6 +261,10 @@ impl Editor {
     }
 
     fn sync_hover_refs(&mut self, hover: Ref) {
+        if !self.game.doc.exists(hover) {
+            self.hover_outline_refs = (None, Vec::new());
+            return;
+        }
         let key = (hover, self.game.doc.id, self.game.doc.journal_end());
         if self.hover_outline_refs.0 != Some(key) {
             let refs = std::iter::once(hover)
@@ -697,14 +701,19 @@ impl Editor {
             }
         }
         if !driving && !ui_pointer && !ui_scrolling && (!over_selector || self.game.look_grab.is_some()) {
-            let look = self.game.update_look_grab(&ctx, &resp, delta);
-            if let Some(d) = look {
-                let sens = if self.game.touch.mode() == Some(rustudio_engine::touch_input::Mode::Look) {
-                    self.joystick_config.clamped().look_sensitivity
-                } else {
-                    1.0
-                };
-                self.game.cam.rotate(d.x * sens, d.y * sens);
+            let allow_look = !self.plugins.active_plugin_exclusive_mouse()
+                || self.game.look_grab.is_some()
+                || (ctx.input(|i| i.pointer.secondary_down()) && !self.game.touch.any());
+            if allow_look {
+                let look = self.game.update_look_grab(&ctx, &resp, delta);
+                if let Some(d) = look {
+                    let sens = if self.game.touch.mode() == Some(rustudio_engine::touch_input::Mode::Look) {
+                        self.joystick_config.clamped().look_sensitivity
+                    } else {
+                        1.0
+                    };
+                    self.game.cam.rotate(d.x * sens, d.y * sens);
+                }
             }
             if resp.dragged_by(PointerButton::Middle) {
                 self.game.cam.pan(delta.x, delta.y, &crate::studio_settings::camera_prefs());
@@ -951,6 +960,7 @@ impl Editor {
                 stick,
                 jump,
                 handle_hover: hover_handle.is_some() || self.drag.is_some() || rustudio_engine::gui::share().adorn_hot || { let _ch = rustudio_engine::gui::share_channel(1); rustudio_engine::gui::share().adorn_hot },
+                plugin_exclusive_mouse: !driving && self.plugins.active_plugin_exclusive_mouse(),
                 frame: self.game.frame_no,
             };
         }
@@ -971,6 +981,7 @@ impl Editor {
             && !in_play
             && !self.clean_view
             && !roblox_dragger_idle
+            && self.plugins.active_plugin().is_none()
             && !joystick_or_look_busy
             && !pointer_on_joystick
             && !pointer_on_mobile_win
@@ -1038,8 +1049,8 @@ impl Editor {
         // input plugins hear (src/plugin_host/widgets_ui.rs); a press a
         // CoreGui button, a handle or an active plugin's mouse took is not
         // the selection tool's.
-        let plugin_took = if !playing && show_gui {
-            let took = self.plugin_viewport(&ctx, &painter, rect, &resp);
+        let plugin_took = if !playing {
+            let took = self.plugin_viewport(&ctx, &painter, rect, &resp, show_gui);
             self.plugin_keys(&ctx);
             took
         } else {
@@ -1233,7 +1244,10 @@ impl Editor {
         // Studio Settings > Selection: Show Hover Over, Hover Over Color,
         // Hover Line Thickness.
         let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
-        if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none()) {
+        if self.hover.is_some_and(|h| !self.game.doc.exists(h)) {
+            self.hover = None;
+        }
+        if let Some(h) = self.hover.filter(|h| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none() && self.game.doc.exists(*h)) {
             let _s = rustudio_core::bench::scope("vp_hover_outline");
             self.sync_hover_refs(h);
             let refs = std::mem::take(&mut self.hover_outline_refs.1);

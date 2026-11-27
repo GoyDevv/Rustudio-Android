@@ -30,10 +30,10 @@ fn clean_tab_button_click(ui: &Ui, res: &Response) -> bool {
         return false;
     }
     ui.input(|i| {
-        let origin_in = i.pointer.press_origin().is_some_and(|p| res.rect.contains(p));
-        let pos_in = i.pointer.interact_pos().is_some_and(|p| res.rect.contains(p));
+        let origin_in = i.pointer.press_origin().map_or(true, |p| res.rect.expand(8.0).contains(p));
+        let pos_in = i.pointer.interact_pos().map_or(true, |p| res.rect.expand(8.0).contains(p));
         let clean_tap = match (i.pointer.press_origin(), i.pointer.interact_pos()) {
-            (Some(a), Some(b)) => a.distance(b) <= 10.0,
+            (Some(a), Some(b)) => a.distance(b) <= 14.0,
             _ => true,
         };
         origin_in && pos_in && clean_tap && !i.pointer.is_decidedly_dragging()

@@ -59,6 +59,13 @@ pub fn prop_get(lua: &Lua, _r: Ref, class: &str, key: &str) -> mlua::Result<Opti
     }
     Ok(match key {
         "X" | "Y" if !pointer_in_view(lua) => Some(Value::Number(-1.0)),
+        "TargetFilter" => {
+            let tf = world(lua)?.input.mouse_target_filter;
+            match tf {
+                Some(r) if world(lua).is_ok_and(|w| w.d().exists(r)) => Some(inst_value(lua, r)?),
+                _ => Some(Value::Nil),
+            }
+        }
         _ => None,
     })
 }

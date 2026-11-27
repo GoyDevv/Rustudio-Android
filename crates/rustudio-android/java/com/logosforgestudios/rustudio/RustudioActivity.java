@@ -1,5 +1,6 @@
 package com.logosforgestudios.rustudio;
 
+import android.Manifest;
 import android.app.NativeActivity;
 import android.app.PendingIntent;
 import android.content.ClipData;
@@ -8,7 +9,9 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.net.Uri;
 import android.provider.Settings;
@@ -18,6 +21,9 @@ import java.io.OutputStream;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -44,13 +50,17 @@ import android.widget.FrameLayout;
  */
 public class RustudioActivity extends NativeActivity {
     private static final int REQ_UNKNOWN_SOURCES = 4107;
+    private static final int REQ_STORAGE_PERMISSION = 4108;
     private static final int REQ_SAF_CREATE_DOC = 0x5253;
     private static final int REQ_SAF_OPEN_DOC = 0x5254;
+    private static final String PREFS_NAME = "rustudio_prefs";
+    private static final String PREF_STORAGE_PROMPTED = "storage_perm_prompted_v1";
     private static final String ACTION_INSTALL_COMMIT = "com.logosforgestudios.rustudio.ACTION_INSTALL_COMMIT";
     private ImeProxyView imeView;
     private String pendingInstallApkPath = null;
     private BroadcastReceiver installReceiver = null;
     private boolean imeListenerInstalled = false;
+    private boolean storagePromptScheduled = false;
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -163,6 +173,61 @@ public class RustudioActivity extends NativeActivity {
         nativeOnLifecycle(3);
         applyDarkFullscreenWindow();
         maybeResumePendingInstall();
+        if (!storagePromptScheduled) {
+            storagePromptScheduled = true;
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    requestInitialStoragePermissionIfNeeded();
+                }
+            }, 400);
+        }
+    }
+
+    private void requestInitialStoragePermissionIfNeeded() {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.getBoolean(PREF_STORAGE_PROMPTED, false)) {
+            return;
+        }
+        prefs.edit().putBoolean(PREF_STORAGE_PROMPTED, true).apply();
+
+        if (Build.VERSION.SDK_INT <= 29) {
+            boolean hasRead = checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                    == PackageManager.PERMISSION_GRANTED;
+            boolean hasWrite = checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    == PackageManager.PERMISSION_GRANTED;
+            if (!hasRead || !hasWrite) {
+                try {
+                    requestPermissions(
+                            new String[]{
+                                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                            },
+                            REQ_STORAGE_PERMISSION
+                    );
+                } catch (Throwable ignored) {
+                }
+            }
+        } else {
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    Intent intent = new Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + getPackageName())
+                    );
+                    startActivityForResult(intent, REQ_STORAGE_PERMISSION);
+                } catch (Throwable t) {
+                    try {
+                        Intent fallback = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                        startActivityForResult(fallback, REQ_STORAGE_PERMISSION);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
     }
 
     @Override

@@ -520,7 +520,9 @@ impl Editor {
             }
             "import_model" => self.insert_from_file(),
             "import_3d" => {
-                if !self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import")) {
+                if cfg!(target_os = "android")
+                    || !self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import"))
+                {
                     self.import_3d_dialog();
                 }
             }

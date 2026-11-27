@@ -2286,6 +2286,7 @@ impl Game {
             }
             None => rect,
         };
+        let is_powervr = self.renderer.as_ref().is_some_and(|r| r.caps().is_powervr());
         let mut scale = rustudio_core::rustudio_settings::render_resolution_scale();
         // On Android fullscreen Playtest (e.g. 2388x1080 = 2.58 Mpx on FHD+ phones),
         // cap default 3D render target to ~1.25 Mpx (~720p-class, matching Roblox Mobile)
@@ -2295,6 +2296,14 @@ impl Game {
             const MOBILE_PLAY_MAX_PX: f32 = 1_250_000.0;
             if px > MOBILE_PLAY_MAX_PX {
                 scale = (MOBILE_PLAY_MAX_PX / px).sqrt().clamp(0.55, 1.0);
+            }
+        } else if is_powervr && !self.is_playing() && scale >= 0.999 {
+            // On PowerVR Edit mode, cap 3D render target to ~600k px (~540p-class)
+            // while keeping 2D egui UI at full native resolution.
+            let px = (size[0] as f32) * (size[1] as f32);
+            const POWERVR_EDIT_MAX_PX: f32 = 600_000.0;
+            if px > POWERVR_EDIT_MAX_PX {
+                scale = (POWERVR_EDIT_MAX_PX / px).sqrt().clamp(0.35, 1.0);
             }
         }
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
@@ -2310,7 +2319,8 @@ impl Game {
         };
         // Studio's scene environment probe (env_probe.rs): the PBR
         // technologies' 128 px indoor reflection cube.
-        let probe = (quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+        // Skip on PowerVR to avoid per-frame CPU raycasts + cubemap convolution passes.
+        let probe = (!is_powervr && quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
             let _p = rustudio_core::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
             let now = rustudio_core::sim_clock::since(started).as_secs_f64();
@@ -2320,9 +2330,11 @@ impl Game {
             self.env_probe.update(self.cam.pos, self.cam.forward(), dt, now, revision, &ray)
         });
         let vp_render = rustudio_core::bench::scope("vp_render");
+        let no_world_gui_or_fx = self.gui.world_batches.is_empty()
+            && self.effects.drawn().is_none_or(|f| f.draws.is_empty());
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
-                r.defer_postfx = true;
+                r.defer_postfx = !(r.caps().is_powervr() && no_world_gui_or_fx);
                 r.render(
                 rs,
                 size,

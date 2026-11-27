@@ -207,6 +207,15 @@ pub struct Conflict {
     pub vt: VersionType,
 }
 
+/// Modal state shown after a Roblox Cloud publish succeeds.
+#[derive(Debug, Clone)]
+pub struct PublishedBanner {
+    pub universe_id: u64,
+    pub place_id: u64,
+    pub place_name: String,
+    pub version: Option<u64>,
+}
+
 struct SaveJob {
     document: u64,
     revision: u64,
@@ -325,6 +334,8 @@ pub struct CloudUi {
     pub avatar_sync_warning: Option<String>,
     /// The last save that went through: (version, Saved/Published).
     pub last_saved: Option<(u64, VersionType)>,
+    /// Publish-complete modal with Open in Roblox / Web / Console buttons.
+    pub published_banner: Option<PublishedBanner>,
     window_title: String,
     /// `--open-roblox` / `--roblox-picker`: done once the session is checked.
     pub open_when_ready: Option<(u64, Option<u64>, bool)>,
@@ -429,6 +440,7 @@ impl CloudUi {
             save_error: None,
             avatar_sync_warning: None,
             last_saved: None,
+            published_banner: None,
             window_title: String::new(),
             open_when_ready: None,
             confirm_copy_save: None,
@@ -1041,6 +1053,7 @@ impl Editor {
                 d.cloud = Some(origin.clone());
                 let n = d.dom.descendants().count();
                 self.set_document(d);
+                self.autosave.check_cloud_recovery(&origin);
                 self.cloud.open = false;
                 if self.cloud.status.as_ref().is_some_and(|(u, _)| *u != origin.universe_id) {
                     self.cloud.status = None;
@@ -1509,7 +1522,28 @@ impl Editor {
                                         self.cloud.last_saved = Some((version, save.vt));
                                     }
                                     self.game.doc.mark_saved_at(save.revision);
+                                    crate::autosave::clear_recovery(&crate::autosave::RecoveryKey::Cloud {
+                                        universe_id: live.universe,
+                                        place_id: live.place,
+                                    });
+                                    self.autosave.note_saved(self.game.doc.id, self.game.doc.revision);
                                     if save.vt == VersionType::Published {
+                                        let tc_universe = self.game.doc.cloud.as_ref().map(|o| o.universe_id).unwrap_or(live.universe);
+                                        let tc_name = self
+                                            .game
+                                            .doc
+                                            .cloud
+                                            .as_ref()
+                                            .map(|o| o.name.clone())
+                                            .filter(|n| !n.is_empty())
+                                            .or_else(|| (!self.game.doc.title.is_empty()).then(|| self.game.doc.title.clone()))
+                                            .unwrap_or_else(|| format!("Place {}", live.place));
+                                        self.cloud.published_banner = Some(PublishedBanner {
+                                            universe_id: tc_universe,
+                                            place_id: live.place,
+                                            place_name: tc_name,
+                                            version,
+                                        });
                                         if let (Some(universe_id), Some(av)) = (
                                             self.game
                                                 .doc
@@ -2099,8 +2133,27 @@ impl Editor {
         let action = if job.vt == VersionType::Published { "Published" } else { "Saved" };
         match result {
             Ok(SaveOutcome::Saved { version }) => {
+                let published_place_name = job
+                    .origin
+                    .as_ref()
+                    .map(|o| o.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| {
+                        self.game
+                            .doc
+                            .cloud
+                            .as_ref()
+                            .map(|o| o.name.clone())
+                            .filter(|n| !n.is_empty())
+                    })
+                    .or_else(|| (!self.game.doc.title.is_empty()).then(|| self.game.doc.title.clone()))
+                    .unwrap_or_else(|| format!("Place {}", job.place));
                 self.cloud.last_saved = Some((version, job.vt));
                 self.info(format!("{action} to Roblox: version {version} of place {}", job.place));
+                crate::autosave::clear_recovery(&crate::autosave::RecoveryKey::Cloud {
+                    universe_id: job.universe,
+                    place_id: job.place,
+                });
                 if let Some(sync) = job.avatar_sync {
                     self.log_avatar_sync(job.universe, sync);
                 }
@@ -2118,9 +2171,19 @@ impl Editor {
                         origin.version = version;
                         self.game.doc.mark_saved_at(job.revision);
                     }
+                    crate::autosave::clear_for_doc(&self.game.doc);
+                    self.autosave.note_saved(self.game.doc.id, self.game.doc.revision);
                     if job.from_dialog && self.cloud_upload_mode().is_some() {
                         self.cloud.upload_result = Some(Ok(Some(version)));
                     }
+                }
+                if job.vt == VersionType::Published {
+                    self.cloud.published_banner = Some(PublishedBanner {
+                        universe_id: job.universe,
+                        place_id: job.place,
+                        place_name: published_place_name,
+                        version: Some(version),
+                    });
                 }
             }
             Ok(SaveOutcome::Conflict { opened, server }) => {
@@ -2158,6 +2221,7 @@ impl Editor {
         self.cloud.save_error = None;
         self.cloud.avatar_sync_warning = None;
         self.cloud.confirm_copy_save = None;
+        self.cloud.published_banner = None;
     }
 
     pub fn cloud_windows(&mut self, ctx: &egui::Context) {
@@ -2169,6 +2233,7 @@ impl Editor {
         self.copy_save_modal(ctx);
         self.save_error_modal(ctx);
         self.avatar_sync_warning_modal(ctx);
+        self.published_banner_modal(ctx);
         self.revert_version_modal(ctx);
         self.join_modal(ctx);
     }
@@ -2378,6 +2443,68 @@ impl Editor {
         }
         if save_as {
             self.save_as();
+        }
+    }
+
+    fn published_banner_modal(&mut self, ctx: &egui::Context) {
+        let Some(banner) = self.cloud.published_banner.clone() else { return };
+        let mut close = false;
+        let screen = ctx.content_rect();
+        let max_w = (screen.width() - 32.0).clamp(260.0, 480.0);
+        let max_h = (screen.height() - 110.0).max(120.0);
+        egui::Modal::new(egui::Id::new("cloud_published_banner")).show(ctx, |ui| {
+            ui.set_max_width(max_w);
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close = true;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("cloud_published_banner_scroll")
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Published to Roblox").strong().size(15.0));
+                    ui.add_space(4.0);
+                    let detail = match banner.version {
+                        Some(v) => format!("{} (version {v}) is now published on Roblox.", banner.place_name),
+                        None => format!("{} is now published on Roblox.", banner.place_name),
+                    };
+                    ui.label(detail);
+                    ui.label(
+                        RichText::new(format!("Place {} · Universe {}", banner.place_id, banner.universe_id))
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open in Roblox").clicked() {
+                    crate::browser::open_url(
+                        ui.ctx(),
+                        &format!("roblox://placeId={}", banner.place_id),
+                    );
+                }
+                if ui.button("Open in Web").clicked() {
+                    crate::browser::open_url(
+                        ui.ctx(),
+                        &format!("https://www.roblox.com/games/{}", banner.place_id),
+                    );
+                }
+                if ui.button("Open in Console").clicked() {
+                    crate::browser::open_url(
+                        ui.ctx(),
+                        &format!(
+                            "https://create.roblox.com/dashboard/creations/experiences/{}/overview",
+                            banner.universe_id
+                        ),
+                    );
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.cloud.published_banner = None;
         }
     }
 

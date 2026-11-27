@@ -114,13 +114,15 @@ pub struct Zones {
     pub jump: Option<Rect>,
     /// A transform handle is under the pointer (a press goes to it at once).
     pub handle_hover: bool,
+    /// An activated plugin requested exclusive mouse (1-finger drags emit Primary instead of Look).
+    pub plugin_exclusive_mouse: bool,
     /// `Editor::frame_no` when these were written; older zones are stale.
     pub frame: u64,
 }
 
 impl Default for Zones {
     fn default() -> Self {
-        Self { viewport: Rect::NOTHING, playing: false, game: false, ui: Vec::new(), direct_drag: Vec::new(), stick: None, jump: None, handle_hover: false, frame: 0 }
+        Self { viewport: Rect::NOTHING, playing: false, game: false, ui: Vec::new(), direct_drag: Vec::new(), stick: None, jump: None, handle_hover: false, plugin_exclusive_mouse: false, frame: 0 }
     }
 }
 
@@ -558,10 +560,10 @@ impl Touch {
                 match p.mode {
                     Mode::Pending => {
                         if (pos - p.start).length() > SLOP {
-                            if p.in_view && self.zones.handle_hover {
-                                // Finger landed on a 3D transform gizmo or Roblox plugin
-                                // ArcHandles / Handles ring: drag with Primary instead of
-                                // orbiting the camera!
+                            if p.in_view && (self.zones.handle_hover || self.zones.plugin_exclusive_mouse) {
+                                // Finger landed on a 3D transform gizmo, Roblox plugin
+                                // ArcHandles / Handles ring, or an active exclusive-mouse
+                                // plugin: drag with Primary instead of orbiting the camera!
                                 out.push(Event::PointerMoved(p.start));
                                 out.push(button(p.start, PointerButton::Primary, true));
                                 out.push(Event::PointerMoved(pos));

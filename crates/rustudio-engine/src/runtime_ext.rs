@@ -53,6 +53,7 @@ pub struct Inputs {
     /// Point and part under the cursor (client).
     pub mouse_hit: Option<Xform>,
     pub mouse_target: Option<Ref>,
+    pub mouse_target_filter: Option<Ref>,
     pub mouse_ray: (Vec3, Vec3),
     pub mouse_xy: [f32; 2],
     pub view_size: [f32; 2],
@@ -5332,6 +5333,10 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 Some(t) => inst_value(lua, t)?,
                 None => Value::Nil,
             },
+            "TargetFilter" => match inp.mouse_target_filter {
+                Some(tf) if world(lua).is_ok_and(|w| w.d().exists(tf)) => inst_value(lua, tf)?,
+                _ => Value::Nil,
+            },
             "Origin" => cframe_value(
                 lua,
                 Xform {
@@ -5539,6 +5544,20 @@ pub(crate) fn clock_hours(lua: &Lua, r: Ref) -> mlua::Result<f32> {
 
 /// Write-side hooks: returns true when handled here.
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
+    if key == "TargetFilter" && doc::is_a(class, "Mouse") {
+        let tf = match value {
+            Value::Nil => None,
+            v => Some(
+                opt_inst(v)
+                    .ok_or_else(|| rt_err("Unable to assign property TargetFilter. Instance expected"))?,
+            ),
+        };
+        let mut w = world(lua)?;
+        w.input.mouse_target_filter = tf;
+        w.fire(r, "Changed", vec![Value::String(lua.create_string("TargetFilter")?)]);
+        w.fire(r, "Changed:TargetFilter", vec![]);
+        return Ok(true);
+    }
     // Model.WorldPivot (Roblox): with a PrimaryPart, its PivotOffset becomes
     // PrimaryPart.CFrame⁻¹ · pivot; without one, the model keeps the pivot
     // itself (WorldPivotData). Nothing moves. (model_pivot reads both.)

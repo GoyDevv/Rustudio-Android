@@ -98,6 +98,7 @@ const HAS_EFFECT: &[(&str, &str)] = &[
     ("Studio", "Number Color"),
     ("Studio", "Comment Color"),
     ("Studio", "Operator Color"),
+    ("Studio", "Auto-Recovery Enabled"),
     ("PhysicsSettings", "AllowSleep"),
     ("RenderSettings", "EditQualityLevel"),
 ];
@@ -1123,7 +1124,11 @@ impl Dialog {
             p.galley(Pos2::new(r.min.x + 22.0, top.max.y + 1.0), galley, c::TEXT_DIM);
             let vx = r.min.x + col;
             let vr = Rect::from_min_max(Pos2::new(vx, top.min.y), Pos2::new(top.max.x, top.max.y - 1.0));
-            let vresp = ui.interact(vr, egui::Id::new(("rustudio_option_value", i)), if disabled { Sense::hover() } else { Sense::click() });
+            let vresp = ui.interact(
+                vr,
+                egui::Id::new(("rustudio_option_value", i)),
+                if disabled || matches!(o.kind, OptKind::IntRange { .. }) { Sense::hover() } else { Sense::click() },
+            );
             if ui.clip_rect().intersects(vr) {
                 self.hits.push((Hit::Opt(i), vr.intersect(ui.clip_rect())));
             }
@@ -1309,6 +1314,33 @@ impl Dialog {
                         p.text(Pos2::new(vx + 3.0, top.center().y), egui::Align2::LEFT_CENTER, t, font.clone(), col);
                         if vresp.clicked() {
                             self.editing = Some((ei, path));
+                        }
+                    }
+                }
+                (OptKind::IntRange { min, max, suffix }, Shown::Int(val)) => {
+                    if disabled {
+                        p.text(
+                            Pos2::new(vx + 3.0, top.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{val}{suffix}"),
+                            font.clone(),
+                            tc,
+                        );
+                    } else {
+                        let er = Rect::from_min_max(
+                            Pos2::new(vx + 2.0, top.min.y + 1.0),
+                            Pos2::new((vx + 110.0).min(top.max.x - 2.0), top.max.y - 2.0),
+                        );
+                        let mut cur = val.clamp(min, max);
+                        let resp = ui.put(
+                            er,
+                            egui::DragValue::new(&mut cur)
+                                .range(min..=max)
+                                .speed(0.25)
+                                .suffix(suffix),
+                        );
+                        if resp.changed() {
+                            rs::set_int(o.key, cur);
                         }
                     }
                 }

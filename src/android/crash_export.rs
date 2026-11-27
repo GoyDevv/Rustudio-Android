@@ -248,8 +248,9 @@ fn write_content_uri(uri_str: &str, bytes: &[u8]) -> super::jni::Result<()> {
     })
 }
 
-/// Writes `bytes` into the public `Download/` folder via `MediaStore.Downloads`
-/// (API 29+, no storage permission required), falling back to `/storage/emulated/0/Download`.
+/// Writes `bytes` into the public `Download/Rustudio/crashes/` folder via
+/// `MediaStore.Downloads` (API 29+, no storage permission required), falling
+/// back to `/storage/emulated/0/Download/Rustudio/crashes`.
 #[cfg(target_os = "android")]
 pub fn save_to_downloads_android(file_name: &str, bytes: &[u8]) -> super::jni::Result<String> {
     if super::jni::sdk_int() >= 29 {
@@ -257,9 +258,11 @@ pub fn save_to_downloads_android(file_name: &str, bytes: &[u8]) -> super::jni::R
             return Ok(desc);
         }
     }
-    let dl_path = std::path::PathBuf::from("/storage/emulated/0/Download").join(file_name);
+    let dl_dir = std::path::PathBuf::from("/storage/emulated/0/Download/Rustudio/crashes");
+    std::fs::create_dir_all(&dl_dir).map_err(|e| format!("{}: {e}", dl_dir.display()))?;
+    let dl_path = dl_dir.join(file_name);
     std::fs::write(&dl_path, bytes).map_err(|e| format!("{}: {e}", dl_path.display()))?;
-    Ok(format!("Download/{file_name}"))
+    Ok(format!("Download/Rustudio/crashes/{file_name}"))
 }
 
 #[cfg(target_os = "android")]
@@ -282,7 +285,7 @@ fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::
         };
         put_str(env, "_display_name", file_name)?;
         put_str(env, "mime_type", "text/plain")?;
-        put_str(env, "relative_path", "Download/Rustudio/")?;
+        put_str(env, "relative_path", "Download/Rustudio/crashes/")?;
         {
             let jk = env.new_string("is_pending")?;
             let jone = env.call_static_method(jni_str!("java/lang/Integer"), jni_str!("valueOf"), jni_sig!("(I)Ljava/lang/Integer;"), &[JValue::Int(1)])?.l()?;
@@ -344,7 +347,7 @@ fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::
             env.call_method(&clear_cv, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/Integer;)V"), &[JValue::Object(&jk), JValue::Object(&jzero)])?;
             let _ = env.call_method(&resolver, jni_str!("update"), jni_sig!("(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I"), &[JValue::Object(&inserted), JValue::Object(&clear_cv), JValue::Object(&jni::objects::JObject::null()), JValue::Object(&jni::objects::JObject::null())]);
         }
-        Ok(format!("Download/Rustudio/{file_name}"))
+        Ok(format!("Download/Rustudio/crashes/{file_name}"))
     })
 }
 

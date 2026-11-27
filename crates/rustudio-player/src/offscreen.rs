@@ -390,8 +390,59 @@ pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
 /// notes the same halving on iOS). Three images let the next frame start
 /// while the last one is still queued. `RUSTUDIO_FRAME_LATENCY` (1 to 3)
 /// overrides, for measuring.
+#[cfg(target_os = "android")]
+fn is_android_powervr_gles() -> bool {
+    const POWERVR_PATHS: &[&str] = &[
+        "/vendor/lib64/egl/libGLES_powervr.so",
+        "/vendor/lib64/hw/vulkan.powervr.so",
+        "/vendor/lib64/hw/vulkan.mt6765.so",
+        "/vendor/lib64/hw/vulkan.mt6762.so",
+        "/vendor/lib64/hw/vulkan.mt6761.so",
+        "/vendor/lib64/hw/vulkan.mt6739.so",
+        "/vendor/lib64/hw/vulkan.mt8766.so",
+        "/vendor/lib64/hw/vulkan.mt8768.so",
+    ];
+    if POWERVR_PATHS.iter().any(|p| std::path::Path::new(p).exists()) {
+        return true;
+    }
+    extern "C" {
+        fn __system_property_get(
+            name: *const std::os::raw::c_char,
+            value: *mut std::os::raw::c_char,
+        ) -> std::os::raw::c_int;
+    }
+    const PROPS: &[&str] = &[
+        "ro.hardware.egl",
+        "ro.hardware.vulkan",
+        "ro.board.platform",
+        "ro.hardware",
+        "ro.soc.model",
+    ];
+    const TOKENS: &[&str] = &[
+        "powervr", "rogue", "imagination", "ge8320", "ge8300", "ge8100", "gm9446",
+        "mt6765", "mt6762", "mt6761", "mt6739", "mt8766", "mt8768",
+    ];
+    for prop in PROPS {
+        let Ok(c_name) = std::ffi::CString::new(*prop) else { continue };
+        let mut buf = [0u8; 92];
+        let n = unsafe {
+            __system_property_get(c_name.as_ptr(), buf.as_mut_ptr() as *mut std::os::raw::c_char)
+        };
+        if n > 0 {
+            let val = String::from_utf8_lossy(&buf[..n as usize]).to_ascii_lowercase();
+            if TOKENS.iter().any(|t| val.contains(t)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn frame_latency() -> u32 {
-    let default = if cfg!(target_os = "android") { 2 } else { 1 };
+    #[cfg(target_os = "android")]
+    let default = if is_android_powervr_gles() { 1 } else { 2 };
+    #[cfg(not(target_os = "android"))]
+    let default = 1;
     std::env::var("RUSTUDIO_FRAME_LATENCY")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())

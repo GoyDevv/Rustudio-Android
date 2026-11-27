@@ -30,6 +30,12 @@ const PENDING_SIGNAL_FILE: &str = "pending_signal_crash.txt";
 /// Marker appended once a signal crash report has been enriched at startup.
 const STARTUP_ENRICHMENT_MARKER: &str = "=== Startup Logcat & Device Enrichment ===";
 
+/// Marker appended once a pending signal crash report has been exported to Downloads.
+const DOWNLOADS_EXPORT_MARKER: &str = "=== Exported to Download/Rustudio/crashes/ ===";
+
+/// Tracking file in each crash directory listing reports already synced to Downloads.
+const EXPORTED_DOWNLOADS_INDEX: &str = ".exported_downloads";
+
 /// Size of the pre-formatted static header buffer read by the async-signal-safe handler.
 const SIGNAL_HEADER_CAP: usize = 4096;
 
@@ -303,36 +309,33 @@ fn refresh_signal_header(_header_text: &str) {}
 /// Pre-computed CString path to `<crash_dir>/pending_signal_crash.txt` so the
 /// signal handler never allocates.
 static SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
-/// Pre-computed CString path in public shared storage (`Documents/Rustudio/` or
-/// `Download/Rustudio/`) so even a black-screen native crash leaves a user-visible `.txt`.
+/// Pre-computed CString path in public shared storage (`Download/Rustudio/crashes/`)
+/// so even a black-screen native crash leaves a user-visible `.txt`.
 static PUBLIC_SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
 
-/// Best-effort automatic export of a crash report `.txt` directly into
-/// `Documents/Rustudio/` and `Download/Rustudio/` (via direct write + Android
-/// MediaStore.Downloads) so users can recover logs even after a black-screen crash.
-fn auto_export_public_crash(file_name: &str, body: &str) {
+/// Best-effort automatic export of a crash report `.txt` into
+/// `Download/Rustudio/crashes/` (preferring Android `MediaStore.Downloads` so it
+/// works on API 29+ even without All Files Access, with direct filesystem write
+/// as fallback) so users can recover logs even after a black-screen crash.
+fn auto_export_public_crash(file_name: &str, body: &str) -> bool {
     #[cfg(target_os = "android")]
     {
-        let mut wrote_direct = false;
-        for dir in [
-            "/storage/emulated/0/Documents/Rustudio",
-            "/storage/emulated/0/Download/Rustudio",
-        ] {
-            if std::fs::create_dir_all(dir).is_ok() {
-                let p = Path::new(dir).join(file_name);
-                if std::fs::write(&p, body.as_bytes()).is_ok() {
-                    wrote_direct = true;
-                    break;
-                }
+        if crate::android::crash_export::save_to_downloads_android(file_name, body.as_bytes()).is_ok() {
+            return true;
+        }
+        let dir = Path::new("/storage/emulated/0/Download/Rustudio/crashes");
+        if std::fs::create_dir_all(dir).is_ok() {
+            let p = dir.join(file_name);
+            if std::fs::write(&p, body.as_bytes()).is_ok() {
+                return true;
             }
         }
-        if !wrote_direct {
-            let _ = crate::android::crash_export::save_to_downloads_android(file_name, body.as_bytes());
-        }
+        false
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = (file_name, body);
+        false
     }
 }
 
@@ -476,7 +479,9 @@ fn write_pending_panic_report(body: &str) -> Option<PathBuf> {
     f.write_all(body.as_bytes()).ok()?;
     let _ = f.sync_all();
     let pub_name = format!("rustudio-crash-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
-    auto_export_public_crash(&pub_name, body);
+    if auto_export_public_crash(&pub_name, body) {
+        record_exported_download(&d, &pending, PENDING_PANIC_FILE);
+    }
     if let Ok(mut l) = LAST_REPORT.lock() {
         *l = Some(pending.clone());
     }
@@ -499,16 +504,11 @@ pub fn install() {
     let sig_path = crash_dir.join(PENDING_SIGNAL_FILE);
     #[cfg(target_os = "android")]
     {
-        for dir in [
-            "/storage/emulated/0/Documents/Rustudio",
-            "/storage/emulated/0/Download/Rustudio",
-        ] {
-            let _ = std::fs::create_dir_all(dir);
-            let p = Path::new(dir).join("rustudio-crash-signal.txt");
-            if let Ok(c) = CString::new(p.to_string_lossy().as_bytes()) {
-                let _ = PUBLIC_SIGNAL_PATH.set(c);
-                break;
-            }
+        let dir = "/storage/emulated/0/Download/Rustudio/crashes";
+        let _ = std::fs::create_dir_all(dir);
+        let p = Path::new(dir).join("rustudio-crash-signal.txt");
+        if let Ok(c) = CString::new(p.to_string_lossy().as_bytes()) {
+            let _ = PUBLIC_SIGNAL_PATH.set(c);
         }
     }
     let _ = SIGNAL_PATH.set(CString::new(sig_path.to_string_lossy().as_bytes()).unwrap_or_default());
@@ -786,6 +786,14 @@ pub fn load_pending_crash() -> Option<CrashReport> {
                 text.push_str(&enrichment);
                 let _ = std::fs::write(&signal_path, &text);
             }
+            if !text.contains(DOWNLOADS_EXPORT_MARKER) {
+                let pub_name = format!("rustudio-signal-crash-{}.txt", stamp_filename());
+                if auto_export_public_crash(&pub_name, &text) {
+                    text.push_str(&format!("\n{DOWNLOADS_EXPORT_MARKER}\n"));
+                    let _ = std::fs::write(&signal_path, &text);
+                    record_exported_download(&crash_dir, &signal_path, PENDING_SIGNAL_FILE);
+                }
+            }
             return Some(parse_crash_report(CrashKind::Signal, signal_path, text));
         }
     }
@@ -901,5 +909,106 @@ pub fn record_fatal_message(kind: &str, message: &str) {
             stamp_human()
         );
         let _ = write_pending_panic_report(&body);
+    }
+}
+
+fn crash_export_key(path: &Path, file_name: &str) -> String {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let len = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{file_name}|{len}|{mtime}")
+    } else {
+        file_name.to_string()
+    }
+}
+
+fn record_exported_download(crash_dir: &Path, file_path: &Path, file_name: &str) {
+    let key = crash_export_key(file_path, file_name);
+    let index_path = crash_dir.join(EXPORTED_DOWNLOADS_INDEX);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index_path)
+    {
+        let _ = writeln!(f, "{key}");
+    }
+}
+
+/// Scans `src/crash.rs::dir()` and `rustudio_core::crash::dir()` for any `.txt`
+/// crash reports not yet listed in `<crash_dir>/.exported_downloads`, exports
+/// each to `Download/Rustudio/crashes/` via `save_to_downloads_android()`, and
+/// records it so every panic, signal, or core crash appears in Downloads.
+pub fn sync_unexported_crashes_to_downloads() {
+    #[cfg(target_os = "android")]
+    {
+        use std::collections::HashSet;
+
+        let dirs = [dir(), rustudio_core::crash::dir()];
+        for crash_dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&crash_dir) else {
+                continue;
+            };
+            let index_path = crash_dir.join(EXPORTED_DOWNLOADS_INDEX);
+            let mut exported: HashSet<String> = std::fs::read_to_string(&index_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let is_txt = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
+                if !is_txt {
+                    continue;
+                }
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let key = crash_export_key(&path, file_name);
+                if exported.contains(&key) || exported.contains(file_name) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                    continue;
+                }
+                let export_name = if file_name == PENDING_PANIC_FILE || file_name == PENDING_SIGNAL_FILE {
+                    format!(
+                        "rustudio-{}-{}.txt",
+                        file_name.trim_end_matches(".txt"),
+                        stamp_filename()
+                    )
+                } else if file_name.starts_with("rustudio-") {
+                    file_name.to_string()
+                } else {
+                    format!("rustudio-crash-{file_name}")
+                };
+
+                match crate::android::crash_export::save_to_downloads_android(&export_name, &bytes) {
+                    Ok(dest) => {
+                        log::info!("crash: synced {} -> {dest}", path.display());
+                        record_exported_download(&crash_dir, &path, file_name);
+                        exported.insert(key);
+                    }
+                    Err(e) => {
+                        log::warn!("crash: failed to sync {} to Downloads: {e}", path.display());
+                    }
+                }
+            }
+        }
     }
 }

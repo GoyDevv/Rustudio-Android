@@ -191,6 +191,7 @@ pub fn run(app: AndroidApp) {
     // in Output at the next start (and logcat gets the panic message).
     rustudio_core::crash::install();
     crate::crash::install();
+    crate::crash::sync_unexported_crashes_to_downloads();
     // Studio's installations of the engine's start-up hooks (src/studio_hooks.rs).
     crate::studio_hooks::install();
     // Native Android graphics driver only (Vulkan with GLES 3 fallback).

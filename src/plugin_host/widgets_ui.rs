@@ -444,6 +444,16 @@ pub struct PluginUi {
     /// `plugin-widget:…` actions waiting for a freshly awakened deferred plugin
     /// to finish creating its DockWidgetPluginGui slot.
     pending_widget_actions: Vec<(String, u8)>,
+    /// Events deferred by 1 frame so quick taps don't collapse `Button1Down` +
+    /// `Button1Up` (and paired `Uis(End, MouseButton1)`) into the same tick.
+    next_frame_queue: Vec<In>,
+    /// Last non-`None` pointer position (used right after touch `PointerGone`
+    /// so `GetRelativeMousePosition()` still resolves the tap location).
+    last_pointer_pos: Option<Pos2>,
+    /// Set centrally in `plugin_ui_note_open` when Android's soft keyboard
+    /// releases a TextBox, consumed by `plugin_widget_ui` to surrender egui focus.
+    #[cfg(target_os = "android")]
+    surrender_widget_focus: bool,
 }
 
 impl PluginUi {
@@ -964,8 +974,12 @@ impl Editor {
     /// Which plugin panels the dock holds now (after its requests ran).
     pub fn plugin_ui_note_open(&mut self, is_open: impl Fn(&Tab) -> bool) {
         #[cfg(target_os = "android")]
-        if crate::android::keyboard::take_textbox_released() {
-            self.plugin_ui.release_all_text_focus();
+        {
+            self.plugin_ui.surrender_widget_focus = false;
+            if crate::android::keyboard::take_textbox_released() {
+                self.plugin_ui.release_all_text_focus();
+                self.plugin_ui.surrender_widget_focus = true;
+            }
         }
         for (i, s) in self.plugin_ui.slots.iter_mut().enumerate() {
             let open = is_open(&Tab::Plugin(i as u32));
@@ -1010,12 +1024,22 @@ impl Editor {
         let state = self.plugin_ui.slots[n].state.clone();
         // Explorer instances dragged over the widget (see explorer_drag_widget).
         let xd = crate::explorer::explorer_drag_active(&ctx);
+        let live_ptr = ctx.input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()));
+        if let Some(p) = live_ptr {
+            self.plugin_ui.last_pointer_pos = Some(p);
+        }
+        let eff_ptr = live_ptr.or(self.plugin_ui.last_pointer_pos);
         {
             let mut g = reg();
             g.dock_sizes.insert(state, [rect.width(), rect.height()]);
-            let rel = ctx
-                .input(|i| i.pointer.latest_pos())
-                .filter(|p| rect.contains(*p) && (resp.hovered() || self.plugin_ui.drag_over == Some(r) || xd))
+            let rel = eff_ptr
+                .filter(|p| {
+                    rect.contains(*p)
+                        && (resp.hovered()
+                            || live_ptr.is_none()
+                            || self.plugin_ui.drag_over == Some(r)
+                            || xd)
+                })
                 .map(|p| [(p.x - rect.min.x).floor(), (p.y - rect.min.y).floor()]);
             g.live.insert(
                 r,
@@ -1036,8 +1060,7 @@ impl Editor {
             ..
         } = self;
         #[cfg(target_os = "android")]
-        if crate::android::keyboard::take_textbox_released() {
-            plugin_ui.release_all_text_focus();
+        if plugin_ui.surrender_widget_focus {
             resp.surrender_focus();
         }
         let slot = &mut plugin_ui.slots[n];
@@ -1056,6 +1079,15 @@ impl Editor {
                 roots: Roots::Widget(r),
             },
         );
+        if cfg!(target_os = "android") {
+            let drag_rects = slot.gui.direct_drag_rects(rect);
+            if !drag_rects.is_empty() {
+                ctx.data_mut(|d| {
+                    d.get_temp_mut_or_default::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects"))
+                        .extend(drag_rects);
+                });
+            }
+        }
         let mut q: Vec<In> = Vec::new();
         match explorer_drag_widget(&ctx, rect, r, xd, &mut plugin_ui.xdrag_over, plugin_ui.xdrag_dead, slot, &mut q) {
             XGui::Normal => {
@@ -1105,7 +1137,7 @@ impl Editor {
     /// then its input, the pointer for PluginMouse, and whether the
     /// editor's tools must leave this press alone (a CoreGui button, a
     /// handle, or an active plugin with the exclusive mouse took it).
-    pub fn plugin_viewport(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect, resp: &egui::Response) -> bool {
+    pub fn plugin_viewport(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect, resp: &egui::Response, show_gui: bool) -> bool {
         if !self.plugins_on() || self.game.play.is_some() {
             self.plugin_ui.view = ViewIn::default();
             return false;
@@ -1118,6 +1150,13 @@ impl Editor {
         let pointer = resp
             .hover_pos()
             .or_else(|| if self.toolbox_drag_in_live() { ctx.pointer_hover_pos() } else { None })
+            .or_else(|| {
+                if self.plugin_ui.view_buttons[0] {
+                    ctx.input(|i| i.pointer.interact_pos())
+                } else {
+                    None
+                }
+            })
             .filter(|p| rect.contains(*p));
         let was_over = self.plugin_ui.view.xy.is_some();
         let now_over = pointer.is_some();
@@ -1137,34 +1176,35 @@ impl Editor {
             game: Game { doc, cam, assets, render_state, fixed_dt, .. },
             ..
         } = self;
-        if std::env::var_os("RUSTUDIO_NO_GUI").is_none() {
-            plugin_ui.core.draw(
-                ctx,
-                painter,
-                rustudio_engine::gui::DrawIn {
-                    render_state: render_state.as_ref(),
-                    doc,
-                    cam,
-                    rect,
-                    store: assets,
-                    doc_dir: doc_dir.as_deref(),
-                    playing: false,
-                    fixed_step: fixed_dt.is_some(),
-                    roots: Roots::CoreGui,
-                },
-            );
-        }
-        #[cfg(target_os = "android")]
-        if crate::android::keyboard::take_textbox_released() {
-            plugin_ui.release_all_text_focus();
-        }
-        let gui_took = plugin_ui.core.input(ctx, resp, rect);
-        plugin_ui.core.keyboard(ctx, doc);
-        let events = std::mem::take(&mut plugin_ui.core.events);
-        if !events.is_empty() {
-            plugin_ui.queue.push(In::Gui(events));
-        }
-        let over_gui = pointer.is_some_and(|p| plugin_ui.core.object_at(p).is_some());
+        let gui_took = if show_gui {
+            if std::env::var_os("RUSTUDIO_NO_GUI").is_none() {
+                plugin_ui.core.draw(
+                    ctx,
+                    painter,
+                    rustudio_engine::gui::DrawIn {
+                        render_state: render_state.as_ref(),
+                        doc,
+                        cam,
+                        rect,
+                        store: assets,
+                        doc_dir: doc_dir.as_deref(),
+                        playing: false,
+                        fixed_step: fixed_dt.is_some(),
+                        roots: Roots::CoreGui,
+                    },
+                );
+            }
+            let gt = plugin_ui.core.input(ctx, resp, rect);
+            plugin_ui.core.keyboard(ctx, doc);
+            let events = std::mem::take(&mut plugin_ui.core.events);
+            if !events.is_empty() {
+                plugin_ui.queue.push(In::Gui(events));
+            }
+            gt
+        } else {
+            false
+        };
+        let over_gui = show_gui && pointer.is_some_and(|p| plugin_ui.core.object_at(p).is_some());
         let xy = plugin_ui.view.xy.unwrap_or([0.0, 0.0]);
         // The active plugin's PluginMouse (F57: not over CoreGui GUI).
         let active = self.plugins.active_plugin().is_some();
@@ -1173,6 +1213,7 @@ impl Editor {
             (s.adorn_hot, s.adorn_handles)
         };
         let mut took = gui_took || (adorn_hot && pointer.is_some());
+        let mut defer_b1_up = false;
         if active && pointer.is_some() && !over_gui {
             let q = &mut self.plugin_ui.queue;
             let (presses, moved) = ctx.input(|i| {
@@ -1192,6 +1233,7 @@ impl Editor {
             if moved {
                 q.push(In::Mouse("Move", None));
             }
+            let mut saw_b1_down = false;
             for (b, down) in presses {
                 let (ev, i) = match (b, down) {
                     (egui::PointerButton::Primary, true) => ("Button1Down", 0),
@@ -1206,7 +1248,17 @@ impl Editor {
                 } else if !down && i == 0 && std::mem::take(&mut self.plugin_ui.handle_press) {
                     // (after the handle's MouseButton1Up, which its step fires)
                     self.plugin_ui.late.push(In::Mouse(ev, None));
+                } else if !down && i == 0 && saw_b1_down {
+                    // Quick tap queued both Button1Down and Button1Up in the same
+                    // frame: defer Button1Up by 1 frame so stateful RenderStepped/
+                    // Heartbeat brush/stamp plugins observe Button1Down active.
+                    self.plugin_ui.next_frame_queue.push(In::Mouse(ev, None));
+                    defer_b1_up = true;
+                    ctx.request_repaint();
                 } else {
+                    if down && i == 0 {
+                        saw_b1_down = true;
+                    }
                     self.plugin_ui.queue.push(In::Mouse(ev, None));
                 }
                 // exclusive mouse: the editor's selection tool leaves it
@@ -1247,12 +1299,17 @@ impl Editor {
         // before UIS.InputBegan); gameProcessed over CoreGui GUI.
         if pointer.is_some() {
             // (a press on a handle: after the handle's MouseButton1Down)
+            let deferred = if defer_b1_up {
+                Some(&mut self.plugin_ui.next_frame_queue)
+            } else {
+                None
+            };
             let q = if adorn_hot && !over_gui {
                 &mut self.plugin_ui.late
             } else {
                 &mut self.plugin_ui.queue
             };
-            push_buttons(ctx, q, over_gui || adorn_handles, xy);
+            push_buttons(ctx, q, deferred, over_gui || adorn_handles, xy);
         }
         if !(active && pointer.is_some() && !over_gui) {
             // (a release outside still ends a press the mouse had)
@@ -1450,6 +1507,9 @@ impl Editor {
             }
         };
         let queue = std::mem::take(&mut self.plugin_ui.queue);
+        if !self.plugin_ui.next_frame_queue.is_empty() {
+            self.plugin_ui.queue.append(&mut self.plugin_ui.next_frame_queue);
+        }
         let view = self.plugin_ui.view;
         let active_mouse = self.plugins.active_mouse();
         let keys = if self.plugin_ui.keys_down != self.plugin_ui.keys_sent {
@@ -1884,7 +1944,13 @@ fn explorer_drag_widget(
 
 /// UserInputService's InputBegan / InputEnded for mouse buttons pressed
 /// this frame (gameProcessed: over GUI).
-fn push_buttons(ctx: &egui::Context, q: &mut Vec<In>, gp: bool, xy: [f32; 2]) {
+fn push_buttons(
+    ctx: &egui::Context,
+    q: &mut Vec<In>,
+    mut defer_b1_up: Option<&mut Vec<In>>,
+    gp: bool,
+    xy: [f32; 2],
+) {
     let presses: Vec<(egui::PointerButton, bool)> = ctx.input(|i| {
         i.events
             .iter()
@@ -1901,14 +1967,21 @@ fn push_buttons(ctx: &egui::Context, q: &mut Vec<In>, gp: bool, xy: [f32; 2]) {
             egui::PointerButton::Middle => "MouseButton3",
             _ => continue,
         };
-        q.push(In::Uis {
+        let ev = In::Uis {
             state: if down { "Begin" } else { "End" },
             uit,
             key: "Unknown".into(),
             pos: [xy[0], xy[1], 0.0],
             delta: [0.0; 2],
             gp,
-        });
+        };
+        if !down && b == egui::PointerButton::Primary {
+            if let Some(next_q) = defer_b1_up.as_deref_mut() {
+                next_q.push(ev);
+                continue;
+            }
+        }
+        q.push(ev);
     }
 }
 
@@ -1925,11 +1998,18 @@ pub fn set_persist_dir(dir: Option<PathBuf>) {
 }
 
 impl Editor {
-    /// The nearest part along a ray, locked ones too (Mouse.Target: Studio
-    /// reports the locked Baseplate, F57).
+    /// The nearest part (or Workspace.Terrain) along a ray, locked ones too
+    /// (Mouse.Target: Studio reports the locked Baseplate, F57), skipping
+    /// `Mouse.TargetFilter` and its descendants.
     fn plugin_pick(&self, ray: &rustudio_core::math::Ray) -> Option<(Ref, f32)> {
+        let filter = self.plugins.edit_mouse_target_filter();
         let mut best: Option<(f32, Ref)> = None;
         for (sp, b) in self.game.scene.parts.iter().zip(&self.game.scene.bounds) {
+            if let Some(f) = filter {
+                if sp.r == f || self.game.doc.is_ancestor(f, sp.r) {
+                    continue;
+                }
+            }
             let oc = b.truncate() - ray.origin;
             let along = oc.dot(ray.dir);
             if oc.length_squared() - along * along > b.w * b.w || along < -b.w {
@@ -1938,6 +2018,27 @@ impl Editor {
             if let Some(t) = ray.hit_obb(&sp.xf, sp.size) {
                 if t > 0.0 && best.is_none_or(|(bt, _)| t < bt) {
                     best = Some((t, sp.r));
+                }
+            }
+        }
+        if let Some(terrain_ref) = self
+            .game
+            .doc
+            .workspace()
+            .and_then(|ws| self.game.doc.find_child(ws, "Terrain"))
+        {
+            let skipped = filter.is_some_and(|f| terrain_ref == f || self.game.doc.is_ancestor(f, terrain_ref));
+            if !skipped {
+                let max_d = best.map_or(10000.0, |(bt, _)| bt);
+                if let Some((_, _, v)) = self.game.terrain_drawn.as_ref() {
+                    if v.count() > 0 {
+                        if let Some((hit_pos, _)) = crate::terrain_editor::ray_voxels(v, ray.origin, ray.dir, max_d, false) {
+                            let t = (hit_pos - ray.origin).dot(ray.dir);
+                            if t > 0.0 && best.is_none_or(|(bt, _)| t < bt) {
+                                best = Some((t, terrain_ref));
+                            }
+                        }
+                    }
                 }
             }
         }

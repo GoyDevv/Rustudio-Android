@@ -61,6 +61,8 @@ pub enum OptKind {
     /// (saved value, shown text)
     Choice(&'static [(&'static str, &'static str)]),
     Path,
+    /// Whole-number setting clamped to `min..=max` with an optional unit suffix (e.g. "s").
+    IntRange { min: u64, max: u64, suffix: &'static str },
 }
 
 pub struct Opt {
@@ -502,6 +504,22 @@ pub const OPTS: &[Opt] = &[
         kind: OptKind::Bool,
     },
     Opt {
+        key: "autosave_enabled",
+        cat: "Auto-Save",
+        label: "Auto-Save enabled",
+        desc: "Automatically saves per-place crash-recovery snapshots for dirty Roblox Cloud and local places in the background.",
+        env: "RUSTUDIO_AUTOSAVE",
+        kind: OptKind::Bool,
+    },
+    Opt {
+        key: "autosave_interval_secs",
+        cat: "Auto-Save",
+        label: "Auto-Save interval",
+        desc: "Seconds between background auto-save snapshots (3–300s, default 5s).",
+        env: "RUSTUDIO_AUTOSAVE_INTERVAL",
+        kind: OptKind::IntRange { min: 3, max: 300, suffix: "s" },
+    },
+    Opt {
         key: "update_check",
         cat: "Updates",
         label: "Check for updates on start",
@@ -939,6 +957,7 @@ pub fn restart_pending(o: &Opt) -> bool {
         Shown::Bool(b) => b.to_string(),
         Shown::Choice(n) => n.to_string(),
         Shown::Path(p) => p,
+        Shown::Int(n) => n.to_string(),
     };
     let mut first = FIRST_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
     let first = first.get_or_insert_with(Default::default).entry(o.key).or_insert_with(|| now.clone());
@@ -950,6 +969,7 @@ pub enum Shown {
     Bool(bool),
     Choice(usize),
     Path(String),
+    Int(u64),
 }
 
 static WEAK_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1186,6 +1206,75 @@ pub fn ui_scale_choice_index() -> usize {
     UI_SCALE_CHOICES.iter().position(|&c| c == key).unwrap_or(6)
 }
 
+pub const AUTOSAVE_INTERVAL_DEFAULT_SECS: u64 = 5;
+pub const AUTOSAVE_INTERVAL_MIN_SECS: u64 = 3;
+pub const AUTOSAVE_INTERVAL_MAX_SECS: u64 = 300;
+
+/// Whether background per-place auto-save is enabled (default `true`).
+pub fn autosave_enabled() -> bool {
+    resolve_bool_opt(
+        env("RUSTUDIO_AUTOSAVE").as_deref(),
+        saved("autosave_enabled").as_ref(),
+        bool_default("autosave_enabled"),
+    ) && studio_flag("Studio", "Auto-Recovery Enabled", true)
+}
+
+pub fn set_autosave_enabled(on: bool) {
+    set_bool("autosave_enabled", on);
+}
+
+pub fn parse_autosave_interval_secs(raw: &str) -> Option<u64> {
+    let t = raw.trim().trim_end_matches(|c: char| c == 's' || c == 'S' || c.is_whitespace());
+    if let Ok(n) = t.parse::<u64>() {
+        return Some(n.clamp(AUTOSAVE_INTERVAL_MIN_SECS, AUTOSAVE_INTERVAL_MAX_SECS));
+    }
+    let f: f64 = t.parse().ok()?;
+    if f.is_finite() && f >= 0.0 {
+        Some((f.round() as u64).clamp(AUTOSAVE_INTERVAL_MIN_SECS, AUTOSAVE_INTERVAL_MAX_SECS))
+    } else {
+        None
+    }
+}
+
+/// Auto-save interval in seconds (default `5`, clamped `3..=300`).
+pub fn autosave_interval_secs() -> u64 {
+    if let Some(raw) = env("RUSTUDIO_AUTOSAVE_INTERVAL") {
+        if let Some(n) = parse_autosave_interval_secs(&raw) {
+            return n;
+        }
+    }
+    if let Some(val) = saved("autosave_interval_secs") {
+        if let Some(n) = val.as_u64() {
+            return n.clamp(AUTOSAVE_INTERVAL_MIN_SECS, AUTOSAVE_INTERVAL_MAX_SECS);
+        }
+        if let Some(f) = val.as_f64().filter(|f| f.is_finite() && *f >= 0.0) {
+            return (f.round() as u64).clamp(AUTOSAVE_INTERVAL_MIN_SECS, AUTOSAVE_INTERVAL_MAX_SECS);
+        }
+        if let Some(s) = val.as_str() {
+            if let Some(n) = parse_autosave_interval_secs(s) {
+                return n;
+            }
+        }
+    }
+    AUTOSAVE_INTERVAL_DEFAULT_SECS
+}
+
+pub fn set_autosave_interval_secs(secs: u64) {
+    let clamped = secs.clamp(AUTOSAVE_INTERVAL_MIN_SECS, AUTOSAVE_INTERVAL_MAX_SECS);
+    set(
+        "autosave_interval_secs",
+        (clamped != AUTOSAVE_INTERVAL_DEFAULT_SECS).then(|| Value::from(clamped)),
+    );
+}
+
+pub fn set_int(key: &str, v: u64) {
+    if key == "autosave_interval_secs" {
+        set_autosave_interval_secs(v);
+    } else {
+        set(key, Some(Value::from(v)));
+    }
+}
+
 pub fn shown(o: &Opt) -> Shown {
     match o.key {
         "perf_overlay" => Shown::Bool(perf_overlay_enabled()),
@@ -1207,6 +1296,8 @@ pub fn shown(o: &Opt) -> Shown {
         "builtin_material_picker" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::MaterialPicker) == ToolImpl::Roblox)),
         "project_any_path" => Shown::Bool(project_any_path()),
         "classic_death_sound" => Shown::Bool(classic_death_sound_fetch()),
+        "autosave_enabled" => Shown::Bool(autosave_enabled()),
+        "autosave_interval_secs" => Shown::Int(autosave_interval_secs()),
         "update_check" => Shown::Bool(update_check()),
         "local_assets" => Shown::Path(local_assets().map(|p| p.display().to_string()).unwrap_or_default()),
         _ => Shown::Bool(false),
@@ -1221,6 +1312,9 @@ pub fn inactive(o: &Opt) -> Option<&'static str> {
     }
     if BuiltinTool::ALL.iter().any(|t| t.key() == o.key) && !builtin_plugins() {
         return Some("Turn on Roblox's built-in plugins to choose.");
+    }
+    if o.key == "autosave_interval_secs" && !autosave_enabled() {
+        return Some("Turn on Auto-Save enabled to change the interval.");
     }
     None
 }
@@ -1413,7 +1507,8 @@ mod tests {
             match (o.kind, shown(o)) {
                 (OptKind::Bool, Shown::Bool(_))
                 | (OptKind::Choice(_), Shown::Choice(_))
-                | (OptKind::Path, Shown::Path(_)) => {}
+                | (OptKind::Path, Shown::Path(_))
+                | (OptKind::IntRange { .. }, Shown::Int(_)) => {}
                 (kind, _) => panic!("shown({}) mismatched kind {:?}", o.key, kind),
             }
         }

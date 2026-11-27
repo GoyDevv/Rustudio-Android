@@ -360,6 +360,8 @@ pub struct Editor {
     pub beta_features_changed: bool,
     /// File > Open Configs in-app viewer (Android, or Desktop fallback).
     pub configs_window_open: bool,
+    /// Per-place background auto-save and crash-recovery prompt state.
+    pub autosave: crate::autosave::AutoSaveState,
 }
 
 #[derive(Debug, Clone)]
@@ -585,6 +587,7 @@ impl RustudioApp {
             beta_features_open: false,
             beta_features_changed: false,
             configs_window_open: false,
+            autosave: crate::autosave::AutoSaveState::new(),
         };
         ed.info(format!(
             "rustudio {} ready. Reflection database has {} classes.",
@@ -932,6 +935,7 @@ impl Editor {
 
     pub fn set_document(&mut self, doc: Document) {
         self.reset_cloud_save_dialogs();
+        self.autosave.pending_recovery = None;
         // Another document closes the open project (open_project sets it again).
         self.project = None;
         crate::project_config::set_active(None);
@@ -1023,6 +1027,9 @@ impl Editor {
                 let n = d.dom.descendants().count();
                 rustudio_core::load_trace::mark("document built");
                 self.set_document(d);
+                if !harness {
+                    self.autosave.check_local_recovery(&path);
+                }
                 rustudio_core::load_trace::mark(&format!("opened ({n} instances)"));
                 self.info(format!("Opened {} ({n} instances)", path.display()));
             }
@@ -1264,8 +1271,12 @@ impl Editor {
     }
 
     pub fn save_to(&mut self, p: PathBuf) {
+        let prev_key = crate::autosave::RecoveryKey::for_doc(&self.game.doc);
         match self.game.doc.save_to(&p) {
             Ok(()) => {
+                crate::autosave::clear_recovery(&prev_key);
+                crate::autosave::clear_for_doc(&self.game.doc);
+                self.autosave.note_saved(self.game.doc.id, self.game.doc.revision);
                 crate::studio_ui::remember_recent(&mut self.ui, &p);
                 self.info(format!("Saved {}", p.display()));
             }
@@ -1285,11 +1296,91 @@ impl Editor {
         self.insert_from_file_into(None);
     }
 
+    /// Detects the model or 3D mesh format from magic bytes first (so Android SAF
+    /// cached files with generic or stripped extensions still import cleanly),
+    /// falling back to the file extension or OBJ/mesh parser probe.
+    fn detect_model_format(path: &std::path::Path, bytes: &[u8]) -> &'static str {
+        if bytes.starts_with(b"glTF") {
+            return "glb";
+        }
+        if bytes.starts_with(b"<roblox") {
+            return "rbxm";
+        }
+        if bytes.starts_with(b"Kaydara FBX") {
+            return "fbx";
+        }
+        if bytes.starts_with(b"version 1.")
+            || bytes.starts_with(b"version 2.")
+            || bytes.starts_with(b"version 3.")
+            || bytes.starts_with(b"version 4.")
+            || bytes.starts_with(b"version 5.")
+            || bytes.starts_with(b"version 6.")
+            || bytes.starts_with(b"version 7.")
+        {
+            return "mesh";
+        }
+        let no_bom = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+        let trimmed = no_bom
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map(|i| &no_bom[i..])
+            .unwrap_or(&[]);
+        if trimmed.starts_with(b"<roblox") {
+            return "rbxm";
+        }
+        if trimmed.starts_with(b"<?xml")
+            && trimmed[..trimmed.len().min(512)]
+                .windows(7)
+                .any(|w| w == b"<roblox")
+        {
+            return "rbxm";
+        }
+        if trimmed.starts_with(b"{") && trimmed.windows(7).any(|w| w == b"\"asset\"") {
+            return "gltf";
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext.eq_ignore_ascii_case("glb") {
+                return "glb";
+            }
+            if ext.eq_ignore_ascii_case("gltf") {
+                return "gltf";
+            }
+            if ext.eq_ignore_ascii_case("obj") {
+                return "obj";
+            }
+            if ext.eq_ignore_ascii_case("fbx") {
+                return "fbx";
+            }
+            if ext.eq_ignore_ascii_case("mesh") {
+                return "mesh";
+            }
+            if ext.eq_ignore_ascii_case("rbxm") {
+                return "rbxm";
+            }
+            if ext.eq_ignore_ascii_case("rbxmx") {
+                return "rbxmx";
+            }
+            if ext.eq_ignore_ascii_case("rbxl") {
+                return "rbxl";
+            }
+            if ext.eq_ignore_ascii_case("rbxlx") {
+                return "rbxlx";
+            }
+        }
+        if rustudio_core::mesh::parse(bytes).is_ok() {
+            return "obj";
+        }
+        ""
+    }
+
     pub fn insert_from_file_into(&mut self, parent: Option<Ref>) {
         use crate::file_dialog::{Kind, Purpose};
         let d = crate::file_dialog::Request::new()
             .set_title("Insert from File")
-            .add_filter("Roblox model or place", &["rbxm", "rbxmx", "rbxl", "rbxlx"]);
+            .add_filter(
+                "Models & 3D files",
+                &["rbxm", "rbxmx", "rbxl", "rbxlx", "glb", "gltf", "obj", "fbx", "mesh"],
+            );
         self.dialogs.start(Purpose::InsertModel(parent), d, Kind::PickFile);
     }
 
@@ -1300,6 +1391,11 @@ impl Editor {
     pub(crate) fn insert_model_file_into(&mut self, path: PathBuf, explicit_parent: Option<Ref>) {
         match std::fs::read(&path) {
             Ok(bytes) => {
+                let fmt = Self::detect_model_format(&path, &bytes);
+                if matches!(fmt, "glb" | "gltf" | "obj" | "fbx" | "mesh") {
+                    self.import_3d_file(path);
+                    return;
+                }
                 let target = explicit_parent
                     .filter(|&r| self.game.doc.exists(r))
                     .unwrap_or_else(|| self.paste_target(true));
@@ -1339,7 +1435,10 @@ impl Editor {
         use crate::file_dialog::{Kind, Purpose};
         let d = crate::file_dialog::Request::new()
             .set_title("Import 3D Model")
-            .add_filter("3D Models", &["obj", "fbx", "glb", "gltf"]);
+            .add_filter(
+                "3D & Roblox Models",
+                &["glb", "gltf", "obj", "fbx", "mesh", "rbxm", "rbxmx", "rbxl", "rbxlx"],
+            );
         self.dialogs.start(Purpose::Import3D, d, Kind::PickFile);
     }
 
@@ -1366,7 +1465,7 @@ impl Editor {
     }
 
     fn import_3d_file(&mut self, path: PathBuf) {
-        use rbx_dom_weak::types::{CFrame, Color3, Matrix3, Variant, Vector3};
+        use rbx_dom_weak::types::{CFrame, Color3, Content, Matrix3, Variant, Vector3};
         use std::sync::atomic::{AtomicU64, Ordering};
         static IMPORT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1377,11 +1476,11 @@ impl Editor {
                 return;
             }
         };
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
+        let fmt = Self::detect_model_format(&path, &bytes);
+        if matches!(fmt, "rbxm" | "rbxmx" | "rbxl" | "rbxlx") {
+            self.insert_model_file_into(path, None);
+            return;
+        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1391,11 +1490,27 @@ impl Editor {
         let parent = self.game.doc.default_parent();
         let seq = IMPORT_SEQ.fetch_add(1, Ordering::Relaxed);
 
-        match ext.as_str() {
+        // Spawn imported models right in front of the current camera and cleanly
+        // above Y = 0 so small models are never buried inside the Baseplate or
+        // placed off-screen.
+        let cam_pos = self.game.cam.pos;
+        let cam_fwd = self.game.cam.forward();
+        let placement_offset = |min_all: Vec3, max_all: Vec3| -> Vec3 {
+            let extent = (max_all - min_all).max(Vec3::splat(0.001));
+            let radius = (extent.length() * 0.5).max(0.5);
+            let dist = (radius * 3.0).clamp(6.0, 60.0);
+            let target = cam_pos + cam_fwd * dist;
+            let min_center_y = extent.y * 0.5 + 0.5;
+            let target_center = Vec3::new(target.x, target.y.max(min_center_y), target.z);
+            target_center - (min_all + max_all) * 0.5
+        };
+
+        match fmt {
             "obj" => match rustudio_core::mesh::parse(&bytes) {
                 Ok(m) if m.positions.len() >= 3 => {
                     let size = (m.max - m.min).max(Vec3::splat(0.001));
                     let centre = (m.max + m.min) * 0.5;
+                    let pos = centre + placement_offset(m.min, m.max);
                     let centered: Vec<Vec3> = m.positions.iter().map(|p| *p - centre).collect();
                     let mesh_id = format!("rbxtemp://rustudio/import/obj/{seq}");
                     let v2 = crate::export_3d::mesh_data_to_v2(&centered, &m.normals, &m.uvs);
@@ -1403,13 +1518,14 @@ impl Editor {
                     rustudio_core::assets::bump_mesh_generation();
                     let builder = InstanceBuilder::new("MeshPart")
                         .with_name(stem)
-                        .with_property("MeshId", Variant::ContentId(mesh_id.into()))
+                        .with_property("MeshId", Variant::ContentId(mesh_id.clone().into()))
+                        .with_property("MeshContent", Variant::Content(Content::from_uri(mesh_id)))
                         .with_property("Size", Vector3::new(size.x, size.y, size.z))
                         .with_property("InitialSize", Vector3::new(size.x, size.y, size.z))
                         .with_property("MeshSize", Vector3::new(size.x, size.y, size.z))
                         .with_property(
                             "CFrame",
-                            CFrame::new(Vector3::new(centre.x, centre.y, centre.z), Matrix3::identity()),
+                            CFrame::new(Vector3::new(pos.x, pos.y, pos.z), Matrix3::identity()),
                         )
                         .with_property("Anchored", true);
                     let r = self.game.doc.insert(parent, builder);
@@ -1420,10 +1536,44 @@ impl Editor {
                 Ok(_) => self.error(format!("OBJ file {} contains no triangles", path.display())),
                 Err(e) => self.error(format!("Could not import OBJ {}: {e}", path.display())),
             },
+            "mesh" => match rustudio_core::mesh::parse(&bytes) {
+                Ok(m) if m.positions.len() >= 3 => {
+                    let size = (m.max - m.min).max(Vec3::splat(0.001));
+                    let centre = (m.max + m.min) * 0.5;
+                    let pos = centre + placement_offset(m.min, m.max);
+                    let mesh_id = format!("rbxtemp://rustudio/import/mesh/{seq}");
+                    rustudio_core::assets::register_generated(&mesh_id, bytes);
+                    rustudio_core::assets::bump_mesh_generation();
+                    let builder = InstanceBuilder::new("MeshPart")
+                        .with_name(stem)
+                        .with_property("MeshId", Variant::ContentId(mesh_id.clone().into()))
+                        .with_property("MeshContent", Variant::Content(Content::from_uri(mesh_id)))
+                        .with_property("Size", Vector3::new(size.x, size.y, size.z))
+                        .with_property("InitialSize", Vector3::new(size.x, size.y, size.z))
+                        .with_property("MeshSize", Vector3::new(size.x, size.y, size.z))
+                        .with_property(
+                            "CFrame",
+                            CFrame::new(Vector3::new(pos.x, pos.y, pos.z), Matrix3::identity()),
+                        )
+                        .with_property("Anchored", true);
+                    let r = self.game.doc.insert(parent, builder);
+                    self.explorer.expanded.insert(parent);
+                    self.select(vec![r]);
+                    self.info(format!("Imported Roblox mesh from {}", path.display()));
+                }
+                Ok(_) => self.error(format!("Mesh file {} contains no triangles", path.display())),
+                Err(e) => self.error(format!("Could not import mesh {}: {e}", path.display())),
+            },
             "fbx" => match rustudio_core::fbx::import(&bytes) {
                 Ok(nodes) => {
+                    let mut min_all = Vec3::splat(f32::MAX);
+                    let mut max_all = Vec3::splat(f32::MIN);
                     for (i, node) in nodes.iter().enumerate() {
                         if let Some(g) = &node.mesh {
+                            for pt in &g.positions {
+                                min_all = min_all.min(*pt);
+                                max_all = max_all.max(*pt);
+                            }
                             rustudio_core::assets::register_generated(
                                 &format!("rbxtemp://rustudio/import/fbx/{seq}/{i}"),
                                 rustudio_core::fbx::mesh_v2(g),
@@ -1436,6 +1586,11 @@ impl Editor {
                             );
                         }
                     }
+                    let offset = if min_all.x <= max_all.x {
+                        placement_offset(min_all, max_all)
+                    } else {
+                        Vec3::ZERO
+                    };
                     rustudio_core::assets::bump_mesh_generation();
                     let root_model = self.game.doc.insert(parent, InstanceBuilder::new("Model").with_name(stem));
                     let mut made: Vec<Ref> = Vec::with_capacity(nodes.len());
@@ -1449,20 +1604,19 @@ impl Editor {
                                     hi = hi.max(*pt);
                                 }
                                 let size = (hi - lo).max(Vec3::splat(0.001));
-                                let centre = (hi + lo) * 0.5;
+                                let pos = (hi + lo) * 0.5 + offset;
                                 let color = n.color.unwrap_or([163.0 / 255.0, 162.0 / 255.0, 165.0 / 255.0]);
+                                let mesh_id = format!("rbxtemp://rustudio/import/fbx/{seq}/{i}");
                                 let mut b = InstanceBuilder::new("MeshPart")
                                     .with_name(n.name.clone())
-                                    .with_property(
-                                        "MeshId",
-                                        Variant::ContentId(format!("rbxtemp://rustudio/import/fbx/{seq}/{i}").into()),
-                                    )
+                                    .with_property("MeshId", Variant::ContentId(mesh_id.clone().into()))
+                                    .with_property("MeshContent", Variant::Content(Content::from_uri(mesh_id)))
                                     .with_property("Size", Vector3::new(size.x, size.y, size.z))
                                     .with_property("InitialSize", Vector3::new(size.x, size.y, size.z))
                                     .with_property("MeshSize", Vector3::new(size.x, size.y, size.z))
                                     .with_property(
                                         "CFrame",
-                                        CFrame::new(Vector3::new(centre.x, centre.y, centre.z), Matrix3::identity()),
+                                        CFrame::new(Vector3::new(pos.x, pos.y, pos.z), Matrix3::identity()),
                                     )
                                     .with_property("Color", Color3::new(color[0], color[1], color[2]))
                                     .with_property("Anchored", true);
@@ -1487,6 +1641,19 @@ impl Editor {
             },
             "glb" | "gltf" => match crate::export_3d::parse_gltf(&path, &bytes) {
                 Ok(meshes) => {
+                    let mut min_all = Vec3::splat(f32::MAX);
+                    let mut max_all = Vec3::splat(f32::MIN);
+                    for m in &meshes {
+                        for pt in &m.positions {
+                            min_all = min_all.min(*pt);
+                            max_all = max_all.max(*pt);
+                        }
+                    }
+                    let offset = if min_all.x <= max_all.x {
+                        placement_offset(min_all, max_all)
+                    } else {
+                        Vec3::ZERO
+                    };
                     let container = if meshes.len() > 1 {
                         Some(self.game.doc.insert(parent, InstanceBuilder::new("Model").with_name(stem)))
                     } else {
@@ -1502,23 +1669,30 @@ impl Editor {
                         }
                         let size = (hi - lo).max(Vec3::splat(0.001));
                         let centre = (hi + lo) * 0.5;
+                        let pos = centre + offset;
                         let centered: Vec<Vec3> = m.positions.iter().map(|pt| *pt - centre).collect();
                         let mesh_id = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}");
                         let v2 = crate::export_3d::mesh_data_to_v2(&centered, &m.normals, &m.uvs);
                         rustudio_core::assets::register_generated(&mesh_id, v2);
                         let color = m.color.unwrap_or([163.0 / 255.0, 162.0 / 255.0, 165.0 / 255.0]);
-                        let builder = InstanceBuilder::new("MeshPart")
+                        let mut builder = InstanceBuilder::new("MeshPart")
                             .with_name(m.name.clone())
-                            .with_property("MeshId", Variant::ContentId(mesh_id.into()))
+                            .with_property("MeshId", Variant::ContentId(mesh_id.clone().into()))
+                            .with_property("MeshContent", Variant::Content(Content::from_uri(mesh_id)))
                             .with_property("Size", Vector3::new(size.x, size.y, size.z))
                             .with_property("InitialSize", Vector3::new(size.x, size.y, size.z))
                             .with_property("MeshSize", Vector3::new(size.x, size.y, size.z))
                             .with_property(
                                 "CFrame",
-                                CFrame::new(Vector3::new(centre.x, centre.y, centre.z), Matrix3::identity()),
+                                CFrame::new(Vector3::new(pos.x, pos.y, pos.z), Matrix3::identity()),
                             )
                             .with_property("Color", Color3::new(color[0], color[1], color[2]))
                             .with_property("Anchored", true);
+                        if let Some(tex) = &m.texture {
+                            let tex_id = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}.tex");
+                            rustudio_core::assets::register_generated(&tex_id, tex.clone());
+                            builder = builder.with_property("TextureID", Variant::ContentId(tex_id.into()));
+                        }
                         inserted.push(self.game.doc.insert(target_parent, builder));
                     }
                     rustudio_core::assets::bump_mesh_generation();
@@ -3112,6 +3286,9 @@ impl eframe::App for RustudioApp {
         rustudio_core::rustudio_settings::flush();
         rustudio_render::pipeline_cache::save(true);
         crate::plugin_host::widgets_ui::on_exit();
+        if !self.ed.game.doc.dirty() {
+            crate::autosave::clear_for_doc(&self.ed.game.doc);
+        }
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.mobile_windows, &self.ed);
         }
@@ -3125,16 +3302,9 @@ impl eframe::App for RustudioApp {
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.mobile_windows, &self.ed);
         }
-        if self.ed.game.doc.dirty() && self.ed.game.play.is_none() {
-            let dir = rustudio_core::paths::data().join("AutoSaves");
-            let _ = std::fs::create_dir_all(&dir);
-            let tmp = dir.join("autosave.rbxl.tmp");
-            let dst = dir.join("autosave.rbxl");
-            if let Ok(bytes) = self.ed.game.doc.encode_all(false) {
-                if std::fs::write(&tmp, bytes).is_ok() {
-                    let _ = std::fs::rename(&tmp, &dst);
-                }
-            }
+        let is_start = self.ed.start.visible && self.ed.game.doc.id == self.ed.start.doc_id;
+        if !is_start {
+            self.ed.autosave.flush_sync(&self.ed.game.doc, self.ed.game.play.is_some());
         }
         if crate::android::lifecycle::is_backgrounded() {
             self.watchdog.hidden();
@@ -3696,6 +3866,14 @@ impl RustudioApp {
             self.watchdog.complete();
             return;
         }
+        let is_harness = ed.harness.run.screenshot.is_some()
+            || ed.harness.selftest.is_some()
+            || ed.harness.run.bench.is_some()
+            || ed.harness.ui_shots.is_some()
+            || ed.harness.run.no_ui;
+        if !is_harness {
+            ed.autosave.tick(&ed.game.doc, ed.game.play.is_some());
+        }
         self.watchdog.stage("scene synchronization", "dock UI and GPU viewport preparation");
         ed.shortcuts(&ctx);
         let script_active = ed.is_script_maximized()
@@ -3927,6 +4105,8 @@ impl RustudioApp {
             || self.ed.configs_window_open
             || self.ed.project_choice.is_some()
             || self.ed.confirm_discard.is_some()
+            || self.ed.autosave.pending_recovery.is_some()
+            || self.ed.cloud.published_banner.is_some()
             || self.ed.game.account.open
             || egui::Popup::is_any_open(&ctx);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("rustudio_modal_open"), dock_modal_open));
@@ -3987,7 +4167,9 @@ impl RustudioApp {
             || self.ed.beta_features_open
             || self.ed.configs_window_open
             || self.ed.project_choice.is_some()
-            || self.ed.confirm_discard.is_some();
+            || self.ed.confirm_discard.is_some()
+            || self.ed.autosave.pending_recovery.is_some()
+            || self.ed.cloud.published_banner.is_some();
         let mobile_actions = {
             let mut viewer = Viewer { ed: &mut self.ed, window: None, windows: &windows };
             self.mobile_windows.show(&ctx, dock_rect, modal_open, |ui, tab| viewer.ui(ui, tab))
@@ -4213,6 +4395,7 @@ impl RustudioApp {
             ed.character_builder_window(&ctx);
         }
         ed.cloud_windows(&ctx);
+        ed.autosave_recovery_modal(&ctx);
         ed.mcp_windows(&ctx);
         ed.file_sync_popover_ui(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");

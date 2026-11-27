@@ -38,6 +38,8 @@ pub struct ImportedMesh {
     pub uvs: Vec<Vec2>,
     /// Optional sRGB base colour in `0.0..=1.0`.
     pub color: Option<[f32; 3]>,
+    /// Optional embedded base-colour texture bytes (PNG/JPEG/etc.).
+    pub texture: Option<Vec<u8>>,
 }
 
 fn linear_to_srgb(c: f32) -> f32 {
@@ -788,6 +790,7 @@ pub fn parse_gltf(path: &Path, bytes: &[u8]) -> Result<Vec<ImportedMesh>, String
             extract_gltf_mesh(
                 &json,
                 &buffers,
+                base_dir,
                 mesh,
                 &materials,
                 &name,
@@ -809,7 +812,7 @@ pub fn parse_gltf(path: &Path, bytes: &[u8]) -> Result<Vec<ImportedMesh>, String
                 .or_else(|| mesh.get("name").and_then(|v| v.as_str()))
                 .unwrap_or("Mesh")
                 .to_string();
-            extract_gltf_mesh(&json, &buffers, mesh, &materials, &name, ni, world, &mut out)?;
+            extract_gltf_mesh(&json, &buffers, base_dir, mesh, &materials, &name, ni, world, &mut out)?;
         }
     }
 
@@ -874,6 +877,7 @@ fn node_local_mat4(node: &serde_json::Value) -> Mat4 {
 fn extract_gltf_mesh(
     json: &serde_json::Value,
     buffers: &[Vec<u8>],
+    base_dir: &Path,
     mesh: &serde_json::Value,
     materials: &[serde_json::Value],
     base_name: &str,
@@ -887,7 +891,7 @@ fn extract_gltf_mesh(
     let normal_mat = Mat3::from_mat4(world).inverse().transpose();
     for (pi, prim) in prims.iter().enumerate() {
         let mode = prim.get("mode").and_then(|v| v.as_u64()).unwrap_or(4);
-        if mode != 4 {
+        if !matches!(mode, 4 | 5 | 6) {
             continue;
         }
         let Some(attrs) = prim.get("attributes") else { continue };
@@ -906,16 +910,61 @@ fn extract_gltf_mesh(
             .get("TEXCOORD_0")
             .and_then(|v| v.as_u64())
             .and_then(|idx| read_vec2_accessor(json, buffers, idx as usize).ok());
+        let raw_col = attrs
+            .get("COLOR_0")
+            .and_then(|v| v.as_u64())
+            .and_then(|idx| read_color_accessor(json, buffers, idx as usize).ok());
         let indices: Vec<u32> = match prim.get("indices").and_then(|v| v.as_u64()) {
             Some(idx) => read_indices_accessor(json, buffers, idx as usize)?,
             None => (0..raw_pos.len() as u32).collect(),
         };
 
-        let mut positions = Vec::with_capacity(indices.len());
-        let mut normals = Vec::with_capacity(indices.len());
-        let mut uvs = Vec::with_capacity(indices.len());
-        for tri in indices.chunks_exact(3) {
-            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        // Expand TRIANGLES (4), TRIANGLE_STRIP (5), or TRIANGLE_FAN (6) into triangle index triples.
+        let mut tri_indices: Vec<[usize; 3]> = Vec::new();
+        match mode {
+            4 => {
+                tri_indices.reserve(indices.len() / 3);
+                for tri in indices.chunks_exact(3) {
+                    tri_indices.push([tri[0] as usize, tri[1] as usize, tri[2] as usize]);
+                }
+            }
+            5 => {
+                if indices.len() >= 3 {
+                    tri_indices.reserve(indices.len() - 2);
+                    for i in 0..indices.len() - 2 {
+                        let (a, b, c) = if i % 2 == 0 {
+                            (indices[i] as usize, indices[i + 1] as usize, indices[i + 2] as usize)
+                        } else {
+                            (indices[i + 1] as usize, indices[i] as usize, indices[i + 2] as usize)
+                        };
+                        if a != b && b != c && a != c {
+                            tri_indices.push([a, b, c]);
+                        }
+                    }
+                }
+            }
+            6 => {
+                if indices.len() >= 3 {
+                    tri_indices.reserve(indices.len() - 2);
+                    let root = indices[0] as usize;
+                    for i in 1..indices.len() - 1 {
+                        let (b, c) = (indices[i] as usize, indices[i + 1] as usize);
+                        if root != b && b != c && root != c {
+                            tri_indices.push([root, b, c]);
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+
+        let mut positions = Vec::with_capacity(tri_indices.len() * 3);
+        let mut normals = Vec::with_capacity(tri_indices.len() * 3);
+        let mut uvs = Vec::with_capacity(tri_indices.len() * 3);
+        let mut col_sum = [0.0f64; 3];
+        let mut col_count = 0usize;
+
+        for [i0, i1, i2] in tri_indices {
             if i0 >= raw_pos.len() || i1 >= raw_pos.len() || i2 >= raw_pos.len() {
                 continue;
             }
@@ -938,15 +987,26 @@ fn extract_gltf_mesh(
                         .and_then(|us| us.get(vi).copied())
                         .unwrap_or(Vec2::ZERO),
                 );
+                if let Some(cols) = &raw_col {
+                    if let Some(c) = cols.get(vi) {
+                        col_sum[0] += c[0] as f64;
+                        col_sum[1] += c[1] as f64;
+                        col_sum[2] += c[2] as f64;
+                        col_count += 1;
+                    }
+                }
             }
         }
         if positions.is_empty() {
             continue;
         }
-        let color = prim
+
+        let mat = prim
             .get("material")
             .and_then(|v| v.as_u64())
-            .and_then(|mi| materials.get(mi as usize))
+            .and_then(|mi| materials.get(mi as usize));
+        let texture = mat.and_then(|m| extract_material_texture(json, buffers, base_dir, m));
+        let mut color = mat
             .and_then(|m| m.get("pbrMetallicRoughness"))
             .and_then(|p| p.get("baseColorFactor"))
             .and_then(|c| c.as_array())
@@ -958,6 +1018,19 @@ fn extract_gltf_mesh(
                     linear_to_srgb(a[2].as_f64().unwrap_or(0.64) as f32),
                 ]
             });
+
+        let is_default_white = color
+            .map(|c| c[0] >= 0.99 && c[1] >= 0.99 && c[2] >= 0.99)
+            .unwrap_or(true);
+        if texture.is_none() && is_default_white && col_count > 0 {
+            let inv = 1.0 / col_count as f64;
+            color = Some([
+                linear_to_srgb((col_sum[0] * inv) as f32),
+                linear_to_srgb((col_sum[1] * inv) as f32),
+                linear_to_srgb((col_sum[2] * inv) as f32),
+            ]);
+        }
+
         let name = if prims.len() > 1 {
             format!("{base_name}_{pi}")
         } else {
@@ -969,9 +1042,105 @@ fn extract_gltf_mesh(
             normals,
             uvs,
             color,
+            texture,
         });
     }
     Ok(())
+}
+
+fn extract_material_texture(
+    json: &serde_json::Value,
+    buffers: &[Vec<u8>],
+    base_dir: &Path,
+    mat: &serde_json::Value,
+) -> Option<Vec<u8>> {
+    let tex_idx = mat
+        .get("pbrMetallicRoughness")?
+        .get("baseColorTexture")?
+        .get("index")?
+        .as_u64()? as usize;
+    let img_idx = json
+        .get("textures")?
+        .as_array()?
+        .get(tex_idx)?
+        .get("source")?
+        .as_u64()? as usize;
+    let img = json.get("images")?.as_array()?.get(img_idx)?;
+
+    if let Some(bv_idx) = img.get("bufferView").and_then(|v| v.as_u64()) {
+        let bv = json.get("bufferViews")?.as_array()?.get(bv_idx as usize)?;
+        let buf_idx = bv.get("buffer").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let buf = buffers.get(buf_idx)?;
+        let offset = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let len = bv.get("byteLength").and_then(|v| v.as_u64())? as usize;
+        let end = offset.checked_add(len)?;
+        if end <= buf.len() {
+            return Some(buf[offset..end].to_vec());
+        }
+    }
+    if let Some(uri) = img.get("uri").and_then(|u| u.as_str()) {
+        if let Some(rest) = uri.strip_prefix("data:") {
+            let b64 = rest.split_once(',').map(|(_, d)| d)?;
+            return decode_base64(b64).ok();
+        } else {
+            let rel = uri.replace("%20", " ");
+            return std::fs::read(base_dir.join(rel)).ok();
+        }
+    }
+    None
+}
+
+fn component_byte_size(comp: u64) -> Option<usize> {
+    match comp {
+        5120 | 5121 => Some(1),
+        5122 | 5123 => Some(2),
+        5125 | 5126 => Some(4),
+        _ => None,
+    }
+}
+
+fn read_component_f32(slice: &[u8], offset: usize, comp: u64, normalized: bool) -> f32 {
+    match comp {
+        5120 => {
+            let v = slice[offset] as i8 as f32;
+            if normalized {
+                (v / 127.0).max(-1.0)
+            } else {
+                v
+            }
+        }
+        5121 => {
+            let v = slice[offset] as f32;
+            if normalized {
+                v / 255.0
+            } else {
+                v
+            }
+        }
+        5122 => {
+            let v = i16::from_le_bytes([slice[offset], slice[offset + 1]]) as f32;
+            if normalized {
+                (v / 32767.0).max(-1.0)
+            } else {
+                v
+            }
+        }
+        5123 => {
+            let v = u16::from_le_bytes([slice[offset], slice[offset + 1]]) as f32;
+            if normalized {
+                v / 65535.0
+            } else {
+                v
+            }
+        }
+        5126 => f32::from_le_bytes([
+            slice[offset],
+            slice[offset + 1],
+            slice[offset + 2],
+            slice[offset + 3],
+        ]),
+        _ => 0.0,
+    }
 }
 
 fn accessor_slice<'a>(
@@ -1026,16 +1195,24 @@ fn read_vec3_accessor(
     buffers: &[Vec<u8>],
     acc_idx: usize,
 ) -> Result<Vec<Vec3>, String> {
-    let (slice, count, stride, comp) = accessor_slice(json, buffers, acc_idx, 12)?;
-    if comp != 5126 {
+    let acc = json
+        .get("accessors")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(acc_idx))
+        .ok_or_else(|| format!("glTF missing accessor {acc_idx}"))?;
+    let comp = acc.get("componentType").and_then(|v| v.as_u64()).unwrap_or(0);
+    let normalized = acc.get("normalized").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !matches!(comp, 5120 | 5121 | 5122 | 5123 | 5126) {
         return Err(format!("Unsupported glTF VEC3 componentType {comp}"));
     }
+    let csize = component_byte_size(comp).unwrap();
+    let (slice, count, stride, _) = accessor_slice(json, buffers, acc_idx, csize * 3)?;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let o = i * stride;
-        let x = f32::from_le_bytes([slice[o], slice[o + 1], slice[o + 2], slice[o + 3]]);
-        let y = f32::from_le_bytes([slice[o + 4], slice[o + 5], slice[o + 6], slice[o + 7]]);
-        let z = f32::from_le_bytes([slice[o + 8], slice[o + 9], slice[o + 10], slice[o + 11]]);
+        let x = read_component_f32(slice, o, comp, normalized);
+        let y = read_component_f32(slice, o + csize, comp, normalized);
+        let z = read_component_f32(slice, o + csize * 2, comp, normalized);
         out.push(Vec3::new(x, y, z));
     }
     Ok(out)
@@ -1046,16 +1223,61 @@ fn read_vec2_accessor(
     buffers: &[Vec<u8>],
     acc_idx: usize,
 ) -> Result<Vec<Vec2>, String> {
-    let (slice, count, stride, comp) = accessor_slice(json, buffers, acc_idx, 8)?;
-    if comp != 5126 {
+    let acc = json
+        .get("accessors")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(acc_idx))
+        .ok_or_else(|| format!("glTF missing accessor {acc_idx}"))?;
+    let comp = acc.get("componentType").and_then(|v| v.as_u64()).unwrap_or(0);
+    let normalized = acc.get("normalized").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !matches!(comp, 5120 | 5121 | 5122 | 5123 | 5126) {
         return Err(format!("Unsupported glTF VEC2 componentType {comp}"));
     }
+    let csize = component_byte_size(comp).unwrap();
+    let (slice, count, stride, _) = accessor_slice(json, buffers, acc_idx, csize * 2)?;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let o = i * stride;
-        let u = f32::from_le_bytes([slice[o], slice[o + 1], slice[o + 2], slice[o + 3]]);
-        let v = f32::from_le_bytes([slice[o + 4], slice[o + 5], slice[o + 6], slice[o + 7]]);
+        let u = read_component_f32(slice, o, comp, normalized);
+        let v = read_component_f32(slice, o + csize, comp, normalized);
         out.push(Vec2::new(u, v));
+    }
+    Ok(out)
+}
+
+fn read_color_accessor(
+    json: &serde_json::Value,
+    buffers: &[Vec<u8>],
+    acc_idx: usize,
+) -> Result<Vec<[f32; 3]>, String> {
+    let acc = json
+        .get("accessors")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(acc_idx))
+        .ok_or_else(|| format!("glTF missing COLOR_0 accessor {acc_idx}"))?;
+    let ncomp = match acc.get("type").and_then(|v| v.as_str()) {
+        Some("VEC3") => 3usize,
+        Some("VEC4") => 4usize,
+        other => return Err(format!("Unsupported glTF COLOR_0 type {other:?}")),
+    };
+    let comp = acc.get("componentType").and_then(|v| v.as_u64()).unwrap_or(0);
+    if !matches!(comp, 5120 | 5121 | 5122 | 5123 | 5126) {
+        return Err(format!("Unsupported glTF COLOR_0 componentType {comp}"));
+    }
+    // Per glTF 2.0 spec, integer COLOR_0 attributes are normalized.
+    let normalized = acc
+        .get("normalized")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(matches!(comp, 5121 | 5123));
+    let csize = component_byte_size(comp).unwrap();
+    let (slice, count, stride, _) = accessor_slice(json, buffers, acc_idx, csize * ncomp)?;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = i * stride;
+        let r = read_component_f32(slice, o, comp, normalized).clamp(0.0, 1.0);
+        let g = read_component_f32(slice, o + csize, comp, normalized).clamp(0.0, 1.0);
+        let b = read_component_f32(slice, o + csize * 2, comp, normalized).clamp(0.0, 1.0);
+        out.push([r, g, b]);
     }
     Ok(out)
 }

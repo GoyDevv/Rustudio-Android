@@ -694,6 +694,30 @@ impl PluginHost {
         e.rt.lua.app_data_ref::<vm::PluginVm>()?.active
     }
 
+    /// True when an activated plugin in the edit DataModel requested exclusive mouse.
+    pub fn active_plugin_exclusive_mouse(&self) -> bool {
+        let Some(e) = self.edit.as_ref() else {
+            return false;
+        };
+        let Some(v) = e.rt.lua.app_data_ref::<vm::PluginVm>() else {
+            return false;
+        };
+        let Some(active) = v.active else {
+            return false;
+        };
+        v.plugins
+            .iter()
+            .any(|p| p.id == active && p.activated && p.exclusive_mouse)
+    }
+
+    /// The edit VM's `Mouse.TargetFilter` / `PluginMouse.TargetFilter`, if set.
+    pub fn edit_mouse_target_filter(&self) -> Option<Ref> {
+        self.edit
+            .as_ref()
+            .and_then(|e| e.world.as_ref())
+            .and_then(|w| w.input.mouse_target_filter)
+    }
+
     /// The edit VM's plugin UI objects (toolbars, buttons, actions, menus,
     /// widgets, mice) for the UI.
     pub fn ui_items(&self) -> Vec<UiItem> {

@@ -74,7 +74,11 @@ pub struct LightShadows {
 
 impl LightShadows {
     fn new(device: &wgpu::Device, caps: &crate::gpu_caps::GpuCaps) -> Self {
-        let side = rustudio_core::mech::LSHADOW_ATLAS;
+        let side = if caps.is_powervr() && !caps.hdr_float_rt {
+            1
+        } else {
+            rustudio_core::mech::LSHADOW_ATLAS
+        };
         let tex = |label: &str, format, usage| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -3351,7 +3355,7 @@ pub(crate) fn single_sample_shader(source: String) -> String {
 ///   where concurrent `vkCreateGraphicsPipelines` across threads can corrupt
 ///   internal driver mutexes (`FORTIFY: pthread_mutex_lock called on a destroyed mutex`).
 fn use_incremental_pipelines(caps: &crate::gpu_caps::GpuCaps) -> bool {
-    if caps.backend == wgpu::Backend::Gl {
+    if caps.backend == wgpu::Backend::Gl || caps.is_powervr() {
         return true;
     }
     if cfg!(target_os = "android") && caps.backend == wgpu::Backend::Vulkan {
@@ -3415,8 +3419,8 @@ pub struct Renderer {
     postfx: crate::postfx::PostFx,
     last_postfx: crate::postfx::PostFxParams,
     pub defer_postfx: bool,
-    shadow: wgpu::RenderPipeline,
-    shadow_cutout: wgpu::RenderPipeline,
+    shadow: Option<wgpu::RenderPipeline>,
+    shadow_cutout: Option<wgpu::RenderPipeline>,
     /// Each sun cascade's static casters, kept between redraws (SunCache).
     sun_cache: SunCache,
     /// Local light shadow maps (Studio's Future path) and their pass.
@@ -3444,8 +3448,8 @@ pub struct Renderer {
     caster_flushes: u64,
     /// Smooth terrain (round 21): per-chunk triangle buffers, drawn with
     /// Studio's terrain shading, and their per-palette parameters.
-    terrain_shadow: wgpu::RenderPipeline,
-    terrain_shadow_back: wgpu::RenderPipeline,
+    terrain_shadow: Option<wgpu::RenderPipeline>,
+    terrain_shadow_back: Option<wgpu::RenderPipeline>,
     terrain_params_buf: wgpu::Buffer,
     terrain_bg: wgpu::BindGroup,
     terrain_chunks: HashMap<[i32; 3], TerrainChunk>,
@@ -3463,7 +3467,10 @@ pub struct Renderer {
     /// The depth map the sun's cascades are drawn into, one at a time.
     shadow_view: wgpu::TextureView,
     /// The sun's shadow cascades: the atlas the shaders read (sun_shadow.rs).
-    sun: crate::sun_shadow::SunShadows,
+    /// Omitted on PowerVR GLES (`is_powervr() && !hdr_float_rt`) where shadows are always off.
+    sun: Option<crate::sun_shadow::SunShadows>,
+    /// The sun shadow atlas texture view (real atlas or 1x1 dummy when `sun` is None).
+    sun_atlas_view: wgpu::TextureView,
     /// Terrain.Clouds' passes (clouds.rs), made on first use.
     clouds: [Option<crate::clouds::CloudsGpu>; 3],
     sky_tex: wgpu::Texture,
@@ -3768,11 +3775,13 @@ impl Renderer {
             },
             mapped_at_creation: false,
         });
+        let skip_shadow_atlases = caps.is_powervr() && !caps.hdr_float_rt;
+        let shadow_side = if skip_shadow_atlases { 1 } else { SHADOW_SIZE };
         let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sun shadow map"),
             size: wgpu::Extent3d {
-                width: SHADOW_SIZE,
-                height: SHADOW_SIZE,
+                width: shadow_side,
+                height: shadow_side,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -3877,7 +3886,25 @@ impl Renderer {
             ..Default::default()
         });
         let lshadow = LightShadows::new(device, &caps);
-        let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view, caps.hdr_float_rt);
+        let (sun, sun_atlas_view) = if skip_shadow_atlases {
+            let dummy = device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("sun shadow atlas dummy"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default());
+            (None, dummy)
+        } else {
+            let s = crate::sun_shadow::SunShadows::new(device, &shadow_view, caps.hdr_float_rt);
+            let v = s.atlas_view.clone();
+            (Some(s), v)
+        };
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
         // current slot, 21 the slot it blends to.
         let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), scene_hdr_format(&caps), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
@@ -3888,7 +3915,7 @@ impl Renderer {
             &lights_buf,
             &sky_view,
             &sky_sampler,
-            &sun.atlas_view,
+            &sun_atlas_view,
             &lightgrid_view,
             &lightocc_view,
             &localgrid_view,
@@ -3909,7 +3936,7 @@ impl Renderer {
             &lights_buf,
             &sky_view,
             &sky_sampler,
-            &sun.atlas_view,
+            &sun_atlas_view,
             &lightgrid_view,
             &lightocc_view,
             &localgrid_view,
@@ -4103,75 +4130,6 @@ impl Renderer {
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
         });
-        // A cascade of the sun's shadow: depth only, both sides (thin
-        // parts). No depth bias: the EVSM test's minimum variance is the bias.
-        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shadow"),
-            bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout)],
-            immediate_size: 0,
-        });
-        let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
-        });
-        let shadow_cutout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shadow cutout"),
-            bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout), Some(&tex_layout)],
-            immediate_size: 0,
-        });
-        let shadow_cutout = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow cutout"),
-            layout: Some(&shadow_cutout_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow_cutout"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout), Some(instance_layout)],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_shadow_cutout"),
-                compilation_options: Default::default(),
-                targets: &[],
-            }),
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
-        });
         let sun_cache = SunCache::new(device);
         // Smooth terrain (round 21): its own vertices (terrain.rs
         // TerrainVertex) and per-palette parameters in group 1.
@@ -4207,58 +4165,132 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
         };
-        let terrain_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
-        });
-        let terrain_shadow_back = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
-        });
+        // A cascade of the sun's shadow: depth only, both sides (thin
+        // parts). No depth bias: the EVSM test's minimum variance is the bias.
+        let (shadow, shadow_cutout, terrain_shadow, terrain_shadow_back) = if let Some(sun) = sun.as_ref() {
+            let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow"),
+                bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout)],
+                immediate_size: 0,
+            });
+            let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow"),
+                layout: Some(&shadow_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_shadow"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: T::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(C::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: crate::pipeline_cache::current(),
+            });
+            let shadow_cutout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow cutout"),
+                bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout), Some(&tex_layout)],
+                immediate_size: 0,
+            });
+            let shadow_cutout = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow cutout"),
+                layout: Some(&shadow_cutout_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_shadow_cutout"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vertex_layout), Some(instance_layout)],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: T::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(C::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_shadow_cutout"),
+                    compilation_options: Default::default(),
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: crate::pipeline_cache::current(),
+            });
+            let terrain_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("terrain shadow"),
+                layout: Some(&shadow_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_terrain_shadow"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(terrain_vertex_layout.clone())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: T::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(C::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: crate::pipeline_cache::current(),
+            });
+            let terrain_shadow_back = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("terrain shadow"),
+                layout: Some(&shadow_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_terrain_shadow"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(terrain_vertex_layout.clone())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: T::TriangleList,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(C::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: crate::pipeline_cache::current(),
+            });
+            (Some(shadow), Some(shadow_cutout), Some(terrain_shadow), Some(terrain_shadow_back))
+        } else {
+            (None, None, None, None)
+        };
         let sky_globals = reduced.then(|| {
             let layout = Self::sky_globals_layout(device);
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
@@ -4329,6 +4361,7 @@ impl Renderer {
             lights_buf,
             shadow_view,
             sun,
+            sun_atlas_view,
             clouds: [None, None, None],
             sky_tex,
             sky_view,
@@ -4694,7 +4727,11 @@ impl Renderer {
         self.pending_upload_bytes += uploaded;
         if self.pending_upload_bytes >= 32 * 1024 * 1024 {
             queue.submit(std::iter::empty());
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            if self.caps.is_powervr() {
+                let _ = device.poll(wgpu::PollType::Poll);
+            } else {
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            }
             self.pending_upload_bytes = 0;
         }
         let view = tex.create_view(&Default::default());
@@ -4996,7 +5033,7 @@ impl Renderer {
             &self.lights_buf,
             &self.sky_view,
             &self.sky_sampler,
-            &self.sun.atlas_view,
+            &self.sun_atlas_view,
             &self.lightgrid_view,
             &self.lightocc_view,
             &self.localgrid_view,
@@ -5017,7 +5054,7 @@ impl Renderer {
             &self.lights_buf,
             &self.sky_view,
             &self.sky_sampler,
-            &self.sun.atlas_view,
+            &self.sun_atlas_view,
             &self.lightgrid_view,
             &self.lightocc_view,
             &self.localgrid_view,
@@ -5507,10 +5544,13 @@ impl Renderer {
     }
 
     fn step_gl_builder(&mut self, device: &wgpu::Device) -> bool {
-        const MAX_PIPELINES_PER_FRAME: usize = 2;
-        const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+        let (max_pipelines_per_frame, frame_budget) = if self.caps.is_powervr() {
+            (1usize, std::time::Duration::from_millis(12))
+        } else {
+            (2usize, std::time::Duration::from_millis(25))
+        };
         let done = match self.gl_builder.as_mut() {
-            Some(b) => b.step_chunk(device, MAX_PIPELINES_PER_FRAME, FRAME_BUDGET),
+            Some(b) => b.step_chunk(device, max_pipelines_per_frame, frame_budget),
             None => return false,
         };
         if done {
@@ -5811,7 +5851,7 @@ impl Renderer {
         let pass = self.world_gui[sample_slot(t.samples)]
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_hdr_format(&self.caps), t.samples, self.caps.vertex_storage_buffers(3)));
         pass.font_texture_update = Some(font_texture_update);
-        pass.sun_atlas = self.sun.atlas_view.clone();
+        pass.sun_atlas = self.sun_atlas_view.clone();
         pass.sun_grid = self.lightgrid_view.clone();
         pass.lightgrid = self.gui_lightgrid;
         pass.sun_params = self.gui_sun_params;
@@ -6441,11 +6481,13 @@ impl Renderer {
         let scene_gen = self.caster_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
-        let sun_due = if shadows_on {
-            self.sun.upload(queue, &frame.sun_cascades);
-            self.sun.plan(&frame.sun_cascades, scene_gen, self.dyn_caster_gen, !opaque_runs.is_empty() || !cutout_runs.is_empty() || !self.terrain_grass.is_empty())
+        let sun_due = if let (true, Some(sun)) = (shadows_on, self.sun.as_mut()) {
+            sun.upload(queue, &frame.sun_cascades);
+            sun.plan(&frame.sun_cascades, scene_gen, self.dyn_caster_gen, !opaque_runs.is_empty() || !cutout_runs.is_empty() || !self.terrain_grass.is_empty())
         } else {
-            self.sun.forget();
+            if let Some(sun) = self.sun.as_mut() {
+                sun.forget();
+            }
             [false; crate::sun_shadow::CASCADES]
         };
 
@@ -6541,6 +6583,15 @@ impl Renderer {
                     mesh.draw_bound(pass, range, &cast_bound);
                 }
             };
+            let (Some(sun), Some(shadow_pipe), Some(shadow_cutout_pipe), Some(terrain_shadow_pipe), Some(terrain_shadow_back_pipe)) = (
+                self.sun.as_ref(),
+                self.shadow.as_ref(),
+                self.shadow_cutout.as_ref(),
+                self.terrain_shadow.as_ref(),
+                self.terrain_shadow_back.as_ref(),
+            ) else {
+                continue;
+            };
             let terrain = |pass: &mut wgpu::RenderPass, solid: bool| {
                 let chunks: Box<dyn Iterator<Item = &TerrainChunk>> = if solid {
                     Box::new(self.terrain_chunks.values())
@@ -6548,7 +6599,7 @@ impl Renderer {
                     Box::new(self.terrain_grass.values().filter(|_| grass_shadows))
                 };
                 for c in chunks {
-                    pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
+                    pass.set_pipeline(if solid && diagnostic_back { terrain_shadow_back_pipe } else { terrain_shadow_pipe });
                     if box_visible(&sp, c.lo, c.hi) {
                         rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (c.count / 3) as u64);
                         draw_top::add(1 + ci as u8, usize::MAX, (c.count / 3) as u64, 1);
@@ -6595,9 +6646,9 @@ impl Renderer {
                     }
                     if !started {
                         cast_bound.set(UNBOUND);
-                        pass.set_pipeline(&self.shadow_cutout);
+                        pass.set_pipeline(shadow_cutout_pipe);
                         pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-                        self.sun.bind(pass, ci);
+                        sun.bind(pass, ci);
                         started = true;
                     }
                     if bound_t != r.0.1 {
@@ -6613,9 +6664,9 @@ impl Renderer {
             };
             let draw_static = |pass: &mut wgpu::RenderPass, all: bool| {
                 cast_bound.set(UNBOUND);
-                pass.set_pipeline(&self.shadow);
+                pass.set_pipeline(shadow_pipe);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-                self.sun.bind(pass, ci);
+                sun.bind(pass, ci);
                 pass.set_vertex_buffer(1, self.static_buf.slice(..));
                 for r in shadow_ranges.iter().filter(|r| all || !skinned(r.0)) {
                     cast(pass, r.0, r.1..r.2);
@@ -6630,9 +6681,9 @@ impl Renderer {
             // the camera's distance).
             let draw_moving = |pass: &mut wgpu::RenderPass| {
                 cast_bound.set(UNBOUND);
-                pass.set_pipeline(&self.shadow);
+                pass.set_pipeline(shadow_pipe);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-                self.sun.bind(pass, ci);
+                sun.bind(pass, ci);
                 if ci > 0 && SunCache::on() {
                     pass.set_vertex_buffer(1, self.static_buf.slice(..));
                     for r in shadow_ranges.iter().filter(|r| skinned(r.0)) {
@@ -6689,7 +6740,7 @@ impl Renderer {
                 draw_moving(&mut pass);
             }
             crate::gpu_timing::mark(&mut encoder, if ci == 0 { "gpu: sun cascade 0 draw" } else { "gpu: sun cascade 1-3 draw" });
-            self.sun.blur(&mut encoder, cascade, ci);
+            sun.blur(&mut encoder, cascade, ci);
             crate::gpu_timing::mark(&mut encoder, "gpu: sun blur");
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: sun shadows");
@@ -6721,7 +6772,7 @@ impl Renderer {
                 h.finish()
             };
             // (the reduced binding set has no light shadow atlas to read)
-            if !self.reduced && !slots.is_empty() && self.lshadow.key != Some(key) {
+            if !self.reduced && !(self.caps.is_powervr() && !self.caps.hdr_float_rt) && !slots.is_empty() && self.lshadow.key != Some(key) {
                 self.lshadow.key = Some(key);
                 let n = rustudio_core::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
@@ -7465,7 +7516,8 @@ impl Renderer {
         // SSAO, then its multiply into the scene.
         // Performance > Ambient occlusion Off skips both (a full-resolution
         // pass on a weak chip).
-        if frame.globals.ssao[3] >= 0.5
+        if !self.caps.is_powervr()
+            && frame.globals.ssao[3] >= 0.5
             && frame.quality.map_or_else(
                 || rustudio_core::rustudio_settings::performance_value("ssao") != "off",
                 |profile| profile.ssao(),
@@ -8318,7 +8370,9 @@ impl Renderer {
     pub fn invalidate_shadows(&mut self) {
         self.caster_gen = self.caster_gen.wrapping_add(1);
         self.dyn_caster_gen = self.dyn_caster_gen.wrapping_add(1);
-        self.sun.forget();
+        if let Some(sun) = self.sun.as_mut() {
+            sun.forget();
+        }
         self.lshadow.key = None;
     }
 
@@ -8351,7 +8405,7 @@ impl Renderer {
     }
 
     pub fn has_stale_shadows(&self) -> bool {
-        self.sun.has_stale_dyn(self.dyn_caster_gen)
+        self.sun.as_ref().is_some_and(|s| s.has_stale_dyn(self.dyn_caster_gen))
     }
 
     /// See `items_generation`.

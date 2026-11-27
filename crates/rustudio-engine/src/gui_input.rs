@@ -2595,58 +2595,78 @@ impl Gui {
             self.scrollbar_drag = None;
         }
         // The wheel over a ScrollingFrame scrolls it: ScrollWheelDeltaAmount
-        // (100) pixels per notch.
-        let wheel: f32 = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::MouseWheel { unit, delta, .. } => Some(
-                        mech::GUI_SCROLL_PX_PER_NOTCH
-                            * match unit {
-                                egui::MouseWheelUnit::Line => delta.y,
-                                egui::MouseWheelUnit::Point => {
-                                    delta.y / mech::WHEEL_POINTS_PER_NOTCH
-                                }
-                                egui::MouseWheelUnit::Page => delta.y * 3.0,
-                            },
-                    ),
-                    _ => None,
-                })
-                .sum()
+        // (100) pixels per notch for line/page wheels; Point deltas (touch
+        // scroll / trackpad) route 1:1 through ScrollDrag without 2.5x scaling.
+        let (point_delta, notch_wheel) = ctx.input(|i| {
+            let mut pt = egui::Vec2::ZERO;
+            let mut notch = egui::Vec2::ZERO;
+            for e in &i.raw.events {
+                if let egui::Event::MouseWheel { unit, delta, .. } = e {
+                    match unit {
+                        egui::MouseWheelUnit::Point => {
+                            pt += *delta;
+                        }
+                        egui::MouseWheelUnit::Line => {
+                            notch += *delta * mech::GUI_SCROLL_PX_PER_NOTCH;
+                        }
+                        egui::MouseWheelUnit::Page => {
+                            notch += *delta * (mech::GUI_SCROLL_PX_PER_NOTCH * 3.0);
+                        }
+                    }
+                }
+            }
+            (pt, notch)
         });
-        if moved || had_press || wheel != 0.0 {
+        let any_wheel = point_delta != egui::Vec2::ZERO || notch_wheel != egui::Vec2::ZERO;
+        let wheel_y = if notch_wheel.y != 0.0 { notch_wheel.y } else { point_delta.y };
+        if moved || had_press || any_wheel {
             // Mouse activity hides the keyboard/gamepad selection cursor (matching Roblox).
             super::share().selection_visible = false;
         }
-        if wheel != 0.0 && resp.hovered() {
+        if any_wheel && resp.hovered() {
             // Every object under the pointer hears the notch (MouseWheelForward
             // / Backward and InputChanged with a MouseWheel InputObject).
-            if let Some(p) = pointer {
-                let (x, y) = gui_xy(p);
-                let fwd = wheel > 0.0;
-                for h in &under {
-                    if h.scrollbar.is_some() {
-                        continue;
+            if wheel_y != 0.0 {
+                if let Some(p) = pointer {
+                    let (x, y) = gui_xy(p);
+                    let fwd = wheel_y > 0.0;
+                    for h in &under {
+                        if h.scrollbar.is_some() {
+                            continue;
+                        }
+                        self.events.push(GuiEvent::Fire(
+                            h.r,
+                            if fwd { "MouseWheelForward" } else { "MouseWheelBackward" },
+                            vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)],
+                        ));
+                        self.events.push(GuiEvent::Fire(
+                            h.r,
+                            "InputChanged",
+                            vec![GuiArg::Input { button: if fwd { 3 } else { 4 }, began: false, x, y }],
+                        ));
                     }
-                    self.events.push(GuiEvent::Fire(
-                        h.r,
-                        if fwd { "MouseWheelForward" } else { "MouseWheelBackward" },
-                        vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)],
-                    ));
-                    self.events.push(GuiEvent::Fire(
-                        h.r,
-                        "InputChanged",
-                        vec![GuiArg::Input { button: if fwd { 3 } else { 4 }, began: false, x, y }],
-                    ));
                 }
             }
             if let Some(sf) = under.iter().rev().find(|h| h.scrolling) {
-                self.events.push(GuiEvent::Scroll(sf.r, [0.0, -wheel]));
+                if point_delta != egui::Vec2::ZERO {
+                    self.events.push(GuiEvent::ScrollDrag(sf.r, [-point_delta.x, -point_delta.y]));
+                }
+                if notch_wheel != egui::Vec2::ZERO {
+                    self.events.push(GuiEvent::Scroll(sf.r, [-notch_wheel.x, -notch_wheel.y]));
+                }
                 took = true;
                 self.last_wheel_sunk = true;
             } else if let Some(pl) = under.iter().rev().find_map(|h| h.page_layout) {
-                super::share().page_scrolls.push((pl, if wheel > 0.0 { -1 } else { 1 }));
+                let axis = if wheel_y != 0.0 {
+                    wheel_y
+                } else if notch_wheel.x != 0.0 {
+                    notch_wheel.x
+                } else {
+                    point_delta.x
+                };
+                if axis != 0.0 {
+                    super::share().page_scrolls.push((pl, if axis > 0.0 { -1 } else { 1 }));
+                }
                 took = true;
                 self.last_wheel_sunk = true;
             } else if top.is_some() {
@@ -3099,6 +3119,54 @@ impl Gui {
     pub fn screen_center(&self, r: Ref) -> Option<Pos2> {
         let h = self.hits.iter().find(|h| h.r == r && h.scrollbar.is_none())?;
         Some((h.quad.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / 4.0).to_pos2())
+    }
+
+    /// Screen-space bounding rects of interactive non-ScrollingFrame controls
+    /// (UIDragDetectors, scrollbars, and compact buttons/sliders) so touch input
+    /// can route drags on them directly into `Mode::Press` instead of `Mode::Scroll`.
+    pub fn direct_drag_rects(&self, clip_rect: Rect) -> Vec<Rect> {
+        let mut out = Vec::new();
+        let has_scrolling = self.hits.iter().any(|h| h.scrolling);
+        for h in &self.hits {
+            if h.scrolling || h.textbox {
+                continue;
+            }
+            let is_slider_or_drag = h.drag || h.scrollbar.is_some();
+            let is_interactive = h.button || h.active;
+            if !is_slider_or_drag && !is_interactive {
+                continue;
+            }
+            let mut r = Rect::NOTHING;
+            for &p in &h.quad {
+                r.extend_with(p);
+            }
+            if let Some(c) = h.clip {
+                let mut cr = Rect::NOTHING;
+                for &p in &c {
+                    cr.extend_with(p);
+                }
+                r = r.intersect(cr);
+            }
+            r = r.intersect(clip_rect);
+            if !r.is_positive() {
+                continue;
+            }
+            if !is_slider_or_drag && has_scrolling {
+                let inside_scroll = self.hits.iter().any(|sf| {
+                    sf.scrolling
+                        && point_in_quad(&sf.quad, r.center())
+                        && sf.clip.is_none_or(|c| point_in_quad(&c, r.center()))
+                });
+                if inside_scroll {
+                    let compact = r.height() <= 32.0 || r.width() <= 32.0;
+                    if !compact {
+                        continue;
+                    }
+                }
+            }
+            out.push(r);
+        }
+        out
     }
 }
 

@@ -97,6 +97,9 @@ pub struct PluginUi {
     /// The tool last frame, to see the person picking one.
     last_tool: Option<Tool>,
     popup_pos: HashMap<u64, Pos2>,
+    /// Last non-`None` pointer position (used when `latest_pos()` is `None`
+    /// right after touch `PointerGone` so ShowAsync popups open at the tap).
+    last_pointer_pos: Option<Pos2>,
     /// Button rects of the last drawn Plugins tab ("toolbar/button id"),
     /// the Plugins menu's toolbar entries, open popups (--ui-shots, tests).
     pub rects: Vec<(String, Rect)>,
@@ -840,12 +843,18 @@ impl Editor {
     /// Draws the open PluginMenu popups (top-left at the mouse when each
     /// opened); a pick, Escape or a click outside answers the top one.
     pub fn plugin_popups(&mut self, ctx: &egui::Context) {
+        if let Some(p) = ctx.input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos())) {
+            self.plugin_bar.last_pointer_pos = Some(p);
+        }
         let open = self.plugin_bar.model.menus.clone();
         if open.is_empty() {
             self.plugin_bar.popup_pos.clear();
             return;
         }
-        let mouse = ctx.input(|i| i.pointer.latest_pos()).unwrap_or(egui::pos2(200.0, 120.0));
+        let mouse = ctx
+            .input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()))
+            .or(self.plugin_bar.last_pointer_pos)
+            .unwrap_or(egui::pos2(200.0, 120.0));
         let shortcuts = self.plugin_bar.shortcuts.labels();
         let mut answer: Option<(u64, Option<Ref>)> = None;
         self.plugin_bar.popup_rects.clear();

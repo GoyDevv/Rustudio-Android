@@ -32,20 +32,23 @@ pub struct GpuCaps {
     pub r16_float_rt: bool,
 }
 
+fn matches_powervr(name: &str, driver: &str, driver_info: &str) -> bool {
+    let hit = |s: &str| {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("powervr") || lower.contains("rogue") || lower.contains("imagination")
+    };
+    hit(name) || hit(driver) || hit(driver_info)
+}
+
+/// True on Imagination PowerVR / Rogue GPUs regardless of backend (GLES or Vulkan).
+pub fn is_powervr(info: &wgpu::AdapterInfo) -> bool {
+    matches_powervr(&info.name, &info.driver, &info.driver_info)
+}
+
 /// PowerVR Rogue Android GLES 3.0 drivers have broken Rgba16Float/R16Float FBO
 /// clears and blends (causing uncleared smearing frames and black EVSM/probes).
 pub fn is_powervr_gl(info: &wgpu::AdapterInfo) -> bool {
-    if info.backend != wgpu::Backend::Gl {
-        return false;
-    }
-    let name = info.name.to_ascii_lowercase();
-    let driver = info.driver.to_ascii_lowercase();
-    let dinfo = info.driver_info.to_ascii_lowercase();
-    name.contains("powervr")
-        || name.contains("rogue")
-        || name.contains("imagination")
-        || driver.contains("powervr")
-        || dinfo.contains("powervr")
+    info.backend == wgpu::Backend::Gl && is_powervr(info)
 }
 
 impl GpuCaps {
@@ -149,6 +152,11 @@ impl GpuCaps {
     }
 
 
+    /// True on Imagination PowerVR / Rogue GPUs (both GLES and Vulkan).
+    pub fn is_powervr(&self) -> bool {
+        matches_powervr(&self.name, &self.driver, &self.driver_info)
+    }
+
     /// Why this adapter runs in weak-GPU mode, if it does (before the
     /// RUSTUDIO_LOWEND override).
     pub fn weak_reason(&self) -> Option<String> {
@@ -157,6 +165,9 @@ impl GpuCaps {
         }
         if self.backend == wgpu::Backend::Gl {
             return Some("OpenGL backend".into());
+        }
+        if self.is_powervr() {
+            return Some("PowerVR mobile GPU".into());
         }
         if old_intel(self.vendor, &self.name) {
             return Some("pre-Skylake Intel graphics".into());

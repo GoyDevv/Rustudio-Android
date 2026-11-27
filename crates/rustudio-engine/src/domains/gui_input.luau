@@ -76,6 +76,26 @@ end
 -- Instances this domain keeps up with (StyleLinks, input contexts, prompts,
 -- haptic effects), found once and then through DescendantAdded.
 local tracked = { StyleLink = {}, InputContext = {}, ProximityPrompt = {}, HapticEffect = {}, UIPageLayout = {}, Adorn = {} }
+-- Track HandleAdornments that actually have mouse listeners connected so purely
+-- decorative adornments (e.g. brush preview rings) do not hijack adorn_hot.
+local adorn_listened = {}
+local ADORN_MOUSE_EVENTS = {
+    MouseButton1Down = true,
+    MouseButton1Up = true,
+    MouseEnter = true,
+    MouseLeave = true,
+}
+do
+    local orig_new_signal = __rs_new_signal
+    if type(orig_new_signal) == "function" then
+        __rs_new_signal = function(inst, name)
+            if ADORN_MOUSE_EVENTS[name] and typeof(inst) == "Instance" and inst:IsA("HandleAdornment") then
+                adorn_listened[inst] = true
+            end
+            return orig_new_signal(inst, name)
+        end
+    end
+end
 local tracking = false
 local styles_dirty = true
 local style_recheck_frames = 0
@@ -115,6 +135,7 @@ local function start_tracking()
             if cn == "StyleLink" then styles_dirty = true end
         end
         tracked.Adorn[i] = nil
+        adorn_listened[i] = nil
     end)
 end
 
@@ -1574,8 +1595,12 @@ local function step_adorns()
     elseif press and not G.buttons() then
         finish()
     end
+    local function is_interactive_adorn(a)
+        return a ~= nil and (a:IsA("HandlesBase") or adorn_listened[a] == true)
+    end
     local held = (press and press.a) or hover_a
-    G.set_adorn_hot(hover_a ~= nil or press ~= nil, held ~= nil and held:IsA("HandlesBase"))
+    local hot = is_interactive_adorn(hover_a) or is_interactive_adorn(press and press.a)
+    G.set_adorn_hot(hot, held ~= nil and held:IsA("HandlesBase"))
 end
 
 -------------------------------------------------------------------- Styles

@@ -1873,7 +1873,10 @@ impl WorldGuiPass {
                     (t, Some(g))
                 }
             };
-            let mipped = device.adapter_info().backend != wgpu::Backend::Gl && tex.size().width.max(tex.size().height) > 1;
+            let adapter_info = device.adapter_info();
+            let mipped = adapter_info.backend != wgpu::Backend::Gl
+                && !crate::gpu_caps::is_powervr(&adapter_info)
+                && tex.size().width.max(tex.size().height) > 1;
             let revision = if let Some(generation) = native_gen {
                 TextureRevision::Native(generation)
             } else if id == egui::TextureId::default() {

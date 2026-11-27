@@ -278,9 +278,27 @@ struct DofPipelines {
     tent: wgpu::RenderPipeline,
 }
 
+struct BlurOnlyTargets {
+    quarter_size: [u32; 2],
+    blur_a: wgpu::TextureView,
+    blur_b: wgpu::TextureView,
+    bg_scene_0: wgpu::BindGroup,
+    bg_blur_h: wgpu::BindGroup,
+    bg_blur_v: wgpu::BindGroup,
+    bg_image_process_blur: wgpu::BindGroup,
+}
+
 struct PostFxTargets {
     size: [u32; 2],
     samples: u32,
+    hdr_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    bg_image_process_plain: wgpu::BindGroup,
+    blur_only: Option<BlurOnlyTargets>,
+    full: Option<FullPostFxTargets>,
+}
+
+struct FullPostFxTargets {
     depth_bg: wgpu::BindGroup,
     // Full-res DoF scratch targets (HDR_FORMAT).
     dof_full_prep: wgpu::TextureView,
@@ -379,6 +397,8 @@ pub struct PostFx {
     dof_pipes: Option<DofPipelines>,
     // Depth-reading pipelines: [0] = 1x, [1] = MSAA (>1x), lazily compiled when SunRays/DoF active
     depth_pipes: [Option<DepthPipelines>; 2],
+    is_powervr: bool,
+    powervr_full_postfx: bool,
     targets: Option<PostFxTargets>,
 }
 
@@ -696,6 +716,8 @@ impl PostFx {
             blur_pipes: None,
             dof_pipes: None,
             depth_pipes: [None, None],
+            is_powervr: crate::gpu_caps::is_powervr(&device.adapter_info()),
+            powervr_full_postfx: std::env::var("RUSTUDIO_POWERVR_POSTFX").ok().as_deref() == Some("1"),
             targets: None,
         }
     }
@@ -835,8 +857,114 @@ impl PostFx {
         self.targets = None;
     }
 
+    fn create_tex_bg4(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        t0: &wgpu::TextureView,
+        t1: &wgpu::TextureView,
+        t2: &wgpu::TextureView,
+        t3: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(t1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(t2),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(t3),
+                },
+            ],
+        })
+    }
+
+    fn build_blur_only_targets(
+        &self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        hdr_view: &wgpu::TextureView,
+    ) -> BlurOnlyTargets {
+        let [w, h] = size;
+        let quarter_size = [(w >> 2).max(1), (h >> 2).max(1)];
+        let mk_view = |label: &str| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: quarter_size[0],
+                        height: quarter_size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.hdr_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let blur_a = mk_view("postfx blur a");
+        let blur_b = mk_view("postfx blur b");
+        let bg_scene_0 = self.create_tex_bg4(
+            device,
+            "postfx scene",
+            hdr_view,
+            &self.black_view,
+            &self.black_view,
+            &self.black_view,
+        );
+        let bg_blur_h = self.create_tex_bg4(
+            device,
+            "postfx blur h",
+            &blur_a,
+            &self.black_view,
+            &self.black_view,
+            &self.black_view,
+        );
+        let bg_blur_v = self.create_tex_bg4(
+            device,
+            "postfx blur v",
+            &blur_b,
+            &self.black_view,
+            &self.black_view,
+            &self.black_view,
+        );
+        let bg_image_process_blur = self.create_tex_bg4(
+            device,
+            "postfx image process blur",
+            hdr_view,
+            &self.black_view,
+            &self.black_view,
+            &blur_a,
+        );
+        BlurOnlyTargets {
+            quarter_size,
+            blur_a,
+            blur_b,
+            bg_scene_0,
+            bg_blur_h,
+            bg_blur_v,
+            bg_image_process_blur,
+        }
+    }
+
     /// Rebuilds resolution-dependent targets and bind groups whenever the viewport
-    /// target is created or resized.
+    /// target is created or resized. On PowerVR, optional DoF/SunRays/Blur/Bloom
+    /// targets are allocated lazily on demand instead of eagerly on resize.
     pub fn rebuild_targets(
         &mut self,
         device: &wgpu::Device,
@@ -845,6 +973,38 @@ impl PostFx {
         hdr_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
     ) {
+        let bg_image_process_plain = self.create_tex_bg4(
+            device,
+            "postfx image process plain",
+            hdr_view,
+            &self.black_view,
+            &self.black_view,
+            &self.black_view,
+        );
+        let full = if self.is_powervr {
+            None
+        } else {
+            Some(self.build_full_targets(device, size, samples, hdr_view, depth_view))
+        };
+        self.targets = Some(PostFxTargets {
+            size,
+            samples,
+            hdr_view: hdr_view.clone(),
+            depth_view: depth_view.clone(),
+            bg_image_process_plain,
+            blur_only: None,
+            full,
+        });
+    }
+
+    fn build_full_targets(
+        &self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        samples: u32,
+        hdr_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+    ) -> FullPostFxTargets {
         let mk_tex = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat, copy_src: bool| {
             let mut usage =
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -1072,9 +1232,7 @@ impl PostFx {
             })
         });
 
-        self.targets = Some(PostFxTargets {
-            size,
-            samples,
+        FullPostFxTargets {
             depth_bg,
             dof_full_prep,
             dof_scene_a,
@@ -1131,11 +1289,11 @@ impl PostFx {
             bg_blur_v,
             bg_fx_comp,
             bg_image_process,
-        });
+        }
     }
 
     pub fn bloom_dump_textures(&self) -> Option<(&wgpu::Texture, Option<&wgpu::Texture>, [u32; 2])> {
-        let t = self.targets.as_ref()?;
+        let t = self.targets.as_ref()?.full.as_ref()?;
         Some((
             &t.bloom_textures[0],
             t.bloom_bright_capture.as_ref(),
@@ -1181,11 +1339,17 @@ impl PostFx {
         let (sr_ray_m, sr_radial_n) = studio_sun_rays_taps(size);
 
         let bypass = params.raw_debug || params.terrain_capture_id;
-        let dof_allowed = !bypass && !params.is_ortho && params.post_fx_tier >= 3;
+        let allow_expensive_fx = !self.is_powervr || self.powervr_full_postfx;
+        let dof_allowed = allow_expensive_fx && !bypass && !params.is_ortho && params.post_fx_tier >= 3;
         let far_i = if dof_allowed { params.dof[3] } else { 0.0 };
         let near_i = if dof_allowed { params.dof[2] } else { 0.0 };
         let need_dof = far_i > 0.0 || near_i > 0.0;
-        let sr_on = !bypass
+        let bloom_on = allow_expensive_fx
+            && !bypass
+            && params.bloom_allowed
+            && params.bloom_intensity > 0.0001;
+        let sr_on = allow_expensive_fx
+            && !bypass
             && !params.is_ortho
             && params.post_fx_tier >= 3
             && params.sun_rays_enabled
@@ -1205,7 +1369,27 @@ impl PostFx {
         if need_blur && self.blur_pipes.is_none() {
             self.ensure_blur_pipes(device);
         }
-        let Some(ref t) = self.targets else { return };
+        let need_full_targets = need_dof || bloom_on || sr_on || (need_blur && !self.is_powervr);
+        let need_blur_only = self.is_powervr && need_blur && !need_dof && !bloom_on && !sr_on;
+        if need_full_targets && self.targets.as_ref().is_some_and(|t| t.full.is_none()) {
+            let (hdr_view, depth_view) = {
+                let t = self.targets.as_ref().expect("postfx targets");
+                (t.hdr_view.clone(), t.depth_view.clone())
+            };
+            let full = self.build_full_targets(device, size, samples, &hdr_view, &depth_view);
+            if let Some(t) = self.targets.as_mut() {
+                t.full = Some(full);
+            }
+        } else if need_blur_only
+            && self.targets.as_ref().is_some_and(|t| t.blur_only.is_none() && t.full.is_none())
+        {
+            let hdr_view = self.targets.as_ref().expect("postfx targets").hdr_view.clone();
+            let blur_only = self.build_blur_only_targets(device, size, &hdr_view);
+            if let Some(t) = self.targets.as_mut() {
+                t.blur_only = Some(blur_only);
+            }
+        }
+        let Some(ref targets) = self.targets else { return };
 
         let flags = (u32::from(params.terrain_capture_id)) | (u32::from(params.raw_debug) << 1);
         let base_u = PostFxUniform {
@@ -1289,6 +1473,92 @@ impl PostFx {
 
         let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
         let load = wgpu::LoadOp::Load;
+
+        if self.is_powervr && !need_dof && !bloom_on && !sr_on && !need_blur {
+            // Fast path: no optional PostFX active — run tone-mapping/CC directly without
+            // touching optional DoF/Bloom/SunRays/Blur targets.
+            let op = push_u(base_u);
+            draw_pass(
+                encoder,
+                "postfx image process",
+                &self.image_process_plain,
+                display_view,
+                clear,
+                &self.uniform_bg,
+                op,
+                &targets.bg_image_process_plain,
+                None,
+            );
+            if with_gpu_timing {
+                crate::gpu_timing::mark(encoder, "gpu: post");
+            }
+        } else if let (false, false, false, true, Some(b)) =
+            (need_dof, bloom_on, sr_on, need_blur, targets.blur_only.as_ref())
+        {
+            // PowerVR blur-only fast path: only quarter-res blur_a/blur_b allocated.
+            let blur = self.blur_pipes.as_ref().expect("postfx blur pipes");
+            let qw = b.quarter_size[0] as f32;
+            let qh = b.quarter_size[1] as f32;
+            let hq_down = if params.post_fx_tier >= 2 { 1.0 } else { 0.0 };
+            let mut ud = base_u;
+            ud.extra = [hq_down, 1.0 / qw, 1.0 / qh, 0.0];
+            let od = push_u(ud);
+            draw_pass(
+                encoder,
+                "postfx blur down",
+                &blur.blur_down,
+                &b.blur_a,
+                clear,
+                &self.uniform_bg,
+                od,
+                &b.bg_scene_0,
+                None,
+            );
+            let mut uh = base_u;
+            uh.extra = [1.0 / qw, 0.0, blur_sigma, blur_k_pairs as f32];
+            let oh = push_u(uh);
+            draw_pass(
+                encoder,
+                "postfx blur h",
+                &blur.blur_1d,
+                &b.blur_b,
+                clear,
+                &self.uniform_bg,
+                oh,
+                &b.bg_blur_h,
+                None,
+            );
+            let mut uv = base_u;
+            uv.extra = [0.0, 1.0 / qh, blur_sigma, blur_k_pairs as f32];
+            let ov = push_u(uv);
+            draw_pass(
+                encoder,
+                "postfx blur v",
+                &blur.blur_1d,
+                &b.blur_a,
+                clear,
+                &self.uniform_bg,
+                ov,
+                &b.bg_blur_v,
+                None,
+            );
+            let op = push_u(base_u);
+            draw_pass(
+                encoder,
+                "postfx image process",
+                &self.image_process,
+                display_view,
+                clear,
+                &self.uniform_bg,
+                op,
+                &b.bg_image_process_blur,
+                None,
+            );
+            if with_gpu_timing {
+                crate::gpu_timing::mark(encoder, "gpu: post");
+            }
+        } else {
+        let Some(ref t) = targets.full else { return };
 
         // ----------------------------------------------------------- Stage 1: DepthOfField
         let mut scene_idx: usize = 0; // 0 = hdr_view, 1 = dof_scene_a, 2 = dof_scene_b
@@ -1651,7 +1921,6 @@ impl PostFx {
         }
 
         // ----------------------------------------------------------- Stage 2: Bloom
-        let bloom_on = !bypass && params.bloom_allowed && params.bloom_intensity > 0.0001;
         let mut bloom_slot: usize = 0; // 0 = black, 1 = bloom[0] (HQ), 2 = bloom[2] (LQ)
         if bloom_on {
             let (start_level, levels, lod) =
@@ -1846,6 +2115,7 @@ impl PostFx {
         );
         if with_gpu_timing {
             crate::gpu_timing::mark(encoder, "gpu: post");
+        }
         }
 
         // Upload all uniform slots for this frame in a single write before submission.
