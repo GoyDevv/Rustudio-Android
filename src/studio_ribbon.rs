@@ -420,15 +420,15 @@ impl Editor {
                 }
                 RibbonTab::Ui => {
                     let guis = ["ScreenGui", "BillboardGui", "SurfaceGui"];
-                    self.class_menu_button(ui, "app-window", "GUI", "gui", &guis, a);
+                    self.class_split_button(ui, "app-window", "GUI", "gui", "ScreenGui", &guis, a);
                     let frames = ["Frame", "ScrollingFrame", "CanvasGroup", "ViewportFrame", "VideoFrame"];
-                    self.class_menu_button(ui, "square", "Frame", "ui_frame", &frames, a);
+                    self.class_split_button(ui, "square", "Frame", "ui_frame", "Frame", &frames, a);
                     let labels = ["TextLabel", "ImageLabel"];
-                    self.class_menu_button(ui, "typography", "Label", "ui_label", &labels, a);
+                    self.class_split_button(ui, "typography", "Label", "ui_label", "TextLabel", &labels, a);
                     let buttons = ["TextButton", "ImageButton"];
-                    self.class_menu_button(ui, "click", "Button", "ui_button", &buttons, a);
+                    self.class_split_button(ui, "click", "Button", "ui_button", "TextButton", &buttons, a);
                     let inputs = ["TextBox", "UIDragDetector", "Path2D"];
-                    self.class_menu_button(ui, "forms", "Input", "ui_input", &inputs, a);
+                    self.class_split_button(ui, "forms", "Input", "ui_input", "TextBox", &inputs, a);
                     divider(ui);
                     let ap = ["UICorner", "UIStroke", "UIGradient", "UIPadding", "UIScale"];
                     self.class_menu_button(ui, "border-corner-rounded", "Appearance", "ui_appearance", &ap, a);
@@ -879,6 +879,91 @@ impl Editor {
         }
     }
 
+    /// A 1-tap split ribbon button: tapping the main icon+label area immediately
+    /// inserts `primary_class`, while tapping the `▾` chevron beside it opens
+    /// the popup menu listing all `variants`.
+    #[allow(clippy::too_many_arguments)]
+    fn class_split_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: &str,
+        label: &str,
+        id: &str,
+        primary_class: &str,
+        variants: &[&str],
+        act: &mut Option<String>,
+    ) {
+        let (enabled, _) = self.action_state(id);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            let resp = ribbon_button(ui, icon, label, false, enabled);
+            let arrow_sense = if enabled { Sense::click() } else { Sense::hover() };
+            let (arrow_rect, ar) = ui.allocate_exact_size(Vec2::new(16.0, 50.0), arrow_sense);
+            if enabled && ar.hovered() {
+                ui.painter().rect_filled(arrow_rect, 4.0, theme::HOVER_BG);
+            }
+            let chevron_r = Rect::from_center_size(
+                arrow_rect.center() - Vec2::new(0.0, 4.0),
+                Vec2::splat(12.0),
+            );
+            let chevron_col = if enabled {
+                theme::TEXT_DIM
+            } else {
+                theme::TEXT_DIM.gamma_multiply(0.55)
+            };
+            rustudio_engine::ti::paint(ui.painter(), chevron_r, "chevron-down", chevron_col);
+
+            if !enabled {
+                let tip = format!("{label}: select where it goes first");
+                resp.on_hover_text(tip.as_str());
+                ar.on_hover_text(tip);
+                return;
+            }
+
+            if resp
+                .on_hover_text(format!("Insert {primary_class}"))
+                .clicked()
+            {
+                *act = Some(format!("class:{primary_class}"));
+            }
+
+            let ar = ar.on_hover_text(format!("More {label} classes…"));
+            egui::Popup::menu(&ar)
+                .id(egui::Id::new(("class_split_menu", id)))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    ui.set_min_width(156.0);
+                    for c in variants {
+                        let (row_r, row_resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width().max(156.0), 28.0),
+                            Sense::click(),
+                        );
+                        if row_resp.hovered() {
+                            ui.painter().rect_filled(row_r, 4.0, theme::HOVER_BG);
+                        }
+                        let icon_r = Rect::from_center_size(
+                            egui::Pos2::new(row_r.left() + 14.0, row_r.center().y),
+                            Vec2::splat(16.0),
+                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(icon_r), |ui| {
+                            crate::icons::class_icon(ui, c, 16.0);
+                        });
+                        ui.painter().text(
+                            egui::Pos2::new(row_r.left() + 28.0, row_r.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            *c,
+                            egui::FontId::proportional(13.0),
+                            theme::TEXT,
+                        );
+                        if row_resp.clicked() {
+                            *act = Some(format!("class:{c}"));
+                            ui.close();
+                        }
+                    }
+                });
+        });
+    }
+
     /// A ribbon button whose drop-down inserts one of `classes` into the selection.
     fn class_menu_button(&mut self, ui: &mut egui::Ui, icon: &str, label: &str, action: &str, classes: &[&str], act: &mut Option<String>) {
         let (enabled, _) = self.action_state(action);
@@ -887,17 +972,38 @@ impl Editor {
             resp.on_hover_text(format!("{label}: select where it goes first"));
             return;
         }
-        egui::Popup::menu(&resp).show(|ui| {
-            for c in classes {
-                ui.horizontal(|ui| {
-                    crate::icons::class_icon(ui, c, 16.0);
-                    if ui.selectable_label(false, *c).clicked() {
+        egui::Popup::menu(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(156.0);
+                for c in classes {
+                    let (row_r, row_resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width().max(156.0), 28.0),
+                        Sense::click(),
+                    );
+                    if row_resp.hovered() {
+                        ui.painter().rect_filled(row_r, 4.0, theme::HOVER_BG);
+                    }
+                    let icon_r = Rect::from_center_size(
+                        egui::Pos2::new(row_r.left() + 14.0, row_r.center().y),
+                        Vec2::splat(16.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(icon_r), |ui| {
+                        crate::icons::class_icon(ui, c, 16.0);
+                    });
+                    ui.painter().text(
+                        egui::Pos2::new(row_r.left() + 28.0, row_r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        *c,
+                        egui::FontId::proportional(13.0),
+                        theme::TEXT,
+                    );
+                    if row_resp.clicked() {
                         *act = Some(format!("class:{c}"));
                         ui.close();
                     }
-                });
-            }
-        });
+                }
+            });
     }
 
     /// Part: inserts a block; the arrow beside it lists the shapes (Studio).
@@ -1032,7 +1138,7 @@ mod tests {
         let quoted: Vec<&str> = src.split('"').collect();
         let mut missing = Vec::new();
         for w in quoted.windows(2) {
-            let calls = ["rb(ui, ", "top_icon(ui, ", "class_menu_button(ui, ", "rb_class(ui, ", "ribbon_button(ui, "];
+            let calls = ["rb(ui, ", "top_icon(ui, ", "class_menu_button(ui, ", "class_split_button(ui, ", "rb_class(ui, ", "ribbon_button(ui, "];
             if calls.iter().any(|p| w[0].ends_with(p)) && !rustudio_engine::ti::has(w[1]) {
                 missing.push(w[1]);
             }

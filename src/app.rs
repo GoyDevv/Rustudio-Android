@@ -1547,7 +1547,7 @@ impl Editor {
     }
 
     fn import_3d_file(&mut self, path: PathBuf) {
-        use rbx_dom_weak::types::{CFrame, Color3, Content, Matrix3, Variant, Vector3};
+        use rbx_dom_weak::types::{CFrame, Color3, Color3uint8, Content, Matrix3, Variant, Vector3};
         use std::sync::atomic::{AtomicU64, Ordering};
         static IMPORT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1754,9 +1754,24 @@ impl Editor {
                         let pos = centre + offset;
                         let centered: Vec<Vec3> = m.positions.iter().map(|pt| *pt - centre).collect();
                         let mesh_id = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}");
-                        let v2 = crate::export_3d::mesh_data_to_v2(&centered, &m.normals, &m.uvs);
+                        let v2 = crate::export_3d::mesh_data_to_v2_colored(
+                            &centered,
+                            &m.normals,
+                            &m.uvs,
+                            &m.colors,
+                        );
                         rustudio_core::assets::register_generated(&mesh_id, v2);
-                        let color = m.color.unwrap_or([163.0 / 255.0, 162.0 / 255.0, 165.0 / 255.0]);
+                        let default_color = if m.texture.is_some() {
+                            [1.0, 1.0, 1.0]
+                        } else {
+                            [163.0 / 255.0, 162.0 / 255.0, 165.0 / 255.0]
+                        };
+                        let color = m.color.unwrap_or(default_color);
+                        let color_u8 = Color3uint8::new(
+                            (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        );
                         let mut builder = InstanceBuilder::new("MeshPart")
                             .with_name(m.name.clone())
                             .with_property("MeshId", Variant::ContentId(mesh_id.clone().into()))
@@ -1768,12 +1783,20 @@ impl Editor {
                                 "CFrame",
                                 CFrame::new(Vector3::new(pos.x, pos.y, pos.z), Matrix3::identity()),
                             )
-                            .with_property("Color", Color3::new(color[0], color[1], color[2]))
+                            .with_property("Color", color_u8)
                             .with_property("Anchored", true);
+                        if m.double_sided {
+                            builder = builder.with_property("DoubleSided", Variant::Bool(true));
+                        }
+                        if m.alpha < 0.999 {
+                            builder = builder.with_property("Transparency", (1.0 - m.alpha).clamp(0.0, 1.0));
+                        }
                         if let Some(tex) = &m.texture {
                             let tex_id = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}.tex");
                             rustudio_core::assets::register_generated(&tex_id, tex.clone());
-                            builder = builder.with_property("TextureID", Variant::ContentId(tex_id.into()));
+                            builder = builder
+                                .with_property("TextureID", Variant::ContentId(tex_id.clone().into()))
+                                .with_property("TextureContent", Variant::Content(Content::from_uri(tex_id)));
                         }
                         inserted.push(self.game.doc.insert(target_parent, builder));
                     }
@@ -3666,11 +3689,17 @@ impl RustudioApp {
         #[cfg(target_os = "android")]
         {
             if let Some(level) = crate::android::lifecycle::take_trim_level() {
-                let critical = level >= 15;
+                // ComponentCallbacks2: RUNNING_CRITICAL = 15, MODERATE = 60, COMPLETE = 80.
+                // Normal backgrounding (UI_HIDDEN = 20, RUNNING_LOW = 10, BACKGROUND = 40)
+                // is non-critical and must not wipe active GUI textures or undo history.
+                let critical = level == 15 || level >= 60;
                 let rs = self.ed.game.render_state.clone();
                 self.ed.game.trim_memory(rs.as_ref(), critical);
                 self.ed.toolbox.thumbs.clear_mem();
                 crate::android::memory::log_trim(level, critical);
+                if critical {
+                    ctx.request_repaint();
+                }
             }
             self.poll_android_insets(&ctx);
             self.ed.keyboard_cover = self.keyboard.cover(&ctx);
@@ -4583,6 +4612,7 @@ impl RustudioApp {
             || (ed.game.play.is_none() && ed.game.edit_audio.has_active())
             || ed.game.assets.busy()
             || ed.game.textures.decoding()
+            || ed.game.gui.has_pending_images()
             || ed.game.asset_gen != ed.game.draws_asset_gen
             || ed.game.lighting.lightgrid_pending()
             || ed.game.renderer.as_ref().is_some_and(|r| r.has_stale_shadows())

@@ -671,8 +671,11 @@ impl Picker {
         });
 
         let roots = roots(self.storage_access);
-        let avail = ctx.content_rect().shrink(12.0);
-        let win_size = Vec2::new(avail.width().min(860.0).max(300.0), avail.height().min(580.0).max(260.0));
+        let screen = ctx.content_rect();
+        let win_size = egui::vec2(
+            (screen.width() - 24.0).clamp(320.0, 680.0),
+            (screen.height() - 24.0).clamp(260.0, 440.0),
+        );
         let mut result: Option<Option<Vec<PathBuf>>> = None;
         let mut open = true;
         let mut nav_dir: Option<PathBuf> = None;
@@ -683,161 +686,190 @@ impl Picker {
             .resizable(false)
             .open(&mut open)
             .fixed_size(win_size)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .min_size(win_size)
+            .max_size(win_size)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(
                 egui::Frame::new()
                     .fill(BG_WINDOW)
                     .stroke(Stroke::new(1.0, BORDER))
                     .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(10)),
+                    .inner_margin(Margin::same(8)),
             )
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                ui.spacing_mut().button_padding = Vec2::new(9.0, 5.0);
+                ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+                ui.spacing_mut().button_padding = Vec2::new(7.0, 4.0);
+                let inner_w = ui.available_width().max(280.0);
 
-                // ==================== 1. TOP TOOLBAR ====================
-                ui.horizontal(|ui| {
-                    let up = self.listing.dir.parent().map(Path::to_path_buf);
-                    let at_root = roots.iter().any(|r| r.path == self.listing.dir)
-                        || self.listing.dir == Path::new("/");
-                    if ui
-                        .add_enabled(
-                            up.is_some() && !at_root,
-                            egui::Button::new(RichText::new("↑ Up").size(12.5).color(TEXT_PRIMARY))
-                                .fill(BG_TILE)
-                                .min_size(Vec2::new(48.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        if let Some(u) = up {
-                            nav_dir = Some(u);
-                        }
-                    }
+                // ==================== 1. TOP TOOLBAR (~30px, clipped) ====================
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inner_w, 30.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_clip_rect(ui.max_rect());
+                        ui.spacing_mut().item_spacing.x = 4.0;
 
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Home").size(12.5).color(TEXT_PRIMARY))
-                                .fill(BG_TILE)
-                                .min_size(Vec2::new(48.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        nav_dir = Some(super::data_dir());
-                    }
-
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("+ Folder").size(12.5).color(TEXT_PRIMARY))
-                                .fill(BG_TILE)
-                                .min_size(Vec2::new(66.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        self.new_folder = Some(String::new());
-                    }
-
-                    // Right-aligned view toggle & System Picker accent button.
-                    let right_controls_w = if self.kind == Kind::PickFile { 206.0 } else { 94.0 };
-                    let path_w = (ui.available_width() - right_controls_w).max(60.0);
-
-                    // Path / breadcrumb bar
-                    let (path_rect, _) = ui.allocate_exact_size(Vec2::new(path_w, 28.0), Sense::hover());
-                    ui.painter().rect_filled(path_rect, 5.0, BG_BROWSER);
-                    ui.painter().rect_stroke(path_rect, 5.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
-                    let path_text = shorten(&self.listing.dir);
-                    ui.painter().with_clip_rect(path_rect.shrink2(Vec2::new(8.0, 2.0))).text(
-                        Pos2::new(path_rect.left() + 8.0, path_rect.center().y),
-                        Align2::LEFT_CENTER,
-                        path_text,
-                        FontId::proportional(12.0),
-                        TEXT_MUTED,
-                    );
-
-                    // List / Grid toggle
-                    let list_active = self.view_mode == ViewMode::List;
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("List").size(12.0).color(if list_active { Color32::WHITE } else { TEXT_MUTED }),
-                            )
-                            .fill(if list_active { ACCENT_SOFT } else { BG_TILE })
-                            .stroke(Stroke::new(1.0, if list_active { ACCENT } else { BORDER }))
-                            .min_size(Vec2::new(40.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::List;
-                    }
-                    let grid_active = self.view_mode == ViewMode::Grid;
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Grid").size(12.0).color(if grid_active { Color32::WHITE } else { TEXT_MUTED }),
-                            )
-                            .fill(if grid_active { ACCENT_SOFT } else { BG_TILE })
-                            .stroke(Stroke::new(1.0, if grid_active { ACCENT } else { BORDER }))
-                            .min_size(Vec2::new(40.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::Grid;
-                    }
-
-                    if self.kind == Kind::PickFile {
+                        let up = self.listing.dir.parent().map(Path::to_path_buf);
+                        let at_root = roots.iter().any(|r| r.path == self.listing.dir)
+                            || self.listing.dir == Path::new("/");
                         if ui
-                            .add(
-                                egui::Button::new(RichText::new("System Picker").size(12.0).strong().color(Color32::WHITE))
-                                    .fill(ACCENT)
-                                    .min_size(Vec2::new(104.0, 28.0)),
+                            .add_enabled(
+                                up.is_some() && !at_root,
+                                egui::Button::new(RichText::new("↑ Up").size(11.5).color(TEXT_PRIMARY))
+                                    .fill(BG_TILE)
+                                    .min_size(Vec2::new(42.0, 26.0)),
                             )
                             .clicked()
                         {
-                            clear_saf_picker_result();
-                            match open_system_picker(self.multi, &self.request) {
-                                Ok(()) => {
-                                    self.waiting_system_picker = true;
-                                    self.error = None;
-                                }
-                                Err(e) => {
-                                    self.waiting_system_picker = false;
-                                    self.error = Some(format!("Could not open system picker: {e}"));
+                            if let Some(u) = up {
+                                nav_dir = Some(u);
+                            }
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Home").size(11.5).color(TEXT_PRIMARY))
+                                    .fill(BG_TILE)
+                                    .min_size(Vec2::new(44.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            nav_dir = Some(super::data_dir());
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("+ Folder").size(11.5).color(TEXT_PRIMARY))
+                                    .fill(BG_TILE)
+                                    .min_size(Vec2::new(58.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            self.new_folder = Some(String::new());
+                        }
+
+                        // Path / breadcrumb box taking remaining width before right controls
+                        let right_controls_w = if self.kind == Kind::PickFile { 174.0 } else { 76.0 };
+                        let path_w = (ui.available_width() - right_controls_w).max(36.0);
+                        let (path_rect, _) = ui.allocate_exact_size(Vec2::new(path_w, 26.0), Sense::hover());
+                        ui.painter().rect_filled(path_rect, 5.0, BG_BROWSER);
+                        ui.painter().rect_stroke(path_rect, 5.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+                        let max_path_chars = ((path_w - 14.0) / 6.5).floor().max(6.0) as usize;
+                        let path_text = truncate_middle(&shorten(&self.listing.dir), max_path_chars);
+                        ui.painter().with_clip_rect(path_rect.shrink2(Vec2::new(6.0, 2.0))).text(
+                            Pos2::new(path_rect.left() + 6.0, path_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            path_text,
+                            FontId::proportional(11.5),
+                            TEXT_MUTED,
+                        );
+
+                        // List / Grid toggle
+                        let list_active = self.view_mode == ViewMode::List;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("List").size(11.5).color(if list_active { Color32::WHITE } else { TEXT_MUTED }),
+                                )
+                                .fill(if list_active { ACCENT_SOFT } else { BG_TILE })
+                                .stroke(Stroke::new(1.0, if list_active { ACCENT } else { BORDER }))
+                                .min_size(Vec2::new(34.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            self.view_mode = ViewMode::List;
+                        }
+                        let grid_active = self.view_mode == ViewMode::Grid;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Grid").size(11.5).color(if grid_active { Color32::WHITE } else { TEXT_MUTED }),
+                                )
+                                .fill(if grid_active { ACCENT_SOFT } else { BG_TILE })
+                                .stroke(Stroke::new(1.0, if grid_active { ACCENT } else { BORDER }))
+                                .min_size(Vec2::new(34.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            self.view_mode = ViewMode::Grid;
+                        }
+
+                        if self.kind == Kind::PickFile {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("System Picker").size(11.5).strong().color(Color32::WHITE))
+                                        .fill(ACCENT)
+                                        .min_size(Vec2::new(92.0, 26.0)),
+                                )
+                                .clicked()
+                            {
+                                clear_saf_picker_result();
+                                match open_system_picker(self.multi, &self.request) {
+                                    Ok(()) => {
+                                        self.waiting_system_picker = true;
+                                        self.error = None;
+                                    }
+                                    Err(e) => {
+                                        self.waiting_system_picker = false;
+                                        self.error = Some(format!("Could not open system picker: {e}"));
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    },
+                );
 
-                // Compact All Files Access banner when Android Scoped Storage may hide files
+                // Optional compact 1-line Scoped Storage banner when !storage_access
                 if !self.storage_access {
                     egui::Frame::new()
                         .fill(WARN_BG)
                         .stroke(Stroke::new(1.0, WARN_BORDER))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(Margin::symmetric(8, 5))
+                        .corner_radius(CornerRadius::same(5))
+                        .inner_margin(Margin::symmetric(8, 3))
                         .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new(
-                                        "Some files may be hidden by Android — Grant All Files Access or use System Picker.",
-                                    )
-                                    .size(11.5)
-                                    .color(WARN_TEXT),
-                                );
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Grant All Files Access").size(11.5).strong().color(Color32::WHITE),
-                                        )
-                                        .fill(Color32::from_rgb(168, 114, 30))
-                                        .min_size(Vec2::new(0.0, 22.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    if let Err(e) = super::jni::request_storage_access() {
-                                        self.error = Some(format!("Could not open permission page: {e}"));
-                                    }
-                                }
-                            });
+                            let strip_w = (inner_w - 16.0).max(200.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(strip_w, 22.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_clip_rect(ui.max_rect());
+                                    let btn_reserve = 112.0;
+                                    let msg_w = (strip_w - btn_reserve - 6.0).max(80.0);
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(msg_w, 22.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.set_clip_rect(ui.max_rect());
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(
+                                                        "Android scoped storage active — grant access or use System Picker.",
+                                                    )
+                                                    .size(11.0)
+                                                    .color(WARN_TEXT),
+                                                )
+                                                .truncate(),
+                                            );
+                                        },
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("All Files Access").size(11.0).strong().color(Color32::WHITE),
+                                                )
+                                                .fill(Color32::from_rgb(168, 114, 30))
+                                                .min_size(Vec2::new(104.0, 20.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Err(e) = super::jni::request_storage_access() {
+                                                self.error = Some(format!("Could not open permission page: {e}"));
+                                            }
+                                        }
+                                    });
+                                },
+                            );
                         });
                 }
 
@@ -849,21 +881,28 @@ impl Picker {
                         .fill(BG_PANEL)
                         .stroke(Stroke::new(1.0, BORDER))
                         .corner_radius(CornerRadius::same(6))
-                        .inner_margin(Margin::symmetric(8, 5))
+                        .inner_margin(Margin::symmetric(8, 4))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("New folder:").size(12.0).color(TEXT_MUTED));
-                                let r = ui.add(egui::TextEdit::singleline(nf).desired_width(200.0));
-                                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    make = true;
-                                }
-                                if ui.add(egui::Button::new(RichText::new("Create").size(12.0).color(Color32::WHITE)).fill(ACCENT)).clicked() {
-                                    make = true;
-                                }
-                                if ui.add(egui::Button::new(RichText::new("Cancel").size(12.0)).fill(BG_TILE)).clicked() {
-                                    cancel = true;
-                                }
-                            });
+                            let bar_w = (inner_w - 16.0).max(200.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(bar_w, 24.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_clip_rect(ui.max_rect());
+                                    ui.label(RichText::new("New folder:").size(11.5).color(TEXT_MUTED));
+                                    let edit_w = (bar_w - 200.0).clamp(80.0, 200.0);
+                                    let r = ui.add(egui::TextEdit::singleline(nf).desired_width(edit_w));
+                                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        make = true;
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new("Create").size(11.5).color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                                        make = true;
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new("Cancel").size(11.5)).fill(BG_TILE)).clicked() {
+                                        cancel = true;
+                                    }
+                                },
+                            );
                         });
                     if make && !nf.trim().is_empty() {
                         let dir = self.listing.dir.join(safe_name(nf.trim()));
@@ -881,252 +920,319 @@ impl Picker {
 
                 // Subtle waiting indicator if System Picker is currently copying files
                 if self.waiting_system_picker {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Waiting for Android System Picker…").size(11.5).color(ACCENT));
-                        if ui.small_button("Dismiss").clicked() {
-                            self.waiting_system_picker = false;
-                        }
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(inner_w, 20.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            ui.label(RichText::new("Waiting for Android System Picker…").size(11.0).color(ACCENT));
+                            if ui.small_button("Dismiss").clicked() {
+                                self.waiting_system_picker = false;
+                            }
+                        },
+                    );
                 }
 
                 // ==================== 2. MAIN PANES ====================
-                let footer_reserve = if self.error.is_some() { 64.0 } else { 44.0 };
-                let body_h = (ui.available_height() - footer_reserve).max(110.0);
-                let body_w = ui.available_width();
-                let sidebar_w = if body_w >= 460.0 { 126.0 } else { 104.0 };
-
-                let preview_path = self.active_preview_path().filter(|p| p.is_file());
-                let show_preview = body_w >= 560.0 && preview_path.is_some();
-                let preview_w = if show_preview { 172.0 } else { 0.0 };
+                let footer_h = 34.0;
+                let error_h = if self.error.is_some() { 20.0 } else { 0.0 };
+                let body_h = (ui.available_height() - footer_h - error_h - 6.0).max(120.0);
                 let gap = 6.0;
-                let browser_w = (body_w - sidebar_w - gap - if show_preview { preview_w + gap } else { 0.0 }).max(140.0);
+                let sidebar_w = 112.0_f32;
+                let preview_path = self.active_preview_path().filter(|p| p.is_file());
+                let show_preview = inner_w >= 540.0 && preview_path.is_some();
+                let preview_w = if show_preview { 156.0_f32 } else { 0.0 };
+                let center_w = (inner_w - sidebar_w - gap - if show_preview { preview_w + gap } else { 0.0 }).max(140.0);
 
-                ui.allocate_ui_with_layout(
-                    Vec2::new(body_w, body_h),
-                    egui::Layout::left_to_right(egui::Align::TOP),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
 
-                        // ---- LEFT SIDEBAR: Quick Places ----
-                        egui::Frame::new()
-                            .fill(BG_PANEL)
-                            .stroke(Stroke::new(1.0, BORDER))
-                            .corner_radius(CornerRadius::same(7))
-                            .inner_margin(Margin::same(6))
-                            .show(ui, |ui| {
-                                ui.set_width(sidebar_w - 12.0);
-                                ui.set_height(body_h - 12.0);
-                                ui.label(RichText::new("PLACES").size(10.0).strong().color(TEXT_MUTED));
-                                ui.add_space(2.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("android-picker-sidebar")
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        // Find most specific matching root so "Imported" highlights instead of "Rustudio".
-                                        let active_idx = roots
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(_, r)| self.listing.dir.starts_with(&r.path))
-                                            .max_by_key(|(_, r)| r.path.as_os_str().len())
-                                            .map(|(i, _)| i);
-                                        for (idx, r) in roots.iter().enumerate() {
-                                            let active = active_idx == Some(idx);
-                                            let row_w = ui.available_width();
-                                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 30.0), Sense::click());
-                                            if active {
-                                                ui.painter().rect_filled(rect, 5.0, BG_SELECTED);
-                                                let bar = Rect::from_min_size(
-                                                    Pos2::new(rect.left() + 1.0, rect.top() + 5.0),
-                                                    Vec2::new(3.0, rect.height() - 10.0),
+                    // ---- LEFT SIDEBAR: Quick Places (explicit top-down column) ----
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(sidebar_w, body_h),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            egui::Frame::new()
+                                .fill(BG_PANEL)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .corner_radius(CornerRadius::same(7))
+                                .inner_margin(Margin::same(4))
+                                .show(ui, |ui| {
+                                    let col_inner_w = (sidebar_w - 8.0).max(80.0);
+                                    let col_inner_h = (body_h - 8.0).max(80.0);
+                                    ui.set_min_size(Vec2::new(col_inner_w, col_inner_h));
+                                    ui.set_max_width(col_inner_w);
+                                    ui.label(RichText::new("PLACES").size(10.0).strong().color(TEXT_MUTED));
+                                    ui.add_space(2.0);
+                                    let scroll_h = (col_inner_h - 18.0).max(60.0);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("picker_places")
+                                        .max_height(scroll_h)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.spacing_mut().item_spacing.y = 2.0;
+                                            let btn_w = (sidebar_w - 14.0).min(ui.available_width()).max(72.0);
+                                            // Find most specific matching root so "Imported" highlights instead of "Rustudio".
+                                            let active_idx = roots
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, r)| self.listing.dir.starts_with(&r.path))
+                                                .max_by_key(|(_, r)| r.path.as_os_str().len())
+                                                .map(|(i, _)| i);
+                                            for (idx, r) in roots.iter().enumerate() {
+                                                let active = active_idx == Some(idx);
+                                                let (rect, resp) = ui.allocate_exact_size(Vec2::new(btn_w, 28.0), Sense::click());
+                                                if active {
+                                                    ui.painter().rect_filled(rect, 5.0, BG_SELECTED);
+                                                    let bar = Rect::from_min_size(
+                                                        Pos2::new(rect.left() + 1.0, rect.top() + 5.0),
+                                                        Vec2::new(3.0, rect.height() - 10.0),
+                                                    );
+                                                    ui.painter().rect_filled(bar, 1.5, ACCENT);
+                                                } else if resp.hovered() {
+                                                    ui.painter().rect_filled(rect, 5.0, BG_HOVER);
+                                                }
+                                                ui.painter().with_clip_rect(rect.shrink2(Vec2::new(6.0, 2.0))).text(
+                                                    Pos2::new(rect.left() + 8.0, rect.center().y),
+                                                    Align2::LEFT_CENTER,
+                                                    r.label,
+                                                    FontId::proportional(12.0),
+                                                    if active { Color32::WHITE } else { TEXT_PRIMARY },
                                                 );
-                                                ui.painter().rect_filled(bar, 1.5, ACCENT);
-                                            } else if resp.hovered() {
-                                                ui.painter().rect_filled(rect, 5.0, BG_HOVER);
-                                            }
-                                            ui.painter().with_clip_rect(rect.shrink2(Vec2::new(8.0, 2.0))).text(
-                                                Pos2::new(rect.left() + 10.0, rect.center().y),
-                                                Align2::LEFT_CENTER,
-                                                r.label,
-                                                FontId::proportional(12.5),
-                                                if active { Color32::WHITE } else { TEXT_PRIMARY },
-                                            );
-                                            if resp.clicked() {
-                                                nav_dir = Some(r.path.clone());
-                                            }
-                                        }
-                                    });
-                            });
-
-                        // ---- CENTER FILE BROWSER ----
-                        egui::Frame::new()
-                            .fill(BG_BROWSER)
-                            .stroke(Stroke::new(1.0, BORDER))
-                            .corner_radius(CornerRadius::same(7))
-                            .inner_margin(Margin::same(6))
-                            .show(ui, |ui| {
-                                ui.set_width(browser_w - 12.0);
-                                ui.set_height(body_h - 12.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("android-picker-browser")
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        if self.listing.folders.is_empty() && self.listing.files.is_empty() {
-                                            ui.add_space(18.0);
-                                            ui.vertical_centered(|ui| {
-                                                let msg = if self.listing.hidden_by_filter > 0 {
-                                                    format!(
-                                                        "No matching files here ({} hidden by filter).\nTap \"All files\" below to show everything.",
-                                                        self.listing.hidden_by_filter
-                                                    )
-                                                } else {
-                                                    "Empty folder.\nUse System Picker or copy files into this folder.".to_string()
-                                                };
-                                                ui.label(RichText::new(msg).size(12.5).color(TEXT_MUTED));
-                                            });
-                                        } else {
-                                            match self.view_mode {
-                                                ViewMode::List => {
-                                                    self.render_list_view(ui, ctx, &mut nav_dir, &mut result);
-                                                }
-                                                ViewMode::Grid => {
-                                                    self.render_grid_view(ui, ctx, &mut nav_dir, &mut result);
+                                                if resp.clicked() {
+                                                    nav_dir = Some(r.path.clone());
                                                 }
                                             }
-                                        }
-                                    });
-                            });
+                                        });
+                                });
+                        },
+                    );
 
-                        // ---- RIGHT PREVIEW PANEL ----
-                        if show_preview {
-                            if let Some(ref p) = preview_path {
-                                self.render_preview_panel(ui, ctx, p, preview_w, body_h, &mut result);
-                            }
+                    // ---- CENTER FILE BROWSER (explicit top-down column) ----
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(center_w, body_h),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            egui::Frame::new()
+                                .fill(BG_BROWSER)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .corner_radius(CornerRadius::same(7))
+                                .inner_margin(Margin::same(4))
+                                .show(ui, |ui| {
+                                    let col_inner_w = (center_w - 8.0).max(120.0);
+                                    let col_inner_h = (body_h - 8.0).max(80.0);
+                                    ui.set_min_size(Vec2::new(col_inner_w, col_inner_h));
+                                    ui.set_max_width(col_inner_w);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("picker_files")
+                                        .max_height(col_inner_h)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            if self.listing.folders.is_empty() && self.listing.files.is_empty() {
+                                                ui.add_space(18.0);
+                                                ui.vertical_centered(|ui| {
+                                                    let msg = if self.listing.hidden_by_filter > 0 {
+                                                        format!(
+                                                            "No matching files here ({} hidden by filter).
+Tap \"All files\" below to show everything.",
+                                                            self.listing.hidden_by_filter
+                                                        )
+                                                    } else {
+                                                        "Empty folder.
+Use System Picker or copy files into this folder.".to_string()
+                                                    };
+                                                    ui.label(RichText::new(msg).size(12.0).color(TEXT_MUTED));
+                                                });
+                                            } else {
+                                                match self.view_mode {
+                                                    ViewMode::List => {
+                                                        self.render_list_view(ui, ctx, center_w, &mut nav_dir, &mut result);
+                                                    }
+                                                    ViewMode::Grid => {
+                                                        self.render_grid_view(ui, ctx, center_w, &mut nav_dir, &mut result);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                });
+                        },
+                    );
+
+                    // ---- RIGHT PREVIEW PANEL (explicit top-down column) ----
+                    if show_preview {
+                        if let Some(ref p) = preview_path {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(preview_w, body_h),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    ui.set_clip_rect(ui.max_rect());
+                                    self.render_preview_panel(ui, ctx, p, preview_w, body_h, &mut result);
+                                },
+                            );
                         }
-                    },
-                );
+                    }
+                });
 
                 // Error line if any
                 if let Some(e) = &self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, RichText::new(e).size(11.5));
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(inner_w, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(e).size(11.0).color(ui.visuals().error_fg_color),
+                                )
+                                .truncate(),
+                            );
+                        },
+                    );
                 }
 
-                // ==================== 3. BOTTOM FOOTER ====================
-                ui.horizontal(|ui| {
-                    // Left side: Save filename input or selection status + filter toggle
-                    if self.kind == Kind::SaveFile {
-                        ui.label(RichText::new("Name:").size(12.5).color(TEXT_MUTED));
-                        let name_w = (ui.available_width() - 250.0).clamp(110.0, 260.0);
-                        ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(name_w));
-                    } else if self.multi {
-                        if ui
-                            .add_enabled(
-                                !self.listing.files.is_empty(),
-                                egui::Button::new(RichText::new("Select All").size(12.0)).fill(BG_TILE),
-                            )
-                            .clicked()
-                        {
-                            for f in &self.listing.files {
-                                if !self.selected_multi.iter().any(|p| p == &f.path) {
-                                    self.selected_multi.push(f.path.clone());
+                // ==================== 3. BOTTOM FOOTER (34px, clipped) ====================
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inner_w, footer_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_clip_rect(ui.max_rect());
+                        ui.spacing_mut().item_spacing.x = 5.0;
+
+                        let right_reserve = if self.multi { 168.0 } else { 148.0 };
+                        let left_w = (inner_w - right_reserve - 6.0).max(120.0);
+
+                        // Left side: Save input / multi controls + Filter pill + All files toggle
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, footer_h),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_clip_rect(ui.max_rect());
+                                if self.kind == Kind::SaveFile {
+                                    ui.label(RichText::new("Name:").size(11.5).color(TEXT_MUTED));
+                                    let name_w = (left_w - 130.0).clamp(80.0, 210.0);
+                                    ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(name_w));
+                                } else if self.multi {
+                                    if ui
+                                        .add_enabled(
+                                            !self.listing.files.is_empty(),
+                                            egui::Button::new(RichText::new("Select All").size(11.5)).fill(BG_TILE),
+                                        )
+                                        .clicked()
+                                    {
+                                        for f in &self.listing.files {
+                                            if !self.selected_multi.iter().any(|p| p == &f.path) {
+                                                self.selected_multi.push(f.path.clone());
+                                            }
+                                        }
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.selected_multi.is_empty(),
+                                            egui::Button::new(RichText::new("Clear").size(11.5)).fill(BG_TILE),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_multi.clear();
+                                        self.selected = None;
+                                    }
+                                }
+
+                                // Filter pill + All files toggle
+                                if !self.request.filters.is_empty() {
+                                    let summary = filter_summary(&self.request);
+                                    let pill_text = if !self.show_all_files && self.listing.hidden_by_filter > 0 {
+                                        format!("{summary} (+{})", self.listing.hidden_by_filter)
+                                    } else {
+                                        summary
+                                    };
+                                    let all_on = self.show_all_files;
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(pill_text)
+                                                    .size(11.0)
+                                                    .color(if !all_on { Color32::WHITE } else { TEXT_MUTED }),
+                                            )
+                                            .fill(if !all_on { ACCENT_SOFT } else { BG_TILE })
+                                            .stroke(Stroke::new(1.0, if !all_on { ACCENT } else { BORDER }))
+                                            .min_size(Vec2::new(0.0, 24.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.show_all_files = false;
+                                        self.refresh_listing();
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("All files")
+                                                    .size(11.0)
+                                                    .color(if all_on { Color32::WHITE } else { TEXT_MUTED }),
+                                            )
+                                            .fill(if all_on { ACCENT_SOFT } else { BG_TILE })
+                                            .stroke(Stroke::new(1.0, if all_on { ACCENT } else { BORDER }))
+                                            .min_size(Vec2::new(0.0, 24.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.show_all_files = true;
+                                        self.refresh_listing();
+                                    }
+                                } else {
+                                    ui.label(RichText::new("All files").size(11.0).color(TEXT_MUTED));
+                                }
+                            },
+                        );
+
+                        // Right side: Cancel + primary Open/Save/Import action
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.multi {
+                                let count = self.selected_multi.len();
+                                let label = format!("Import ({count})");
+                                if ui
+                                    .add_enabled(
+                                        count > 0,
+                                        egui::Button::new(RichText::new(label).size(12.0).strong().color(Color32::WHITE))
+                                            .fill(if count > 0 { ACCENT } else { BG_TILE })
+                                            .min_size(Vec2::new(84.0, 26.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    result = Some(Some(self.selected_multi.clone()));
+                                }
+                            } else {
+                                let (verb, ready) = match self.kind {
+                                    Kind::PickFile => ("Open", self.selected.is_some()),
+                                    Kind::PickFolder => ("Choose", true),
+                                    Kind::SaveFile => ("Save", !self.name.trim().is_empty()),
+                                };
+                                if ui
+                                    .add_enabled(
+                                        ready,
+                                        egui::Button::new(RichText::new(verb).size(12.0).strong().color(Color32::WHITE))
+                                            .fill(if ready { ACCENT } else { BG_TILE })
+                                            .min_size(Vec2::new(68.0, 26.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    result = Some(self.confirm_single());
                                 }
                             }
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.selected_multi.is_empty(),
-                                egui::Button::new(RichText::new("Clear").size(12.0)).fill(BG_TILE),
-                            )
-                            .clicked()
-                        {
-                            self.selected_multi.clear();
-                            self.selected = None;
-                        }
-                    } else if let Some(sel) = &self.selected {
-                        let fname = sel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        ui.add(
-                            egui::Label::new(RichText::new(fname).size(12.5).color(TEXT_PRIMARY)).truncate(),
-                        );
-                    }
-
-                    // Filter / "All files" one-tap toggle
-                    if !self.request.filters.is_empty() {
-                        let all_on = self.show_all_files;
-                        let filter_label = if all_on {
-                            "All files".to_string()
-                        } else {
-                            let summary = filter_summary(&self.request);
-                            if self.listing.hidden_by_filter > 0 {
-                                format!("{summary} (+{} hidden)", self.listing.hidden_by_filter)
-                            } else {
-                                summary
-                            }
-                        };
-                        let btn = egui::Button::new(
-                            RichText::new(filter_label)
-                                .size(11.5)
-                                .color(if all_on { Color32::WHITE } else { TEXT_MUTED }),
-                        )
-                        .fill(if all_on { ACCENT_SOFT } else { BG_TILE })
-                        .stroke(Stroke::new(1.0, if all_on { ACCENT } else { BORDER }))
-                        .min_size(Vec2::new(0.0, 26.0));
-                        if ui
-                            .add(btn)
-                            .on_hover_text("Tap to toggle between filtered extensions and All files")
-                            .clicked()
-                        {
-                            self.show_all_files = !self.show_all_files;
-                            self.refresh_listing();
-                        }
-                    } else {
-                        ui.label(RichText::new("All files").size(11.5).color(TEXT_MUTED));
-                    }
-
-                    // Right side: Cancel + primary Open/Save/Import action
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.multi {
-                            let count = self.selected_multi.len();
-                            let label = format!("Import ({count})");
                             if ui
-                                .add_enabled(
-                                    count > 0,
-                                    egui::Button::new(RichText::new(label).size(12.5).strong().color(Color32::WHITE))
-                                        .fill(if count > 0 { ACCENT } else { BG_TILE })
-                                        .min_size(Vec2::new(92.0, 28.0)),
+                                .add(
+                                    egui::Button::new(RichText::new("Cancel").size(12.0).color(TEXT_PRIMARY))
+                                        .fill(BG_TILE)
+                                        .min_size(Vec2::new(62.0, 26.0)),
                                 )
                                 .clicked()
                             {
-                                result = Some(Some(self.selected_multi.clone()));
+                                result = Some(None);
                             }
-                        } else {
-                            let (verb, ready) = match self.kind {
-                                Kind::PickFile => ("Open", self.selected.is_some()),
-                                Kind::PickFolder => ("Choose", true),
-                                Kind::SaveFile => ("Save", !self.name.trim().is_empty()),
-                            };
-                            if ui
-                                .add_enabled(
-                                    ready,
-                                    egui::Button::new(RichText::new(verb).size(12.5).strong().color(Color32::WHITE))
-                                        .fill(if ready { ACCENT } else { BG_TILE })
-                                        .min_size(Vec2::new(76.0, 28.0)),
-                                )
-                                .clicked()
-                            {
-                                result = Some(self.confirm_single());
-                            }
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").size(12.5).color(TEXT_PRIMARY))
-                                    .fill(BG_TILE)
-                                    .min_size(Vec2::new(68.0, 28.0)),
-                            )
-                            .clicked()
-                        {
-                            result = Some(None);
-                        }
-                    });
-                });
+                        });
+                    },
+                );
             });
 
         if let Some(dir) = nav_dir {
@@ -1153,11 +1259,13 @@ impl Picker {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        center_w: f32,
         nav_dir: &mut Option<PathBuf>,
         result: &mut Option<Option<Vec<PathBuf>>>,
     ) {
-        let row_w = ui.available_width();
-        let row_h = 38.0;
+        let row_w = (center_w - 14.0).min(ui.available_width()).max(100.0);
+        let row_h = 34.0;
+        ui.spacing_mut().item_spacing.y = 2.0;
 
         // Folders first (left-aligned)
         for idx in 0..self.listing.folders.len() {
@@ -1311,15 +1419,15 @@ impl Picker {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        center_w: f32,
         nav_dir: &mut Option<PathBuf>,
         result: &mut Option<Option<Vec<PathBuf>>>,
     ) {
-        let avail_w = ui.available_width();
-        let gap = 8.0;
-        let min_tile_w = 96.0;
-        let cols = ((avail_w + gap) / (min_tile_w + gap)).floor().max(2.0) as usize;
-        let tile_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).floor().max(80.0);
-        let tile_h = 112.0;
+        let avail_w = (center_w - 16.0).min(ui.available_width()).max(120.0);
+        let gap = 6.0;
+        let cols = ((center_w - 12.0) / 96.0).floor().max(2.0) as usize;
+        let tile_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).floor().max(64.0);
+        let tile_h = 108.0;
 
         enum GridItem {
             Folder(usize),
@@ -1503,18 +1611,21 @@ impl Picker {
             .fill(BG_PANEL)
             .stroke(Stroke::new(1.0, BORDER))
             .corner_radius(CornerRadius::same(7))
-            .inner_margin(Margin::same(8))
+            .inner_margin(Margin::same(6))
             .show(ui, |ui| {
-                let inner_w = preview_w - 16.0;
-                ui.set_width(inner_w);
-                ui.set_height(body_h - 16.0);
+                let inner_w = (preview_w - 12.0).max(100.0);
+                let inner_h = (body_h - 12.0).max(80.0);
+                ui.set_min_size(Vec2::new(inner_w, inner_h));
+                ui.set_max_width(inner_w);
+                ui.set_clip_rect(ui.max_rect());
 
                 ui.label(RichText::new("PREVIEW").size(10.0).strong().color(TEXT_MUTED));
-                ui.add_space(4.0);
+                ui.add_space(3.0);
 
-                // Preview box (up to 150x150)
-                let box_side = inner_w.min(150.0).min((body_h - 150.0).max(80.0));
-                let (pbox, _) = ui.allocate_exact_size(Vec2::new(inner_w, box_side), Sense::hover());
+                // Preview thumbnail box fit cleanly inside 128x110
+                let box_w = inner_w.min(128.0);
+                let box_h = 110.0_f32.min((inner_h - 110.0).max(60.0));
+                let (pbox, _) = ui.allocate_exact_size(Vec2::new(box_w, box_h), Sense::hover());
                 ui.painter().rect_filled(pbox, 6.0, BG_BROWSER);
                 ui.painter().rect_stroke(pbox, 6.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
 
@@ -1526,8 +1637,8 @@ impl Picker {
                             let fit = fit_aspect(pbox.shrink(4.0), tex.size_vec2());
                             egui::Image::new(tex).corner_radius(4.0).paint_at(ui, fit);
                         } else {
-                            let pill = Rect::from_center_size(pbox.center(), Vec2::new(52.0, 26.0));
-                            paint_badge(ui.painter(), pill, badge, 12.0);
+                            let pill = Rect::from_center_size(pbox.center(), Vec2::new(48.0, 24.0));
+                            paint_badge(ui.painter(), pill, badge, 11.0);
                         }
                     } else if let Some(ThumbEntry::Loaded { tex, dims: td }) = self.thumbs.get(path) {
                         dims = Some(*td);
@@ -1538,37 +1649,45 @@ impl Picker {
                             pbox.center(),
                             Align2::CENTER_CENTER,
                             "Loading…",
-                            FontId::proportional(11.5),
+                            FontId::proportional(11.0),
                             TEXT_MUTED,
                         );
                     }
                 } else {
-                    let pill = Rect::from_center_size(pbox.center(), Vec2::new(56.0, 28.0));
-                    paint_badge(ui.painter(), pill, badge, 13.0);
+                    let pill = Rect::from_center_size(pbox.center(), Vec2::new(52.0, 26.0));
+                    paint_badge(ui.painter(), pill, badge, 12.0);
                 }
 
-                ui.add_space(6.0);
-                ui.add(egui::Label::new(RichText::new(&name).size(12.5).strong().color(TEXT_PRIMARY)).wrap());
                 ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(truncate_middle(&name, 30))
+                            .size(11.5)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(2.0);
 
                 ui.horizontal(|ui| {
-                    let (br, _) = ui.allocate_exact_size(Vec2::new(38.0, 18.0), Sense::hover());
-                    paint_badge(ui.painter(), br, badge, 9.5);
-                    ui.label(RichText::new(format_size(file_size)).size(11.5).color(TEXT_MUTED));
+                    let (br, _) = ui.allocate_exact_size(Vec2::new(34.0, 17.0), Sense::hover());
+                    paint_badge(ui.painter(), br, badge, 9.0);
+                    ui.label(RichText::new(format_size(file_size)).size(11.0).color(TEXT_MUTED));
                 });
 
                 if let Some((w, h)) = dims {
-                    ui.label(RichText::new(format!("{w} × {h} px")).size(11.5).color(TEXT_MUTED));
+                    ui.label(RichText::new(format!("{w} × {h} px")).size(11.0).color(TEXT_MUTED));
                 }
 
                 // Quick primary action button inside preview pane
-                if !self.multi && self.kind == Kind::PickFile && ui.available_height() >= 34.0 {
+                if !self.multi && self.kind == Kind::PickFile && ui.available_height() >= 30.0 {
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                         if ui
                             .add(
-                                egui::Button::new(RichText::new("Open File").size(12.0).strong().color(Color32::WHITE))
+                                egui::Button::new(RichText::new("Open").size(12.0).strong().color(Color32::WHITE))
                                     .fill(ACCENT)
-                                    .min_size(Vec2::new(inner_w, 28.0)),
+                                    .min_size(Vec2::new(inner_w, 26.0)),
                             )
                             .clicked()
                         {

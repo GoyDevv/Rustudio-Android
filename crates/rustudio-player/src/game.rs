@@ -349,6 +349,7 @@ impl Game {
                 renderer.release_transient_targets(rs);
                 self.vf_draw_cache = Default::default();
             }
+            self.asset_gen += 1;
         }
         rustudio_core::heap::trim();
     }

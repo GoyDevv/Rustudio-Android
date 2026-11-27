@@ -36,10 +36,17 @@ pub struct ImportedMesh {
     pub normals: Vec<Vec3>,
     /// Texture coordinates (same length as `positions`; top-left origin).
     pub uvs: Vec<Vec2>,
+    /// Optional per-vertex sRGB RGBA8 colours (empty when uniform/white; same
+    /// length as `positions` when present).
+    pub colors: Vec<[u8; 4]>,
     /// Optional sRGB base colour in `0.0..=1.0`.
     pub color: Option<[f32; 3]>,
     /// Optional embedded base-colour texture bytes (PNG/JPEG/etc.).
     pub texture: Option<Vec<u8>>,
+    /// Whether the glTF material requested double-sided rendering.
+    pub double_sided: bool,
+    /// Opacity in `0.0..=1.0` (`1.0` for OPAQUE/MASK; `baseColorFactor[3]` for BLEND).
+    pub alpha: f32,
 }
 
 fn linear_to_srgb(c: f32) -> f32 {
@@ -636,6 +643,44 @@ pub fn mesh_data_to_v2(positions: &[Vec3], normals: &[Vec3], uvs: &[Vec2]) -> Ve
     b
 }
 
+/// Encodes de-indexed triangles into Roblox "version 2.00" binary mesh bytes
+/// with optional per-vertex sRGB RGBA8 colours (40-byte vertices when
+/// `colors` contains non-white entries, otherwise 36-byte vertices).
+pub fn mesh_data_to_v2_colored(
+    positions: &[Vec3],
+    normals: &[Vec3],
+    uvs: &[Vec2],
+    colors: &[[u8; 4]],
+) -> Vec<u8> {
+    let n = positions.len() - (positions.len() % 3);
+    let has_colors = colors.len() >= n && colors[..n].iter().any(|c| *c != [255, 255, 255, 255]);
+    if !has_colors {
+        return mesh_data_to_v2(positions, normals, uvs);
+    }
+    let mut b = Vec::with_capacity(32 + n * 40 + (n / 3) * 12);
+    b.extend_from_slice(b"version 2.00\n");
+    b.extend_from_slice(&12u16.to_le_bytes());
+    b.push(40);
+    b.push(12);
+    b.extend_from_slice(&(n as u32).to_le_bytes());
+    b.extend_from_slice(&((n / 3) as u32).to_le_bytes());
+    for i in 0..n {
+        let p = positions[i];
+        let nn = normals.get(i).copied().unwrap_or(Vec3::Y);
+        let uv = uvs.get(i).copied().unwrap_or(Vec2::ZERO);
+        for f in [p.x, p.y, p.z, nn.x, nn.y, nn.z, uv.x, uv.y, 0.0] {
+            b.extend_from_slice(&f.to_le_bytes());
+        }
+        b.extend_from_slice(&colors[i]);
+    }
+    for t in 0..n / 3 {
+        for k in 0..3 {
+            b.extend_from_slice(&((t * 3 + k) as u32).to_le_bytes());
+        }
+    }
+    b
+}
+
 /// Parses a glTF 2.0 `.glb` or `.gltf` file into world-transformed meshes.
 pub fn parse_gltf(path: &Path, bytes: &[u8]) -> Result<Vec<ImportedMesh>, String> {
     let (json, bin_chunk): (serde_json::Value, Option<&[u8]>) =
@@ -696,7 +741,7 @@ pub fn parse_gltf(path: &Path, bytes: &[u8]) -> Result<Vec<ImportedMesh>, String
                         .ok_or("Invalid data URI in glTF buffer")?;
                     buffers.push(decode_base64(b64)?);
                 } else {
-                    let rel = uri.replace("%20", " ");
+                    let rel = percent_decode(uri);
                     let data = std::fs::read(base_dir.join(&rel))
                         .map_err(|e| format!("Could not read glTF buffer {rel}: {e}"))?;
                     buffers.push(data);
@@ -889,6 +934,7 @@ fn extract_gltf_mesh(
         return Ok(());
     };
     let normal_mat = Mat3::from_mat4(world).inverse().transpose();
+    let flip_winding = world.determinant() < 0.0;
     for (pi, prim) in prims.iter().enumerate() {
         let mode = prim.get("mode").and_then(|v| v.as_u64()).unwrap_or(4);
         if !matches!(mode, 4 | 5 | 6) {
@@ -902,12 +948,28 @@ fn extract_gltf_mesh(
         if raw_pos.len() < 3 {
             continue;
         }
+
+        let mat = prim
+            .get("material")
+            .and_then(|v| v.as_u64())
+            .and_then(|mi| materials.get(mi as usize));
+        let (texture, tex_coord) = match mat.and_then(|m| extract_material_texture_info(json, buffers, base_dir, m)) {
+            Some((bytes, tc)) => (Some(bytes), tc),
+            None => (None, 0),
+        };
+        let uv_attr = if tex_coord == 0 {
+            "TEXCOORD_0".to_string()
+        } else {
+            format!("TEXCOORD_{tex_coord}")
+        };
+
         let raw_norm = attrs
             .get("NORMAL")
             .and_then(|v| v.as_u64())
             .and_then(|idx| read_vec3_accessor(json, buffers, idx as usize).ok());
         let raw_uv = attrs
-            .get("TEXCOORD_0")
+            .get(uv_attr.as_str())
+            .or_else(|| attrs.get("TEXCOORD_0"))
             .and_then(|v| v.as_u64())
             .and_then(|idx| read_vec2_accessor(json, buffers, idx as usize).ok());
         let raw_col = attrs
@@ -961,10 +1023,14 @@ fn extract_gltf_mesh(
         let mut positions = Vec::with_capacity(tri_indices.len() * 3);
         let mut normals = Vec::with_capacity(tri_indices.len() * 3);
         let mut uvs = Vec::with_capacity(tri_indices.len() * 3);
-        let mut col_sum = [0.0f64; 3];
-        let mut col_count = 0usize;
+        let mut linear_vcols: Vec<[f32; 4]> = if raw_col.is_some() {
+            Vec::with_capacity(tri_indices.len() * 3)
+        } else {
+            Vec::new()
+        };
 
-        for [i0, i1, i2] in tri_indices {
+        for [a0, a1, a2] in tri_indices {
+            let [i0, i1, i2] = if flip_winding { [a0, a2, a1] } else { [a0, a1, a2] };
             if i0 >= raw_pos.len() || i1 >= raw_pos.len() || i2 >= raw_pos.len() {
                 continue;
             }
@@ -981,6 +1047,8 @@ fn extract_gltf_mesh(
                     .filter(|n| n.length_squared() > 1e-6)
                     .unwrap_or(flat_n);
                 normals.push(n);
+                // glTF TEXCOORD_0 already uses top-left (0, 0) origin with V
+                // growing downwards, matching binary Roblox v2 mesh UVs.
                 uvs.push(
                     raw_uv
                         .as_ref()
@@ -988,12 +1056,7 @@ fn extract_gltf_mesh(
                         .unwrap_or(Vec2::ZERO),
                 );
                 if let Some(cols) = &raw_col {
-                    if let Some(c) = cols.get(vi) {
-                        col_sum[0] += c[0] as f64;
-                        col_sum[1] += c[1] as f64;
-                        col_sum[2] += c[2] as f64;
-                        col_count += 1;
-                    }
+                    linear_vcols.push(cols.get(vi).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]));
                 }
             }
         }
@@ -1001,34 +1064,116 @@ fn extract_gltf_mesh(
             continue;
         }
 
-        let mat = prim
-            .get("material")
-            .and_then(|v| v.as_u64())
-            .and_then(|mi| materials.get(mi as usize));
-        let texture = mat.and_then(|m| extract_material_texture(json, buffers, base_dir, m));
-        let mut color = mat
-            .and_then(|m| m.get("pbrMetallicRoughness"))
-            .and_then(|p| p.get("baseColorFactor"))
-            .and_then(|c| c.as_array())
-            .filter(|a| a.len() >= 3)
-            .map(|a| {
-                [
-                    linear_to_srgb(a[0].as_f64().unwrap_or(0.64) as f32),
-                    linear_to_srgb(a[1].as_f64().unwrap_or(0.64) as f32),
-                    linear_to_srgb(a[2].as_f64().unwrap_or(0.64) as f32),
-                ]
-            });
+        // Read material base colour factor (linear RGBA): pbrMetallicRoughness.baseColorFactor,
+        // falling back to KHR_materials_pbrSpecularGlossiness.diffuseFactor.
+        let factor_linear: Option<[f32; 4]> = mat.and_then(|m| {
+            let arr = m
+                .get("pbrMetallicRoughness")
+                .and_then(|p| p.get("baseColorFactor"))
+                .and_then(|c| c.as_array())
+                .or_else(|| {
+                    m.get("extensions")
+                        .and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness"))
+                        .and_then(|sg| sg.get("diffuseFactor"))
+                        .and_then(|c| c.as_array())
+                })?;
+            if arr.len() < 3 {
+                return None;
+            }
+            Some([
+                arr[0].as_f64().unwrap_or(1.0) as f32,
+                arr[1].as_f64().unwrap_or(1.0) as f32,
+                arr[2].as_f64().unwrap_or(1.0) as f32,
+                arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+            ])
+        });
+        let double_sided = mat
+            .and_then(|m| m.get("doubleSided"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let alpha_mode = mat
+            .and_then(|m| m.get("alphaMode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("OPAQUE");
+        let alpha = if alpha_mode == "BLEND" {
+            factor_linear.map(|f| f[3].clamp(0.0, 1.0)).unwrap_or(1.0)
+        } else {
+            1.0
+        };
 
-        let is_default_white = color
-            .map(|c| c[0] >= 0.99 && c[1] >= 0.99 && c[2] >= 0.99)
-            .unwrap_or(true);
-        if texture.is_none() && is_default_white && col_count > 0 {
-            let inv = 1.0 / col_count as f64;
+        let linear_to_u8 = |c: f32| -> u8 { (linear_to_srgb(c) * 255.0).round().clamp(0.0, 255.0) as u8 };
+
+        let has_nonwhite_vcol = linear_vcols.iter().any(|c| {
+            c[0] < 0.996 || c[1] < 0.996 || c[2] < 0.996 || c[3] < 0.996
+        });
+        let vcol_varies = if has_nonwhite_vcol && linear_vcols.len() > 1 {
+            let first = linear_vcols[0];
+            linear_vcols.iter().any(|c| {
+                (c[0] - first[0]).abs() > 1e-3
+                    || (c[1] - first[1]).abs() > 1e-3
+                    || (c[2] - first[2]).abs() > 1e-3
+            })
+        } else {
+            false
+        };
+
+        let mut colors: Vec<[u8; 4]> = Vec::new();
+        let color: Option<[f32; 3]>;
+
+        if texture.is_some() {
+            // MeshPart TextureID renders with TexMode::Opaque (`t.rgb * vtint`),
+            // which does not multiply by the part's Color3uint8. Keep the part
+            // Color at baseColorFactor (default white) and bake any non-white
+            // baseColorFactor or COLOR_0 tint into per-vertex mesh colours so
+            // the viewport displays the exact glTF result.
+            let f = factor_linear.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let factor_is_tinted = f[0] < 0.996 || f[1] < 0.996 || f[2] < 0.996;
+            color = Some([linear_to_srgb(f[0]), linear_to_srgb(f[1]), linear_to_srgb(f[2])]);
+            if has_nonwhite_vcol {
+                colors = linear_vcols
+                    .iter()
+                    .map(|c| {
+                        [
+                            linear_to_u8(c[0] * f[0]),
+                            linear_to_u8(c[1] * f[1]),
+                            linear_to_u8(c[2] * f[2]),
+                            (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        ]
+                    })
+                    .collect();
+            } else if factor_is_tinted {
+                let tint = [linear_to_u8(f[0]), linear_to_u8(f[1]), linear_to_u8(f[2]), 255];
+                colors = vec![tint; positions.len()];
+            }
+        } else if has_nonwhite_vcol && vcol_varies {
+            // Varying per-vertex COLOR_0: encode into 40-byte v2 mesh vertices
+            // and keep baseColorFactor on the MeshPart's Color3uint8 so the
+            // shader computes `Color * vtint = baseColorFactor * COLOR_0`.
+            let f = factor_linear.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            color = Some([linear_to_srgb(f[0]), linear_to_srgb(f[1]), linear_to_srgb(f[2])]);
+            colors = linear_vcols
+                .iter()
+                .map(|c| {
+                    [
+                        linear_to_u8(c[0]),
+                        linear_to_u8(c[1]),
+                        linear_to_u8(c[2]),
+                        (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ]
+                })
+                .collect();
+        } else if has_nonwhite_vcol {
+            // Uniform non-white COLOR_0: fold into MeshPart Color3uint8 so it
+            // is also editable cleanly in the Properties panel.
+            let f = factor_linear.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let c = linear_vcols[0];
             color = Some([
-                linear_to_srgb((col_sum[0] * inv) as f32),
-                linear_to_srgb((col_sum[1] * inv) as f32),
-                linear_to_srgb((col_sum[2] * inv) as f32),
+                linear_to_srgb(f[0] * c[0]),
+                linear_to_srgb(f[1] * c[1]),
+                linear_to_srgb(f[2] * c[2]),
             ]);
+        } else {
+            color = factor_linear.map(|f| [linear_to_srgb(f[0]), linear_to_srgb(f[1]), linear_to_srgb(f[2])]);
         }
 
         let name = if prims.len() > 1 {
@@ -1041,30 +1186,42 @@ fn extract_gltf_mesh(
             positions,
             normals,
             uvs,
+            colors,
             color,
             texture,
+            double_sided,
+            alpha,
         });
     }
     Ok(())
 }
 
-fn extract_material_texture(
+fn extract_material_texture_info(
     json: &serde_json::Value,
     buffers: &[Vec<u8>],
     base_dir: &Path,
     mat: &serde_json::Value,
-) -> Option<Vec<u8>> {
-    let tex_idx = mat
-        .get("pbrMetallicRoughness")?
-        .get("baseColorTexture")?
-        .get("index")?
-        .as_u64()? as usize;
-    let img_idx = json
-        .get("textures")?
-        .as_array()?
-        .get(tex_idx)?
-        .get("source")?
-        .as_u64()? as usize;
+) -> Option<(Vec<u8>, usize)> {
+    let tex_info = mat
+        .get("pbrMetallicRoughness")
+        .and_then(|p| p.get("baseColorTexture"))
+        .or_else(|| {
+            mat.get("extensions")
+                .and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness"))
+                .and_then(|sg| sg.get("diffuseTexture"))
+        })?;
+    let tex_idx = tex_info.get("index")?.as_u64()? as usize;
+    let tex_coord = tex_info.get("texCoord").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let tex = json.get("textures")?.as_array()?.get(tex_idx)?;
+    let img_idx = tex
+        .get("source")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            tex.get("extensions")
+                .and_then(|e| e.get("EXT_texture_webp"))
+                .and_then(|w| w.get("source"))
+                .and_then(|v| v.as_u64())
+        })? as usize;
     let img = json.get("images")?.as_array()?.get(img_idx)?;
 
     if let Some(bv_idx) = img.get("bufferView").and_then(|v| v.as_u64()) {
@@ -1075,19 +1232,45 @@ fn extract_material_texture(
         let len = bv.get("byteLength").and_then(|v| v.as_u64())? as usize;
         let end = offset.checked_add(len)?;
         if end <= buf.len() {
-            return Some(buf[offset..end].to_vec());
+            return Some((buf[offset..end].to_vec(), tex_coord));
         }
     }
     if let Some(uri) = img.get("uri").and_then(|u| u.as_str()) {
         if let Some(rest) = uri.strip_prefix("data:") {
             let b64 = rest.split_once(',').map(|(_, d)| d)?;
-            return decode_base64(b64).ok();
+            return decode_base64(b64).ok().map(|b| (b, tex_coord));
         } else {
-            let rel = uri.replace("%20", " ");
-            return std::fs::read(base_dir.join(rel)).ok();
+            let rel = percent_decode(uri);
+            return std::fs::read(base_dir.join(rel)).ok().map(|b| (b, tex_coord));
         }
     }
     None
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn component_byte_size(comp: u64) -> Option<usize> {
@@ -1229,7 +1412,7 @@ fn read_vec2_accessor(
         .and_then(|a| a.get(acc_idx))
         .ok_or_else(|| format!("glTF missing accessor {acc_idx}"))?;
     let comp = acc.get("componentType").and_then(|v| v.as_u64()).unwrap_or(0);
-    let normalized = acc.get("normalized").and_then(|v| v.as_bool()).unwrap_or(false);
+    let normalized = acc.get("normalized").and_then(|v| v.as_bool()).unwrap_or(matches!(comp, 5121 | 5123));
     if !matches!(comp, 5120 | 5121 | 5122 | 5123 | 5126) {
         return Err(format!("Unsupported glTF VEC2 componentType {comp}"));
     }
@@ -1249,7 +1432,7 @@ fn read_color_accessor(
     json: &serde_json::Value,
     buffers: &[Vec<u8>],
     acc_idx: usize,
-) -> Result<Vec<[f32; 3]>, String> {
+) -> Result<Vec<[f32; 4]>, String> {
     let acc = json
         .get("accessors")
         .and_then(|v| v.as_array())
@@ -1277,7 +1460,12 @@ fn read_color_accessor(
         let r = read_component_f32(slice, o, comp, normalized).clamp(0.0, 1.0);
         let g = read_component_f32(slice, o + csize, comp, normalized).clamp(0.0, 1.0);
         let b = read_component_f32(slice, o + csize * 2, comp, normalized).clamp(0.0, 1.0);
-        out.push([r, g, b]);
+        let a = if ncomp == 4 {
+            read_component_f32(slice, o + csize * 3, comp, normalized).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        out.push([r, g, b, a]);
     }
     Ok(out)
 }

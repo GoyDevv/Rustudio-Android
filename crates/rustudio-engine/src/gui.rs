@@ -1774,13 +1774,34 @@ impl Gui {
 
     /// Drops all cached GUI textures, mipmaps, FX textures, editable-image
     /// generations, and queued decoded images to release GPU VRAM (e.g. on
-    /// place switch or Android `onTrimMemory`).
+    /// place switch or Android `onTrimMemory`), and invalidates all cached
+    /// GUI meshes/memos so visible `ImageLabel` / `ImageButton` / `BillboardGui`
+    /// elements re-walk and reload their textures on the next frame.
     pub fn clear_textures(&mut self) {
         self.images.clear();
         self.mips.clear();
         self.fx_images.clear();
         self.editable_gens.clear();
         self.images_ready.clear();
+        self.images_decoding.clear();
+        self.image_decode = None;
+        self.fx_images_decoding.clear();
+        self.fx_image_decode = None;
+        self.clear_billboard_canvases();
+        self.cache.clear();
+        self.memo.clear();
+        self.cache_owner.clear();
+        self.cache_kids.clear();
+        self.cache_owned.clear();
+        self.vf_walked.clear();
+    }
+
+    /// Whether any GUI or 3D-effect image is currently decoding off-thread or
+    /// waiting for GPU upload.
+    pub fn has_pending_images(&self) -> bool {
+        !self.images_decoding.is_empty()
+            || !self.images_ready.is_empty()
+            || !self.fx_images_decoding.is_empty()
     }
 
     /// Resets per-document GUI caches and failed image entries when opening a new place.

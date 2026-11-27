@@ -1348,10 +1348,9 @@ impl AssetPicker {
 
         let target = self.target.clone()?;
         let screen = ctx.content_rect();
-        let max_w = (screen.width() - 16.0).max(280.0);
-        let max_h = (screen.height() - 16.0).max(260.0);
-        let win_w = 620.0_f32.min(max_w);
-        let win_h = 520.0_f32.min(max_h);
+        let win_w = (screen.width() - 24.0).clamp(320.0, 620.0);
+        let win_h = (screen.height() - 24.0).clamp(260.0, 440.0);
+        let win_size = egui::vec2(win_w, win_h);
 
         let mut open = self.open;
         let mut commit_uri: Option<String> = None;
@@ -1363,12 +1362,12 @@ impl AssetPicker {
             .id(egui::Id::new("rustudio_asset_picker_window"))
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .default_size(egui::vec2(win_w, win_h))
-            .max_width(max_w)
-            .max_height(max_h)
+            .fixed_size(win_size)
+            .min_size(win_size)
+            .max_size(win_size)
             .constrain_to(screen.shrink(8.0))
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
@@ -1562,9 +1561,10 @@ impl AssetPicker {
                             ui.horizontal_top(|ui| {
                                 let left_w = (avail_w - preview_card_w - 14.0).max(160.0);
                                 ui.allocate_ui_with_layout(
-                                    Vec2::new(left_w, 130.0),
-                                    egui::Layout::top_down(egui::Align::Min),
+                                    Vec2::new(left_w, 136.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
+                                        ui.set_clip_rect(ui.max_rect());
                                         draw_paste_controls(
                                             ui,
                                             &mut self.input_uri,
@@ -1576,12 +1576,19 @@ impl AssetPicker {
                                     },
                                 );
                                 ui.add_space(6.0);
-                                draw_paste_preview_card(
-                                    ui,
-                                    self.paste_preview_id,
-                                    self.paste_debounce_until.is_some(),
-                                    &self.thumbs,
-                                    is_audio_cat,
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(preview_card_w, 136.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        ui.set_clip_rect(ui.max_rect());
+                                        draw_paste_preview_card(
+                                            ui,
+                                            self.paste_preview_id,
+                                            self.paste_debounce_until.is_some(),
+                                            &self.thumbs,
+                                            is_audio_cat,
+                                        );
+                                    },
                                 );
                             });
                         } else {
@@ -1661,136 +1668,151 @@ impl AssetPicker {
                                 .inner_margin(egui::Margin::same(10))
                                 .show(ui, |ui| {
                                     ui.horizontal_top(|ui| {
-                                        // Preview box (120×120)
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            Vec2::splat(120.0),
-                                            Sense::hover(),
+                                        let card_avail_w = ui.available_width().max(220.0);
+                                        let preview_side = if card_avail_w < 340.0 { 88.0 } else { 112.0 };
+                                        // Left column: Preview box
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::splat(preview_side),
+                                            egui::Layout::top_down(egui::Align::LEFT),
+                                            |ui| {
+                                                ui.set_clip_rect(ui.max_rect());
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    Vec2::splat(preview_side),
+                                                    Sense::hover(),
+                                                );
+                                                let painter = ui.painter();
+                                                if let Some(lp) = &self.local_preview {
+                                                    if let Some(tex) = &lp.texture {
+                                                        paint_checkerboard(painter, rect, 8.0);
+                                                        paint_fitted_texture(painter, rect, tex);
+                                                        painter.rect_stroke(
+                                                            rect,
+                                                            5.0,
+                                                            Stroke::new(
+                                                                1.0,
+                                                                Color32::from_rgb(64, 70, 84),
+                                                            ),
+                                                            StrokeKind::Inside,
+                                                        );
+                                                    } else if lp.loading {
+                                                        painter.rect_filled(
+                                                            rect,
+                                                            5.0,
+                                                            Color32::from_rgb(28, 30, 37),
+                                                        );
+                                                        painter.text(
+                                                            rect.center(),
+                                                            Align2::CENTER_CENTER,
+                                                            "Loading...",
+                                                            FontId::proportional(12.0),
+                                                            Color32::from_rgb(150, 158, 174),
+                                                        );
+                                                    } else if self.category == PickerCategory::Audio {
+                                                        paint_audio_waveform(
+                                                            painter,
+                                                            rect,
+                                                            Color32::from_rgb(86, 156, 245),
+                                                        );
+                                                    } else {
+                                                        painter.rect_filled(
+                                                            rect,
+                                                            5.0,
+                                                            Color32::from_rgb(28, 30, 37),
+                                                        );
+                                                        painter.text(
+                                                            rect.center(),
+                                                            Align2::CENTER_CENTER,
+                                                            &ext_upper,
+                                                            FontId::proportional(16.0),
+                                                            Color32::from_rgb(138, 166, 212),
+                                                        );
+                                                        painter.rect_stroke(
+                                                            rect,
+                                                            5.0,
+                                                            Stroke::new(
+                                                                1.0,
+                                                                Color32::from_rgb(56, 61, 74),
+                                                            ),
+                                                            StrokeKind::Inside,
+                                                        );
+                                                    }
+                                                }
+                                            },
                                         );
-                                        let painter = ui.painter();
-                                        if let Some(lp) = &self.local_preview {
-                                            if let Some(tex) = &lp.texture {
-                                                paint_checkerboard(painter, rect, 8.0);
-                                                paint_fitted_texture(painter, rect, tex);
-                                                painter.rect_stroke(
-                                                    rect,
-                                                    5.0,
-                                                    Stroke::new(
-                                                        1.0,
-                                                        Color32::from_rgb(64, 70, 84),
-                                                    ),
-                                                    StrokeKind::Inside,
-                                                );
-                                            } else if lp.loading {
-                                                painter.rect_filled(
-                                                    rect,
-                                                    5.0,
-                                                    Color32::from_rgb(28, 30, 37),
-                                                );
-                                                painter.text(
-                                                    rect.center(),
-                                                    Align2::CENTER_CENTER,
-                                                    "Loading...",
-                                                    FontId::proportional(12.0),
-                                                    Color32::from_rgb(150, 158, 174),
-                                                );
-                                            } else if self.category == PickerCategory::Audio {
-                                                paint_audio_waveform(
-                                                    painter,
-                                                    rect,
-                                                    Color32::from_rgb(86, 156, 245),
-                                                );
-                                            } else {
-                                                painter.rect_filled(
-                                                    rect,
-                                                    5.0,
-                                                    Color32::from_rgb(28, 30, 37),
-                                                );
-                                                painter.text(
-                                                    rect.center(),
-                                                    Align2::CENTER_CENTER,
-                                                    &ext_upper,
-                                                    FontId::proportional(16.0),
-                                                    Color32::from_rgb(138, 166, 212),
-                                                );
-                                                painter.rect_stroke(
-                                                    rect,
-                                                    5.0,
-                                                    Stroke::new(
-                                                        1.0,
-                                                        Color32::from_rgb(56, 61, 74),
-                                                    ),
-                                                    StrokeKind::Inside,
-                                                );
-                                            }
-                                        }
 
                                         ui.add_space(10.0);
 
-                                        // Metadata + editable Asset Name + Upload button
-                                        ui.vertical(|ui| {
-                                            ui.add(
-                                                egui::Label::new(RichText::new(fname).strong())
-                                                    .truncate(),
-                                            );
-                                            ui.add_space(3.0);
+                                        // Right column: Metadata + editable Asset Name + Upload button
+                                        let right_w = (card_avail_w - preview_side - 14.0).max(120.0);
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(right_w, preview_side.max(120.0)),
+                                            egui::Layout::top_down(egui::Align::LEFT),
+                                            |ui| {
+                                                ui.set_clip_rect(ui.max_rect());
+                                                ui.add(
+                                                    egui::Label::new(RichText::new(fname).strong())
+                                                        .truncate(),
+                                                );
+                                                ui.add_space(3.0);
 
-                                            if let Some(lp) = &self.local_preview {
-                                                let mut meta_parts: Vec<String> = Vec::new();
-                                                if let Some((w, h)) = lp.orig_dims {
-                                                    meta_parts.push(format!("{w}×{h}"));
+                                                if let Some(lp) = &self.local_preview {
+                                                    let mut meta_parts: Vec<String> = Vec::new();
+                                                    if let Some((w, h)) = lp.orig_dims {
+                                                        meta_parts.push(format!("{w}×{h}"));
+                                                    }
+                                                    if lp.file_size > 0 {
+                                                        meta_parts.push(format_file_size(lp.file_size));
+                                                    }
+                                                    if !meta_parts.is_empty() {
+                                                        ui.label(
+                                                            RichText::new(meta_parts.join("  •  "))
+                                                                .small()
+                                                                .monospace()
+                                                                .color(Color32::from_rgb(
+                                                                    165, 178, 200,
+                                                                )),
+                                                        );
+                                                    }
+                                                    if let Some(note) = &lp.note {
+                                                        ui.label(RichText::new(note).small().weak());
+                                                    }
                                                 }
-                                                if lp.file_size > 0 {
-                                                    meta_parts.push(format_file_size(lp.file_size));
-                                                }
-                                                if !meta_parts.is_empty() {
-                                                    ui.label(
-                                                        RichText::new(meta_parts.join("  •  "))
-                                                            .small()
-                                                            .monospace()
-                                                            .color(Color32::from_rgb(
-                                                                165, 178, 200,
-                                                            )),
-                                                    );
-                                                }
-                                                if let Some(note) = &lp.note {
-                                                    ui.label(RichText::new(note).small().weak());
-                                                }
-                                            }
 
-                                            ui.add_space(8.0);
-                                            ui.label(RichText::new("Asset Name:").small().weak());
-                                            ui.add_enabled(
-                                                !self.uploading,
-                                                egui::TextEdit::singleline(&mut self.asset_name)
-                                                    .desired_width(f32::INFINITY)
-                                                    .hint_text("My Asset"),
-                                            );
+                                                ui.add_space(6.0);
+                                                ui.label(RichText::new("Asset Name:").small().weak());
+                                                ui.add_enabled(
+                                                    !self.uploading,
+                                                    egui::TextEdit::singleline(&mut self.asset_name)
+                                                        .desired_width((right_w - 8.0).max(80.0))
+                                                        .hint_text("My Asset"),
+                                                );
 
-                                            ui.add_space(8.0);
-                                            let can_upload = session.is_some()
-                                                && self.selected_file.is_some()
-                                                && !self.uploading;
-                                            ui.horizontal(|ui| {
-                                                if ui
-                                                    .add_enabled(
-                                                        can_upload,
-                                                        egui::Button::new(
-                                                            RichText::new("Upload & Apply")
-                                                                .strong()
-                                                                .color(Color32::WHITE),
+                                                ui.add_space(6.0);
+                                                let can_upload = session.is_some()
+                                                    && self.selected_file.is_some()
+                                                    && !self.uploading;
+                                                ui.horizontal(|ui| {
+                                                    if ui
+                                                        .add_enabled(
+                                                            can_upload,
+                                                            egui::Button::new(
+                                                                RichText::new("Upload & Apply")
+                                                                    .strong()
+                                                                    .color(Color32::WHITE),
+                                                            )
+                                                            .fill(Color32::from_rgb(38, 108, 224)),
                                                         )
-                                                        .fill(Color32::from_rgb(38, 108, 224)),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    want_upload = true;
-                                                }
-                                                if self.uploading {
-                                                    ui.spinner();
-                                                    ui.label("Uploading...");
-                                                }
-                                            });
-                                        });
+                                                        .clicked()
+                                                    {
+                                                        want_upload = true;
+                                                    }
+                                                    if self.uploading {
+                                                        ui.spinner();
+                                                        ui.label("Uploading...");
+                                                    }
+                                                });
+                                            },
+                                        );
                                     });
                                 });
                         } else {
@@ -1895,7 +1917,7 @@ impl AssetPicker {
                         ui.horizontal(|ui| {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.search_query)
-                                    .desired_width((ui.available_width() - 84.0).max(120.0))
+                                    .desired_width((ui.available_width() - 84.0).max(80.0))
                                     .hint_text("Search Roblox assets..."),
                             );
                             let enter =
@@ -1925,7 +1947,7 @@ impl AssetPicker {
                             .and_then(|sid| self.browse_items.iter().find(|i| i.id == sid))
                             .cloned();
                         let bottom_bar_reserve = if selected_item.is_some() { 68.0 } else { 8.0 };
-                        let list_h = (ui.available_height() - bottom_bar_reserve).max(140.0);
+                        let list_h = (ui.available_height() - bottom_bar_reserve).max(90.0);
                         let is_audio_kind = self.browse_kind == ToolboxKind::Audio;
 
                         egui::ScrollArea::vertical()
@@ -1942,7 +1964,7 @@ impl AssetPicker {
 
                                 match self.browse_view {
                                     BrowseViewMode::Grid => {
-                                        let avail_w = ui.available_width().max(140.0);
+                                        let avail_w = (ui.available_width() - 6.0).max(140.0);
                                         let gap = 8.0_f32;
                                         let cols = ((avail_w + gap) / 136.0)
                                             .floor()
@@ -1951,8 +1973,8 @@ impl AssetPicker {
                                         let card_w = ((avail_w - gap * (cols as f32 - 1.0))
                                             / cols as f32)
                                             .floor()
-                                            .max(112.0);
-                                        let inner_w = (card_w - 12.0).max(96.0);
+                                            .max(88.0);
+                                        let inner_w = (card_w - 12.0).max(76.0);
 
                                         for row in self.browse_items.chunks(cols) {
                                             ui.horizontal_top(|ui| {
@@ -1977,14 +1999,19 @@ impl AssetPicker {
                                                         )
                                                     };
 
-                                                    egui::Frame::new()
-                                                        .fill(fill)
-                                                        .stroke(border)
-                                                        .corner_radius(6.0)
-                                                        .inner_margin(egui::Margin::same(6))
-                                                        .show(ui, |ui| {
-                                                            ui.set_width(inner_w);
-                                                            ui.vertical(|ui| {
+                                                    ui.allocate_ui_with_layout(
+                                                        Vec2::new(card_w, 170.0),
+                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                        |ui| {
+                                                            ui.set_clip_rect(ui.max_rect());
+                                                            egui::Frame::new()
+                                                                .fill(fill)
+                                                                .stroke(border)
+                                                                .corner_radius(6.0)
+                                                                .inner_margin(egui::Margin::same(6))
+                                                                .show(ui, |ui| {
+                                                                    ui.set_width(inner_w);
+                                                                    ui.vertical(|ui| {
                                                                 // Clickable preview + text region (does not overlap Use button)
                                                                 let top_resp = ui
                                                                     .vertical(|ui| {
@@ -2101,8 +2128,10 @@ impl AssetPicker {
                                                                         },
                                                                     );
                                                                 });
-                                                            });
-                                                        });
+                                                                    });
+                                                                });
+                                                        },
+                                                    );
                                                 }
                                             });
                                             ui.add_space(gap);
@@ -2154,40 +2183,46 @@ impl AssetPicker {
                                                                         "?",
                                                                     );
                                                                     ui.add_space(6.0);
-                                                                    ui.vertical(|ui| {
-                                                                        ui.add(
-                                                                            egui::Label::new(
-                                                                                RichText::new(
-                                                                                    &item.name,
+                                                                    let text_w = (left_w - 50.0).max(60.0);
+                                                                    ui.allocate_ui_with_layout(
+                                                                        Vec2::new(text_w, 40.0),
+                                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                                        |ui| {
+                                                                            ui.set_clip_rect(ui.max_rect());
+                                                                            ui.add(
+                                                                                egui::Label::new(
+                                                                                    RichText::new(
+                                                                                        &item.name,
+                                                                                    )
+                                                                                    .strong(),
                                                                                 )
-                                                                                .strong(),
-                                                                            )
-                                                                            .truncate(),
-                                                                        );
-                                                                        let meta = if item
-                                                                            .creator
-                                                                            .is_empty()
-                                                                        {
-                                                                            format!(
-                                                                                "ID: {}",
-                                                                                item.id
-                                                                            )
-                                                                        } else {
-                                                                            format!(
-                                                                                "by {}  •  ID: {}",
-                                                                                item.creator,
-                                                                                item.id
-                                                                            )
-                                                                        };
-                                                                        ui.add(
-                                                                            egui::Label::new(
-                                                                                RichText::new(meta)
-                                                                                    .small()
-                                                                                    .weak(),
-                                                                            )
-                                                                            .truncate(),
-                                                                        );
-                                                                    });
+                                                                                .truncate(),
+                                                                            );
+                                                                            let meta = if item
+                                                                                .creator
+                                                                                .is_empty()
+                                                                            {
+                                                                                format!(
+                                                                                    "ID: {}",
+                                                                                    item.id
+                                                                                )
+                                                                            } else {
+                                                                                format!(
+                                                                                    "by {}  •  ID: {}",
+                                                                                    item.creator,
+                                                                                    item.id
+                                                                                )
+                                                                            };
+                                                                            ui.add(
+                                                                                egui::Label::new(
+                                                                                    RichText::new(meta)
+                                                                                        .small()
+                                                                                        .weak(),
+                                                                                )
+                                                                                .truncate(),
+                                                                            );
+                                                                        },
+                                                                    );
                                                                 },
                                                             )
                                                             .response;
@@ -2266,34 +2301,37 @@ impl AssetPicker {
                                             "?",
                                         );
                                         ui.add_space(6.0);
-                                        ui.vertical(|ui| {
-                                            ui.set_max_width(
-                                                (ui.available_width() - 108.0).max(100.0),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&sel.name).strong(),
-                                                )
-                                                .truncate(),
-                                            );
-                                            let subtitle = if sel.creator.is_empty() {
-                                                format!("rbxassetid://{}", sel.id)
-                                            } else {
-                                                format!(
-                                                    "by {}  •  rbxassetid://{}",
-                                                    sel.creator, sel.id
-                                                )
-                                            };
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(subtitle)
-                                                        .small()
-                                                        .monospace()
-                                                        .weak(),
-                                                )
-                                                .truncate(),
-                                            );
-                                        });
+                                        let mid_w = (ui.available_width() - 108.0).max(80.0);
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(mid_w, 40.0),
+                                            egui::Layout::top_down(egui::Align::LEFT),
+                                            |ui| {
+                                                ui.set_clip_rect(ui.max_rect());
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&sel.name).strong(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                let subtitle = if sel.creator.is_empty() {
+                                                    format!("rbxassetid://{}", sel.id)
+                                                } else {
+                                                    format!(
+                                                        "by {}  •  rbxassetid://{}",
+                                                        sel.creator, sel.id
+                                                    )
+                                                };
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(subtitle)
+                                                            .small()
+                                                            .monospace()
+                                                            .weak(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
