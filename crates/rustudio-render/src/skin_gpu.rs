@@ -270,6 +270,13 @@ impl SkinGpu {
         self.due.retain(|s| *s != slot);
     }
 
+    /// Releases all cached GPU skinning source buffers and per-part jobs (e.g. on place switch).
+    pub fn clear(&mut self) {
+        self.sources.clear();
+        self.jobs.clear();
+        self.due.clear();
+    }
+
     /// Records this frame's dispatches.
     pub fn encode(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let Some(pipeline) = self.pipeline.as_ref().filter(|_| !self.due.is_empty()) else {

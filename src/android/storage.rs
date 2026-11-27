@@ -1,23 +1,180 @@
 //! Files on Android: the app's own folder in shared storage
 //! (`Android/data/<package>/files`, visible to file managers, no permission
-//! needed), a file picker drawn in egui over it ([`Picker`], behind
-//! `crate::file_dialog::Dialogs`), and places handed over by other apps
+//! needed), a Godot-style in-app file picker drawn in egui ([`Picker`], behind
+//! `crate::file_dialog::Dialogs`) with async RAM-capped thumbnails and preview,
+//! Android's System Document Picker (SAF `ACTION_OPEN_DOCUMENT` routed directly
+//! back to the waiting [`Picker`]), and places handed over by other apps
 //! through "Open with" (a `content:` URI in the launch Intent, copied in
 //! through ContentResolver: [`launch_file`]).
-//!
-//! The system document picker (Storage Access Framework) needs
-//! `startActivityForResult` and an `onActivityResult`, which `NativeActivity`
-//! doesn't pass on to native code; this in-app picker covers the same files
-//! without a Java class in the APK. Shared storage outside the app's folder
-//! (Download, Documents, …) is listed once the app has storage access:
-//! "All files access" on API 30+ (MANAGE_EXTERNAL_STORAGE, granted on a
-//! settings page the picker opens), the storage permission below that
-//! ([`super::jni::request_storage_access`]).
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+
+use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::file_dialog::{Kind, Request};
+
+// ------------------------------------------------------------------ Palette
+
+const BG_WINDOW: Color32 = Color32::from_rgb(29, 32, 38);
+const BG_PANEL: Color32 = Color32::from_rgb(23, 26, 31);
+const BG_BROWSER: Color32 = Color32::from_rgb(20, 23, 28);
+const BG_TILE: Color32 = Color32::from_rgb(28, 32, 39);
+const BG_HOVER: Color32 = Color32::from_rgb(39, 45, 56);
+const BG_SELECTED: Color32 = Color32::from_rgb(36, 59, 85);
+const BORDER: Color32 = Color32::from_rgb(45, 51, 63);
+const ACCENT: Color32 = Color32::from_rgb(56, 122, 235);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(39, 59, 84);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(232, 236, 242);
+const TEXT_MUTED: Color32 = Color32::from_rgb(142, 151, 166);
+const FOLDER_BODY: Color32 = Color32::from_rgb(229, 181, 92);
+const FOLDER_TAB: Color32 = Color32::from_rgb(198, 148, 60);
+const WARN_BG: Color32 = Color32::from_rgb(54, 43, 24);
+const WARN_BORDER: Color32 = Color32::from_rgb(156, 118, 48);
+const WARN_TEXT: Color32 = Color32::from_rgb(245, 212, 138);
+
+// ------------------------------------------------------------ Thumbnail worker
+
+const MAX_THUMB_CACHE: usize = 48;
+const THUMB_MAX_DIM: u32 = 96;
+const PREVIEW_MAX_DIM: u32 = 150;
+const MAX_THUMB_FILE_BYTES: u64 = 24 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    List,
+    Grid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileBadge {
+    Img,
+    Model3D,
+    Audio,
+    Roblox,
+    Lua,
+    File,
+}
+
+impl FileBadge {
+    fn from_path(path: &Path) -> Self {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tga" | "gif" => Self::Img,
+            "glb" | "gltf" | "obj" | "fbx" | "stl" | "dae" => Self::Model3D,
+            "mp3" | "ogg" | "wav" | "flac" | "m4a" => Self::Audio,
+            "rbxl" | "rbxlx" | "rbxm" | "rbxmx" => Self::Roblox,
+            "lua" | "luau" => Self::Lua,
+            _ => Self::File,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Img => "IMG",
+            Self::Model3D => "3D",
+            Self::Audio => "AUD",
+            Self::Roblox => "RBX",
+            Self::Lua => "LUA",
+            Self::File => "FILE",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Self::Img => Color32::from_rgb(78, 201, 176),
+            Self::Model3D => Color32::from_rgb(197, 134, 192),
+            Self::Audio => Color32::from_rgb(220, 205, 130),
+            Self::Roblox => Color32::from_rgb(86, 156, 214),
+            Self::Lua => Color32::from_rgb(79, 193, 255),
+            Self::File => Color32::from_rgb(140, 149, 166),
+        }
+    }
+
+    fn bg(self) -> Color32 {
+        let c = self.color();
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 34)
+    }
+
+    fn is_image(self) -> bool {
+        self == Self::Img
+    }
+}
+
+struct ThumbReq {
+    path: PathBuf,
+    max_dim: u32,
+    generation: u64,
+    is_preview: bool,
+    ctx: egui::Context,
+}
+
+struct ThumbResp {
+    path: PathBuf,
+    generation: u64,
+    is_preview: bool,
+    decoded: Option<(egui::ColorImage, u32, u32)>,
+}
+
+enum ThumbEntry {
+    Loaded { tex: egui::TextureHandle, dims: (u32, u32) },
+    Failed,
+}
+
+struct PreviewTex {
+    path: PathBuf,
+    tex: Option<egui::TextureHandle>,
+    dims: Option<(u32, u32)>,
+}
+
+fn spawn_thumb_worker() -> (Sender<ThumbReq>, Receiver<ThumbResp>) {
+    let (req_tx, req_rx) = mpsc::channel::<ThumbReq>();
+    let (resp_tx, resp_rx) = mpsc::channel::<ThumbResp>();
+    let _ = std::thread::Builder::new().name("android-picker-thumbs".into()).spawn(move || {
+        while let Ok(req) = req_rx.recv() {
+            let decoded = decode_thumbnail(&req.path, req.max_dim);
+            let ctx = req.ctx;
+            if resp_tx
+                .send(ThumbResp {
+                    path: req.path,
+                    generation: req.generation,
+                    is_preview: req.is_preview,
+                    decoded,
+                })
+                .is_err()
+            {
+                break;
+            }
+            ctx.request_repaint();
+        }
+    });
+    (req_tx, resp_rx)
+}
+
+fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<(egui::ColorImage, u32, u32)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_THUMB_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let dyn_img = image::load_from_memory(&bytes).ok()?;
+    let orig_w = dyn_img.width();
+    let orig_h = dyn_img.height();
+    let resized = dyn_img.thumbnail(max_dim, max_dim).to_rgba8();
+    let size = [resized.width() as usize, resized.height() as usize];
+    if size[0] == 0 || size[1] == 0 {
+        return None;
+    }
+    Some((egui::ColorImage::from_rgba_unmultiplied(size, resized.as_raw()), orig_w, orig_h))
+}
+
+// ------------------------------------------------------------------- Roots
 
 /// A folder the picker can start from.
 struct Root {
@@ -41,78 +198,173 @@ fn shared_storage() -> PathBuf {
     }
 }
 
-fn roots(storage_access: bool) -> Vec<Root> {
-    let mut v = vec![Root { label: "rustudio", path: super::data_dir() }];
+fn roots(_storage_access: bool) -> Vec<Root> {
+    let mut v = vec![Root { label: "Rustudio", path: super::data_dir() }];
     let imported = super::data_dir().join("Imported");
     let _ = std::fs::create_dir_all(&imported);
     v.push(Root { label: "Imported", path: imported });
     if super::data_dir() != super::files_dir() {
         v.push(Root { label: "App data", path: super::files_dir() });
     }
-    // Shared folders: the usual ones when they can be listed (files this
-    // app made are always readable; everything with storage access), and
-    // the whole shared storage once access was granted.
     let shared = shared_storage();
-    if storage_access {
-        for (label, sub) in [
-            ("Download", "Download"),
-            ("Documents", "Documents"),
-            ("Pictures", "Pictures"),
-            ("DCIM", "DCIM"),
-            ("Music", "Music"),
-        ] {
-            let p = shared.join(sub);
-            if std::fs::read_dir(&p).is_ok() {
-                v.push(Root { label, path: p });
-            }
+    for (label, sub) in [
+        ("Download", "Download"),
+        ("Pictures", "Pictures"),
+        ("DCIM", "DCIM"),
+        ("Documents", "Documents"),
+        ("Music", "Music"),
+    ] {
+        let p = shared.join(sub);
+        if p.is_dir() && std::fs::read_dir(&p).is_ok() {
+            v.push(Root { label, path: p });
         }
     }
-    if storage_access && std::fs::read_dir(&shared).is_ok() {
+    if shared.is_dir() && std::fs::read_dir(&shared).is_ok() {
         v.push(Root { label: "Shared storage", path: shared });
     }
     v
 }
 
+// ----------------------------------------------------------------- Listing
+
+struct FolderEntry {
+    path: PathBuf,
+    name: String,
+}
+
+struct FileEntry {
+    path: PathBuf,
+    name: String,
+    size: u64,
+    badge: FileBadge,
+}
+
 /// One folder's listing, sorted folders first.
 struct Listing {
     dir: PathBuf,
-    folders: Vec<PathBuf>,
-    files: Vec<PathBuf>,
+    folders: Vec<FolderEntry>,
+    files: Vec<FileEntry>,
+    hidden_by_filter: usize,
+}
+
+fn request_accepts_case_insensitive(request: &Request, path: &Path) -> bool {
+    if request.filters.is_empty() {
+        return true;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext.is_empty() {
+        return false;
+    }
+    request.filters.iter().any(|(_, exts)| {
+        exts.iter().any(|f| {
+            let f_low = f.trim_start_matches('.').to_ascii_lowercase();
+            if f_low == "*" || f_low == ext {
+                return true;
+            }
+            // Treat jpg/jpeg and tif/tiff as equivalent so camera photos are never missed.
+            matches!(
+                (f_low.as_str(), ext.as_str()),
+                ("jpg", "jpeg") | ("jpeg", "jpg") | ("tif", "tiff") | ("tiff", "tif")
+            )
+        })
+    })
 }
 
 impl Listing {
-    fn read(dir: &Path, request: &Request) -> Self {
+    fn read(dir: &Path, request: &Request, show_all_files: bool) -> Self {
         let mut folders = Vec::new();
         let mut files = Vec::new();
+        let mut hidden_by_filter = 0usize;
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                let hidden = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'));
-                if hidden {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if name.is_empty() || name.starts_with('.') {
                     continue;
                 }
-                if p.is_dir() {
-                    folders.push(p);
-                } else if request.accepts(&p) {
-                    files.push(p);
+                // Follow symlinks via metadata() first, falling back to DirEntry::file_type().
+                let meta = std::fs::metadata(&p).ok();
+                let is_dir = meta
+                    .as_ref()
+                    .map(|m| m.is_dir())
+                    .unwrap_or_else(|| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false));
+                if is_dir {
+                    folders.push(FolderEntry { path: p, name });
+                } else if show_all_files || request_accepts_case_insensitive(request, &p) {
+                    let size = meta.map(|m| m.len()).unwrap_or(0);
+                    let badge = FileBadge::from_path(&p);
+                    files.push(FileEntry { path: p, name, size, badge });
+                } else {
+                    hidden_by_filter += 1;
                 }
             }
         }
-        let key = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-        folders.sort_by_key(key);
-        files.sort_by_key(key);
-        Listing { dir: dir.to_path_buf(), folders, files }
+        folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Listing { dir: dir.to_path_buf(), folders, files, hidden_by_filter }
     }
 }
 
+// --------------------------------------------------- System Picker (SAF)
+
 const SAF_OPEN_DOC_REQUEST_CODE: i32 = 0x5254;
 
+/// Dedicated result slot for Android's SAF System Picker (`REQ_SAF_OPEN_DOC`).
+/// Completely separate from [`OPENED`] (which handles external "Open with" VIEW
+/// intents) so picking images/models/audio never triggers place-open prompts.
+static SAF_PICKER_RESULT: std::sync::Mutex<Option<Vec<PathBuf>>> = std::sync::Mutex::new(None);
+
+fn clear_saf_picker_result() {
+    *SAF_PICKER_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn set_saf_picker_result(paths: Vec<PathBuf>) {
+    *SAF_PICKER_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(paths);
+}
+
+fn take_saf_picker_result() -> Option<Vec<PathBuf>> {
+    SAF_PICKER_RESULT.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+fn saf_mime_for_request(request: &Request) -> &'static str {
+    if request.filters.is_empty() {
+        return "*/*";
+    }
+    let mut saw_any = false;
+    let mut all_images = true;
+    let mut all_audio = true;
+    for (_, exts) in &request.filters {
+        for ext in exts {
+            saw_any = true;
+            let low = ext.trim_start_matches('.').to_ascii_lowercase();
+            if !matches!(low.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tga") {
+                all_images = false;
+            }
+            if !matches!(low.as_str(), "mp3" | "ogg" | "wav" | "flac" | "m4a") {
+                all_audio = false;
+            }
+        }
+    }
+    if saw_any && all_images {
+        "image/*"
+    } else if saw_any && all_audio {
+        "audio/*"
+    } else {
+        "*/*"
+    }
+}
+
 /// Launches Android's Storage Access Framework document picker
-/// (`ACTION_OPEN_DOCUMENT`, `CATEGORY_OPENABLE`, `*/*`, `EXTRA_ALLOW_MULTIPLE`).
-fn open_system_picker() -> super::jni::Result<()> {
+/// (`ACTION_OPEN_DOCUMENT`, `CATEGORY_OPENABLE`).
+fn open_system_picker(multi: bool, request: &Request) -> super::jni::Result<()> {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
+    let mime_str = saf_mime_for_request(request);
     super::jni::with_activity(|env, activity| {
         let action = env.new_string("android.intent.action.OPEN_DOCUMENT")?;
         let intent = env.new_object(
@@ -127,20 +379,29 @@ fn open_system_picker() -> super::jni::Result<()> {
             jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
             &[JValue::Object(&category)],
         )?;
-        let mime = env.new_string("*/*")?;
+        let mime = env.new_string(mime_str)?;
         env.call_method(
             &intent,
             jni_str!("setType"),
             jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
             &[JValue::Object(&mime)],
         )?;
-        let extra_multi = env.new_string("android.intent.extra.ALLOW_MULTIPLE")?;
+        // FLAG_GRANT_READ_URI_PERMISSION = 0x1
         env.call_method(
             &intent,
-            jni_str!("putExtra"),
-            jni_sig!("(Ljava/lang/String;Z)Landroid/content/Intent;"),
-            &[JValue::Object(&extra_multi), JValue::Bool(true)],
+            jni_str!("addFlags"),
+            jni_sig!("(I)Landroid/content/Intent;"),
+            &[JValue::Int(0x0000_0001)],
         )?;
+        if multi {
+            let extra_multi = env.new_string("android.intent.extra.ALLOW_MULTIPLE")?;
+            env.call_method(
+                &intent,
+                jni_str!("putExtra"),
+                jni_sig!("(Ljava/lang/String;Z)Landroid/content/Intent;"),
+                &[JValue::Object(&extra_multi), JValue::Bool(true)],
+            )?;
+        }
         env.call_method(
             activity,
             jni_str!("startActivityForResult"),
@@ -151,11 +412,15 @@ fn open_system_picker() -> super::jni::Result<()> {
     })
 }
 
-/// The in-app file dialog.
+// ------------------------------------------------------------------ Picker
+
+/// The in-app Godot-style file dialog.
 pub struct Picker {
     request: Request,
     kind: Kind,
     multi: bool,
+    show_all_files: bool,
+    view_mode: ViewMode,
     listing: Listing,
     selected: Option<PathBuf>,
     selected_multi: Vec<PathBuf>,
@@ -163,10 +428,26 @@ pub struct Picker {
     name: String,
     new_folder: Option<String>,
     error: Option<String>,
+    waiting_system_picker: bool,
     /// Shared storage may be read (asked again now and then while the
     /// dialog is open: the grant happens on a system page).
     storage_access: bool,
     access_checked: Instant,
+    // Async RAM-capped thumbnail state
+    thumb_tx: Sender<ThumbReq>,
+    thumb_rx: Receiver<ThumbResp>,
+    thumb_generation: u64,
+    thumbs: HashMap<PathBuf, ThumbEntry>,
+    thumb_lru: VecDeque<PathBuf>,
+    thumb_inflight: HashSet<PathBuf>,
+    preview_tex: Option<PreviewTex>,
+    preview_inflight: Option<PathBuf>,
+}
+
+impl Drop for Picker {
+    fn drop(&mut self) {
+        self.clear_thumbnails();
+    }
 }
 
 impl Picker {
@@ -192,18 +473,133 @@ impl Picker {
         if kind != Kind::SaveFile {
             name.clear();
         }
+        let show_all_files = request.filters.is_empty();
+        let (thumb_tx, thumb_rx) = spawn_thumb_worker();
         Picker {
-            listing: Listing::read(&start, &request),
+            listing: Listing::read(&start, &request, show_all_files),
             request,
             kind,
             multi,
+            show_all_files,
+            view_mode: ViewMode::List,
             selected: None,
             selected_multi: Vec::new(),
             name,
             new_folder: None,
             error: None,
+            waiting_system_picker: false,
             storage_access: super::jni::has_storage_access(),
             access_checked: Instant::now(),
+            thumb_tx,
+            thumb_rx,
+            thumb_generation: 1,
+            thumbs: HashMap::new(),
+            thumb_lru: VecDeque::new(),
+            thumb_inflight: HashSet::new(),
+            preview_tex: None,
+            preview_inflight: None,
+        }
+    }
+
+    fn clear_thumbnails(&mut self) {
+        self.thumb_generation = self.thumb_generation.wrapping_add(1);
+        self.thumbs.clear();
+        self.thumb_lru.clear();
+        self.thumb_inflight.clear();
+        self.preview_tex = None;
+        self.preview_inflight = None;
+    }
+
+    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
+        while let Ok(resp) = self.thumb_rx.try_recv() {
+            if resp.generation != self.thumb_generation {
+                continue;
+            }
+            if resp.is_preview {
+                if self.preview_inflight.as_ref() == Some(&resp.path) {
+                    self.preview_inflight = None;
+                }
+                if self.active_preview_path().as_deref() == Some(resp.path.as_path()) {
+                    let (tex, dims) = match resp.decoded {
+                        Some((img, w, h)) => {
+                            let handle = ctx.load_texture(
+                                format!("android-picker-preview-{}", self.thumb_generation),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            (Some(handle), Some((w, h)))
+                        }
+                        None => (None, None),
+                    };
+                    self.preview_tex = Some(PreviewTex { path: resp.path, tex, dims });
+                }
+                continue;
+            }
+            self.thumb_inflight.remove(&resp.path);
+            match resp.decoded {
+                Some((img, w, h)) => {
+                    // Enforce strict 48-texture RAM cap.
+                    while self.thumb_lru.len() >= MAX_THUMB_CACHE {
+                        if let Some(evict) = self.thumb_lru.pop_front() {
+                            self.thumbs.remove(&evict);
+                        }
+                    }
+                    let tex = ctx.load_texture(
+                        format!("android-picker-thumb-{}-{}", self.thumb_generation, self.thumb_lru.len()),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumb_lru.push_back(resp.path.clone());
+                    self.thumbs.insert(resp.path, ThumbEntry::Loaded { tex, dims: (w, h) });
+                }
+                None => {
+                    self.thumbs.insert(resp.path, ThumbEntry::Failed);
+                }
+            }
+        }
+    }
+
+    fn request_thumb_if_needed(&mut self, ctx: &egui::Context, path: &Path) {
+        if self.thumbs.contains_key(path) || self.thumb_inflight.contains(path) {
+            return;
+        }
+        // Keep in-flight queue bounded so rapid scrolling doesn't queue hundreds of images.
+        if self.thumb_inflight.len() >= 12 {
+            return;
+        }
+        self.thumb_inflight.insert(path.to_path_buf());
+        let _ = self.thumb_tx.send(ThumbReq {
+            path: path.to_path_buf(),
+            max_dim: THUMB_MAX_DIM,
+            generation: self.thumb_generation,
+            is_preview: false,
+            ctx: ctx.clone(),
+        });
+    }
+
+    fn request_preview_if_needed(&mut self, ctx: &egui::Context, path: &Path) {
+        if self.preview_tex.as_ref().is_some_and(|p| p.path == path) {
+            return;
+        }
+        if self.preview_inflight.as_deref() == Some(path) {
+            return;
+        }
+        self.preview_tex = None;
+        self.preview_inflight = Some(path.to_path_buf());
+        let _ = self.thumb_tx.send(ThumbReq {
+            path: path.to_path_buf(),
+            max_dim: PREVIEW_MAX_DIM,
+            generation: self.thumb_generation,
+            is_preview: true,
+            ctx: ctx.clone(),
+        });
+    }
+
+    fn active_preview_path(&self) -> Option<PathBuf> {
+        if self.multi {
+            self.selected.clone().or_else(|| self.selected_multi.last().cloned())
+        } else {
+            self.selected.clone()
         }
     }
 
@@ -213,20 +609,26 @@ impl Picker {
             self.access_checked = Instant::now();
             let now = super::jni::has_storage_access();
             if now && !self.storage_access {
-                // Folders that were unreadable list now.
-                self.go(&self.listing.dir.clone());
+                let dir = self.listing.dir.clone();
+                self.go(&dir);
             }
             self.storage_access = now;
         }
         if !self.storage_access {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 
     fn go(&mut self, dir: &Path) {
-        self.listing = Listing::read(dir, &self.request);
+        self.clear_thumbnails();
+        self.listing = Listing::read(dir, &self.request, self.show_all_files);
         self.selected = None;
         self.error = None;
+    }
+
+    fn refresh_listing(&mut self) {
+        let dir = self.listing.dir.clone();
+        self.listing = Listing::read(&dir, &self.request, self.show_all_files);
     }
 
     /// The answer when the single-file dialog closes: `Some(Some(path))` chosen,
@@ -242,92 +644,233 @@ impl Picker {
     }
 
     fn show_inner(&mut self, ctx: &egui::Context) -> Option<Option<Vec<PathBuf>>> {
+        // 1. Check if Android's System Picker (SAF) returned a result while paused/resumed.
+        if let Some(paths) = take_saf_picker_result() {
+            self.waiting_system_picker = false;
+            if !paths.is_empty() {
+                self.clear_thumbnails();
+                let picked = if self.multi { paths } else { vec![paths[0].clone()] };
+                return Some(Some(picked));
+            }
+        }
+        if self.waiting_system_picker {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+
+        self.poll_access(ctx);
+        self.poll_thumbnails(ctx);
+
         let title = self.request.title.clone().unwrap_or_else(|| {
             match self.kind {
                 Kind::PickFile if self.multi => "Import Files",
-                Kind::PickFile => "Open",
-                Kind::PickFolder => "Choose folder",
-                Kind::SaveFile => "Save as",
+                Kind::PickFile => "Open File",
+                Kind::PickFolder => "Choose Folder",
+                Kind::SaveFile => "Save As",
             }
             .to_string()
         });
-        self.poll_access(ctx);
+
         let roots = roots(self.storage_access);
-        let screen = ctx.content_rect();
-        let size = egui::vec2((screen.width() - 32.0).min(720.0), (screen.height() - 32.0).min(560.0));
+        let avail = ctx.content_rect().shrink(12.0);
+        let win_size = Vec2::new(avail.width().min(860.0).max(300.0), avail.height().min(580.0).max(260.0));
         let mut result: Option<Option<Vec<PathBuf>>> = None;
         let mut open = true;
-        egui::Window::new(title)
+        let mut nav_dir: Option<PathBuf> = None;
+
+        egui::Window::new(RichText::new(title).strong().color(TEXT_PRIMARY))
             .id(egui::Id::new("android-file-picker"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
-            .default_size(size)
-            .min_size(size)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(win_size)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::new()
+                    .fill(BG_WINDOW)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(10)),
+            )
             .show(ctx, |ui| {
-                ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
-                // Roots and the path.
-                ui.horizontal_wrapped(|ui| {
-                    for r in &roots {
-                        let here = self.listing.dir.starts_with(&r.path);
-                        if ui.selectable_label(here, r.label).clicked() {
-                            self.go(&r.path);
-                        }
-                    }
-                });
-                if !self.storage_access {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Grant storage access to browse Download, Pictures, Documents, and Music directly with multi-select right inside Rustudio.",
-                            )
-                            .weak()
-                            .size(12.0),
-                        );
-                        if ui.small_button("Grant storage access").clicked() {
-                            if let Err(e) = super::jni::request_storage_access() {
-                                self.error = Some(format!("Could not open the permission page: {e}"));
-                            }
-                        }
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.spacing_mut().button_padding = Vec2::new(9.0, 5.0);
+
+                // ==================== 1. TOP TOOLBAR ====================
+                ui.horizontal(|ui| {
                     let up = self.listing.dir.parent().map(Path::to_path_buf);
-                    let at_root = roots.iter().any(|r| r.path == self.listing.dir);
-                    if ui.add_enabled(up.is_some() && !at_root, egui::Button::new("⬆ Up")).clicked() {
+                    let at_root = roots.iter().any(|r| r.path == self.listing.dir)
+                        || self.listing.dir == Path::new("/");
+                    if ui
+                        .add_enabled(
+                            up.is_some() && !at_root,
+                            egui::Button::new(RichText::new("↑ Up").size(12.5).color(TEXT_PRIMARY))
+                                .fill(BG_TILE)
+                                .min_size(Vec2::new(48.0, 28.0)),
+                        )
+                        .clicked()
+                    {
                         if let Some(u) = up {
-                            self.go(&u);
+                            nav_dir = Some(u);
                         }
                     }
-                    if ui.button("New folder").clicked() {
+
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Home").size(12.5).color(TEXT_PRIMARY))
+                                .fill(BG_TILE)
+                                .min_size(Vec2::new(48.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        nav_dir = Some(super::data_dir());
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("+ Folder").size(12.5).color(TEXT_PRIMARY))
+                                .fill(BG_TILE)
+                                .min_size(Vec2::new(66.0, 28.0)),
+                        )
+                        .clicked()
+                    {
                         self.new_folder = Some(String::new());
                     }
-                    if ui.button("Open System Picker").clicked() {
-                        if let Err(e) = open_system_picker() {
-                            self.error = Some(format!("Could not open system picker: {e}"));
+
+                    // Right-aligned view toggle & System Picker accent button.
+                    let right_controls_w = if self.kind == Kind::PickFile { 206.0 } else { 94.0 };
+                    let path_w = (ui.available_width() - right_controls_w).max(60.0);
+
+                    // Path / breadcrumb bar
+                    let (path_rect, _) = ui.allocate_exact_size(Vec2::new(path_w, 28.0), Sense::hover());
+                    ui.painter().rect_filled(path_rect, 5.0, BG_BROWSER);
+                    ui.painter().rect_stroke(path_rect, 5.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+                    let path_text = shorten(&self.listing.dir);
+                    ui.painter().with_clip_rect(path_rect.shrink2(Vec2::new(8.0, 2.0))).text(
+                        Pos2::new(path_rect.left() + 8.0, path_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        path_text,
+                        FontId::proportional(12.0),
+                        TEXT_MUTED,
+                    );
+
+                    // List / Grid toggle
+                    let list_active = self.view_mode == ViewMode::List;
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("List").size(12.0).color(if list_active { Color32::WHITE } else { TEXT_MUTED }),
+                            )
+                            .fill(if list_active { ACCENT_SOFT } else { BG_TILE })
+                            .stroke(Stroke::new(1.0, if list_active { ACCENT } else { BORDER }))
+                            .min_size(Vec2::new(40.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.view_mode = ViewMode::List;
+                    }
+                    let grid_active = self.view_mode == ViewMode::Grid;
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Grid").size(12.0).color(if grid_active { Color32::WHITE } else { TEXT_MUTED }),
+                            )
+                            .fill(if grid_active { ACCENT_SOFT } else { BG_TILE })
+                            .stroke(Stroke::new(1.0, if grid_active { ACCENT } else { BORDER }))
+                            .min_size(Vec2::new(40.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.view_mode = ViewMode::Grid;
+                    }
+
+                    if self.kind == Kind::PickFile {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("System Picker").size(12.0).strong().color(Color32::WHITE))
+                                    .fill(ACCENT)
+                                    .min_size(Vec2::new(104.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            clear_saf_picker_result();
+                            match open_system_picker(self.multi, &self.request) {
+                                Ok(()) => {
+                                    self.waiting_system_picker = true;
+                                    self.error = None;
+                                }
+                                Err(e) => {
+                                    self.waiting_system_picker = false;
+                                    self.error = Some(format!("Could not open system picker: {e}"));
+                                }
+                            }
                         }
                     }
-                    ui.add(egui::Label::new(egui::RichText::new(shorten(&self.listing.dir)).weak()).truncate());
                 });
+
+                // Compact All Files Access banner when Android Scoped Storage may hide files
+                if !self.storage_access {
+                    egui::Frame::new()
+                        .fill(WARN_BG)
+                        .stroke(Stroke::new(1.0, WARN_BORDER))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "Some files may be hidden by Android — Grant All Files Access or use System Picker.",
+                                    )
+                                    .size(11.5)
+                                    .color(WARN_TEXT),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Grant All Files Access").size(11.5).strong().color(Color32::WHITE),
+                                        )
+                                        .fill(Color32::from_rgb(168, 114, 30))
+                                        .min_size(Vec2::new(0.0, 22.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Err(e) = super::jni::request_storage_access() {
+                                        self.error = Some(format!("Could not open permission page: {e}"));
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                // Inline New Folder creation bar
                 if let Some(nf) = &mut self.new_folder {
                     let mut make = false;
                     let mut cancel = false;
-                    ui.horizontal(|ui| {
-                        ui.label("Name:");
-                        let r = ui.add(egui::TextEdit::singleline(nf).desired_width(220.0));
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            make = true;
-                        }
-                        make |= ui.button("Create").clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
+                    egui::Frame::new()
+                        .fill(BG_PANEL)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("New folder:").size(12.0).color(TEXT_MUTED));
+                                let r = ui.add(egui::TextEdit::singleline(nf).desired_width(200.0));
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    make = true;
+                                }
+                                if ui.add(egui::Button::new(RichText::new("Create").size(12.0).color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                                    make = true;
+                                }
+                                if ui.add(egui::Button::new(RichText::new("Cancel").size(12.0)).fill(BG_TILE)).clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        });
                     if make && !nf.trim().is_empty() {
                         let dir = self.listing.dir.join(safe_name(nf.trim()));
                         match std::fs::create_dir_all(&dir) {
                             Ok(()) => {
                                 self.new_folder = None;
-                                self.go(&dir);
+                                nav_dir = Some(dir);
                             }
                             Err(e) => self.error = Some(format!("{}: {e}", dir.display())),
                         }
@@ -335,99 +878,223 @@ impl Picker {
                         self.new_folder = None;
                     }
                 }
-                ui.separator();
-                let list_height = ui.available_height() - 56.0;
-                egui::ScrollArea::vertical().max_height(list_height.max(80.0)).auto_shrink([false, false]).show(ui, |ui| {
-                    let row = egui::vec2(ui.available_width(), 36.0);
-                    let mut enter: Option<PathBuf> = None;
-                    for f in &self.listing.folders {
-                        let name = format!("📁 {}", f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
-                        let sel = self.kind == Kind::PickFolder && self.selected.as_deref() == Some(f.as_path());
-                        let r = ui.add_sized(row, egui::Button::selectable(sel, name));
-                        if r.double_clicked() || (r.clicked() && self.kind != Kind::PickFolder) {
-                            enter = Some(f.clone());
-                        } else if r.clicked() {
-                            self.selected = Some(f.clone());
+
+                // Subtle waiting indicator if System Picker is currently copying files
+                if self.waiting_system_picker {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Waiting for Android System Picker…").size(11.5).color(ACCENT));
+                        if ui.small_button("Dismiss").clicked() {
+                            self.waiting_system_picker = false;
                         }
-                    }
-                    for f in &self.listing.files {
-                        let label = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if self.multi {
-                            let mut checked = self.selected_multi.iter().any(|p| p == f);
-                            let mut toggled = false;
-                            ui.horizontal(|ui| {
-                                if ui.checkbox(&mut checked, "").changed() {
-                                    toggled = true;
-                                }
-                                let btn_w = ui.available_width().max(40.0);
-                                let r = ui.add_sized(
-                                    egui::vec2(btn_w, 36.0),
-                                    egui::Button::selectable(checked, format!("📄 {label}")),
-                                );
-                                if r.clicked() {
-                                    checked = !checked;
-                                    toggled = true;
-                                }
-                            });
-                            if toggled {
-                                if checked {
-                                    if !self.selected_multi.iter().any(|p| p == f) {
-                                        self.selected_multi.push(f.clone());
-                                    }
-                                } else {
-                                    self.selected_multi.retain(|p| p != f);
-                                }
-                            }
-                        } else {
-                            let sel = self.selected.as_deref() == Some(f.as_path());
-                            let r = ui.add_sized(row, egui::Button::selectable(sel, format!("📄 {label}")));
-                            if r.clicked() {
-                                self.selected = Some(f.clone());
-                                if self.kind == Kind::SaveFile {
-                                    self.name = label.clone();
-                                }
-                            }
-                            if r.double_clicked() && self.kind == Kind::PickFile {
-                                result = Some(Some(vec![f.clone()]));
-                            }
-                        }
-                    }
-                    if self.listing.folders.is_empty() && self.listing.files.is_empty() {
-                        ui.add_space(12.0);
-                        ui.weak("Nothing here. Files put in this folder with a file manager, or opened\nfrom one with rustudio, show up in this list.");
-                    }
-                    if let Some(d) = enter {
-                        self.go(&d);
-                    }
-                });
-                ui.separator();
-                if let Some(e) = &self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
+                    });
                 }
+
+                // ==================== 2. MAIN PANES ====================
+                let footer_reserve = if self.error.is_some() { 64.0 } else { 44.0 };
+                let body_h = (ui.available_height() - footer_reserve).max(110.0);
+                let body_w = ui.available_width();
+                let sidebar_w = if body_w >= 460.0 { 126.0 } else { 104.0 };
+
+                let preview_path = self.active_preview_path().filter(|p| p.is_file());
+                let show_preview = body_w >= 560.0 && preview_path.is_some();
+                let preview_w = if show_preview { 172.0 } else { 0.0 };
+                let gap = 6.0;
+                let browser_w = (body_w - sidebar_w - gap - if show_preview { preview_w + gap } else { 0.0 }).max(140.0);
+
+                ui.allocate_ui_with_layout(
+                    Vec2::new(body_w, body_h),
+                    egui::Layout::left_to_right(egui::Align::TOP),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+
+                        // ---- LEFT SIDEBAR: Quick Places ----
+                        egui::Frame::new()
+                            .fill(BG_PANEL)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .corner_radius(CornerRadius::same(7))
+                            .inner_margin(Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.set_width(sidebar_w - 12.0);
+                                ui.set_height(body_h - 12.0);
+                                ui.label(RichText::new("PLACES").size(10.0).strong().color(TEXT_MUTED));
+                                ui.add_space(2.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("android-picker-sidebar")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        // Find most specific matching root so "Imported" highlights instead of "Rustudio".
+                                        let active_idx = roots
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, r)| self.listing.dir.starts_with(&r.path))
+                                            .max_by_key(|(_, r)| r.path.as_os_str().len())
+                                            .map(|(i, _)| i);
+                                        for (idx, r) in roots.iter().enumerate() {
+                                            let active = active_idx == Some(idx);
+                                            let row_w = ui.available_width();
+                                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 30.0), Sense::click());
+                                            if active {
+                                                ui.painter().rect_filled(rect, 5.0, BG_SELECTED);
+                                                let bar = Rect::from_min_size(
+                                                    Pos2::new(rect.left() + 1.0, rect.top() + 5.0),
+                                                    Vec2::new(3.0, rect.height() - 10.0),
+                                                );
+                                                ui.painter().rect_filled(bar, 1.5, ACCENT);
+                                            } else if resp.hovered() {
+                                                ui.painter().rect_filled(rect, 5.0, BG_HOVER);
+                                            }
+                                            ui.painter().with_clip_rect(rect.shrink2(Vec2::new(8.0, 2.0))).text(
+                                                Pos2::new(rect.left() + 10.0, rect.center().y),
+                                                Align2::LEFT_CENTER,
+                                                r.label,
+                                                FontId::proportional(12.5),
+                                                if active { Color32::WHITE } else { TEXT_PRIMARY },
+                                            );
+                                            if resp.clicked() {
+                                                nav_dir = Some(r.path.clone());
+                                            }
+                                        }
+                                    });
+                            });
+
+                        // ---- CENTER FILE BROWSER ----
+                        egui::Frame::new()
+                            .fill(BG_BROWSER)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .corner_radius(CornerRadius::same(7))
+                            .inner_margin(Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.set_width(browser_w - 12.0);
+                                ui.set_height(body_h - 12.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("android-picker-browser")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if self.listing.folders.is_empty() && self.listing.files.is_empty() {
+                                            ui.add_space(18.0);
+                                            ui.vertical_centered(|ui| {
+                                                let msg = if self.listing.hidden_by_filter > 0 {
+                                                    format!(
+                                                        "No matching files here ({} hidden by filter).\nTap \"All files\" below to show everything.",
+                                                        self.listing.hidden_by_filter
+                                                    )
+                                                } else {
+                                                    "Empty folder.\nUse System Picker or copy files into this folder.".to_string()
+                                                };
+                                                ui.label(RichText::new(msg).size(12.5).color(TEXT_MUTED));
+                                            });
+                                        } else {
+                                            match self.view_mode {
+                                                ViewMode::List => {
+                                                    self.render_list_view(ui, ctx, &mut nav_dir, &mut result);
+                                                }
+                                                ViewMode::Grid => {
+                                                    self.render_grid_view(ui, ctx, &mut nav_dir, &mut result);
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+
+                        // ---- RIGHT PREVIEW PANEL ----
+                        if show_preview {
+                            if let Some(ref p) = preview_path {
+                                self.render_preview_panel(ui, ctx, p, preview_w, body_h, &mut result);
+                            }
+                        }
+                    },
+                );
+
+                // Error line if any
+                if let Some(e) = &self.error {
+                    ui.colored_label(ui.visuals().error_fg_color, RichText::new(e).size(11.5));
+                }
+
+                // ==================== 3. BOTTOM FOOTER ====================
                 ui.horizontal(|ui| {
-                    if self.multi {
-                        if ui.add_enabled(!self.listing.files.is_empty(), egui::Button::new("Select All")).clicked() {
+                    // Left side: Save filename input or selection status + filter toggle
+                    if self.kind == Kind::SaveFile {
+                        ui.label(RichText::new("Name:").size(12.5).color(TEXT_MUTED));
+                        let name_w = (ui.available_width() - 250.0).clamp(110.0, 260.0);
+                        ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(name_w));
+                    } else if self.multi {
+                        if ui
+                            .add_enabled(
+                                !self.listing.files.is_empty(),
+                                egui::Button::new(RichText::new("Select All").size(12.0)).fill(BG_TILE),
+                            )
+                            .clicked()
+                        {
                             for f in &self.listing.files {
-                                if !self.selected_multi.iter().any(|p| p == f) {
-                                    self.selected_multi.push(f.clone());
+                                if !self.selected_multi.iter().any(|p| p == &f.path) {
+                                    self.selected_multi.push(f.path.clone());
                                 }
                             }
                         }
-                        if ui.add_enabled(!self.selected_multi.is_empty(), egui::Button::new("Clear")).clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.selected_multi.is_empty(),
+                                egui::Button::new(RichText::new("Clear").size(12.0)).fill(BG_TILE),
+                            )
+                            .clicked()
+                        {
                             self.selected_multi.clear();
+                            self.selected = None;
                         }
+                    } else if let Some(sel) = &self.selected {
+                        let fname = sel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        ui.add(
+                            egui::Label::new(RichText::new(fname).size(12.5).color(TEXT_PRIMARY)).truncate(),
+                        );
                     }
-                    if self.kind == Kind::SaveFile {
-                        ui.horizontal(|ui| {
-                            ui.label("Name:");
-                            ui.add(egui::TextEdit::singleline(&mut self.name).desired_width((ui.available_width() - 8.0).max(120.0)));
-                        });
+
+                    // Filter / "All files" one-tap toggle
+                    if !self.request.filters.is_empty() {
+                        let all_on = self.show_all_files;
+                        let filter_label = if all_on {
+                            "All files".to_string()
+                        } else {
+                            let summary = filter_summary(&self.request);
+                            if self.listing.hidden_by_filter > 0 {
+                                format!("{summary} (+{} hidden)", self.listing.hidden_by_filter)
+                            } else {
+                                summary
+                            }
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(filter_label)
+                                .size(11.5)
+                                .color(if all_on { Color32::WHITE } else { TEXT_MUTED }),
+                        )
+                        .fill(if all_on { ACCENT_SOFT } else { BG_TILE })
+                        .stroke(Stroke::new(1.0, if all_on { ACCENT } else { BORDER }))
+                        .min_size(Vec2::new(0.0, 26.0));
+                        if ui
+                            .add(btn)
+                            .on_hover_text("Tap to toggle between filtered extensions and All files")
+                            .clicked()
+                        {
+                            self.show_all_files = !self.show_all_files;
+                            self.refresh_listing();
+                        }
+                    } else {
+                        ui.label(RichText::new("All files").size(11.5).color(TEXT_MUTED));
                     }
+
+                    // Right side: Cancel + primary Open/Save/Import action
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.multi {
                             let count = self.selected_multi.len();
-                            let label = format!("Import Selected ({count})");
-                            if ui.add_enabled(count > 0, egui::Button::new(label)).clicked() {
+                            let label = format!("Import ({count})");
+                            if ui
+                                .add_enabled(
+                                    count > 0,
+                                    egui::Button::new(RichText::new(label).size(12.5).strong().color(Color32::WHITE))
+                                        .fill(if count > 0 { ACCENT } else { BG_TILE })
+                                        .min_size(Vec2::new(92.0, 28.0)),
+                                )
+                                .clicked()
+                            {
                                 result = Some(Some(self.selected_multi.clone()));
                             }
                         } else {
@@ -436,24 +1103,480 @@ impl Picker {
                                 Kind::PickFolder => ("Choose", true),
                                 Kind::SaveFile => ("Save", !self.name.trim().is_empty()),
                             };
-                            if ui.add_enabled(ready, egui::Button::new(verb)).clicked() {
-                                result = Some(match self.kind {
-                                    Kind::PickFile => self.selected.clone().map(|p| vec![p]),
-                                    Kind::PickFolder => Some(vec![self.selected.clone().unwrap_or_else(|| self.listing.dir.clone())]),
-                                    Kind::SaveFile => Some(vec![self.listing.dir.join(self.save_name())]),
-                                });
+                            if ui
+                                .add_enabled(
+                                    ready,
+                                    egui::Button::new(RichText::new(verb).size(12.5).strong().color(Color32::WHITE))
+                                        .fill(if ready { ACCENT } else { BG_TILE })
+                                        .min_size(Vec2::new(76.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                result = Some(self.confirm_single());
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Cancel").size(12.5).color(TEXT_PRIMARY))
+                                    .fill(BG_TILE)
+                                    .min_size(Vec2::new(68.0, 28.0)),
+                            )
+                            .clicked()
+                        {
                             result = Some(None);
                         }
                     });
                 });
             });
+
+        if let Some(dir) = nav_dir {
+            self.go(&dir);
+        }
         if !open {
             result = Some(None);
         }
+        if result.is_some() {
+            self.clear_thumbnails();
+        }
         result
+    }
+
+    fn confirm_single(&self) -> Option<Vec<PathBuf>> {
+        match self.kind {
+            Kind::PickFile => self.selected.clone().map(|p| vec![p]),
+            Kind::PickFolder => Some(vec![self.selected.clone().unwrap_or_else(|| self.listing.dir.clone())]),
+            Kind::SaveFile => Some(vec![self.listing.dir.join(self.save_name())]),
+        }
+    }
+
+    fn render_list_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        nav_dir: &mut Option<PathBuf>,
+        result: &mut Option<Option<Vec<PathBuf>>>,
+    ) {
+        let row_w = ui.available_width();
+        let row_h = 38.0;
+
+        // Folders first (left-aligned)
+        for idx in 0..self.listing.folders.len() {
+            let path = self.listing.folders[idx].path.clone();
+            let name = self.listing.folders[idx].name.clone();
+            let sel = self.kind == Kind::PickFolder && self.selected.as_deref() == Some(path.as_path());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::click());
+            if ui.is_rect_visible(rect) {
+                if sel {
+                    ui.painter().rect_filled(rect, 5.0, BG_SELECTED);
+                    ui.painter().rect_stroke(rect, 5.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 5.0, BG_HOVER);
+                }
+                let icon_rect = Rect::from_min_size(Pos2::new(rect.left() + 10.0, rect.center().y - 8.0), Vec2::new(20.0, 16.0));
+                paint_folder_icon(ui.painter(), icon_rect);
+
+                let text_clip = Rect::from_min_max(
+                    Pos2::new(rect.left() + 38.0, rect.top()),
+                    Pos2::new((rect.right() - 24.0).max(rect.left() + 48.0), rect.bottom()),
+                );
+                ui.painter().with_clip_rect(text_clip).text(
+                    Pos2::new(text_clip.left(), rect.center().y),
+                    Align2::LEFT_CENTER,
+                    &name,
+                    FontId::proportional(13.0),
+                    TEXT_PRIMARY,
+                );
+                ui.painter().text(
+                    Pos2::new(rect.right() - 12.0, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    "›",
+                    FontId::proportional(15.0),
+                    TEXT_MUTED,
+                );
+            }
+            if resp.double_clicked() || (resp.clicked() && self.kind != Kind::PickFolder) {
+                *nav_dir = Some(path);
+            } else if resp.clicked() {
+                self.selected = Some(path);
+            }
+        }
+
+        // Files (left-aligned name, thumbnail or typed badge, right-aligned size)
+        let mut to_request_thumbs: Vec<PathBuf> = Vec::new();
+        for idx in 0..self.listing.files.len() {
+            let path = self.listing.files[idx].path.clone();
+            let name = self.listing.files[idx].name.clone();
+            let size = self.listing.files[idx].size;
+            let badge = self.listing.files[idx].badge;
+
+            let is_checked = self.multi && self.selected_multi.iter().any(|p| p == &path);
+            let is_selected = if self.multi {
+                is_checked || self.selected.as_deref() == Some(path.as_path())
+            } else {
+                self.selected.as_deref() == Some(path.as_path())
+            };
+
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::click());
+            if ui.is_rect_visible(rect) {
+                if badge.is_image() {
+                    to_request_thumbs.push(path.clone());
+                }
+                if is_selected {
+                    ui.painter().rect_filled(rect, 5.0, BG_SELECTED);
+                    ui.painter().rect_stroke(rect, 5.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 5.0, BG_HOVER);
+                }
+
+                let mut x = rect.left() + 8.0;
+
+                // Checkbox in multi-select mode
+                if self.multi {
+                    let cb = Rect::from_min_size(Pos2::new(x, rect.center().y - 8.0), Vec2::splat(16.0));
+                    ui.painter().rect_filled(cb, 3.0, if is_checked { ACCENT } else { BG_PANEL });
+                    ui.painter().rect_stroke(
+                        cb,
+                        3.0,
+                        Stroke::new(1.0, if is_checked { ACCENT } else { BORDER }),
+                        StrokeKind::Inside,
+                    );
+                    if is_checked {
+                        ui.painter().text(cb.center(), Align2::CENTER_CENTER, "✓", FontId::proportional(11.0), Color32::WHITE);
+                    }
+                    x += 24.0;
+                }
+
+                // Thumbnail (28x28) or typed file badge
+                let icon_box = Rect::from_min_size(Pos2::new(x, rect.center().y - 14.0), Vec2::new(34.0, 28.0));
+                if let Some(ThumbEntry::Loaded { tex, .. }) = self.thumbs.get(&path) {
+                    let fit = fit_aspect(icon_box, tex.size_vec2());
+                    egui::Image::new(tex).corner_radius(3.0).paint_at(ui, fit);
+                } else {
+                    let pill = Rect::from_center_size(icon_box.center(), Vec2::new(34.0, 20.0));
+                    paint_badge(ui.painter(), pill, badge, 9.5);
+                }
+                x += 42.0;
+
+                // Right-aligned human-readable file size
+                let size_str = format_size(size);
+                let size_reserve = 68.0;
+                ui.painter().text(
+                    Pos2::new(rect.right() - 10.0, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    size_str,
+                    FontId::proportional(11.5),
+                    TEXT_MUTED,
+                );
+
+                // Left-aligned filename clipped cleanly before size column
+                let text_clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new((rect.right() - size_reserve).max(x + 24.0), rect.bottom()),
+                );
+                ui.painter().with_clip_rect(text_clip).text(
+                    Pos2::new(x, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    &name,
+                    FontId::proportional(13.0),
+                    if is_selected { Color32::WHITE } else { TEXT_PRIMARY },
+                );
+            }
+
+            if resp.clicked() {
+                if self.multi {
+                    if let Some(pos) = self.selected_multi.iter().position(|p| p == &path) {
+                        self.selected_multi.remove(pos);
+                    } else {
+                        self.selected_multi.push(path.clone());
+                    }
+                    self.selected = Some(path.clone());
+                } else {
+                    self.selected = Some(path.clone());
+                    if self.kind == Kind::SaveFile {
+                        self.name = name.clone();
+                    }
+                }
+            }
+            if resp.double_clicked() && self.kind == Kind::PickFile && !self.multi {
+                *result = Some(Some(vec![path]));
+            }
+        }
+
+        for p in to_request_thumbs {
+            self.request_thumb_if_needed(ctx, &p);
+        }
+    }
+
+    fn render_grid_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        nav_dir: &mut Option<PathBuf>,
+        result: &mut Option<Option<Vec<PathBuf>>>,
+    ) {
+        let avail_w = ui.available_width();
+        let gap = 8.0;
+        let min_tile_w = 96.0;
+        let cols = ((avail_w + gap) / (min_tile_w + gap)).floor().max(2.0) as usize;
+        let tile_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).floor().max(80.0);
+        let tile_h = 112.0;
+
+        enum GridItem {
+            Folder(usize),
+            File(usize),
+        }
+        let mut items = Vec::with_capacity(self.listing.folders.len() + self.listing.files.len());
+        for i in 0..self.listing.folders.len() {
+            items.push(GridItem::Folder(i));
+        }
+        for i in 0..self.listing.files.len() {
+            items.push(GridItem::File(i));
+        }
+
+        let mut to_request_thumbs: Vec<PathBuf> = Vec::new();
+
+        for row in items.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for item in row {
+                    match *item {
+                        GridItem::Folder(idx) => {
+                            let path = self.listing.folders[idx].path.clone();
+                            let name = self.listing.folders[idx].name.clone();
+                            let sel = self.kind == Kind::PickFolder && self.selected.as_deref() == Some(path.as_path());
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
+                            if ui.is_rect_visible(rect) {
+                                let bg = if sel { BG_SELECTED } else if resp.hovered() { BG_HOVER } else { BG_TILE };
+                                ui.painter().rect_filled(rect, 7.0, bg);
+                                if sel {
+                                    ui.painter().rect_stroke(rect, 7.0, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
+                                }
+                                let icon_r = Rect::from_center_size(
+                                    Pos2::new(rect.center().x, rect.top() + 38.0),
+                                    Vec2::new(42.0, 32.0),
+                                );
+                                paint_folder_icon(ui.painter(), icon_r);
+
+                                let name_clip = Rect::from_min_max(
+                                    Pos2::new(rect.left() + 6.0, rect.top() + 68.0),
+                                    Pos2::new(rect.right() - 6.0, rect.bottom() - 6.0),
+                                );
+                                ui.painter().with_clip_rect(name_clip).text(
+                                    Pos2::new(rect.center().x, rect.top() + 84.0),
+                                    Align2::CENTER_CENTER,
+                                    truncate_middle(&name, 14),
+                                    FontId::proportional(11.5),
+                                    TEXT_PRIMARY,
+                                );
+                            }
+                            if resp.double_clicked() || (resp.clicked() && self.kind != Kind::PickFolder) {
+                                *nav_dir = Some(path);
+                            } else if resp.clicked() {
+                                self.selected = Some(path);
+                            }
+                        }
+                        GridItem::File(idx) => {
+                            let path = self.listing.files[idx].path.clone();
+                            let name = self.listing.files[idx].name.clone();
+                            let size = self.listing.files[idx].size;
+                            let badge = self.listing.files[idx].badge;
+
+                            let is_checked = self.multi && self.selected_multi.iter().any(|p| p == &path);
+                            let is_selected = if self.multi {
+                                is_checked || self.selected.as_deref() == Some(path.as_path())
+                            } else {
+                                self.selected.as_deref() == Some(path.as_path())
+                            };
+
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
+                            if ui.is_rect_visible(rect) {
+                                if badge.is_image() {
+                                    to_request_thumbs.push(path.clone());
+                                }
+                                let bg = if is_selected { BG_SELECTED } else if resp.hovered() { BG_HOVER } else { BG_TILE };
+                                ui.painter().rect_filled(rect, 7.0, bg);
+                                if is_selected {
+                                    ui.painter().rect_stroke(rect, 7.0, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
+                                }
+
+                                let thumb_box = Rect::from_min_max(
+                                    Pos2::new(rect.left() + 6.0, rect.top() + 6.0),
+                                    Pos2::new(rect.right() - 6.0, rect.top() + 72.0),
+                                );
+                                ui.painter().rect_filled(thumb_box, 5.0, BG_BROWSER);
+                                if let Some(ThumbEntry::Loaded { tex, .. }) = self.thumbs.get(&path) {
+                                    let fit = fit_aspect(thumb_box.shrink(2.0), tex.size_vec2());
+                                    egui::Image::new(tex).corner_radius(4.0).paint_at(ui, fit);
+                                } else {
+                                    let pill = Rect::from_center_size(thumb_box.center(), Vec2::new(42.0, 22.0));
+                                    paint_badge(ui.painter(), pill, badge, 11.0);
+                                }
+
+                                if is_checked {
+                                    let check_r = Rect::from_min_size(
+                                        Pos2::new(rect.right() - 22.0, rect.top() + 6.0),
+                                        Vec2::splat(16.0),
+                                    );
+                                    ui.painter().rect_filled(check_r, 8.0, ACCENT);
+                                    ui.painter().text(
+                                        check_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        "✓",
+                                        FontId::proportional(10.5),
+                                        Color32::WHITE,
+                                    );
+                                }
+
+                                let label_clip = Rect::from_min_max(
+                                    Pos2::new(rect.left() + 6.0, rect.top() + 75.0),
+                                    Pos2::new(rect.right() - 6.0, rect.top() + 94.0),
+                                );
+                                ui.painter().with_clip_rect(label_clip).text(
+                                    Pos2::new(label_clip.left(), label_clip.center().y),
+                                    Align2::LEFT_CENTER,
+                                    truncate_middle(&name, 14),
+                                    FontId::proportional(11.5),
+                                    if is_selected { Color32::WHITE } else { TEXT_PRIMARY },
+                                );
+                                ui.painter().text(
+                                    Pos2::new(rect.left() + 6.0, rect.bottom() - 10.0),
+                                    Align2::LEFT_CENTER,
+                                    format_size(size),
+                                    FontId::proportional(10.0),
+                                    TEXT_MUTED,
+                                );
+                            }
+
+                            if resp.clicked() {
+                                if self.multi {
+                                    if let Some(pos) = self.selected_multi.iter().position(|p| p == &path) {
+                                        self.selected_multi.remove(pos);
+                                    } else {
+                                        self.selected_multi.push(path.clone());
+                                    }
+                                    self.selected = Some(path.clone());
+                                } else {
+                                    self.selected = Some(path.clone());
+                                    if self.kind == Kind::SaveFile {
+                                        self.name = name.clone();
+                                    }
+                                }
+                            }
+                            if resp.double_clicked() && self.kind == Kind::PickFile && !self.multi {
+                                *result = Some(Some(vec![path]));
+                            }
+                        }
+                    }
+                }
+            });
+            ui.add_space(2.0);
+        }
+
+        for p in to_request_thumbs {
+            self.request_thumb_if_needed(ctx, &p);
+        }
+    }
+
+    fn render_preview_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        path: &Path,
+        preview_w: f32,
+        body_h: f32,
+        result: &mut Option<Option<Vec<PathBuf>>>,
+    ) {
+        let badge = FileBadge::from_path(path);
+        if badge.is_image() {
+            self.request_preview_if_needed(ctx, path);
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let file_size = self
+            .listing
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.size)
+            .unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+
+        egui::Frame::new()
+            .fill(BG_PANEL)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                let inner_w = preview_w - 16.0;
+                ui.set_width(inner_w);
+                ui.set_height(body_h - 16.0);
+
+                ui.label(RichText::new("PREVIEW").size(10.0).strong().color(TEXT_MUTED));
+                ui.add_space(4.0);
+
+                // Preview box (up to 150x150)
+                let box_side = inner_w.min(150.0).min((body_h - 150.0).max(80.0));
+                let (pbox, _) = ui.allocate_exact_size(Vec2::new(inner_w, box_side), Sense::hover());
+                ui.painter().rect_filled(pbox, 6.0, BG_BROWSER);
+                ui.painter().rect_stroke(pbox, 6.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+
+                let mut dims: Option<(u32, u32)> = None;
+                if badge.is_image() {
+                    if let Some(pt) = self.preview_tex.as_ref().filter(|pt| pt.path == path) {
+                        dims = pt.dims;
+                        if let Some(tex) = &pt.tex {
+                            let fit = fit_aspect(pbox.shrink(4.0), tex.size_vec2());
+                            egui::Image::new(tex).corner_radius(4.0).paint_at(ui, fit);
+                        } else {
+                            let pill = Rect::from_center_size(pbox.center(), Vec2::new(52.0, 26.0));
+                            paint_badge(ui.painter(), pill, badge, 12.0);
+                        }
+                    } else if let Some(ThumbEntry::Loaded { tex, dims: td }) = self.thumbs.get(path) {
+                        dims = Some(*td);
+                        let fit = fit_aspect(pbox.shrink(4.0), tex.size_vec2());
+                        egui::Image::new(tex).corner_radius(4.0).paint_at(ui, fit);
+                    } else {
+                        ui.painter().text(
+                            pbox.center(),
+                            Align2::CENTER_CENTER,
+                            "Loading…",
+                            FontId::proportional(11.5),
+                            TEXT_MUTED,
+                        );
+                    }
+                } else {
+                    let pill = Rect::from_center_size(pbox.center(), Vec2::new(56.0, 28.0));
+                    paint_badge(ui.painter(), pill, badge, 13.0);
+                }
+
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(&name).size(12.5).strong().color(TEXT_PRIMARY)).wrap());
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    let (br, _) = ui.allocate_exact_size(Vec2::new(38.0, 18.0), Sense::hover());
+                    paint_badge(ui.painter(), br, badge, 9.5);
+                    ui.label(RichText::new(format_size(file_size)).size(11.5).color(TEXT_MUTED));
+                });
+
+                if let Some((w, h)) = dims {
+                    ui.label(RichText::new(format!("{w} × {h} px")).size(11.5).color(TEXT_MUTED));
+                }
+
+                // Quick primary action button inside preview pane
+                if !self.multi && self.kind == Kind::PickFile && ui.available_height() >= 34.0 {
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Open File").size(12.0).strong().color(Color32::WHITE))
+                                    .fill(ACCENT)
+                                    .min_size(Vec2::new(inner_w, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            *result = Some(Some(vec![path.to_path_buf()]));
+                        }
+                    });
+                }
+            });
     }
 
     /// The name to save as, with the first filter's extension when none was
@@ -468,6 +1591,90 @@ impl Picker {
     }
 }
 
+// ------------------------------------------------------------ UI Helpers
+
+fn paint_folder_icon(painter: &egui::Painter, rect: Rect) {
+    let tab_h = (rect.height() * 0.28).max(3.0);
+    let tab = Rect::from_min_size(rect.min, Vec2::new(rect.width() * 0.44, tab_h + 2.0));
+    painter.rect_filled(tab, CornerRadius::same(2), FOLDER_TAB);
+    let body = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + tab_h), rect.max);
+    painter.rect_filled(body, CornerRadius::same(2), FOLDER_BODY);
+}
+
+fn paint_badge(painter: &egui::Painter, rect: Rect, badge: FileBadge, font_size: f32) {
+    painter.rect_filled(rect, 4.0, badge.bg());
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, badge.color().gamma_multiply(0.65)), StrokeKind::Inside);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        badge.label(),
+        FontId::proportional(font_size),
+        badge.color(),
+    );
+}
+
+fn fit_aspect(bounds: Rect, img_size: Vec2) -> Rect {
+    if img_size.x <= 0.0 || img_size.y <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.width() / img_size.x).min(bounds.height() / img_size.y);
+    let size = img_size * scale;
+    Rect::from_center_size(bounds.center(), size)
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.0} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.2} GB", b / GB)
+    }
+}
+
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars || max_chars < 5 {
+        return s.to_string();
+    }
+    let head = (max_chars - 1) / 2;
+    let tail = max_chars - 1 - head;
+    let mut out = String::with_capacity(s.len());
+    for &c in &chars[..head] {
+        out.push(c);
+    }
+    out.push('…');
+    for &c in &chars[chars.len() - tail..] {
+        out.push(c);
+    }
+    out
+}
+
+fn filter_summary(request: &Request) -> String {
+    let mut exts: Vec<String> = Vec::new();
+    for (_, list) in &request.filters {
+        for e in list {
+            let tag = format!("*.{}", e.trim_start_matches('.').to_ascii_lowercase());
+            if !exts.contains(&tag) {
+                exts.push(tag);
+            }
+        }
+    }
+    if exts.is_empty() {
+        "All files".to_string()
+    } else if exts.len() <= 3 {
+        exts.join(", ")
+    } else {
+        format!("{}, {} +{}", exts[0], exts[1], exts.len() - 2)
+    }
+}
+
 /// A file name without path separators or control characters.
 fn safe_name(s: &str) -> String {
     let out: String = s.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c }).collect();
@@ -476,10 +1683,19 @@ fn safe_name(s: &str) -> String {
 
 /// A path with the app's folder prefix replaced by its label.
 fn shorten(p: &Path) -> String {
-    for r in roots(true) {
-        if let Ok(rest) = p.strip_prefix(&r.path) {
+    let all = roots(true);
+    if let Some(best) = all
+        .iter()
+        .filter(|r| p.starts_with(&r.path))
+        .max_by_key(|r| r.path.as_os_str().len())
+    {
+        if let Ok(rest) = p.strip_prefix(&best.path) {
             let rest = rest.display().to_string();
-            return if rest.is_empty() { r.label.to_string() } else { format!("{} / {}", r.label, rest.replace('/', " / ")) };
+            return if rest.is_empty() {
+                best.label.to_string()
+            } else {
+                format!("{} / {}", best.label, rest.replace('/', " / "))
+            };
         }
     }
     p.display().to_string()
@@ -606,41 +1822,60 @@ pub fn take_opened() -> Vec<PathBuf> {
 
 /// Raw JNI bridge called from `crates/rustudio-android/src/lib.rs` on SAF open-document result.
 ///
+/// Receives either newline-separated local file paths copied into `cacheDir/picked/` by
+/// `RustudioActivity.java`, raw `content://` URIs (fallback), or an empty string when cancelled.
+/// Delivers directly to [`SAF_PICKER_RESULT`] for the waiting [`Picker`] — never to [`OPENED`].
+///
 /// # Safety
 /// Must be called by the JVM with valid `JNIEnv*` and optional `jstring`.
 pub unsafe fn jni_on_saf_document_opened(
     env: *mut std::ffi::c_void,
     uri: *mut std::ffi::c_void,
 ) {
-    if env.is_null() || uri.is_null() {
+    if env.is_null() {
         return;
     }
-    let env_ptr = env as *mut jni::sys::JNIEnv;
-    let jstr = uri as jni::sys::jstring;
-    let s = unsafe {
-        let Some(vtable) = (*env_ptr).as_ref() else {
-            return;
-        };
-        let len = (vtable.v1_1.GetStringLength)(env_ptr, jstr);
-        if len <= 0 {
-            return;
+    let s = if uri.is_null() {
+        String::new()
+    } else {
+        let env_ptr = env as *mut jni::sys::JNIEnv;
+        let jstr = uri as jni::sys::jstring;
+        unsafe {
+            let Some(vtable) = (*env_ptr).as_ref() else {
+                return;
+            };
+            let len = (vtable.v1_1.GetStringLength)(env_ptr, jstr);
+            if len <= 0 {
+                String::new()
+            } else {
+                let ptr = (vtable.v1_1.GetStringChars)(env_ptr, jstr, std::ptr::null_mut());
+                if ptr.is_null() {
+                    String::new()
+                } else {
+                    let slice = std::slice::from_raw_parts(ptr, len as usize);
+                    let decoded = String::from_utf16_lossy(slice);
+                    (vtable.v1_1.ReleaseStringChars)(env_ptr, jstr, ptr);
+                    decoded
+                }
+            }
         }
-        let ptr = (vtable.v1_1.GetStringChars)(env_ptr, jstr, std::ptr::null_mut());
-        if ptr.is_null() {
-            return;
-        }
-        let slice = std::slice::from_raw_parts(ptr, len as usize);
-        let decoded = String::from_utf16_lossy(slice);
-        (vtable.v1_1.ReleaseStringChars)(env_ptr, jstr, ptr);
-        decoded
     };
-    if s.is_empty() {
-        return;
+
+    let mut paths = Vec::new();
+    for line in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.starts_with("content://") || line.starts_with("file://") {
+            if let Some(p) = import_uri(line) {
+                paths.push(p);
+            }
+        } else {
+            let p = PathBuf::from(line);
+            if p.is_file() {
+                paths.push(p);
+            }
+        }
     }
-    if let Some(path) = import_uri(&s) {
-        push_opened(path);
-        super::lifecycle::wake();
-    }
+    set_saf_picker_result(paths);
+    super::lifecycle::wake();
 }
 
 // ------------------------------------------------------- the opening marker
@@ -682,12 +1917,7 @@ fn opening_marker(p: Option<&Path>) {
 }
 
 /// Whether the last start ended (a crash, a kill) within [`SETTLED`] of
-/// opening `p` by itself. The Activity's VIEW intent is delivered again
-/// each time its task comes back after the process died, so a place that
-/// brings the app down would otherwise bring it down at every launch,
-/// with nothing to be done about it on the device. The file is left alone
-/// then and Output says so; File ▸ Open Recent opens it on purpose, and
-/// once such a start has settled the marker is forgotten.
+/// opening `p` by itself.
 fn skip_crashed(p: &Path) -> bool {
     let Ok(last) = std::fs::read_to_string(marker_path()) else { return false };
     if Path::new(last.trim()) != p {

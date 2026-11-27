@@ -5,6 +5,7 @@ import android.app.NativeActivity;
 import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.ComponentCallbacks2;
+import android.content.ContentResolver;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -13,11 +14,19 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.Cursor;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.webkit.MimeTypeMap;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.os.Bundle;
@@ -304,7 +313,7 @@ public class RustudioActivity extends NativeActivity {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
             nativeOnTrimMemory(level);
         }
     }
@@ -327,20 +336,250 @@ public class RustudioActivity extends NativeActivity {
             }
             nativeOnSafDocumentCreated(uri);
         } else if (requestCode == REQ_SAF_OPEN_DOC) {
-            if (resultCode == RESULT_OK && data != null) {
-                ClipData clip = data.getClipData();
-                if (clip != null && clip.getItemCount() > 0) {
-                    for (int i = 0; i < clip.getItemCount(); i++) {
-                        ClipData.Item item = clip.getItemAt(i);
-                        if (item != null && item.getUri() != null) {
-                            nativeOnSafDocumentOpened(item.getUri().toString());
+            if (resultCode != RESULT_OK || data == null) {
+                nativeOnSafDocumentOpened("");
+                return;
+            }
+            final ArrayList<Uri> uris = new ArrayList<Uri>();
+            ClipData clip = data.getClipData();
+            if (clip != null && clip.getItemCount() > 0) {
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    ClipData.Item item = clip.getItemAt(i);
+                    if (item != null && item.getUri() != null) {
+                        uris.add(item.getUri());
+                    }
+                }
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+            if (uris.isEmpty()) {
+                nativeOnSafDocumentOpened("");
+                return;
+            }
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    StringBuilder joined = new StringBuilder();
+                    File pickedRoot = new File(getCacheDir(), "picked");
+                    pickedRoot.mkdirs();
+                    pruneOldPickedDirs(pickedRoot, 60);
+                    String batchTag = String.valueOf(System.currentTimeMillis());
+                    for (int i = 0; i < uris.size(); i++) {
+                        File copied = copyUriToPickedCache(uris.get(i), pickedRoot, batchTag, i);
+                        if (copied != null) {
+                            if (joined.length() > 0) {
+                                joined.append('\n');
+                            }
+                            joined.append(copied.getAbsolutePath());
                         }
                     }
-                } else if (data.getData() != null) {
-                    nativeOnSafDocumentOpened(data.getData().toString());
+                    nativeOnSafDocumentOpened(joined.toString());
+                }
+            }, "rustudio-saf-copy").start();
+        }
+    }
+
+    private File copyUriToPickedCache(Uri uri, File pickedRoot, String batchTag, int index) {
+        if (uri == null) {
+            return null;
+        }
+        ContentResolver resolver = getContentResolver();
+        if (resolver == null) {
+            return null;
+        }
+        String fileName = queryDisplayName(resolver, uri);
+        if (fileName == null || fileName.trim().isEmpty()) {
+            String seg = uri.getLastPathSegment();
+            if (seg != null) {
+                int slash = seg.lastIndexOf('/');
+                if (slash >= 0 && slash + 1 < seg.length()) {
+                    seg = seg.substring(slash + 1);
+                }
+                int colon = seg.lastIndexOf(':');
+                if (colon >= 0 && colon + 1 < seg.length()) {
+                    seg = seg.substring(colon + 1);
+                }
+                fileName = seg;
+            }
+        }
+        fileName = sanitizePickedName(fileName);
+        int dot = fileName.lastIndexOf('.');
+        boolean hasExt = dot > 0 && dot < fileName.length() - 1;
+        if (!hasExt) {
+            String mime = null;
+            try {
+                mime = resolver.getType(uri);
+            } catch (Throwable ignored) {
+            }
+            String ext = resolveExtensionForMime(mime);
+            if (ext != null && !ext.isEmpty()) {
+                fileName = fileName + "." + ext;
+            }
+        }
+        File slotDir = new File(pickedRoot, batchTag + "_" + index);
+        if (!slotDir.exists() && !slotDir.mkdirs()) {
+            slotDir = pickedRoot;
+        }
+        File dest = new File(slotDir, fileName);
+        try (InputStream in = resolver.openInputStream(uri);
+             FileOutputStream out = new FileOutputStream(dest)) {
+            if (in == null) {
+                return null;
+            }
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+            return dest;
+        } catch (Throwable t) {
+            try {
+                dest.delete();
+            } catch (Throwable ignored) {
+            }
+            return null;
+        }
+    }
+
+    private static String queryDisplayName(ContentResolver resolver, Uri uri) {
+        Cursor cursor = null;
+        try {
+            cursor = resolver.query(
+                    uri,
+                    new String[]{OpenableColumns.DISPLAY_NAME},
+                    null,
+                    null,
+                    null
+            );
+            if (cursor != null && cursor.moveToFirst()) {
+                int col = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (col < 0) {
+                    col = 0;
+                }
+                return cursor.getString(col);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (cursor != null) {
+                try {
+                    cursor.close();
+                } catch (Throwable ignored) {
                 }
             }
         }
+        return null;
+    }
+
+    private static String sanitizePickedName(String raw) {
+        if (raw == null) {
+            return "picked_file";
+        }
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) {
+            return "picked_file";
+        }
+        StringBuilder sb = new StringBuilder(trimmed.length());
+        for (int i = 0; i < trimmed.length(); i++) {
+            char c = trimmed.charAt(i);
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?'
+                    || c == '"' || c == '<' || c == '>' || c == '|' || c < 32) {
+                sb.append('_');
+            } else {
+                sb.append(c);
+            }
+        }
+        String out = sb.toString().trim();
+        if (out.isEmpty() || ".".equals(out) || "..".equals(out)) {
+            return "picked_file";
+        }
+        return out;
+    }
+
+    private static String resolveExtensionForMime(String mime) {
+        if (mime == null) {
+            return null;
+        }
+        String m = mime.trim().toLowerCase();
+        if (m.isEmpty()) {
+            return null;
+        }
+        if ("image/jpeg".equals(m) || "image/jpg".equals(m)) {
+            return "jpg";
+        }
+        if ("image/png".equals(m)) {
+            return "png";
+        }
+        if ("image/webp".equals(m)) {
+            return "webp";
+        }
+        if ("image/bmp".equals(m) || "image/x-ms-bmp".equals(m)) {
+            return "bmp";
+        }
+        if ("image/gif".equals(m)) {
+            return "gif";
+        }
+        if ("model/gltf-binary".equals(m)) {
+            return "glb";
+        }
+        if ("model/gltf+json".equals(m)) {
+            return "gltf";
+        }
+        if ("audio/mpeg".equals(m)) {
+            return "mp3";
+        }
+        if ("audio/ogg".equals(m)) {
+            return "ogg";
+        }
+        if ("audio/wav".equals(m) || "audio/x-wav".equals(m)) {
+            return "wav";
+        }
+        if ("audio/flac".equals(m)) {
+            return "flac";
+        }
+        String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(m);
+        if (ext != null && !ext.isEmpty()) {
+            if ("jpeg".equals(ext)) {
+                return "jpg";
+            }
+            return ext;
+        }
+        return null;
+    }
+
+    private static void pruneOldPickedDirs(File pickedRoot, int maxKeep) {
+        try {
+            File[] children = pickedRoot.listFiles();
+            if (children == null || children.length <= maxKeep) {
+                return;
+            }
+            Arrays.sort(children, new Comparator<File>() {
+                @Override
+                public int compare(File a, File b) {
+                    return Long.compare(a.lastModified(), b.lastModified());
+                }
+            });
+            int toDelete = children.length - maxKeep;
+            for (int i = 0; i < toDelete; i++) {
+                deleteRecursive(children[i]);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void deleteRecursive(File f) {
+        if (f == null || !f.exists()) {
+            return;
+        }
+        if (f.isDirectory()) {
+            File[] kids = f.listFiles();
+            if (kids != null) {
+                for (int i = 0; i < kids.length; i++) {
+                    deleteRecursive(kids[i]);
+                }
+            }
+        }
+        f.delete();
     }
 
     @Override

@@ -398,18 +398,101 @@ fn media(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, Media>> {
 
 // ------------------------------------------------------------ decoded audio
 
-static PCM: Mutex<Option<HashMap<String, Arc<Pcm>>>> = Mutex::new(None);
+const PCM_CACHE_BUDGET: usize = if cfg!(target_os = "android") {
+    24 * 1024 * 1024
+} else {
+    128 * 1024 * 1024
+};
+
+fn pcm_bytes(p: &Pcm) -> usize {
+    p.chans
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>()
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+struct PcmEntry {
+    pcm: Arc<Pcm>,
+    bytes: usize,
+    tick: u64,
+}
+
+#[derive(Default)]
+struct PcmCache {
+    map: HashMap<String, PcmEntry>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl PcmCache {
+    fn get(&mut self, id: &str) -> Option<Arc<Pcm>> {
+        let entry = self.map.get_mut(id)?;
+        self.clock = self.clock.wrapping_add(1);
+        entry.tick = self.clock;
+        Some(entry.pcm.clone())
+    }
+
+    fn insert(&mut self, id: String, pcm: Arc<Pcm>) {
+        let bytes = pcm_bytes(&pcm);
+        if let Some(old) = self.map.remove(&id) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        if bytes > PCM_CACHE_BUDGET {
+            return;
+        }
+        while self.bytes.saturating_add(bytes) > PCM_CACHE_BUDGET {
+            let Some(oldest_key) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.tick)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = self.map.remove(&oldest_key) {
+                self.bytes = self.bytes.saturating_sub(evicted.bytes);
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.map.insert(id, PcmEntry { pcm, bytes, tick: self.clock });
+    }
+
+    #[cfg(test)]
+    fn remove(&mut self, id: &str) {
+        if let Some(old) = self.map.remove(id) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+}
+
+static PCM: Mutex<Option<PcmCache>> = Mutex::new(None);
 
 fn pcm_cached(id: &str) -> Option<Arc<Pcm>> {
     if !audio_allowed(id) {
         return None;
     }
-    PCM.lock().ok()?.as_ref()?.get(id).cloned()
+    PCM.lock().ok()?.as_mut()?.get(id)
 }
 
 fn pcm_store(id: &str, p: Arc<Pcm>) {
     if let Ok(mut g) = PCM.lock() {
-        g.get_or_insert_with(HashMap::new).insert(id.to_string(), p);
+        g.get_or_insert_with(PcmCache::default).insert(id.to_string(), p);
+    }
+}
+
+/// Drops all cached decoded PCM audio buffers (e.g. on place switch or low-memory trim).
+pub fn clear_pcm_cache() {
+    if let Ok(mut g) = PCM.lock() {
+        if let Some(cache) = g.as_mut() {
+            cache.clear();
+        }
     }
 }
 

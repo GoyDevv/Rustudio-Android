@@ -235,7 +235,15 @@ pub const LIGHTOCC_MAX_STEPS: f32 = 24.0; // samples per light at most (one per 
 // Studio's encoded SrcAlpha blend (checks/laser-tag-parity/render/findings.md).
 
 // Undo
+#[cfg(target_os = "android")]
+pub const UNDO_LIMIT: usize = 100;
+#[cfg(not(target_os = "android"))]
 pub const UNDO_LIMIT: usize = 500;
+#[cfg(target_os = "android")]
+pub const UNDO_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+#[cfg(not(target_os = "android"))]
+pub const UNDO_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+pub const UNDO_PENDING_CAP: usize = 10_000;
 pub const UNDO_MERGE_MS: u64 = 700;
 
 // Harness

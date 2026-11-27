@@ -7,8 +7,8 @@
 //! - Untitled dirty place: `untitled_latest.rbxl` (+ `.meta.json`)
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::RichText;
@@ -17,6 +17,12 @@ use rustudio_core::doc::Document;
 use serde::{Deserialize, Serialize};
 
 use crate::app::Editor;
+
+/// Serializes recovery file writes/clears so `flush_sync()` and background
+/// `tick()` threads can never double-write or race on the same snapshot.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Monotonic sequence counter for unique temporary filenames.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Directory where per-place auto-recovery snapshots are stored.
 pub fn dir() -> PathBuf {
@@ -85,12 +91,12 @@ impl RecoveryKey {
         dir().join(format!("{}.meta.json", self.stem()))
     }
 
-    fn tmp_rbxl_path(&self) -> PathBuf {
-        dir().join(format!("{}.rbxl.tmp", self.stem()))
+    fn tmp_rbxl_path(&self, seq: u64) -> PathBuf {
+        dir().join(format!("{}.{seq}.rbxl.tmp", self.stem()))
     }
 
-    fn tmp_meta_path(&self) -> PathBuf {
-        dir().join(format!("{}.meta.json.tmp", self.stem()))
+    fn tmp_meta_path(&self, seq: u64) -> PathBuf {
+        dir().join(format!("{}.{seq}.meta.json.tmp", self.stem()))
     }
 }
 
@@ -125,18 +131,30 @@ impl RecoveryMeta {
 
 /// Atomically writes the `.rbxl` snapshot and its `.meta.json` sidecar.
 pub fn write_recovery(key: &RecoveryKey, bytes: &[u8], meta: &RecoveryMeta) -> std::io::Result<()> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = dir();
     std::fs::create_dir_all(&root)?;
-    let tmp_rbxl = key.tmp_rbxl_path();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_rbxl = key.tmp_rbxl_path(seq);
     let dst_rbxl = key.rbxl_path();
-    std::fs::write(&tmp_rbxl, bytes)?;
-    std::fs::rename(&tmp_rbxl, &dst_rbxl)?;
+    if let Err(e) = std::fs::write(&tmp_rbxl, bytes) {
+        let _ = std::fs::remove_file(&tmp_rbxl);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_rbxl, &dst_rbxl) {
+        let _ = std::fs::remove_file(&tmp_rbxl);
+        return Err(e);
+    }
 
     if let Ok(json) = serde_json::to_string_pretty(meta) {
-        let tmp_meta = key.tmp_meta_path();
+        let tmp_meta = key.tmp_meta_path(seq);
         let dst_meta = key.meta_path();
         if std::fs::write(&tmp_meta, json).is_ok() {
-            let _ = std::fs::rename(&tmp_meta, &dst_meta);
+            if std::fs::rename(&tmp_meta, &dst_meta).is_err() {
+                let _ = std::fs::remove_file(&tmp_meta);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp_meta);
         }
     }
     Ok(())
@@ -144,10 +162,23 @@ pub fn write_recovery(key: &RecoveryKey, bytes: &[u8], meta: &RecoveryMeta) -> s
 
 /// Deletes any recovery snapshot and metadata matching `key`.
 pub fn clear_recovery(key: &RecoveryKey) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ = std::fs::remove_file(key.rbxl_path());
     let _ = std::fs::remove_file(key.meta_path());
-    let _ = std::fs::remove_file(key.tmp_rbxl_path());
-    let _ = std::fs::remove_file(key.tmp_meta_path());
+    let stem = key.stem();
+    let root = dir();
+    let _ = std::fs::remove_file(root.join(format!("{stem}.rbxl.tmp")));
+    let _ = std::fs::remove_file(root.join(format!("{stem}.meta.json.tmp")));
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        let prefix = format!("{stem}.");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// Deletes any recovery snapshot matching `doc`.

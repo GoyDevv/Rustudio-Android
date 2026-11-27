@@ -119,10 +119,23 @@ fn uv_key(uv: Vec2) -> (i64, i64) {
     ((uv.x * 1e4).round() as i64, (uv.y * 1e4).round() as i64)
 }
 
+static CACHE: OnceLock<Mutex<HashMap<u64, Arc<Hsr>>>> = OnceLock::new();
+
+/// Clears all cached HSR blobs and computed body-mesh states (e.g. on place switch).
+pub fn clear_caches() {
+    if let Some(c) = CACHE.get() {
+        if let Ok(mut g) = c.lock() {
+            g.clear();
+        }
+    }
+    if let Ok(mut s) = states().lock() {
+        s.clear();
+    }
+}
+
 /// An HSR asset by id: downloaded (public), its HiddenSurfaceRemovalAsset's
 /// blob parsed.
 fn load(id: u64) -> Result<Arc<Hsr>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<Hsr>>>> = OnceLock::new();
     if let Some(h) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&id).cloned()) {
         return Ok(h);
     }

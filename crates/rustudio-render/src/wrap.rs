@@ -200,6 +200,14 @@ pub fn bump_generation() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Clears cached layered-clothing fitting states (e.g. on place switch).
+pub fn clear_caches() {
+    if let Ok(mut s) = states().lock() {
+        s.clear();
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 pub enum Lookup {
     /// No layered clothing on this character.
     None,

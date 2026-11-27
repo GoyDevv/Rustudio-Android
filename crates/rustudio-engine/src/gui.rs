@@ -1772,6 +1772,17 @@ impl Gui {
         }
     }
 
+    /// Drops all cached GUI textures, mipmaps, FX textures, editable-image
+    /// generations, and queued decoded images to release GPU VRAM (e.g. on
+    /// place switch or Android `onTrimMemory`).
+    pub fn clear_textures(&mut self) {
+        self.images.clear();
+        self.mips.clear();
+        self.fx_images.clear();
+        self.editable_gens.clear();
+        self.images_ready.clear();
+    }
+
     /// Resets per-document GUI caches and failed image entries when opening a new place.
     pub fn on_document_changed(&mut self) {
         self.clear_billboard_canvases();

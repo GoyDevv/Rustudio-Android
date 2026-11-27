@@ -1394,11 +1394,32 @@ fn public_prefetch_inner(id: u64) -> Fetch {
     Fetch::Pending
 }
 
+enum RbxThumbState {
+    Pending,
+    /// Saved to disk under `cache_dir()/thumbs/{key}.png`; raw PNG bytes are not held in RAM.
+    OnDisk,
+    /// Fallback when disk write failed (bounded and cleared by `clear_static_caches`).
+    InRam(Arc<Vec<u8>>),
+    Failed(String),
+}
+
+#[cfg(target_os = "android")]
+const RBXTHUMB_MAX_ENTRIES: usize = 64;
+#[cfg(not(target_os = "android"))]
+const RBXTHUMB_MAX_ENTRIES: usize = 512;
+
+static RBXTHUMB_STATES: Mutex<Option<HashMap<String, RbxThumbState>>> = Mutex::new(None);
+
+fn rbxthumb_insert(map: &mut HashMap<String, RbxThumbState>, key: String, state: RbxThumbState) {
+    if map.len() >= RBXTHUMB_MAX_ENTRIES && !map.contains_key(&key) {
+        map.retain(|_, v| matches!(v, RbxThumbState::Pending));
+    }
+    map.insert(key, state);
+}
+
 /// Fetches a `rbxthumb://type=...&id=...&w=...&h=...` image via Roblox's
-/// public thumbnails v1 API, cached in memory and under `cache_dir()/thumbs/`.
+/// public thumbnails v1 API, cached on disk under `cache_dir()/thumbs/`.
 fn fetch_rbxthumb(uri: &str) -> Fetch {
-    type States = HashMap<String, Option<Result<Arc<Vec<u8>>, String>>>;
-    static STATES: Mutex<Option<States>> = Mutex::new(None);
     let Some(rest) = uri.strip_prefix("rbxthumb://") else {
         return Fetch::Unavailable("not an rbxthumb uri".into());
     };
@@ -1428,87 +1449,101 @@ fn fetch_rbxthumb(uri: &str) -> Fetch {
         .find(|&&v| v >= req_sz)
         .unwrap_or(valid.last().unwrap_or(&150));
     let key = format!("{kind}_{id}_{sz}x{sz}");
-    let mut g = STATES.lock().unwrap_or_else(|e| e.into_inner());
-    let map = g.get_or_insert_with(HashMap::new);
-    match map.get(&key) {
-        Some(Some(Ok(b))) => return Fetch::Ready(b.clone()),
-        Some(Some(Err(e))) => return Fetch::Unavailable(e.clone()),
-        Some(None) => return Fetch::Pending,
-        None => {}
-    }
     let disk = cache_dir().join("thumbs").join(format!("{key}.png"));
-    if let Ok(b) = std::fs::read(&disk) {
-        if !b.is_empty() {
-            let b = Arc::new(b);
-            map.insert(key, Some(Ok(b.clone())));
-            return Fetch::Ready(b);
+    {
+        let mut g = RBXTHUMB_STATES.lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(HashMap::new);
+        match map.get(&key) {
+            Some(RbxThumbState::InRam(b)) => return Fetch::Ready(b.clone()),
+            Some(RbxThumbState::Failed(e)) => return Fetch::Unavailable(e.clone()),
+            Some(RbxThumbState::Pending) => return Fetch::Pending,
+            Some(RbxThumbState::OnDisk) => {
+                if let Ok(b) = std::fs::read(&disk) {
+                    if !b.is_empty() {
+                        return Fetch::Ready(Arc::new(b));
+                    }
+                }
+                map.remove(&key);
+            }
+            None => {}
         }
+        if let Ok(b) = std::fs::read(&disk) {
+            if !b.is_empty() {
+                rbxthumb_insert(map, key, RbxThumbState::OnDisk);
+                return Fetch::Ready(Arc::new(b));
+            }
+        }
+        let api_url = match kind {
+            "AvatarHeadShot" => format!(
+                "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "AvatarBust" => format!(
+                "https://thumbnails.roblox.com/v1/users/avatar-bust?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "Avatar" => format!(
+                "https://thumbnails.roblox.com/v1/users/avatar?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "Asset" => format!(
+                "https://thumbnails.roblox.com/v1/assets?assetIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "GameIcon" => format!(
+                "https://thumbnails.roblox.com/v1/games/icons?universeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "BadgeIcon" => format!(
+                "https://thumbnails.roblox.com/v1/badges/icons?badgeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "GroupIcon" => format!(
+                "https://thumbnails.roblox.com/v1/groups/icons?groupIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            "Outfit" => format!(
+                "https://thumbnails.roblox.com/v1/users/outfits?userOutfitIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+            ),
+            _ => return Fetch::Unavailable(format!("unsupported rbxthumb type '{kind}'")),
+        };
+        rbxthumb_insert(map, key.clone(), RbxThumbState::Pending);
+        std::thread::spawn(move || {
+            let state = (|| -> Result<RbxThumbState, String> {
+                let agent = rustudio_account::api::agent();
+                let mut resp = agent.get(&api_url).call().map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status().as_u16()));
+                }
+                let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+                let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                let img_url = v
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("imageUrl"))
+                    .and_then(|u| u.as_str())
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| "thumbnail not ready".to_string())?;
+                let mut img_resp = agent.get(img_url).call().map_err(|e| e.to_string())?;
+                if !img_resp.status().is_success() {
+                    return Err(format!("image HTTP {}", img_resp.status().as_u16()));
+                }
+                let bytes = img_resp
+                    .body_mut()
+                    .with_config()
+                    .limit(8 * 1024 * 1024)
+                    .read_to_vec()
+                    .map_err(|e| e.to_string())?;
+                if let Some(parent) = disk.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&disk, &bytes).is_ok() {
+                    Ok(RbxThumbState::OnDisk)
+                } else {
+                    Ok(RbxThumbState::InRam(Arc::new(bytes)))
+                }
+            })()
+            .unwrap_or_else(RbxThumbState::Failed);
+            if let Ok(mut g) = RBXTHUMB_STATES.lock() {
+                let map = g.get_or_insert_with(HashMap::new);
+                rbxthumb_insert(map, key, state);
+            }
+        });
     }
-    let api_url = match kind {
-        "AvatarHeadShot" => format!(
-            "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "AvatarBust" => format!(
-            "https://thumbnails.roblox.com/v1/users/avatar-bust?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "Avatar" => format!(
-            "https://thumbnails.roblox.com/v1/users/avatar?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "Asset" => format!(
-            "https://thumbnails.roblox.com/v1/assets?assetIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "GameIcon" => format!(
-            "https://thumbnails.roblox.com/v1/games/icons?universeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "BadgeIcon" => format!(
-            "https://thumbnails.roblox.com/v1/badges/icons?badgeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "GroupIcon" => format!(
-            "https://thumbnails.roblox.com/v1/groups/icons?groupIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "Outfit" => format!(
-            "https://thumbnails.roblox.com/v1/users/outfits?userOutfitIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        _ => return Fetch::Unavailable(format!("unsupported rbxthumb type '{kind}'")),
-    };
-    map.insert(key.clone(), None);
-    std::thread::spawn(move || {
-        let r = (|| -> Result<Arc<Vec<u8>>, String> {
-            let agent = rustudio_account::api::agent();
-            let mut resp = agent.get(&api_url).call().map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("HTTP {}", resp.status().as_u16()));
-            }
-            let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-            let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            let img_url = v
-                .get("data")
-                .and_then(|d| d.as_array())
-                .and_then(|a| a.first())
-                .and_then(|e| e.get("imageUrl"))
-                .and_then(|u| u.as_str())
-                .filter(|u| !u.is_empty())
-                .ok_or_else(|| "thumbnail not ready".to_string())?;
-            let mut img_resp = agent.get(img_url).call().map_err(|e| e.to_string())?;
-            if !img_resp.status().is_success() {
-                return Err(format!("image HTTP {}", img_resp.status().as_u16()));
-            }
-            let bytes = img_resp
-                .body_mut()
-                .with_config()
-                .limit(8 * 1024 * 1024)
-                .read_to_vec()
-                .map_err(|e| e.to_string())?;
-            if let Some(parent) = disk.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&disk, &bytes);
-            Ok(Arc::new(bytes))
-        })();
-        if let Ok(mut g) = STATES.lock() {
-            g.get_or_insert_with(HashMap::new).insert(key, Some(r));
-        }
-    });
     Fetch::Pending
 }
 
@@ -3833,9 +3868,51 @@ mod tests {
 /// Size), read straight from local files (generated, local store / ledger,
 /// disk cache, content folder) for ray tests; None when it isn't here.
 /// A mesh's bounds size (its unit-box triangles × this = mesh space).
+static MESH_EXTENT_CACHE: Mutex<Option<HashMap<String, Vec3>>> = Mutex::new(None);
+
+#[derive(Default)]
+struct MeshTrianglesCache {
+    map: HashMap<String, Option<Arc<Vec<[Vec3; 3]>>>>,
+    order: std::collections::VecDeque<String>,
+    total_tris: usize,
+}
+
+#[cfg(target_os = "android")]
+const MESH_TRIANGLES_MAX_ENTRIES: usize = 256;
+#[cfg(target_os = "android")]
+const MESH_TRIANGLES_MAX_TRIS: usize = 250_000;
+
+static MESH_TRIANGLES_CACHE: Mutex<Option<MeshTrianglesCache>> = Mutex::new(None);
+
+/// Clears process-wide static asset caches (`mesh_triangles`, `mesh_extent`,
+/// and `rbxthumb` RAM entries) to reclaim memory on place switch or low-memory trim.
+pub fn clear_static_caches() {
+    if let Ok(mut g) = MESH_TRIANGLES_CACHE.lock() {
+        if let Some(c) = g.as_mut() {
+            c.map.clear();
+            c.map.shrink_to_fit();
+            c.order.clear();
+            c.order.shrink_to_fit();
+            c.total_tris = 0;
+        }
+    }
+    if let Ok(mut g) = MESH_EXTENT_CACHE.lock() {
+        if let Some(m) = g.as_mut() {
+            m.clear();
+            m.shrink_to_fit();
+        }
+    }
+    if let Ok(mut g) = RBXTHUMB_STATES.lock() {
+        if let Some(m) = g.as_mut() {
+            m.retain(|_, v| matches!(v, RbxThumbState::Pending));
+            m.shrink_to_fit();
+        }
+    }
+    bump_mesh_generation();
+}
+
 pub fn mesh_extent(id: &str) -> Option<Vec3> {
-    static CACHE: Mutex<Option<HashMap<String, Vec3>>> = Mutex::new(None);
-    if let Some(hit) = CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(id) {
+    if let Some(hit) = MESH_EXTENT_CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(id) {
         return Some(*hit);
     }
     mesh_triangles(id)?;
@@ -3846,7 +3923,7 @@ pub fn mesh_extent(id: &str) -> Option<Vec3> {
             None => resolve(id, None).and_then(|p| std::fs::read(p).ok()),
         });
     let ext = bytes.and_then(|b| mesh::parse(&b).ok()).map(|m| (m.max - m.min).max(Vec3::splat(1e-4)))?;
-    if let Ok(mut g) = CACHE.lock() {
+    if let Ok(mut g) = MESH_EXTENT_CACHE.lock() {
         g.get_or_insert_with(HashMap::new).insert(id.to_string(), ext);
     }
     Some(ext)
@@ -3866,11 +3943,16 @@ pub fn bump_mesh_generation() {
 }
 
 pub fn mesh_triangles(id: &str) -> Option<Arc<Vec<[Vec3; 3]>>> {
-    static CACHE: Mutex<Option<HashMap<String, Option<Arc<Vec<[Vec3; 3]>>>>>> = Mutex::new(None);
     if !place_content_ok(id) {
         return None;
     }
-    if let Some(hit) = CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(id) {
+    if let Some(hit) = MESH_TRIANGLES_CACHE
+        .lock()
+        .ok()?
+        .get_or_insert_with(MeshTrianglesCache::default)
+        .map
+        .get(id)
+    {
         return hit.clone();
     }
     let bytes: Option<Vec<u8>> =
@@ -3893,10 +3975,37 @@ pub fn mesh_triangles(id: &str) -> Option<Arc<Vec<[Vec3; 3]>>> {
     // A mesh can still be downloading when decals first ask for geometry.
     // Retain successful parses only, so the overlay can follow the mesh once
     // its bytes arrive instead of permanently keeping the box fallback.
-    if tris.is_some() {
-        if let Ok(mut g) = CACHE.lock() {
-            g.get_or_insert_with(HashMap::new)
-                .insert(id.to_string(), tris.clone());
+    if let Some(ref arc) = tris {
+        if let Ok(mut g) = MESH_TRIANGLES_CACHE.lock() {
+            let cache = g.get_or_insert_with(MeshTrianglesCache::default);
+            let new_tris = arc.len();
+            if let Some(Some(old)) = cache.map.remove(id) {
+                cache.total_tris = cache.total_tris.saturating_sub(old.len());
+            }
+            #[cfg(target_os = "android")]
+            {
+                while !cache.order.is_empty()
+                    && (cache.map.len() >= MESH_TRIANGLES_MAX_ENTRIES
+                        || cache.total_tris.saturating_add(new_tris) > MESH_TRIANGLES_MAX_TRIS)
+                {
+                    if let Some(old_key) = cache.order.pop_front() {
+                        if let Some(Some(old)) = cache.map.remove(&old_key) {
+                            cache.total_tris = cache.total_tris.saturating_sub(old.len());
+                        }
+                    }
+                }
+                if new_tris <= MESH_TRIANGLES_MAX_TRIS {
+                    cache.map.insert(id.to_string(), tris.clone());
+                    cache.order.push_back(id.to_string());
+                    cache.total_tris = cache.total_tris.saturating_add(new_tris);
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                cache.map.insert(id.to_string(), tris.clone());
+                cache.order.push_back(id.to_string());
+                cache.total_tris = cache.total_tris.saturating_add(new_tris);
+            }
         }
         bump_mesh_generation();
     }

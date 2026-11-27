@@ -164,10 +164,16 @@ impl Document {
         if self.history.disabled {
             return;
         }
-        match &mut self.history.recording {
-            Some(rec) => rec.changes.push(c),
-            None => self.history.pending.push(c),
+        let list = match &mut self.history.recording {
+            Some(rec) => &mut rec.changes,
+            None => &mut self.history.pending,
+        };
+        let cap = crate::mech::UNDO_PENDING_CAP;
+        if list.len() >= cap {
+            let drop_n = (cap / 10).max(1);
+            list.drain(0..drop_n);
         }
+        list.push(c);
     }
 
     /// The instance a script just moved out (its last Parent change) was
@@ -299,6 +305,7 @@ impl Document {
             }
         }
         self.prune_selection();
+        self.gc_limbo();
         self.revision += 1;
         true
     }
@@ -406,11 +413,15 @@ impl Document {
 
     /// Pushes an already-applied step (no journal marks: the changes were
     /// marked when made). Returns whether a non-empty step was pushed.
-    fn push_step(&mut self, label: String, display: Option<String>, mut changes: Vec<Change>) -> bool {
+    fn push_step(&mut self, label: String, display: Option<String>, mut changes: Vec<Change>, force_gc: bool) -> bool {
         coalesce(&mut changes);
         if changes.is_empty() {
+            if force_gc {
+                self.gc_limbo();
+            }
             return false;
         }
+        let had_redo = !self.redo.is_empty();
         self.redo.clear();
         let sel_before = self.selection.clone();
         self.undo.push(Command {
@@ -422,9 +433,7 @@ impl Document {
             sel_after: Vec::new(),
             display,
         });
-        if self.undo.len() > crate::mech::UNDO_LIMIT {
-            self.undo.remove(0);
-        }
+        self.enforce_history_budget(had_redo || force_gc);
         true
     }
 
@@ -436,7 +445,7 @@ impl Document {
             return false;
         }
         let changes = std::mem::take(&mut self.history.pending);
-        self.push_step(label.to_string(), None, changes)
+        self.push_step(label.to_string(), None, changes, false)
     }
 
     // ------------------------------------------- ChangeHistoryService calls
@@ -445,9 +454,10 @@ impl Document {
         if self.history.recording.is_some() {
             return;
         }
+        let had_redo = !self.redo.is_empty();
         self.redo.clear();
         let changes = std::mem::take(&mut self.history.pending);
-        self.push_step(name.to_string(), None, changes);
+        self.push_step(name.to_string(), None, changes, had_redo);
     }
 
     /// GetCanUndo: the last step's name.
@@ -466,6 +476,7 @@ impl Document {
         if let Some(rec) = &mut self.history.recording {
             rec.changes.clear();
         }
+        self.gc_limbo();
     }
 
     pub fn chs_set_enabled(&mut self, on: bool) {
@@ -530,8 +541,9 @@ impl Document {
         let mut reverted = Vec::new();
         match op {
             FinishOp::Commit => {
+                let had_redo = !self.redo.is_empty();
                 self.redo.clear();
-                self.push_step(rec.name.clone(), rec.display.clone(), rec.changes);
+                self.push_step(rec.name.clone(), rec.display.clone(), rec.changes, had_redo);
             }
             FinishOp::Cancel => {
                 for c in rec.changes.iter().rev() {
@@ -545,11 +557,14 @@ impl Document {
                     let mut ch = rec.changes;
                     last.changes.append(&mut ch);
                     coalesce(&mut last.changes);
+                    let had_redo = !self.redo.is_empty();
                     self.redo.clear();
+                    self.enforce_history_budget(had_redo);
                 }
                 None => {
+                    let had_redo = !self.redo.is_empty();
                     self.redo.clear();
-                    self.push_step(rec.name.clone(), rec.display.clone(), rec.changes);
+                    self.push_step(rec.name.clone(), rec.display.clone(), rec.changes, had_redo);
                 }
             },
         }

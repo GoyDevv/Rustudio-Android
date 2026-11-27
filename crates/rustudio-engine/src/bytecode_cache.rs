@@ -21,7 +21,7 @@ const MIN_MEMORY: usize = if cfg!(target_os = "android") { 512 } else { 1024 };
 /// disk too (a few MB, one file a script, in the app's cache directory).
 const MIN_DISK: usize = if cfg!(target_os = "android") { 1024 } else { 256 * 1024 };
 /// Bytecode held in memory at most (later sources compile as before).
-const MEMORY_CAP: usize = if cfg!(target_os = "android") { 128 * 1024 * 1024 } else { 768 * 1024 * 1024 };
+const MEMORY_CAP: usize = if cfg!(target_os = "android") { 32 * 1024 * 1024 } else { 768 * 1024 * 1024 };
 
 /// Monotonic suffix for atomic `.tmp` writes so concurrent threads in the
 /// same process never race on the same temp file.
@@ -94,6 +94,16 @@ struct Memory {
 fn memory() -> &'static Mutex<Memory> {
     static M: OnceLock<Mutex<Memory>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(Memory { map: HashMap::new(), bytes: 0 }))
+}
+
+/// Drops all in-memory compiled bytecode entries and resets the byte counter
+/// (e.g. on place switch or Android `onTrimMemory`).
+pub fn clear_memory() {
+    if let Ok(mut m) = memory().lock() {
+        m.map.clear();
+        m.map.shrink_to_fit();
+        m.bytes = 0;
+    }
 }
 
 fn dir() -> PathBuf {

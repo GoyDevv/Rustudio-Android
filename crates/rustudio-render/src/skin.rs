@@ -597,10 +597,43 @@ pub fn forget_part(part: Ref) {
     if let Ok(mut m) = LOOKUPS.lock() {
         m.remove(&part);
     }
+    if let Ok(mut m) = SLOTS.lock() {
+        m.retain(|(p, _), _| *p != part);
+    }
     if let Ok(mut m) = LAST.lock() {
         m.remove(&(part, 0));
         m.remove(&(part, R15_CLOTHING_TAG));
     }
+}
+
+/// Clears all cached skinning bases, rig indices, slots, clothing/decal bases,
+/// bone lookups, and last-pose palettes (e.g. on place switch).
+pub fn clear_caches() {
+    if let Ok(mut g) = BASES.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = RIG_INDEX.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = SLOTS.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = CLOTHING.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = DECALS.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = LOOKUPS.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = LAST.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = WORLD.lock() {
+        g.memo.clear();
+    }
+    rig_changed();
 }
 
 /// FACS offsets (bone name → local frame) from the part's FaceControls.
@@ -890,9 +923,10 @@ pub const DECAL_TAG: u32 = 16;
 
 /// A skinned R15 body part's base with UVs remapped into the composited
 /// classic-clothing atlas (`assets::r15_atlas_uvs`), cached by `(key, part_name)`.
+static CLOTHING: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn r15_clothing_base(base: &Base, key: &str, part_name: &str) -> Option<Arc<Base>> {
-    static CLOTHING: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     let k = format!("{key}|r15cloth|{part_name}");
     if let Some(b) = CLOTHING.lock().ok()?.get(&k) {
         return b.clone();
@@ -962,9 +996,10 @@ pub fn set_slot_tag(part: Ref, tag: u32, idx: u32, corners: usize) {
 /// coordinates (a mesh not centred on its bounds takes the image off
 /// centre, clamped at its edges). The copy shares the mesh's bones, so the
 /// part's skin palette drives it. None: no triangle faces that way.
+static DECALS: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn decal_base(base: &Base, key: &str, face: u32) -> Option<Arc<Base>> {
-    static DECALS: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     let k = format!("{key}|decal{face}");
     if let Some(b) = DECALS.lock().ok()?.get(&k) {
         return b.clone();

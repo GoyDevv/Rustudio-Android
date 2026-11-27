@@ -22,7 +22,7 @@
 //! `android.app.func_name`, and that calls the glue's
 //! `ANativeActivity_onCreate` and then [`hook`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,8 @@ static ORIGINAL_LOW_MEMORY: Mutex<Option<unsafe extern "C" fn(*mut ndk_sys::ANat
 /// The system said memory is short (`Activity.onLowMemory`) since the
 /// last [`take_low_memory`].
 static LOW_MEMORY: AtomicBool = AtomicBool::new(false);
+/// Highest pending `onTrimMemory` level (>= 10), or 0 when none is pending.
+static TRIM_LEVEL: AtomicI32 = AtomicI32::new(0);
 static BACKGROUNDED: AtomicBool = AtomicBool::new(false);
 /// `run_native` has returned.
 pub static LOOP_DONE: AtomicBool = AtomicBool::new(false);
@@ -47,7 +49,7 @@ const GRACE: Duration = Duration::from_millis(1500);
 
 /// Keeps the context the hook will close.
 pub fn note_context(ctx: &egui::Context) {
-    *CTX.lock().unwrap() = Some(ctx.clone());
+    *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx.clone());
 }
 
 /// Whether an activity already owns the editor's loop in this process.
@@ -90,12 +92,12 @@ pub unsafe fn hook(activity: *mut std::ffi::c_void) {
         if original.is_none() {
             log::warn!("destroy hook: the glue installed no onDestroy");
         }
-        *ORIGINAL.lock().unwrap() = original;
+        *ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()) = original;
         (*callbacks).onDestroy = Some(on_destroy);
         // The low-memory notice too: the glue turns it into an event winit
         // reports as a memory warning, which eframe drops; the flag here
         // reaches the editor's frame (src/android/memory.rs).
-        *ORIGINAL_LOW_MEMORY.lock().unwrap() = (*callbacks).onLowMemory;
+        *ORIGINAL_LOW_MEMORY.lock().unwrap_or_else(|e| e.into_inner()) = (*callbacks).onLowMemory;
         (*callbacks).onLowMemory = Some(on_low_memory);
     }
     LOOP_OWNED.store(true, Ordering::SeqCst);
@@ -104,6 +106,7 @@ pub unsafe fn hook(activity: *mut std::ffi::c_void) {
 
 unsafe extern "C" fn on_low_memory(activity: *mut ndk_sys::ANativeActivity) {
     LOW_MEMORY.store(true, Ordering::SeqCst);
+    TRIM_LEVEL.fetch_max(80, Ordering::SeqCst);
     let original = *ORIGINAL_LOW_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(f) = original {
         // SAFETY: the glue's own callback, with the activity it was
@@ -141,11 +144,20 @@ pub fn on_java_lifecycle(state: i32) {
     }
 }
 
+/// Returns and clears the highest pending `onTrimMemory` level (>= 10), if any.
+pub fn take_trim_level() -> Option<i32> {
+    let level = TRIM_LEVEL.swap(0, Ordering::SeqCst);
+    (level >= 10).then_some(level)
+}
+
 /// Called from RustudioActivity.onTrimMemory / onLowMemory.
 pub fn on_trim_memory(level: i32) {
+    if level >= 10 {
+        TRIM_LEVEL.fetch_max(level, Ordering::SeqCst);
+        rustudio_core::heap::trim();
+    }
     if level >= 20 {
         LOW_MEMORY.store(true, Ordering::SeqCst);
-        rustudio_core::heap::trim();
     }
 }
 
@@ -153,7 +165,7 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
     crate::crash::begin_shutdown();
     rustudio_core::crash::begin_shutdown();
     log::info!("activity destroyed: closing the editor");
-    if let Some(ctx) = CTX.lock().unwrap().clone() {
+    if let Some(ctx) = CTX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ctx.request_repaint();
     }
@@ -163,7 +175,7 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
     }
     if LOOP_DONE.load(Ordering::SeqCst) {
         // The loop returned: the glue's onDestroy no longer has to wait.
-        let original = *ORIGINAL.lock().unwrap();
+        let original = *ORIGINAL.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = original {
             // SAFETY: the glue's own callback, with the activity it was
             // registered for.

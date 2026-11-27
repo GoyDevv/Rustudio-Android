@@ -285,13 +285,72 @@ impl Game {
 
     fn trim_output(&mut self) {
         // Studio Settings > Output > Maximum Output Lines (5000: past it the
-        // oldest fifth goes).
-        let max = max_output_lines().clamp(10.0, 1e7) as usize;
+        // oldest fifth goes). On Android, clamp max lines to 10_000 and cap
+        // total retained bytes at 4 MiB to avoid OOM from noisy scripts.
+        let upper = if cfg!(target_os = "android") { 10_000.0 } else { 1e7 };
+        let max = max_output_lines().clamp(10.0, upper) as usize;
         if self.log.len() > max {
             let n = self.log.len() - max - 1 + max / 5;
             self.log.drain(0..n);
             self.log_drained += n;
         }
+        #[cfg(target_os = "android")]
+        {
+            const MAX_BYTES: usize = 4 * 1024 * 1024;
+            let mut total: usize = self.log.iter().map(|l| l.at.len() + l.text.len()).sum();
+            if total > MAX_BYTES {
+                let target = MAX_BYTES * 4 / 5;
+                let mut drop_n = 0;
+                while drop_n < self.log.len() && total > target {
+                    total -= self.log[drop_n].at.len() + self.log[drop_n].text.len();
+                    drop_n += 1;
+                }
+                if drop_n > 0 {
+                    self.log.drain(0..drop_n);
+                    self.log_drained += drop_n;
+                }
+            }
+        }
+    }
+
+    /// Releases GPU/CPU caches and static asset/physics caches before loading a new place.
+    pub fn reset_place_resources(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.reset_place_assets();
+        }
+        self.meshes = Default::default();
+        self.textures = Default::default();
+        self.clothing_meshes.clear();
+        self.wrap_meshes.clear();
+        self.wrap_warned.clear();
+        self.draw_cache = Default::default();
+        self.vf_draw_cache = Default::default();
+        self.assets.clear_memory();
+        self.gui.clear_textures();
+        rustudio_core::assets::clear_static_caches();
+        rustudio_engine::runtime::domains::media::clear_pcm_cache();
+        rustudio_engine::bytecode_cache::clear_memory();
+        rustudio_physics::physics_mesh::clear_shape_cache();
+        rustudio_core::heap::trim();
+    }
+
+    /// Releases non-essential caches in response to OS memory pressure (`onTrimMemory`).
+    pub fn trim_memory(&mut self, rs: Option<&egui_wgpu::RenderState>, critical: bool) {
+        self.assets.clear_memory();
+        self.textures.trim();
+        rustudio_core::assets::clear_static_caches();
+        rustudio_engine::runtime::domains::media::clear_pcm_cache();
+        rustudio_engine::bytecode_cache::clear_memory();
+        self.doc.gc_limbo();
+        if critical {
+            self.gui.clear_textures();
+            self.doc.trim_history_emergency();
+            if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), rs) {
+                renderer.release_transient_targets(rs);
+                self.vf_draw_cache = Default::default();
+            }
+        }
+        rustudio_core::heap::trim();
     }
     pub fn info(&mut self, t: impl Into<String>) {
         self.push_log(Level::Info, t)

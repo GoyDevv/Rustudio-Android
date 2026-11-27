@@ -786,6 +786,42 @@ fn limbo_dom() -> WeakDom {
     WeakDom::new(InstanceBuilder::new("Folder").with_name("Limbo"))
 }
 
+fn estimate_variant_bytes(v: &Variant) -> usize {
+    match v {
+        Variant::BinaryString(b) => AsRef::<[u8]>::as_ref(b).len() + 32,
+        Variant::SharedString(s) => s.data().len() + 32,
+        Variant::String(s) => s.len() + 24,
+        Variant::Attributes(a) => {
+            a.iter()
+                .map(|(k, val)| k.len() + 24 + estimate_variant_bytes(val))
+                .sum::<usize>()
+                + 32
+        }
+        _ => std::mem::size_of::<Variant>(),
+    }
+}
+
+fn estimate_change_bytes(c: &Change) -> usize {
+    let base = std::mem::size_of::<Change>();
+    match c {
+        Change::Prop { old, new, .. } => {
+            base + old.as_ref().map_or(0, estimate_variant_bytes)
+                + new.as_ref().map_or(0, estimate_variant_bytes)
+        }
+        Change::Name { old, new, .. } => base + old.len() + new.len(),
+        _ => base,
+    }
+}
+
+fn estimate_command_bytes(cmd: &Command) -> usize {
+    std::mem::size_of::<Command>()
+        + cmd.label.len()
+        + cmd.merge_key.as_ref().map_or(0, |k| k.len())
+        + cmd.display.as_ref().map_or(0, |d| d.len())
+        + (cmd.sel_before.len() + cmd.sel_after.len()) * std::mem::size_of::<Ref>()
+        + cmd.changes.iter().map(estimate_change_bytes).sum::<usize>()
+}
+
 pub fn new_part(
     name: &str,
     shape: u32,
@@ -1690,6 +1726,7 @@ impl Document {
         if !pending.is_empty() {
             changes.splice(0..0, pending);
         }
+        let had_redo = !self.redo.is_empty();
         self.redo.clear();
         let now = Instant::now();
         if let (Some(key), Some(last)) = (&merge_key, self.undo.last_mut()) {
@@ -1706,6 +1743,7 @@ impl Document {
                     last.changes.push(c);
                 }
                 last.at = now;
+                self.enforce_history_budget(had_redo);
                 return;
             }
         }
@@ -1719,9 +1757,80 @@ impl Document {
             sel_after: Vec::new(),
             display: None,
         });
-        if self.undo.len() > mech::UNDO_LIMIT {
-            self.undo.remove(0);
+        self.enforce_history_budget(had_redo);
+    }
+
+    /// Destroys every direct child of `self.limbo` whose subtree contains no
+    /// `Ref` still referenced by undo, redo, pending, or active recording history.
+    pub fn gc_limbo(&mut self) {
+        let root = self.limbo.root_ref();
+        let children: Vec<Ref> = match self.limbo.get_by_ref(root) {
+            Some(inst) => inst.children().to_vec(),
+            None => return,
+        };
+        if children.is_empty() {
+            return;
         }
+        let keep = self.history_refs();
+        let mut stack = Vec::new();
+        for child in children {
+            stack.clear();
+            stack.push(child);
+            let mut referenced = false;
+            while let Some(r) = stack.pop() {
+                if keep.contains(&r) {
+                    referenced = true;
+                    break;
+                }
+                if let Some(inst) = self.limbo.get_by_ref(r) {
+                    stack.extend_from_slice(inst.children());
+                }
+            }
+            if !referenced {
+                self.limbo.destroy(child);
+            }
+        }
+    }
+
+    pub(super) fn enforce_history_budget(&mut self, force_gc: bool) {
+        let mut evicted = false;
+        while self.undo.len() > mech::UNDO_LIMIT {
+            self.undo.remove(0);
+            evicted = true;
+        }
+        let mut total_bytes: usize = self
+            .undo
+            .iter()
+            .chain(self.redo.iter())
+            .map(estimate_command_bytes)
+            .sum();
+        while total_bytes > mech::UNDO_BYTE_BUDGET && self.undo.len() > 1 {
+            let removed = self.undo.remove(0);
+            total_bytes = total_bytes.saturating_sub(estimate_command_bytes(&removed));
+            evicted = true;
+        }
+        if evicted || force_gc {
+            self.gc_limbo();
+        }
+    }
+
+    /// Emergency memory trim (e.g. Android `onTrimMemory`): clears redo,
+    /// truncates undo to at most the last 20 steps within a 16 MiB budget,
+    /// and garbage-collects unreachable limbo instances.
+    pub fn trim_history_emergency(&mut self) {
+        const MAX_STEPS: usize = 20;
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        self.redo.clear();
+        if self.undo.len() > MAX_STEPS {
+            let drop_count = self.undo.len() - MAX_STEPS;
+            self.undo.drain(0..drop_count);
+        }
+        let mut total_bytes: usize = self.undo.iter().map(estimate_command_bytes).sum();
+        while total_bytes > MAX_BYTES && !self.undo.is_empty() {
+            let removed = self.undo.remove(0);
+            total_bytes = total_bytes.saturating_sub(estimate_command_bytes(&removed));
+        }
+        self.gc_limbo();
     }
 
     /// How many undo steps there are.
@@ -1773,6 +1882,7 @@ impl Document {
         self.undo.clear();
         self.redo.clear();
         self.chs_reset();
+        self.limbo = limbo_dom();
         self.saved_revision = self.revision;
     }
 

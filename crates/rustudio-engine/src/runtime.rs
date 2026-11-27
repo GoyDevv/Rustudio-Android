@@ -188,6 +188,8 @@ pub struct World {
     pub structure_changed: bool,
     pub destroyed: HashSet<Ref>,
     pub output: Vec<(Level, String)>,
+    output_bytes: usize,
+    output_truncated: bool,
     /// Velocities read from physics (AssemblyLinearVelocity).
     pub velocities: rustc_hash::FxHashMap<Ref, Vec3>,
     /// Velocities scripts asked for.
@@ -750,7 +752,40 @@ fn signals(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, Signals>> {
         .ok_or_else(|| rt_err("signals missing"))
 }
 
+const OUTPUT_MAX_LINES: usize = 4_096;
+const OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const OUTPUT_MAX_MSG_BYTES: usize = 4_096;
+
 impl World {
+    /// Appends a line to `self.output`, enforcing per-frame line/byte caps and
+    /// truncating oversized individual messages on a UTF-8 char boundary.
+    pub fn push_output(&mut self, level: Level, mut msg: String) {
+        if self.output.is_empty() {
+            self.output_bytes = 0;
+            self.output_truncated = false;
+        }
+        if self.output_truncated {
+            return;
+        }
+        if msg.len() > OUTPUT_MAX_MSG_BYTES {
+            let mut end = OUTPUT_MAX_MSG_BYTES;
+            while end > 0 && !msg.is_char_boundary(end) {
+                end -= 1;
+            }
+            msg.truncate(end);
+            msg.push_str("...");
+        }
+        if self.output.len() >= OUTPUT_MAX_LINES
+            || self.output_bytes.saturating_add(msg.len()) > OUTPUT_MAX_BYTES
+        {
+            self.output_truncated = true;
+            self.output.push((Level::Warn, "... output truncated this frame".to_string()));
+            return;
+        }
+        self.output_bytes = self.output_bytes.saturating_add(msg.len());
+        self.output.push((level, msg));
+    }
+
     pub fn new(doc: Document, mode: RunMode) -> Self {
         let groups = rustudio_core::collision_groups::shared_from_doc(&doc);
         World {
@@ -773,6 +808,8 @@ impl World {
             structure_changed: false,
             destroyed: HashSet::new(),
             output: Vec::new(),
+            output_bytes: 0,
+            output_truncated: false,
             velocities: Default::default(),
             velocity_requests: Vec::new(),
             died: Vec::new(),
@@ -5724,12 +5761,12 @@ fn call_method_routed(
                 let size = payload_byte_size(&payload);
                 if size > UNRELIABLE_REMOTE_MAX_BYTES {
                     let full = w.full_name(this);
-                    w.output.push((
+                    w.push_output(
                         Level::Warn,
                         format!(
                             "UnreliableRemoteEvent {full} payload size ({size} bytes) exceeds the 900 byte limit and was dropped"
                         ),
-                    ));
+                    );
                     return none();
                 }
             }
@@ -5759,12 +5796,12 @@ fn call_method_routed(
                 let size = payload_byte_size(&payload);
                 if size > UNRELIABLE_REMOTE_MAX_BYTES {
                     let full = w.full_name(this);
-                    w.output.push((
+                    w.push_output(
                         Level::Warn,
                         format!(
                             "UnreliableRemoteEvent {full} payload size ({size} bytes) exceeds the 900 byte limit and was dropped"
                         ),
-                    ));
+                    );
                     return none();
                 }
             }
@@ -6234,6 +6271,8 @@ impl Runtime {
         domains::plugin_api::freeze();
         luau_flags();
         let lua = Lua::new();
+        #[cfg(target_os = "android")]
+        let _ = lua.set_memory_limit(256 * 1024 * 1024);
         // Scripts marked --!native (and @native functions) run as native
         // code, as in Roblox (vendor mlua state/raw.rs: other chunks are
         // interpreted). RUSTUDIO_NO_NATIVE=1: everything interpreted.
@@ -6586,18 +6625,18 @@ impl Runtime {
                         .map(|(p, l, _)| format!("{p}:{l}"))
                         .unwrap_or_default();
                     let line = if loc.is_empty() { msg } else { format!("{msg}  —  {loc}") };
-                    w.output.push((Level::Warn, line));
+                    w.push_output(Level::Warn, line);
                     if !frames.is_empty() {
                         let mark = STACK_MARK;
-                        w.output.push((Level::Info, format!("{mark}Stack Begin")));
+                        w.push_output(Level::Info, format!("{mark}Stack Begin"));
                         for (path, ln, func) in &frames {
                             let text = match func {
                                 Some(f) => format!("Script '{path}', Line {ln} - function {f}"),
                                 None => format!("Script '{path}', Line {ln}"),
                             };
-                            w.output.push((Level::Info, format!("{mark}{text}  —  {path}:{ln}")));
+                            w.push_output(Level::Info, format!("{mark}{text}  —  {path}:{ln}"));
                         }
-                        w.output.push((Level::Info, format!("{mark}Stack End")));
+                        w.push_output(Level::Info, format!("{mark}Stack End"));
                     }
                     return Ok(());
                 }
@@ -6613,7 +6652,7 @@ impl Runtime {
                     _ => Level::Info,
                 };
                 let line = if loc.is_empty() { msg } else { format!("{msg}  —  {loc}") };
-                world(lua)?.output.push((level, line));
+                world(lua)?.push_output(level, line);
                 Ok(())
             },
         )?;
@@ -7204,6 +7243,15 @@ impl Runtime {
 
     /// Hands the play document (inside its World) to Lua for this frame.
     pub fn enter(&self, world: World) {
+        #[cfg(target_os = "android")]
+        {
+            let limit = if world.mode == RunMode::Edit {
+                160 * 1024 * 1024
+            } else {
+                256 * 1024 * 1024
+            };
+            let _ = self.lua.set_memory_limit(limit);
+        }
         self.lua.set_app_data(world);
         domains::services::on_enter(&self.lua);
     }
@@ -7366,10 +7414,10 @@ impl Runtime {
         });
         if let Some(full) = flagged {
             if let Ok(mut w) = world(lua) {
-                w.output.push((
+                w.push_output(
                     Level::Warn,
                     format!("Script {full} detected as malicious.  Script will not run."),
-                ));
+                );
             }
             return;
         }
@@ -7708,14 +7756,15 @@ impl Runtime {
     /// Nothing to do while no unparented instance is watched.
     pub fn gc_step(&self, dt: f64) {
         let lua = &self.lua;
+        let used = lua.used_memory();
         let Some(busy) = lua
             .app_data_ref::<World>()
-            .filter(|w| w.doc.is_some() && !w.orphans.is_empty())
+            .filter(|w| w.doc.is_some() && (!w.orphans.is_empty() || used > 32 * 1024 * 1024))
             .map(|w| w.gc_busy)
         else {
             return;
         };
-        let heap_kb = (lua.used_memory() / 1024) as f64;
+        let heap_kb = (used / 1024) as f64;
         let kb = if busy {
             let pass_kb = (heap_kb / mech::GC_CYCLE_PASSES as f64)
                 .clamp(mech::GC_STEP_MIN_KB as f64, mech::GC_STEP_MAX_KB as f64);
@@ -7729,6 +7778,13 @@ impl Runtime {
                 mlua::ffi::lua_gc(state, mlua::ffi::LUA_GCSTEP, kb as std::ffi::c_int);
             })
         };
+    }
+
+    /// Runs a full Luau GC cycle and expires dead registry slots (e.g. on place
+    /// switch or Android `onTrimMemory`).
+    pub fn gc_full(&mut self) {
+        let _ = self.lua.gc_collect();
+        self.lua.expire_registry_values();
     }
 
     /// Instances with a slot in the Lua value cache (bounded by the ones
@@ -7842,10 +7898,10 @@ impl Runtime {
             }
         }
         if let Some(mut w) = lua.app_data_mut::<World>() {
-            w.output.push((
+            w.push_output(
                 Level::Warn,
                 "Too many chained signal fires in one frame; the rest run next frame".into(),
-            ));
+            );
         }
     }
 }
@@ -7904,18 +7960,18 @@ fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Optio
     }
     let target = {
         let Some(mut w) = lua.app_data_mut::<World>() else { return };
-        w.output.push((Level::Error, msg.clone()));
+        w.push_output(Level::Error, msg.clone());
         if !frames.is_empty() {
             let mark = STACK_MARK;
-            w.output.push((Level::Info, format!("{mark}Stack Begin")));
+            w.push_output(Level::Info, format!("{mark}Stack Begin"));
             for (path, line, func) in &frames {
                 let text = match func {
                     Some(f) => format!("Script '{path}', Line {line} - function {f}"),
                     None => format!("Script '{path}', Line {line}"),
                 };
-                w.output.push((Level::Info, format!("{mark}{text}  —  {path}:{line}")));
+                w.push_output(Level::Info, format!("{mark}{text}  —  {path}:{line}"));
             }
-            w.output.push((Level::Info, format!("{mark}Stack End")));
+            w.push_output(Level::Info, format!("{mark}Stack End"));
         }
         // ScriptContext.Error(message, stackTrace, script): the script from
         // the message's "Full.Name:line:" prefix when it resolves.
@@ -8636,12 +8692,12 @@ impl Runtime {
                 if warn_overflow {
                     if let Some(mut w) = lua.app_data_mut::<World>() {
                         let full = w.full_name(remote);
-                        w.output.push((
+                        w.push_output(
                             Level::Warn,
                             format!(
                                 "Remote event invocation queue exhausted for {full}; did you forget to implement {event}?"
                             ),
-                        ));
+                        );
                     }
                 }
                 if queued {

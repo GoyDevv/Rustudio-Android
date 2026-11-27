@@ -877,7 +877,7 @@ impl Editor {
                         }
                         None => host_source(&src).and_then(|h| self.plugins.load(h)),
                     };
-                    let b = self.plugin_store.runtime.bridge().unwrap();
+                    let Some(b) = self.plugin_store.runtime.bridge() else { continue; };
                     match r {
                         Ok(pid) => {
                             b.ids.insert(src.id.clone(), pid);
@@ -952,6 +952,8 @@ impl Editor {
         self.ui.minimize_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
         self.ui.restore_requests.retain(|tab| !matches!(tab, Tab::Script(_)));
         self.ui.anim = Default::default();
+        self.game.reset_place_resources();
+        self.toolbox.thumbs.clear_mem();
         self.game.doc = doc;
         rustudio_engine::bytecode_cache::prewarm(
             rustudio_engine::bytecode_cache::collect_script_sources(&self.game.doc),
@@ -3390,6 +3392,7 @@ impl eframe::App for RustudioApp {
             self.watchdog.hidden();
             if let (Some(r), Some(rs)) = (self.ed.game.renderer.as_mut(), self.ed.game.render_state.as_ref()) {
                 r.release_transient_targets(rs);
+                self.ed.game.vf_draw_cache = Default::default();
             }
             self.ed.game.assets.clear_memory();
             self.ed.game.textures.trim();
@@ -3662,6 +3665,13 @@ impl RustudioApp {
         // `over`, decided in raw_input_hook with the safe-area inset.
         #[cfg(target_os = "android")]
         {
+            if let Some(level) = crate::android::lifecycle::take_trim_level() {
+                let critical = level >= 15;
+                let rs = self.ed.game.render_state.clone();
+                self.ed.game.trim_memory(rs.as_ref(), critical);
+                self.ed.toolbox.thumbs.clear_mem();
+                crate::android::memory::log_trim(level, critical);
+            }
             self.poll_android_insets(&ctx);
             self.ed.keyboard_cover = self.keyboard.cover(&ctx);
             self.keyboard.shrink(ui);

@@ -98,6 +98,19 @@ fn device_line() -> String {
     }
 }
 
+/// Logs a foreground trim handled via `lifecycle::take_trim_level()` and clears
+/// any redundant `LOW_MEMORY` flag from the same event so [`tick`] does not
+/// double-trim in the same frame.
+pub fn log_trim(level: i32, critical: bool) {
+    if level >= 20 {
+        let _ = super::lifecycle::take_low_memory();
+    }
+    log::info!(
+        "memory: trimmed caches for onTrimMemory(level={level}, critical={critical}) at {} MB resident",
+        resident_mb().unwrap_or(0)
+    );
+}
+
 /// Once a frame: logs the resident size when it has moved a step (the
 /// module comment), and answers the system's low-memory notice. `doing`
 /// names what the app is at (the place opening).

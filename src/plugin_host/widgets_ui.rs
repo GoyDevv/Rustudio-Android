@@ -1863,13 +1863,15 @@ fn fire_inputs(rt: &rustudio_engine::runtime::Runtime, queue: Vec<In>, active_mo
                 delta,
                 gp,
             } => {
-                let s = |x: &str| Value::String(lua.create_string(x).expect("lua string"));
+                let Ok(s_state) = lua.create_string(state) else { return; };
+                let Ok(s_uit) = lua.create_string(uit) else { return; };
+                let Ok(s_key) = lua.create_string(&key) else { return; };
                 rt.spawn_global(
                     "__rs_input_event",
                     vec![
-                        s(state),
-                        s(uit),
-                        s(&key),
+                        Value::String(s_state),
+                        Value::String(s_uit),
+                        Value::String(s_key),
                         Value::Number(pos[0] as f64),
                         Value::Number(pos[1] as f64),
                         Value::Number(pos[2] as f64),
@@ -1882,7 +1884,10 @@ fn fire_inputs(rt: &rustudio_engine::runtime::Runtime, queue: Vec<In>, active_mo
             In::Mouse(name, key) => {
                 if let Some(m) = active_mouse {
                     let args = match key {
-                        Some(k) => vec![Value::String(lua.create_string(&k).expect("lua string"))],
+                        Some(k) => {
+                            let Ok(s) = lua.create_string(&k) else { return; };
+                            vec![Value::String(s)]
+                        }
                         None => vec![],
                     };
                     rt.fire(m, name, args);

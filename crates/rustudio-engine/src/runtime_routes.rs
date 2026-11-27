@@ -480,9 +480,18 @@ pub(super) fn fast_index_fn(lua: &Lua) -> Option<(crate::cmeta::Fast, [Value; 4]
     let [a, b] = probe_layout(lua)?;
     // A registry slot mlua owns (its registry accessors take no protected
     // call), for moving values between mlua and the calling thread's
-    // stack. Kept for the VM's life.
-    let key: &'static mut mlua::RegistryKey = Box::leak(Box::new(lua.create_registry_value(true).ok()?));
-    let slot = Value::LightUserData(mlua::LightUserData(key as *mut mlua::RegistryKey as *mut std::ffi::c_void));
+    // stack. Stored in Lua app data (stable heap address via Box) so it is
+    // freed when the Lua VM drops instead of leaking permanently.
+    struct FastIndexSlot(Box<mlua::RegistryKey>);
+    let key_ptr: *mut mlua::RegistryKey = if let Some(mut existing) = lua.app_data_mut::<FastIndexSlot>() {
+        existing.0.as_mut() as *mut mlua::RegistryKey
+    } else {
+        let mut boxed = Box::new(lua.create_registry_value(true).ok()?);
+        let ptr = boxed.as_mut() as *mut mlua::RegistryKey;
+        lua.set_app_data(FastIndexSlot(boxed));
+        ptr
+    };
+    let slot = Value::LightUserData(mlua::LightUserData(key_ptr as *mut std::ffi::c_void));
     // The instance cache's weak table: cached Instance userdata pushed
     // straight from it.
     let weak = lua.app_data_ref::<Cache>().and_then(|c| c.weak.clone()).map(Value::Table).unwrap_or(Value::Nil);

@@ -8401,7 +8401,49 @@ impl Renderer {
                 c.idle();
             }
         }
+        let vf_layers: Vec<Ref> = self.vf.layer_of.values().copied().collect();
+        let mut freed = HashSet::new();
+        for layer in vf_layers {
+            if freed.insert(layer) {
+                if let Some((id, _)) = self.vf_texture(layer) {
+                    rs.renderer.write().free_texture(&id);
+                    crate::world_gui::unregister_native(id);
+                }
+            }
+        }
+        self.clear_layered_items();
+        self.vf = vf::Layers::default();
+        self.world_gui = [None, None, None];
         let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// Releases per-place GPU textures, meshes, slab pools, skinning buffers,
+    /// ViewportFrame targets, world_gui mip caches, and CPU render caches on place switch.
+    pub fn reset_place_assets(&mut self) {
+        let vf_layers: Vec<Ref> = self.vf.layer_of.values().copied().collect();
+        let mut freed = HashSet::new();
+        for layer in vf_layers {
+            if freed.insert(layer) {
+                if let Some((id, _)) = self.vf_texture(layer) {
+                    crate::world_gui::unregister_native(id);
+                }
+            }
+        }
+        self.clear_layered_items();
+        self.clear_items();
+        self.textures.truncate(1);
+        self.meshes.truncate(BUILTIN_MESHES);
+        self.pool.slabs.clear();
+        self.pool.pending.clear();
+        self.cull_alias.clear();
+        self.skin.clear();
+        self.vf = vf::Layers::default();
+        self.world_gui = [None, None, None];
+        self.sun_cache.slots = [None, None, None, None];
+        self.mesh_gen = self.mesh_gen.wrapping_add(1);
+        crate::skin::clear_caches();
+        crate::hsr::clear_caches();
+        crate::wrap::clear_caches();
     }
 
     pub fn has_stale_shadows(&self) -> bool {
@@ -9213,7 +9255,7 @@ fn prefilter_env_mips(base_raw: &[u8], base_size: u32, atmos: Option<&Globals>) 
         out[0].1[i * 4..i * 4 + 4].copy_from_slice(&encode_px(*lin));
     }
     // Mips 1..levels: GGX-prefiltered in parallel across the 6 faces.
-    let face_mips: Vec<Vec<Vec<u8>>> = std::thread::scope(|scope| {
+    let face_mips: Vec<(usize, Vec<Vec<u8>>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..6)
             .map(|f| {
                 let fetch = &fetch;
@@ -9272,13 +9314,25 @@ fn prefilter_env_mips(base_raw: &[u8], base_size: u32, atmos: Option<&Globals>) 
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .enumerate()
+            .filter_map(|(face, h)| match h.join() {
+                Ok(v) => Some((face, v)),
+                Err(_) => {
+                    log::warn!("ggx prefilter worker panicked on cubemap face {face}");
+                    None
+                }
+            })
+            .collect()
     });
     for l in 1..levels {
         let w = out[l].0 as usize;
         let face_bytes = w * w * 4;
-        for f in 0..6 {
-            out[l].1[f * face_bytes..(f + 1) * face_bytes].copy_from_slice(&face_mips[f][l - 1]);
+        for &(f, ref mips) in &face_mips {
+            if let Some(src) = mips.get(l - 1) {
+                out[l].1[f * face_bytes..(f + 1) * face_bytes].copy_from_slice(src);
+            }
         }
     }
     out

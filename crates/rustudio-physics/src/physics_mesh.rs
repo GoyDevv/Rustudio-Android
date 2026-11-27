@@ -459,10 +459,23 @@ pub fn ray(p: &Pieces, xf: &rustudio_core::math::Xform, scale: Vec3, o: Vec3, di
 /// triangles (a union's thin skins are stored that way: a test place's graveyard island
 /// ground has some). With `touch_only`, one hull around every piece (a
 /// moving CanCollide=false part only reports touches). Cached.
+type ColliderShapeKey = (u32, [u32; 3], bool, bool);
+static SHAPES: OnceLock<Mutex<HashMap<ColliderShapeKey, Option<rapier3d::prelude::SharedShape>>>> = OnceLock::new();
+
+/// Clears cached Rapier collider shapes and sweep shapes (e.g. on place switch).
+pub fn clear_shape_cache() {
+    if let Some(cache) = SHAPES.get() {
+        if let Ok(mut c) = cache.lock() {
+            c.clear();
+        }
+    }
+    if let Ok(mut reg) = registry().lock() {
+        reg.shapes.clear();
+    }
+}
+
 pub fn collider_shape(id: u32, scale: Vec3, touch_only: bool, fixed: bool) -> Option<rapier3d::prelude::SharedShape> {
     use rapier3d::prelude::{Pose, SharedShape, Vector};
-    type Key = (u32, [u32; 3], bool, bool);
-    static SHAPES: OnceLock<Mutex<HashMap<Key, Option<SharedShape>>>> = OnceLock::new();
     let key = (id, scale.to_array().map(f32::to_bits), touch_only, fixed);
     let cache = SHAPES.get_or_init(Default::default);
     if let Some(s) = cache.lock().ok()?.get(&key) {
