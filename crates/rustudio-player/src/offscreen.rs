@@ -347,35 +347,63 @@ pub fn wgpu_options_with(
     }
 }
 
-/// The swapchain's present mode: no vsync when measuring (`no_vsync`);
-/// else the Presentation setting's — Mailbox (Studio presents without
-/// waiting for the refresh, its D3D11 frames run past the display rate
-/// with a higher TaskSchedulerTargetFps, and paces them with its own
-/// frame cap; composited, so nothing tears; Mailbox is the tear-free
-/// equivalent, the vendored egui-wgpu falls back to Fifo on a surface
-/// without it, and native_loop.rs paces redraws; FIFO blocked a low-end
-/// laptop's main thread on the GPU, a test place 24.6 -> 30.5 fps with
-/// mailbox) or `AutoVsync` (FIFO, relaxed where the driver has it) for
-/// "Wait for vsync". On Android it is `AutoVsync` whatever the setting:
-/// the activity runs eframe's own loop (src/android/mod.rs), with no
-/// native_loop to pace Mailbox frames to the refresh, and an unpaced
-/// Mailbox loop on a phone draws as fast as the GPU allows — heat and
-/// battery for frames the display never shows (the standalone player
-/// keeps vsync for the same reason). `RUSTUDIO_PRESENT_MODE` overrides
-/// for measuring — `fifo`, `relaxed`, `mailbox`, `immediate`, `vsync`,
-/// `novsync`; a mode the surface lacks falls back to FIFO in wgpu, with a
-/// warning in its log.
+/// Explicit Presentation override from `RUSTUDIO_PERF_PRESENT` or the saved
+/// `"present"` setting in `rustudio-settings.json`.
+fn perf_present_override() -> Option<String> {
+    std::env::var("RUSTUDIO_PERF_PRESENT")
+        .ok()
+        .or_else(|| {
+            rustudio_core::rustudio_settings::saved_value("present")
+                .and_then(|v| v.as_str().map(str::to_owned))
+        })
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+/// The swapchain's present mode: `RUSTUDIO_PRESENT_MODE` overrides for
+/// measuring (`fifo`, `relaxed`, `mailbox`, `immediate`, `vsync`, `novsync`).
+/// Otherwise, explicit `RUSTUDIO_PERF_PRESENT` / saved `"present"` settings
+/// (`novsync`, `immediate`, `mailbox`, `fifo`, `vsync`, `relaxed`) are honored
+/// on all platforms including Android. When not explicitly set to `"fifo"` or
+/// `"vsync"`, Android defaults to `PresentMode::AutoNoVsync` (selecting
+/// `Immediate` -> `Mailbox` -> `Fifo` safely based on driver support so FPS is
+/// uncapped without crashing on Fifo-only drivers), and `no_vsync` also uses
+/// `PresentMode::AutoNoVsync`. Desktop defaults to `PresentMode::Mailbox` when
+/// interactive_mailbox() is active, or `PresentMode::AutoVsync` for "Wait for
+/// vsync".
 pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
     use egui_wgpu::wgpu::PresentMode;
-    match std::env::var("RUSTUDIO_PRESENT_MODE").ok().as_deref().map(str::trim) {
-        Some("fifo") => PresentMode::Fifo,
-        Some("relaxed") => PresentMode::FifoRelaxed,
-        Some("mailbox") => PresentMode::Mailbox,
-        Some("immediate") => PresentMode::Immediate,
-        Some("vsync") => PresentMode::AutoVsync,
-        Some("novsync") => PresentMode::AutoNoVsync,
-        _ if no_vsync => PresentMode::AutoNoVsync,
-        _ if interactive_mailbox() && cfg!(not(target_os = "android")) => PresentMode::Mailbox,
+    if let Some(env_mode) = std::env::var("RUSTUDIO_PRESENT_MODE").ok().as_deref().map(str::trim) {
+        match env_mode.to_ascii_lowercase().as_str() {
+            "fifo" => return PresentMode::Fifo,
+            "relaxed" => return PresentMode::FifoRelaxed,
+            "mailbox" => return PresentMode::Mailbox,
+            "immediate" => return PresentMode::Immediate,
+            "vsync" => return PresentMode::AutoVsync,
+            "novsync" => return PresentMode::AutoNoVsync,
+            _ => {}
+        }
+    }
+    if let Some(pref) = perf_present_override() {
+        match pref.as_str() {
+            "fifo" => return PresentMode::Fifo,
+            "vsync" => return PresentMode::AutoVsync,
+            "relaxed" => return PresentMode::FifoRelaxed,
+            "mailbox" => return PresentMode::Mailbox,
+            "immediate" => return PresentMode::Immediate,
+            "novsync" => return PresentMode::AutoNoVsync,
+            _ => {}
+        }
+    }
+    if no_vsync || cfg!(target_os = "android") {
+        return PresentMode::AutoNoVsync;
+    }
+    match rustudio_core::rustudio_settings::performance_value("present") {
+        "fifo" | "vsync" => PresentMode::AutoVsync,
+        "novsync" => PresentMode::AutoNoVsync,
+        "immediate" => PresentMode::Immediate,
+        "mailbox" => PresentMode::Mailbox,
+        _ if interactive_mailbox() => PresentMode::Mailbox,
         _ => PresentMode::AutoVsync,
     }
 }

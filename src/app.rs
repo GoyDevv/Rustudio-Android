@@ -269,6 +269,8 @@ pub struct Editor {
     pub toolbox: crate::toolbox::Toolbox,
     /// The Asset Manager panel's state (src/asset_manager), kept while hidden.
     pub asset_manager: crate::asset_manager::AssetManager,
+    /// Roblox Studio-style Asset ID Picker / Upload / ID Browser modal (src/asset_picker.rs).
+    pub asset_picker: crate::asset_picker::AssetPicker,
     /// The MicroProfiler window while its tab is open (recording runs while
     /// it exists; dropping it stops recording).
     pub profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
@@ -542,6 +544,7 @@ impl RustudioApp {
             terrain_ed: Default::default(),
             toolbox: Default::default(),
             asset_manager: Default::default(),
+            asset_picker: crate::asset_picker::AssetPicker::new(),
             profiler: None,
             toolbox_vf: Default::default(),
             fly_held: 0.0,
@@ -1217,6 +1220,83 @@ impl Editor {
                         Err(e) => self.error(format!("glTF export failed: {e}")),
                     }
                 }
+            }
+        }
+    }
+
+    /// Renders and polls the Asset Picker modal each frame and commits any
+    /// chosen `rbxassetid://...` value back to the target instance(s).
+    pub fn asset_picker_ui(&mut self, ctx: &egui::Context) {
+        if !self.asset_picker.open {
+            return;
+        }
+        let session = self.game.account.shared_client().and_then(|c| {
+            c.try_lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|cl| cl.session.downloader()))
+        });
+        if let Some(apply) = self.asset_picker.show(ctx, session) {
+            self.apply_asset_picker(apply);
+        }
+    }
+
+    /// Commits an Asset Picker selection to the target instance(s) with proper
+    /// undo recording and paired-property syncing (`AudioContent`/`SoundId`/`Asset`,
+    /// `MeshContent`/`MeshId`).
+    pub fn apply_asset_picker(&mut self, apply: crate::asset_picker::PickerApply) {
+        use rbx_dom_weak::types::{Content, Variant};
+        use rbx_dom_weak::ustr;
+
+        let target = apply.target;
+        let uri = apply.uri;
+        let prop_name = target.prop_name;
+        let content_val = Variant::Content(Content::from(uri.clone()));
+        let cid_val = Variant::ContentId(uri.clone().into());
+
+        let mut changes = Vec::new();
+        for &r in &target.targets {
+            let Some(class) = self.game.doc.class_of(r) else {
+                continue;
+            };
+            let cl = class.as_str();
+            match prop_name.as_str() {
+                "AudioContent" | "SoundId" | "Asset" if matches!(cl, "Sound" | "AudioPlayer") => {
+                    changes.push((r, ustr("AudioContent"), content_val.clone()));
+                    if cl == "Sound" {
+                        changes.push((r, ustr("SoundId"), cid_val.clone()));
+                    } else {
+                        changes.push((r, ustr("Asset"), cid_val.clone()));
+                    }
+                }
+                "MeshContent" | "MeshId" => {
+                    if crate::properties::has_prop(cl, "MeshContent") {
+                        changes.push((r, ustr("MeshContent"), content_val.clone()));
+                    }
+                    if crate::properties::has_prop(cl, "MeshId") {
+                        changes.push((r, ustr("MeshId"), cid_val.clone()));
+                    }
+                }
+                _ => {
+                    if crate::properties::has_prop(cl, &prop_name) {
+                        let val = if target.is_content_variant {
+                            content_val.clone()
+                        } else {
+                            cid_val.clone()
+                        };
+                        changes.push((r, ustr(&prop_name), val));
+                    }
+                }
+            }
+        }
+
+        if !changes.is_empty() {
+            self.game
+                .doc
+                .set_props(&format!("Set {prop_name}"), changes, None);
+            if uri.is_empty() {
+                self.info(format!("Cleared {prop_name}"));
+            } else {
+                self.info(format!("Set {prop_name} to {uri}"));
             }
         }
     }
@@ -4107,6 +4187,7 @@ impl RustudioApp {
             || self.ed.confirm_discard.is_some()
             || self.ed.autosave.pending_recovery.is_some()
             || self.ed.cloud.published_banner.is_some()
+            || self.ed.asset_picker.open
             || self.ed.game.account.open
             || egui::Popup::is_any_open(&ctx);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("rustudio_modal_open"), dock_modal_open));
@@ -4169,7 +4250,8 @@ impl RustudioApp {
             || self.ed.project_choice.is_some()
             || self.ed.confirm_discard.is_some()
             || self.ed.autosave.pending_recovery.is_some()
-            || self.ed.cloud.published_banner.is_some();
+            || self.ed.cloud.published_banner.is_some()
+            || self.ed.asset_picker.open;
         let mobile_actions = {
             let mut viewer = Viewer { ed: &mut self.ed, window: None, windows: &windows };
             self.mobile_windows.show(&ctx, dock_rect, modal_open, |ui, tab| viewer.ui(ui, tab))
@@ -4395,6 +4477,7 @@ impl RustudioApp {
             ed.character_builder_window(&ctx);
         }
         ed.cloud_windows(&ctx);
+        ed.asset_picker_ui(&ctx);
         ed.autosave_recovery_modal(&ctx);
         ed.mcp_windows(&ctx);
         ed.file_sync_popover_ui(&ctx);
@@ -4497,6 +4580,7 @@ impl RustudioApp {
             || ed.harness.run.screenshot.is_some()
             || ed.harness.selftest.is_some()
             || ed.game.account.busy()
+            || ed.asset_picker.busy()
         {
             ctx.request_repaint();
         } else if ed.fps >= 0.5 {

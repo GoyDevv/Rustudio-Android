@@ -342,7 +342,7 @@ pub const OPTS: &[Opt] = &[
         kind: OptKind::Bool,
     },
     Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(FPS_PRESETS) },
-    Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit (the screen's refresh rate when Unlimited). Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
+    Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Uncapped (Max FPS) disables vsync wait (Immediate / Mailbox when supported, safe FIFO fallback) to push every possible frame. Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit. Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("novsync", "Uncapped (Max FPS)"), ("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
     Opt { key: "idle", cat: "Performance", label: "Idle grass animation", desc: "Pauses grass animation redraws while the editor is idle.", env: "RUSTUDIO_PERF_IDLE", kind: OptKind::Choice(&[("animate", "Animate"), ("pause", "Pause when idle")]) },
     Opt { key: "background", cat: "Performance", label: "Hidden window", desc: "Keeps a running playtest and Team Create going while the window is on another workspace or minimized, without drawing (as Studio does behind other windows). Pause freezes them until the window shows again.", env: "RUSTUDIO_PERF_BACKGROUND", kind: OptKind::Choice(&[("run", "Keep running"), ("pause", "Pause")]) },
     Opt {
@@ -1006,9 +1006,10 @@ fn choice_default(key: &str) -> Option<&'static str> {
 /// hands on every platform (including Android and low-end GPUs) — Graphics
 /// quality defaults to `"custom"` and 3D resolution defaults to `"100"`
 /// (100% Native) unless the user explicitly selects another preset or scale.
-fn choice_default_for(key: &str, _weak: bool, _android: bool) -> Option<&'static str> {
+fn choice_default_for(key: &str, _weak: bool, android: bool) -> Option<&'static str> {
     match key {
         "quality" => Some("custom"),
+        "present" => Some(if android { "novsync" } else { "mailbox" }),
         _ => None,
     }
 }
@@ -1394,9 +1395,13 @@ mod tests {
             assert_eq!(choice_default_for("view_distance", weak, android), None);
             assert_eq!(choice_default_for("aa", weak, android), None);
             assert_eq!(choice_default_for("texture_quality", weak, android), None);
+            assert_eq!(
+                choice_default_for("present", weak, android),
+                Some(if android { "novsync" } else { "mailbox" })
+            );
         }
         // Every default is one of its row's choices.
-        for key in ["quality", "resolution", "view_distance", "aa", "texture_quality"] {
+        for key in ["quality", "resolution", "view_distance", "aa", "texture_quality", "present"] {
             let OptKind::Choice(items) = opt(key).kind else { panic!("{key} is a choice") };
             for (weak, android) in [(false, false), (true, false), (false, true), (true, true)] {
                 if let Some(d) = choice_default_for(key, weak, android) {
@@ -1528,11 +1533,12 @@ mod tests {
     #[test]
     fn restart_shows_only_while_a_restart_option_differs_from_startup() {
         let o = opt("present");
-        let start = matches!(shown(o), Shown::Choice(1));
+        let start = performance_value("present");
+        let alt = if start == "fifo" { "novsync" } else { "fifo" };
         assert!(!restart_pending(o));
-        set_choice("present", if start { "mailbox" } else { "fifo" }, "mailbox");
+        set_choice("present", alt, start);
         assert!(restart_pending(o));
-        set_choice("present", if start { "fifo" } else { "mailbox" }, "mailbox");
+        set_choice("present", start, start);
         assert!(!restart_pending(o));
         assert!(!restart_pending(opt("core_scripts")));
     }

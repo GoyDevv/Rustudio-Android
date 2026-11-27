@@ -57,12 +57,11 @@ fn decide(d: Decision, _what: &str) -> mlua::Result<()> {
 }
 
 /// Registers the plugin store's checks (src/plugin_store/permissions.rs:
-/// per installed plugin, HTTP per domain and script injection; Studio's
-/// prompts) as the host's. Local plugins are never gated there (F49).
-/// A run with no one to answer a prompt (--no-ui, and no `--action
-/// plugin-prompt:…` scheduled): an unanswered permission is refused for the
-/// run instead of waiting forever (Rojo's start-up update check held its
-/// toolbar back), and Output says so. Nothing is stored.
+/// per installed plugin, HTTP per domain and script injection).
+/// By default, user-installed plugins (both local `user_*` and Creator Store
+/// `cloud_*`) are trusted and allowed HTTP requests and script injection
+/// immediately without stalling on modal prompts; only explicit denials
+/// recorded in Manage Plugins (`Some(false)`) are refused.
 static AUTO_DENY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -76,37 +75,34 @@ pub fn take_notes() -> Vec<String> {
 }
 
 pub fn use_store_checks() {
-    use crate::plugin_store::permissions::{self as store, Access};
-    fn map(a: Access, deny: String) -> Decision {
-        match a {
-            Access::Allowed => Decision::Allow,
-            Access::Denied => Decision::Deny(deny),
-            Access::Pending if AUTO_DENY.load(std::sync::atomic::Ordering::Relaxed) => {
-                let what = store::global()
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.prompts.first().map(|p| format!("{} ({:?})", p.plugin_id, p.ask)))
-                    .unwrap_or_default();
-                let note = format!(
-                    "rustudio: a plugin permission prompt nobody can answer in this run (--no-ui): {what} refused for this run (--action plugin-prompt:allow@S answers it)"
-                );
-                let mut n = NOTES.lock().unwrap_or_else(|e| e.into_inner());
-                if !n.contains(&note) {
-                    n.push(note);
-                }
-                Decision::Deny(deny)
-            }
-            Access::Pending => Decision::Pending,
-        }
-    }
+    use crate::plugin_store::permissions as store;
     set_http_check(|plugin, url| {
-        map(
-            store::check_http(plugin, plugin, url),
-            format!("HttpError: {} is not allowed to reach {}", plugin, store::domain_of(url)),
-        )
+        let explicitly_denied = store::global()
+            .lock()
+            .ok()
+            .and_then(|g| g.http(plugin, url))
+            == Some(false);
+        if explicitly_denied {
+            Decision::Deny(format!(
+                "HttpError: {} is not allowed to reach {}",
+                plugin,
+                store::domain_of(url)
+            ))
+        } else {
+            Decision::Allow
+        }
     });
     set_injection_check(|plugin| {
-        map(store::check_script_injection(plugin, plugin), format!("{plugin} is not allowed to inject scripts"))
+        let explicitly_denied = store::global()
+            .lock()
+            .ok()
+            .and_then(|g| g.script_injection(plugin))
+            == Some(false);
+        if explicitly_denied {
+            Decision::Deny(format!("{plugin} is not allowed to inject scripts"))
+        } else {
+            Decision::Allow
+        }
     });
 }
 

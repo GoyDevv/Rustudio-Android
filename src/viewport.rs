@@ -754,14 +754,10 @@ impl Editor {
                 for (tid, phase, pos) in touch_events {
                     // Always deliver Move/End/Cancel to the finger that ALREADY owns the joystick,
                     // even if the thumb drifted onto a side/bottom panel or floating window.
+                    // Never skip joystick touches for ScreenGui elements or resize handles beneath it.
                     let owns_joy = self.editor_joystick.active_touch() == Some(tid);
-                    let on_gui_handle = !owns_joy
-                        && (gui_drag_active()
-                            || (phase == egui::TouchPhase::Start
-                                && self.gui_overlay_handle_at(rect, pos).is_some()));
                     if !owns_joy
-                        && (on_gui_handle
-                            || self.game.touch.is_ui_touch(tid)
+                        && (self.game.touch.is_ui_touch(tid)
                             || self.mobile_window_rects.iter().any(|r| r.contains(pos))
                             || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background))
                     {
@@ -960,6 +956,8 @@ impl Editor {
                 stick,
                 jump,
                 handle_hover: hover_handle.is_some() || self.drag.is_some() || rustudio_engine::gui::share().adorn_hot || { let _ch = rustudio_engine::gui::share_channel(1); rustudio_engine::gui::share().adorn_hot },
+                joystick: joystick_zone,
+                joystick_touch: self.editor_joystick.active_touch(),
                 plugin_exclusive_mouse: !driving && self.plugins.active_plugin_exclusive_mouse(),
                 frame: self.game.frame_no,
             };
@@ -974,6 +972,9 @@ impl Editor {
             .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
             && self.tool == Tool::None;
         let pointer_on_joystick = pointer.is_some_and(|p| joystick_zone.is_some_and(|jr| jr.contains(p)));
+        let press_started_on_joystick = ctx
+            .input(|i| i.pointer.press_origin())
+            .is_some_and(|orig| joystick_zone.is_some_and(|jr| jr.contains(orig)));
         let pointer_on_mobile_win = pointer.is_some_and(|p| self.mobile_window_rects.iter().any(|r| r.contains(p)));
         self.hover = if hover_handle.is_none()
             && self.drag.is_none()
@@ -984,6 +985,7 @@ impl Editor {
             && self.plugins.active_plugin().is_none()
             && !joystick_or_look_busy
             && !pointer_on_joystick
+            && !press_started_on_joystick
             && !pointer_on_mobile_win
         {
             pointer.and_then(|p| self.hover_pick(rect, p, alt))
@@ -1142,7 +1144,18 @@ impl Editor {
             }
         }
         // -------------------------------------------------- 2D GUI editor drag
-        let gui_drag_took = if !playing && !self.clean_view && self.ui.show_gui && !in_game && !press_taken && !brushing && !pointer_on_mobile_win && !self.editor_joystick.is_active() {
+        let gui_drag_took = if !playing
+            && !self.clean_view
+            && self.ui.show_gui
+            && !in_game
+            && !press_taken
+            && !brushing
+            && !pointer_on_mobile_win
+            && !self.editor_joystick.is_active()
+            && !pointer_on_joystick
+            && !press_started_on_joystick
+            && !joystick_or_look_busy
+        {
             self.update_gui_2d_drag(&ctx, rect, &resp, pointer)
         } else {
             if gui_drag_active() {
@@ -1153,8 +1166,8 @@ impl Editor {
 
         // -------------------------------------------------- select & gizmo
         let pointer_on_overlay = pointer.is_some_and(|p| ctx.layer_id_at(p).is_some_and(|l| l.order != egui::Order::Background));
-        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay;
-        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
+        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay;
+        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
                 // A handle takes the press even with Alt held (Alt = scale all axes).
@@ -1207,7 +1220,7 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
+        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing && !gui_drag_took && !joystick_or_look_busy && !pointer_on_joystick && !press_started_on_joystick && !pointer_on_mobile_win && !pointer_on_overlay {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self.game

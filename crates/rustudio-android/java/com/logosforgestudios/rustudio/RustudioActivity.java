@@ -25,6 +25,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.view.Display;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -155,10 +156,67 @@ public class RustudioActivity extends NativeActivity {
         }
     }
 
+    private void unlockMaxRefreshRate() {
+        if (Build.VERSION.SDK_INT < 23) {
+            return;
+        }
+        try {
+            Window w = getWindow();
+            if (w == null) {
+                return;
+            }
+            Display display = null;
+            if (Build.VERSION.SDK_INT >= 30) {
+                display = getDisplay();
+            }
+            if (display == null) {
+                WindowManager wm = getWindowManager();
+                if (wm != null) {
+                    display = wm.getDefaultDisplay();
+                }
+            }
+            if (display == null) {
+                return;
+            }
+            Display.Mode currentMode = display.getMode();
+            Display.Mode[] modes = display.getSupportedModes();
+            if (modes == null || modes.length == 0) {
+                return;
+            }
+            int curW = currentMode != null ? currentMode.getPhysicalWidth() : 0;
+            int curH = currentMode != null ? currentMode.getPhysicalHeight() : 0;
+            Display.Mode bestMode = currentMode;
+            float maxRate = currentMode != null ? currentMode.getRefreshRate() : 0.0f;
+            for (int i = 0; i < modes.length; i++) {
+                Display.Mode m = modes[i];
+                if (m == null) {
+                    continue;
+                }
+                if (curW > 0 && curH > 0
+                        && (m.getPhysicalWidth() != curW || m.getPhysicalHeight() != curH)) {
+                    continue;
+                }
+                float rate = m.getRefreshRate();
+                if (rate > maxRate) {
+                    maxRate = rate;
+                    bestMode = m;
+                }
+            }
+            if (bestMode != null && maxRate > 0.0f) {
+                WindowManager.LayoutParams lp = w.getAttributes();
+                lp.preferredDisplayModeId = bestMode.getModeId();
+                lp.preferredRefreshRate = maxRate;
+                w.setAttributes(lp);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         applyDarkFullscreenWindow();
+        unlockMaxRefreshRate();
         imeView = new ImeProxyView(this);
         imeView.setBackgroundColor(0);
         imeView.setFocusable(true);
@@ -172,6 +230,7 @@ public class RustudioActivity extends NativeActivity {
         super.onResume();
         nativeOnLifecycle(3);
         applyDarkFullscreenWindow();
+        unlockMaxRefreshRate();
         maybeResumePendingInstall();
         if (!storagePromptScheduled) {
             storagePromptScheduled = true;

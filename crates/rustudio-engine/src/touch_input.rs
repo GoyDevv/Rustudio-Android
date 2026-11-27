@@ -114,6 +114,10 @@ pub struct Zones {
     pub jump: Option<Rect>,
     /// A transform handle is under the pointer (a press goes to it at once).
     pub handle_hover: bool,
+    /// Edit-mode virtual joystick rect (drawn above ScreenGui; always wins over `direct_drag` and viewport touches).
+    pub joystick: Option<Rect>,
+    /// TouchId currently owned by the Edit-mode virtual joystick, if any.
+    pub joystick_touch: Option<TouchId>,
     /// An activated plugin requested exclusive mouse (1-finger drags emit Primary instead of Look).
     pub plugin_exclusive_mouse: bool,
     /// `Editor::frame_no` when these were written; older zones are stale.
@@ -122,7 +126,7 @@ pub struct Zones {
 
 impl Default for Zones {
     fn default() -> Self {
-        Self { viewport: Rect::NOTHING, playing: false, game: false, ui: Vec::new(), direct_drag: Vec::new(), stick: None, jump: None, handle_hover: false, plugin_exclusive_mouse: false, frame: 0 }
+        Self { viewport: Rect::NOTHING, playing: false, game: false, ui: Vec::new(), direct_drag: Vec::new(), stick: None, jump: None, handle_hover: false, joystick: None, joystick_touch: None, plugin_exclusive_mouse: false, frame: 0 }
     }
 }
 
@@ -279,6 +283,9 @@ pub struct Touch {
     ui_fingers: BTreeSet<TouchId>,
     /// Per-touch-ID ownership locked at `TouchPhase::Start` until `End`/`Cancel`.
     owners: BTreeMap<TouchId, TouchOwner>,
+    /// Set once 2+ viewport fingers are down; suppresses starting a new 1-finger
+    /// pointer (e.g. PluginMouse Button1Down) until all viewport fingers lift back to 0.
+    viewport_multi_lock: bool,
 }
 
 fn key_event(key: Key, pressed: bool) -> Event {
@@ -299,11 +306,17 @@ impl Touch {
         self.zones.frame == frame_no
     }
 
+    /// Number of currently active touches locked to the 3D viewport.
+    fn active_viewport_touches(&self) -> usize {
+        self.owners.values().filter(|o| **o == TouchOwner::Viewport).count()
+    }
+
     /// Whether `pos` is on the unobstructed 3D view itself (not a window,
-    /// popup, menu, ribbon, or `Zones::ui` / `Zones::direct_drag` overlay).
+    /// popup, menu, ribbon, virtual joystick, or `Zones::ui` / `Zones::direct_drag` overlay).
     fn on_view(&self, ctx: &egui::Context, pos: Pos2, frame_no: u64) -> bool {
         self.zones_fresh(frame_no)
             && self.zones.viewport.contains(pos)
+            && !self.zones.joystick.is_some_and(|r| r.contains(pos))
             && !self.zones.ui.iter().any(|r| r.contains(pos))
             && !self.zones.direct_drag.iter().any(|r| r.contains(pos))
             && !egui::Popup::is_any_open(ctx)
@@ -314,9 +327,11 @@ impl Touch {
     /// the editor's frame counter, to tell fresh zones from stale ones.
     pub fn filter(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, frame_no: u64) {
         let now = Instant::now();
-        // The pointer of a finger lifted last frame leaves now, ahead of
-        // this frame's events.
-        if std::mem::take(&mut self.gone) && self.pointer.is_none() {
+        // The pointer of a finger lifted (or cancelled into Multi) last frame
+        // leaves now, ahead of this frame's events.
+        if std::mem::take(&mut self.gone)
+            && self.pointer.as_ref().is_none_or(|p| p.mode == Mode::Multi)
+        {
             raw.events.insert(0, Event::PointerGone);
         }
         // Switched off, or fingers from then still down: egui gets the
@@ -442,7 +457,21 @@ impl Touch {
                         TouchOwner::EditorJoystick => {
                             self.ui_fingers.remove(&id);
                         }
-                        TouchOwner::Ui | TouchOwner::Viewport => {}
+                        TouchOwner::Ui | TouchOwner::Viewport => {
+                            if self.pointer.as_ref().is_some_and(|p| p.id == id) {
+                                if let Some(p) = self.pointer.take() {
+                                    match p.mode {
+                                        Mode::Look => out.push(button(p.pos, PointerButton::Secondary, false)),
+                                        Mode::Press => out.push(button(p.pos, PointerButton::Primary, false)),
+                                        Mode::Scroll => out.push(wheel(Vec2::ZERO, TouchPhase::End)),
+                                        Mode::Pending | Mode::Multi | Mode::Done => {}
+                                    }
+                                }
+                            }
+                            if self.active_viewport_touches() == 0 {
+                                self.viewport_multi_lock = false;
+                            }
+                        }
                     }
                 }
                 self.active.insert(id);
@@ -460,16 +489,22 @@ impl Touch {
                     self.push_game(GameTouch { id, phase, pos });
                     return true;
                 }
-                if fresh
+                let on_joystick = fresh
+                    && !self.zones.playing
+                    && (self.zones.joystick.is_some_and(|r| r.contains(pos))
+                        || self.zones.joystick_touch == Some(id));
+                let on_editor_ui_overlay = fresh
                     && !self.zones.playing
                     && self.zones.ui.iter().any(|r| r.contains(pos))
-                    && !self.zones.direct_drag.iter().any(|r| r.contains(pos))
+                    && !self.zones.direct_drag.iter().any(|r| r.contains(pos));
+                if (on_joystick || on_editor_ui_overlay)
                     && !egui::Popup::is_any_open(ctx)
                     && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
                 {
-                    // Finger landed on an editor overlay control (virtual joystick):
-                    // keep raw Event::Touch for that control and never convert it
-                    // into a viewport Mode::Look camera drag.
+                    // Finger landed on the Edit-mode virtual joystick (drawn above ScreenGui)
+                    // or another editor overlay control: keep raw Event::Touch for that control
+                    // and never convert it into a viewport Mode::Look camera drag, 2D ScreenGui
+                    // direct_drag, or PluginMouse click.
                     self.owners.insert(id, TouchOwner::EditorJoystick);
                     self.ui_fingers.insert(id);
                     return false;
@@ -489,7 +524,25 @@ impl Touch {
                 }
                 let owner = if in_view { TouchOwner::Viewport } else { TouchOwner::Ui };
                 self.owners.insert(id, owner);
-                if self.pointer.is_none() {
+                let viewport_count = self.active_viewport_touches();
+                if in_view && (self.viewport_multi_lock || viewport_count >= 2) {
+                    // Two or more fingers on the 3D viewport (or a finger landing while a
+                    // previous 2-finger gesture still has another viewport finger held down):
+                    // immediately release any active 1-finger look/press (e.g. PluginMouse
+                    // Button1Down) and stay in Multi until ALL viewport fingers lift to 0.
+                    self.viewport_multi_lock = true;
+                    if let Some(p) = self.pointer.as_mut() {
+                        if p.in_view && p.mode != Mode::Multi {
+                            match p.mode {
+                                Mode::Look => out.push(button(p.pos, PointerButton::Secondary, false)),
+                                Mode::Press => out.push(button(p.pos, PointerButton::Primary, false)),
+                                _ => {}
+                            }
+                            p.mode = Mode::Multi;
+                            self.gone = true;
+                        }
+                    }
+                } else if self.pointer.is_none() {
                     // (a lift in this same frame owes no PointerGone: the
                     // pointer is this finger now)
                     self.gone = false;
@@ -522,13 +575,15 @@ impl Touch {
                             _ => {}
                         }
                         p.mode = Mode::Multi;
+                        self.gone = true;
+                        self.viewport_multi_lock = true;
                     }
                 }
                 return owner == TouchOwner::Ui;
             }
             TouchPhase::Move => {
                 let owner = self.owners.get(&id).copied();
-                if self.ui_fingers.contains(&id) {
+                if self.ui_fingers.contains(&id) || self.zones.joystick_touch == Some(id) {
                     return false;
                 }
                 if self.game_fingers.contains(&id) {
@@ -616,7 +671,10 @@ impl Touch {
             TouchPhase::End | TouchPhase::Cancel => {
                 self.active.remove(&id);
                 let owner = self.owners.remove(&id);
-                if self.ui_fingers.remove(&id) {
+                if self.active_viewport_touches() == 0 {
+                    self.viewport_multi_lock = false;
+                }
+                if self.ui_fingers.remove(&id) || self.zones.joystick_touch == Some(id) {
                     return false;
                 }
                 if self.game_fingers.remove(&id) {
@@ -801,6 +859,7 @@ impl Touch {
     fn let_go(&mut self, out: &mut Vec<Event>) {
         self.ui_fingers.clear();
         self.owners.clear();
+        self.viewport_multi_lock = false;
         self.release_all(out);
         self.cancel_game_fingers();
         if let Some(p) = self.pointer.take() {
@@ -1449,5 +1508,96 @@ mod tests {
         assert!(!t.jumping());
         assert!(out.iter().any(|e| matches!(e, Event::Key { key: Key::Space, pressed: false, .. })), "{out:?}");
         assert!(t.held.is_empty());
+    }
+
+    #[test]
+    fn edit_joystick_wins_over_overlapping_screengui_direct_drag_and_plugin_mouse() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        let view = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 500.0));
+        let joy = Rect::from_min_max(Pos2::new(28.0, 360.0), Pos2::new(140.0, 472.0));
+        // ScreenGui element sits directly underneath the virtual joystick.
+        let gui_under_joy = Rect::from_min_max(Pos2::new(0.0, 300.0), Pos2::new(220.0, 500.0));
+        t.zones = Zones {
+            viewport: view,
+            playing: false,
+            ui: vec![joy],
+            direct_drag: vec![gui_under_joy],
+            joystick: Some(joy),
+            plugin_exclusive_mouse: true,
+            frame: 1,
+            ..Default::default()
+        };
+        let start = Pos2::new(84.0, 416.0);
+        let out_start = run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, start)]);
+        assert_eq!(t.owner(TouchId(1)), Some(TouchOwner::EditorJoystick));
+        assert!(buttons(&out_start).is_empty(), "{out_start:?}");
+        assert!(!out_start.iter().any(|e| matches!(e, Event::PointerMoved(_))), "{out_start:?}");
+        // Dragging outside the joystick circle must still never trigger ScreenGui drag or PluginMouse.
+        let out_move = run(&mut t, &ctx, vec![touch(1, TouchPhase::Move, Pos2::new(190.0, 416.0))]);
+        assert!(buttons(&out_move).is_empty(), "{out_move:?}");
+        assert!(!out_move.iter().any(|e| matches!(e, Event::PointerMoved(_))), "{out_move:?}");
+        let out_end = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, Pos2::new(190.0, 416.0))]);
+        assert!(buttons(&out_end).is_empty(), "{out_end:?}");
+    }
+
+    #[test]
+    fn plugin_exclusive_mouse_2_finger_cancels_stroke_and_waits_for_all_fingers_up() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        let view = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 500.0));
+        t.zones = Zones {
+            viewport: view,
+            playing: false,
+            plugin_exclusive_mouse: true,
+            frame: 1,
+            ..Default::default()
+        };
+        // 1st finger starts painting.
+        run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, Pos2::new(300.0, 250.0))]);
+        let out_drag = run(&mut t, &ctx, vec![touch(1, TouchPhase::Move, Pos2::new(340.0, 250.0))]);
+        assert_eq!(buttons(&out_drag), vec![(PointerButton::Primary, true)], "{out_drag:?}");
+        assert_eq!(t.mode(), Some(Mode::Press));
+
+        // 2nd finger lands -> cancels plugin stroke with a single Button1Up and enters Multi.
+        let out_second = run(&mut t, &ctx, vec![touch(2, TouchPhase::Start, Pos2::new(500.0, 250.0))]);
+        assert_eq!(buttons(&out_second), vec![(PointerButton::Primary, false)], "{out_second:?}");
+        assert_eq!(t.mode(), Some(Mode::Multi));
+
+        // Next frame clears hover via PointerGone; moving either finger emits no pointer events.
+        let out_multi_move = run(
+            &mut t,
+            &ctx,
+            vec![
+                touch(1, TouchPhase::Move, Pos2::new(320.0, 240.0)),
+                touch(2, TouchPhase::Move, Pos2::new(520.0, 260.0)),
+            ],
+        );
+        assert!(matches!(out_multi_move.first(), Some(Event::PointerGone)), "{out_multi_move:?}");
+        assert!(buttons(&out_multi_move).is_empty(), "{out_multi_move:?}");
+
+        // Lifting 1st finger while 2nd finger is still down must NOT fire Button1Up again
+        // and must NOT allow a 3rd finger to start painting before all fingers lift.
+        let out_lift1 = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, Pos2::new(320.0, 240.0))]);
+        assert!(buttons(&out_lift1).is_empty(), "{out_lift1:?}");
+        let out_reenter = run(&mut t, &ctx, vec![touch(3, TouchPhase::Start, Pos2::new(360.0, 250.0))]);
+        assert!(buttons(&out_reenter).is_empty(), "{out_reenter:?}");
+        let out_reenter_move = run(&mut t, &ctx, vec![touch(3, TouchPhase::Move, Pos2::new(410.0, 250.0))]);
+        assert!(buttons(&out_reenter_move).is_empty(), "{out_reenter_move:?}");
+
+        // Lift all remaining fingers -> unlocks fresh 1-finger stroke.
+        run(
+            &mut t,
+            &ctx,
+            vec![
+                touch(2, TouchPhase::End, Pos2::new(520.0, 260.0)),
+                touch(3, TouchPhase::End, Pos2::new(410.0, 250.0)),
+            ],
+        );
+        run(&mut t, &ctx, vec![touch(4, TouchPhase::Start, Pos2::new(400.0, 250.0))]);
+        let out_fresh = run(&mut t, &ctx, vec![touch(4, TouchPhase::Move, Pos2::new(440.0, 250.0))]);
+        assert_eq!(buttons(&out_fresh), vec![(PointerButton::Primary, true)], "{out_fresh:?}");
+        let out_fresh_end = run(&mut t, &ctx, vec![touch(4, TouchPhase::End, Pos2::new(440.0, 250.0))]);
+        assert_eq!(buttons(&out_fresh_end), vec![(PointerButton::Primary, false)], "{out_fresh_end:?}");
     }
 }

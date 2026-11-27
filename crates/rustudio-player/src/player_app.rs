@@ -487,11 +487,11 @@ pub fn run() -> eframe::Result<()> {
         );
         std::process::exit(code.max(EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
     }
-    // The standalone player has no redraw pacing of its own (the editor's
-    // native_loop.rs paces mailbox frames): it keeps vsync.
+    // Uncap FPS via AutoNoVsync by default while still honoring explicit
+    // Presentation settings and RUSTUDIO_PRESENT_MODE overrides.
     let mut wgpu_options = wgpu_options;
     if !bench_mode {
-        wgpu_options.surface.present_mode = eframe::egui_wgpu::wgpu::PresentMode::AutoVsync;
+        wgpu_options.surface.present_mode = crate::offscreen::present_mode(true);
     }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,

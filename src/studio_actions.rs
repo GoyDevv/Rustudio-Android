@@ -419,7 +419,8 @@ impl Editor {
                     (edit && self.selected_parts_shared().len() >= 2, None)
                 }
             }
-            "ui_frame" | "ui_label" | "ui_input" | "ui_appearance" | "ui_layout" | "ui_constraint" => {
+            "ui_frame" | "ui_label" | "ui_button" | "ui_input" => (edit, None),
+            "ui_appearance" | "ui_layout" | "ui_constraint" => {
                 (edit && self.gui_target().is_some(), None)
             }
             _ => (false, None),
@@ -442,6 +443,114 @@ impl Editor {
                 .class_of(*r)
                 .is_some_and(|c| rustudio_core::doc::is_a(&c, "GuiObject") || rustudio_core::doc::is_a(&c, "LayerCollector"))
         })
+    }
+
+    /// Returns the selected `LayerCollector`/`GuiObject` (or GUI ancestor of a selected
+    /// UI child), falling back to reusing or auto-creating a `ScreenGui` under `StarterGui`.
+    pub(crate) fn ensure_gui_target(&mut self) -> Ref {
+        if let Some(t) = self.gui_target() {
+            return t;
+        }
+        if let Some(&first) = self.game.doc.selection.first() {
+            let mut cur = self.game.doc.dom.get_by_ref(first).map(|i| i.parent());
+            while let Some(p) = cur {
+                if p.is_none() {
+                    break;
+                }
+                if self.game.doc.class_of(p).is_some_and(|c| {
+                    rustudio_core::doc::is_a(&c, "GuiObject")
+                        || rustudio_core::doc::is_a(&c, "LayerCollector")
+                }) {
+                    return p;
+                }
+                cur = self.game.doc.dom.get_by_ref(p).map(|i| i.parent());
+            }
+        }
+        let sg = self.service("StarterGui");
+        if let Some(existing) = self.game.doc.dom.get_by_ref(sg).and_then(|inst| {
+            inst.children()
+                .iter()
+                .copied()
+                .find(|&c| self.game.doc.class_of(c).as_deref() == Some("ScreenGui"))
+        }) {
+            return existing;
+        }
+        self.game
+            .doc
+            .insert(sg, rbx_dom_weak::InstanceBuilder::new("ScreenGui").with_name("ScreenGui"))
+    }
+
+    /// All currently selected instances that inherit from `GuiObject`.
+    pub(crate) fn selected_gui_objects(&self) -> Vec<Ref> {
+        self.game
+            .doc
+            .selection
+            .iter()
+            .copied()
+            .filter(|&r| {
+                self.game
+                    .doc
+                    .class_of(r)
+                    .is_some_and(|c| rustudio_core::doc::is_a(&c, "GuiObject"))
+            })
+            .collect()
+    }
+
+    /// Sets `AnchorPoint` on all selected `GuiObject`s with undo history.
+    pub(crate) fn set_gui_anchor_point(&mut self, ax: f32, ay: f32) {
+        let objs = self.selected_gui_objects();
+        if objs.is_empty() {
+            return;
+        }
+        let val = Variant::Vector2(rbx_dom_weak::types::Vector2::new(ax, ay));
+        let edits = objs
+            .into_iter()
+            .map(|r| (r, rbx_dom_weak::ustr("AnchorPoint"), val.clone()))
+            .collect();
+        self.game.doc.set_props("Set AnchorPoint", edits, None);
+    }
+
+    /// Centers all selected `GuiObject`s inside their parent with undo history.
+    pub(crate) fn center_gui_in_parent(&mut self) {
+        let objs = self.selected_gui_objects();
+        if objs.is_empty() {
+            return;
+        }
+        let anchor = Variant::Vector2(rbx_dom_weak::types::Vector2::new(0.5, 0.5));
+        let pos = Variant::UDim2(rbx_dom_weak::types::UDim2::new(
+            rbx_dom_weak::types::UDim::new(0.5, 0),
+            rbx_dom_weak::types::UDim::new(0.5, 0),
+        ));
+        let mut edits = Vec::with_capacity(objs.len() * 2);
+        for r in objs {
+            edits.push((r, rbx_dom_weak::ustr("AnchorPoint"), anchor.clone()));
+            edits.push((r, rbx_dom_weak::ustr("Position"), pos.clone()));
+        }
+        self.game.doc.set_props("Center in Parent", edits, None);
+    }
+
+    /// Fills parent bounds on all selected `GuiObject`s with undo history.
+    pub(crate) fn fill_gui_parent(&mut self) {
+        let objs = self.selected_gui_objects();
+        if objs.is_empty() {
+            return;
+        }
+        let anchor = Variant::Vector2(rbx_dom_weak::types::Vector2::new(0.0, 0.0));
+        let pos = Variant::UDim2(rbx_dom_weak::types::UDim2::new(
+            rbx_dom_weak::types::UDim::new(0.0, 0),
+            rbx_dom_weak::types::UDim::new(0.0, 0),
+        ));
+        let size = Variant::UDim2(rbx_dom_weak::types::UDim2::new(
+            rbx_dom_weak::types::UDim::new(1.0, 0),
+            rbx_dom_weak::types::UDim::new(1.0, 0),
+        ));
+        let mut edits = Vec::with_capacity(objs.len() * 3);
+        for r in objs {
+            edits.push((r, rbx_dom_weak::ustr("AnchorPoint"), anchor.clone()));
+            edits.push((r, rbx_dom_weak::ustr("Position"), pos.clone()));
+            edits.push((r, rbx_dom_weak::ustr("Size"), size.clone()));
+        }
+        self.game.doc.set_props("Fill Parent", edits, None);
     }
 
     /// Inserts go into the first selected object, else Workspace (Studio).
@@ -937,13 +1046,26 @@ impl Editor {
             other => {
                 if let Some(class) = other.strip_prefix("class:") {
                     let class = class.to_string();
-                    let gui_class = class.starts_with("UI") || rustudio_core::doc::is_a(&class, "GuiObject");
-                    match self.gui_target().filter(|_| gui_class) {
-                        Some(t) => self.insert_class(&class, t),
-                        None => {
-                            for p in self.selected_parts() {
-                                self.insert_class(&class, p);
-                            }
+                    if class == "ScreenGui" {
+                        let sg = self.service("StarterGui");
+                        self.insert_class(&class, sg);
+                    } else if matches!(class.as_str(), "BillboardGui" | "SurfaceGui") {
+                        let parent = self
+                            .selected_parts()
+                            .first()
+                            .copied()
+                            .unwrap_or_else(|| self.service("StarterGui"));
+                        self.insert_class(&class, parent);
+                    } else if class.starts_with("UI")
+                        || class == "Path2D"
+                        || rustudio_core::doc::is_a(&class, "GuiObject")
+                        || rustudio_core::doc::is_a(&class, "UIBase")
+                    {
+                        let target = self.ensure_gui_target();
+                        self.insert_class(&class, target);
+                    } else {
+                        for p in self.selected_parts() {
+                            self.insert_class(&class, p);
                         }
                     }
                 }

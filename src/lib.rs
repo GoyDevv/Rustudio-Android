@@ -22,6 +22,7 @@
 //! `#[cfg(not(target_os = "android"))]`.
 
 pub mod asset_manager;
+pub mod asset_picker;
 pub mod autosave;
 pub mod plugin_store;
 pub mod toolbox;

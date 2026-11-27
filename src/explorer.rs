@@ -49,6 +49,8 @@ pub struct ExplorerState {
     forced_open: HashSet<Ref>,
     /// The search text last frame (clearing it reveals the selection).
     last_filter: String,
+    /// Touch-friendly multi-select mode (normal tap toggles selection like Ctrl+Click).
+    pub multi_select: bool,
 }
 
 /// Order-independent fingerprint of the expanded set.
@@ -299,6 +301,25 @@ fn flatten(doc: &Document, st: &ExplorerState) -> (Vec<(Ref, usize)>, HashSet<Re
     (rows, ancestors)
 }
 
+/// Draws a compact rounded checkbox (filled with checkmark when checked, hollow when unchecked).
+fn paint_checkbox(painter: &egui::Painter, rect: Rect, checked: bool) {
+    if checked {
+        painter.rect_filled(rect, 2.5, theme::SELECT);
+        let c = rect.center();
+        let w = rect.width();
+        let h = rect.height();
+        let p0 = Pos2::new(c.x - w * 0.28, c.y + h * 0.02);
+        let p1 = Pos2::new(c.x - w * 0.06, c.y + h * 0.25);
+        let p2 = Pos2::new(c.x + w * 0.30, c.y - h * 0.24);
+        let stroke = Stroke::new(1.6, Color32::WHITE);
+        painter.line_segment([p0, p1], stroke);
+        painter.line_segment([p1, p2], stroke);
+    } else {
+        painter.rect_filled(rect, 2.5, theme::PANEL_DARK);
+        painter.rect_stroke(rect, 2.5, Stroke::new(1.2, theme::TEXT_DIM), egui::StrokeKind::Inside);
+    }
+}
+
 impl Editor {
     pub fn explorer_ui(&mut self, ui: &mut egui::Ui) {
         let _p = rustudio_core::bench::scope("explorer_build");
@@ -332,28 +353,119 @@ impl Editor {
             }
         }
         ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.explorer.filter)
-                    .hint_text("Search")
-                    .desired_width(f32::INFINITY),
-            );
-            self.ui_rects.insert("explorer.search", r.rect);
-            // An "x" inside the box's right end clears the search.
-            if !self.explorer.filter.is_empty() {
-                let x_rect = Rect::from_center_size(
-                    Pos2::new(r.rect.max.x - 10.0, r.rect.center().y),
-                    Vec2::splat(14.0),
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let active = self.explorer.multi_select;
+                let text_col = if active { Color32::WHITE } else { theme::TEXT };
+                let label_galley = ui.painter().layout_no_wrap(
+                    "Multi".to_string(),
+                    egui::FontId::proportional(12.0),
+                    text_col,
                 );
-                let x = ui.interact(x_rect, egui::Id::new("explorer_search_clear"), Sense::click());
-                let x = x.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Clear search");
-                let col = if x.hovered() { Color32::WHITE } else { theme::TEXT_DIM };
-                rustudio_engine::ti::paint(ui.painter(), x_rect, "x", col);
-                self.ui_rects.insert("explorer.search_clear", x_rect);
-                if x.clicked() {
-                    self.explorer.filter.clear();
+                let box_sz = 11.0;
+                let pad_x = 6.0;
+                let gap = 4.0;
+                let btn_w = pad_x + box_sz + gap + label_galley.size().x + pad_x;
+                let btn_h = ui.spacing().interact_size.y.max(20.0);
+                let (btn_rect, btn_resp) = ui.allocate_exact_size(Vec2::new(btn_w, btn_h), Sense::click());
+                let btn_resp = btn_resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Toggle multi-select mode (tap rows to add/remove from selection)");
+                let btn_fill = if active {
+                    theme::ACCENT
+                } else if btn_resp.hovered() {
+                    theme::ACTIVE_TAB
+                } else {
+                    theme::PANEL_ALT
+                };
+                let btn_stroke = if active {
+                    Stroke::new(1.0, theme::SELECT)
+                } else {
+                    Stroke::new(1.0, theme::DIVIDER)
+                };
+                ui.painter().rect_filled(btn_rect, 3.0, btn_fill);
+                ui.painter().rect_stroke(btn_rect, 3.0, btn_stroke, egui::StrokeKind::Inside);
+                let cb_rect = Rect::from_center_size(
+                    Pos2::new(btn_rect.min.x + pad_x + box_sz * 0.5, btn_rect.center().y),
+                    Vec2::splat(box_sz),
+                );
+                paint_checkbox(ui.painter(), cb_rect, active);
+                ui.painter().galley(
+                    Pos2::new(cb_rect.max.x + gap, btn_rect.center().y - label_galley.size().y * 0.5),
+                    label_galley,
+                    text_col,
+                );
+                self.ui_rects.insert("explorer.multi_select", btn_rect);
+                if btn_resp.clicked() {
+                    self.explorer.multi_select = !self.explorer.multi_select;
                 }
-            }
+
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.explorer.filter)
+                        .hint_text("Search")
+                        .desired_width(f32::INFINITY),
+                );
+                self.ui_rects.insert("explorer.search", r.rect);
+                // An "x" inside the box's right end clears the search.
+                if !self.explorer.filter.is_empty() {
+                    let x_rect = Rect::from_center_size(
+                        Pos2::new(r.rect.max.x - 10.0, r.rect.center().y),
+                        Vec2::splat(14.0),
+                    );
+                    let x = ui.interact(x_rect, egui::Id::new("explorer_search_clear"), Sense::click());
+                    let x = x.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Clear search");
+                    let col = if x.hovered() { Color32::WHITE } else { theme::TEXT_DIM };
+                    rustudio_engine::ti::paint(ui.painter(), x_rect, "x", col);
+                    self.ui_rects.insert("explorer.search_clear", x_rect);
+                    if x.clicked() {
+                        self.explorer.filter.clear();
+                    }
+                }
+            });
         });
+        if self.explorer.multi_select {
+            ui.add_space(2.0);
+            egui::Frame::new()
+                .fill(theme::PANEL_DARK)
+                .stroke(Stroke::new(1.0, theme::SELECT_BG))
+                .corner_radius(3.0)
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let count = self.game.doc.selection.len();
+                        ui.label(
+                            RichText::new(format!("{count} selected"))
+                                .small()
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let done = ui.add(
+                                egui::Button::new(RichText::new("Done").small().strong().color(Color32::WHITE))
+                                    .fill(theme::ACCENT)
+                                    .corner_radius(3.0),
+                            );
+                            self.ui_rects.insert("explorer.multi_done", done.rect);
+                            if done.clicked() {
+                                self.explorer.multi_select = false;
+                            }
+                            let clear = ui.add_enabled(
+                                count > 0,
+                                egui::Button::new(
+                                    RichText::new("Clear")
+                                        .small()
+                                        .color(if count > 0 { theme::TEXT } else { theme::TEXT_DIM }),
+                                )
+                                .fill(theme::PANEL_ALT)
+                                .corner_radius(3.0),
+                            );
+                            self.ui_rects.insert("explorer.multi_clear", clear.rect);
+                            if clear.clicked() {
+                                self.game.doc.selection.clear();
+                            }
+                        });
+                    });
+                });
+        }
         // Clearing the search keeps what was picked in it in view.
         if self.explorer.filter.trim().is_empty() && !self.explorer.last_filter.trim().is_empty() {
             let sel = self.game.doc.selection.clone();
@@ -437,7 +549,7 @@ impl Editor {
                 if let Some(p) = resp.dnd_release_payload::<DragRefs>() {
                     actions.push(RowAction::Reparent(p.0.clone(), self.game.doc.default_parent()));
                 }
-                if resp.clicked() {
+                if resp.clicked() && !self.explorer.multi_select {
                     actions.push(RowAction::ClearSelection);
                 }
             }
@@ -572,7 +684,15 @@ impl Editor {
             painter.rect_filled(rect, 0.0, theme::HOVER_BG);
         }
         let left_pad = if cfg!(target_os = "android") { 8.0 } else { 4.0 };
-        let x0 = rect.min.x + left_pad + depth as f32 * INDENT;
+        let cb_w = if self.explorer.multi_select { 18.0 } else { 0.0 };
+        if self.explorer.multi_select {
+            let cb_rect = Rect::from_center_size(
+                Pos2::new(rect.min.x + left_pad + 6.0, rect.center().y),
+                Vec2::splat(12.0),
+            );
+            paint_checkbox(&painter, cb_rect, selected);
+        }
+        let x0 = rect.min.x + left_pad + cb_w + depth as f32 * INDENT;
         match drop {
             Some(Drop::Into) => {
                 painter.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Inside);
@@ -666,10 +786,11 @@ impl Editor {
                 actions.push(RowAction::Toggle(r));
             } else {
                 let m = ui.input(|i| i.modifiers);
-                actions.push(RowAction::Click(r, m.command, m.shift));
+                let toggle = m.command || self.explorer.multi_select;
+                actions.push(RowAction::Click(r, toggle, m.shift));
             }
         }
-        if resp.double_clicked() && !on_tri {
+        if resp.double_clicked() && !on_tri && !self.explorer.multi_select {
             if matches!(class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
                 actions.push(RowAction::OpenScript(r));
             } else {
@@ -683,7 +804,7 @@ impl Editor {
             // (Data "", MimeType "roblox/selection"), so plugins read Selection
             // (checks/plugins/ref/captures/xdrag.txt S1, S5, S7).
             let refs = if selected { self.game.doc.selection.clone() } else { vec![r] };
-            if !selected && !ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+            if !selected && !self.explorer.multi_select && !ui.input(|i| i.modifiers.command || i.modifiers.shift) {
                 actions.push(RowAction::Click(r, false, false));
             }
             resp.dnd_set_drag_payload(DragRefs(refs));
@@ -721,7 +842,7 @@ impl Editor {
         resp.context_menu(|ui| {
             ui.set_min_width(200.0);
             if !selected {
-                actions.push(RowAction::Click(r, false, false));
+                actions.push(RowAction::Click(r, self.explorer.multi_select, false));
             }
             let item = |ui: &mut egui::Ui, label: &str, enabled: bool| ui.add_enabled(enabled, egui::Button::new(label).frame(false)).clicked();
             if item(ui, "Cut", true) {

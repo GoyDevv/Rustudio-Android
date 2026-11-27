@@ -1147,30 +1147,63 @@ impl Editor {
         let doc_dir = self.game.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
         // (a Toolbox card dragged in and inserted: the plugin drags it, so
         // its mouse follows the pointer though egui's drag owns it)
+        // On Android/touchscreens, a tap or drag often arrives without hover
+        // and before `view_buttons[0]` flips true, so also read `interact_pos()`
+        // and raw PointerButton/Touch positions inside `rect`.
+        let event_pos = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::PointerButton { pos, .. } => Some(*pos),
+                egui::Event::Touch { pos, .. } => Some(*pos),
+                _ => None,
+            })
+        });
         let pointer = resp
             .hover_pos()
             .or_else(|| if self.toolbox_drag_in_live() { ctx.pointer_hover_pos() } else { None })
             .or_else(|| {
-                if self.plugin_ui.view_buttons[0] {
+                if self.plugin_ui.view_buttons[0]
+                    || ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released())
+                {
                     ctx.input(|i| i.pointer.interact_pos())
                 } else {
                     None
                 }
             })
+            .or(event_pos)
             .filter(|p| rect.contains(*p));
         let was_over = self.plugin_ui.view.xy.is_some();
         let now_over = pointer.is_some();
         if was_over != now_over {
             self.plugin_ui.queue.push(In::ViewportHover(now_over));
         }
-        let ray = pointer.map(|p| self.game.cam.ray(rect, p));
-        let hit = ray.as_ref().and_then(|r| self.plugin_pick(r).map(|(t, d)| (t, r.at(d))));
-        self.plugin_ui.view = ViewIn {
-            rect: Some(rect),
-            xy: pointer.map(|p| [p.x - rect.min.x, p.y - rect.min.y]),
-            ray: ray.as_ref().map(|r| (r.origin, r.dir)).unwrap_or_default(),
-            hit,
-        };
+        if let Some(p) = pointer {
+            let ray = self.game.cam.ray(rect, p);
+            let hit = self.plugin_pick(&ray).map(|(t, d)| (t, ray.at(d)));
+            self.plugin_ui.view = ViewIn {
+                rect: Some(rect),
+                xy: Some([p.x - rect.min.x, p.y - rect.min.y]),
+                ray: (ray.origin, ray.dir),
+                hit,
+            };
+        } else if !self.plugin_ui.next_frame_queue.is_empty() && self.plugin_ui.view.xy.is_some() {
+            // Preserve tap coordinates/ray for the 1-frame deferred Button1Up
+            // after a quick touchscreen tap so PluginMouse/UIS still see the hit.
+            let prev = self.plugin_ui.view;
+            let ray = rustudio_core::math::Ray { origin: prev.ray.0, dir: prev.ray.1 };
+            let hit = if ray.dir.length_squared() > 1e-8 {
+                self.plugin_pick(&ray).map(|(t, d)| (t, ray.at(d)))
+            } else {
+                prev.hit
+            };
+            self.plugin_ui.view = ViewIn { rect: Some(rect), xy: prev.xy, ray: prev.ray, hit };
+        } else {
+            self.plugin_ui.view = ViewIn {
+                rect: Some(rect),
+                xy: None,
+                ray: Default::default(),
+                hit: None,
+            };
+        }
         let Editor {
             plugin_ui,
             game: Game { doc, cam, assets, render_state, fixed_dt, .. },
@@ -1309,7 +1342,40 @@ impl Editor {
             } else {
                 &mut self.plugin_ui.queue
             };
-            push_buttons(ctx, q, deferred, over_gui || adorn_handles, xy);
+            let (delta, uis_wheel) = ctx.input(|i| {
+                let w: f32 = i
+                    .raw
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                        _ => None,
+                    })
+                    .sum();
+                (i.pointer.delta(), w)
+            });
+            let gp = over_gui || adorn_handles;
+            if delta != egui::Vec2::ZERO || !was_over {
+                q.push(In::Uis {
+                    state: "Change",
+                    uit: "MouseMovement",
+                    key: "Unknown".into(),
+                    pos: [xy[0], xy[1], 0.0],
+                    delta: [delta.x, delta.y],
+                    gp,
+                });
+            }
+            if uis_wheel != 0.0 {
+                q.push(In::Uis {
+                    state: "Change",
+                    uit: "MouseWheel",
+                    key: "Unknown".into(),
+                    pos: [xy[0], xy[1], uis_wheel.signum()],
+                    delta: [0.0; 2],
+                    gp,
+                });
+            }
+            push_buttons(ctx, q, deferred, gp, xy);
         }
         if !(active && pointer.is_some() && !over_gui) {
             // (a release outside still ends a press the mouse had)
@@ -1655,9 +1721,13 @@ pub(super) fn apply_plugin_ui_flush(
     let had_queue = !flush.queue.is_empty();
     let view = flush.view;
     let mut mouse_changed = false;
+    let mut view_size_changed = false;
+    let hit_rot = crate::plugin_host::api::mouse::ray_look_rot(view.ray.1);
     if let Ok(mut w) = rustudio_engine::runtime::world(lua) {
         if let Some(rect) = view.rect.or(flush.vp_rect) {
-            w.input.view_size = [rect.width(), rect.height()];
+            let next_vs = [rect.width(), rect.height()];
+            view_size_changed = w.input.view_size != next_vs;
+            w.input.view_size = next_vs;
         }
         let next_xy = view.xy.unwrap_or([-1.0, -1.0]);
         mouse_changed = w.input.mouse_xy != next_xy;
@@ -1666,12 +1736,12 @@ pub(super) fn apply_plugin_ui_flush(
         w.input.mouse_target = view.hit.map(|h| h.0);
         w.input.mouse_hit = view.hit.map(|h| rustudio_core::math::Xform {
             pos: h.1,
-            rot: glam::Mat3::IDENTITY,
+            rot: hit_rot,
         });
         if view.hit.is_none() && view.xy.is_some() {
             w.input.mouse_hit = Some(rustudio_core::math::Xform {
                 pos: view.ray.0 + view.ray.1 * 10000.0,
-                rot: glam::Mat3::IDENTITY,
+                rot: hit_rot,
             });
         }
         if let Some(layout) = flush.layout {
@@ -1683,12 +1753,16 @@ pub(super) fn apply_plugin_ui_flush(
     }
     crate::plugin_host::api::mouse::set_pointer_in_view(lua, view.xy.is_some());
     if let Some(now) = flush.cam_now {
-        if cam_sent.is_none_or(|s| !same_cam(&s, &now)) {
+        let dom_stale = rustudio_engine::runtime::world(lua)
+            .ok()
+            .and_then(|w| read_camera(w.d()))
+            .is_none_or(|dom_cam| !same_cam(&dom_cam, &now));
+        if cam_sent.is_none_or(|s| !same_cam(&s, &now)) || dom_stale {
             write_camera(rt, &now);
             *cam_sent = Some(now);
         }
     }
-    if layout_changed {
+    if layout_changed || view_size_changed {
         let _ = rustudio_engine::runtime::ext::fire_layout_changes(lua);
     }
     if had_queue {

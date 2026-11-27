@@ -56,8 +56,8 @@ fn ribbon_icon_color(icon: &str) -> Color32 {
         "mountain" => [89, 210, 190],
         "user-plus" | "user-cog" | "accessible" | "hanger" | "shirt" | "checklist" |
         "movie" | "chart-line" => [255, 160, 35],
-        "app-window" | "square" | "typography" | "forms" | "border-corner-rounded" |
-        "layout-list" | "aspect-ratio" => [229, 126, 174],
+        "app-window" | "square" | "typography" | "click" | "forms" | "border-corner-rounded" |
+        "layout-list" | "aspect-ratio" | "layout-grid" => [229, 126, 174],
         "file-code" | "indent-increase" | "search" | "list-numbers" | "terminal-2" |
         "terminal" | "point" | "stack-2" | "chart-bar" | "activity" => [190, 218, 86],
         _ => [225, 229, 241],
@@ -419,16 +419,25 @@ impl Editor {
                     self.rb(ui, "chart-line", "Graph Editor", "graph_editor", graph_on, a);
                 }
                 RibbonTab::Ui => {
-                    self.rb(ui, "app-window", "GUI", "gui", false, a);
-                    self.rb_class(ui, "square", "Frame", "ui_frame", "Frame", a);
-                    self.rb_class(ui, "typography", "Label", "ui_label", "TextLabel", a);
-                    self.rb_class(ui, "forms", "Input", "ui_input", "TextBox", a);
+                    let guis = ["ScreenGui", "BillboardGui", "SurfaceGui"];
+                    self.class_menu_button(ui, "app-window", "GUI", "gui", &guis, a);
+                    let frames = ["Frame", "ScrollingFrame", "CanvasGroup", "ViewportFrame", "VideoFrame"];
+                    self.class_menu_button(ui, "square", "Frame", "ui_frame", &frames, a);
+                    let labels = ["TextLabel", "ImageLabel"];
+                    self.class_menu_button(ui, "typography", "Label", "ui_label", &labels, a);
+                    let buttons = ["TextButton", "ImageButton"];
+                    self.class_menu_button(ui, "click", "Button", "ui_button", &buttons, a);
+                    let inputs = ["TextBox", "UIDragDetector", "Path2D"];
+                    self.class_menu_button(ui, "forms", "Input", "ui_input", &inputs, a);
+                    divider(ui);
                     let ap = ["UICorner", "UIStroke", "UIGradient", "UIPadding", "UIScale"];
                     self.class_menu_button(ui, "border-corner-rounded", "Appearance", "ui_appearance", &ap, a);
                     let la = ["UIListLayout", "UIGridLayout", "UIPageLayout", "UITableLayout", "UIFlexItem"];
                     self.class_menu_button(ui, "layout-list", "Layout", "ui_layout", &la, a);
                     let co = ["UIAspectRatioConstraint", "UISizeConstraint", "UITextSizeConstraint"];
                     self.class_menu_button(ui, "aspect-ratio", "Constraint", "ui_constraint", &co, a);
+                    divider(ui);
+                    self.ui_anchor_button(ui);
                     divider(ui);
                     let style_on = self.action_state("style_editor").1 == Some(true);
                     self.rb(ui, "brush", "Style Editor", "style_editor", style_on, a);
@@ -718,15 +727,155 @@ impl Editor {
             });
     }
 
-    fn rb_class(&mut self, ui: &mut egui::Ui, icon: &str, label: &str, action: &str, class: &str, act: &mut Option<String>) {
-        let (enabled, _) = self.action_state(action);
-        let resp = ribbon_button(ui, icon, label, false, enabled);
-        if enabled {
-            if resp.clicked() {
-                *act = Some(format!("class:{class}"));
+    /// UI > Anchor: 9-point `AnchorPoint` preset grid plus one-tap
+    /// Center in Parent and Fill Parent helpers for selected `GuiObject`s.
+    fn ui_anchor_button(&mut self, ui: &mut egui::Ui) {
+        enum AnchorAction {
+            SetAnchor(f32, f32),
+            CenterInParent,
+            FillParent,
+        }
+
+        const PRESETS: [[(&str, &str, f32, f32); 3]; 3] = [
+            [
+                ("TL", "(0, 0)", 0.0, 0.0),
+                ("TC", "(0.5, 0)", 0.5, 0.0),
+                ("TR", "(1, 0)", 1.0, 0.0),
+            ],
+            [
+                ("ML", "(0, 0.5)", 0.0, 0.5),
+                ("C", "(0.5, 0.5)", 0.5, 0.5),
+                ("MR", "(1, 0.5)", 1.0, 0.5),
+            ],
+            [
+                ("BL", "(0, 1)", 0.0, 1.0),
+                ("BC", "(0.5, 1)", 0.5, 1.0),
+                ("BR", "(1, 1)", 1.0, 1.0),
+            ],
+        ];
+
+        let edit = self.game.play.is_none();
+        let selected = self.selected_gui_objects();
+        let has_gui = edit && !selected.is_empty();
+        let current_anchor = selected.first().map(|&r| {
+            match self.game.doc.prop(r, "AnchorPoint") {
+                Some(rbx_dom_weak::types::Variant::Vector2(v)) => (v.x, v.y),
+                _ => (0.0, 0.0),
             }
+        });
+
+        let resp = ribbon_button(ui, "layout-grid", "Anchor", false, edit);
+        let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
+        rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        let resp = resp.on_hover_text(if has_gui {
+            "AnchorPoint & Alignment presets for selected GuiObjects"
         } else {
-            resp.on_hover_text(format!("Select a GUI object to add a {class} to it"));
+            "Select a GuiObject to set AnchorPoint or align to parent"
+        });
+        if !edit {
+            return;
+        }
+
+        let mut chosen: Option<AnchorAction> = None;
+        egui::Popup::menu(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_width(188.0);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.label(egui::RichText::new("AnchorPoint").size(12.5).strong().color(theme::TEXT));
+                if !has_gui {
+                    ui.label(
+                        egui::RichText::new("Select a GuiObject to apply presets.")
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+                ui.add_enabled_ui(has_gui, |ui| {
+                    for row in PRESETS {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                            for (code, coords, ax, ay) in row {
+                                let active = current_anchor.is_some_and(|(cx, cy)| {
+                                    (cx - ax).abs() < 0.01 && (cy - ay).abs() < 0.01
+                                });
+                                let sense = if has_gui { Sense::click() } else { Sense::hover() };
+                                let (r, cell) = ui.allocate_exact_size(Vec2::new(58.0, 38.0), sense);
+                                let bg = if active {
+                                    theme::ACTIVE_TAB.gamma_multiply(1.4)
+                                } else if has_gui && cell.hovered() {
+                                    theme::HOVER_BG
+                                } else {
+                                    Color32::from_rgb(38, 40, 46)
+                                };
+                                let stroke_col = if active {
+                                    theme::ACCENT
+                                } else {
+                                    Color32::from_rgb(70, 72, 78)
+                                };
+                                ui.painter().rect_filled(r, 4.0, bg);
+                                ui.painter().rect_stroke(
+                                    r,
+                                    4.0,
+                                    egui::Stroke::new(1.0, stroke_col),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let text_col = if !has_gui {
+                                    theme::TEXT_DIM
+                                } else if active {
+                                    Color32::WHITE
+                                } else {
+                                    theme::TEXT
+                                };
+                                ui.painter().text(
+                                    egui::pos2(r.center().x, r.min.y + 13.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    code,
+                                    egui::FontId::proportional(12.0),
+                                    text_col,
+                                );
+                                ui.painter().text(
+                                    egui::pos2(r.center().x, r.max.y - 10.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    coords,
+                                    egui::FontId::proportional(9.5),
+                                    if active { Color32::WHITE.gamma_multiply(0.9) } else { theme::TEXT_DIM },
+                                );
+                                if cell
+                                    .on_hover_text(format!("{code} {coords}"))
+                                    .clicked()
+                                    && has_gui
+                                {
+                                    chosen = Some(AnchorAction::SetAnchor(ax, ay));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                    if ui
+                        .add_sized(Vec2::new(186.0, 30.0), egui::Button::new("Center in Parent"))
+                        .on_hover_text("AnchorPoint = (0.5, 0.5), Position = (0.5, 0, 0.5, 0)")
+                        .clicked()
+                    {
+                        chosen = Some(AnchorAction::CenterInParent);
+                        ui.close();
+                    }
+                    if ui
+                        .add_sized(Vec2::new(186.0, 30.0), egui::Button::new("Fill Parent"))
+                        .on_hover_text("AnchorPoint = (0, 0), Position = (0, 0, 0, 0), Size = (1, 0, 1, 0)")
+                        .clicked()
+                    {
+                        chosen = Some(AnchorAction::FillParent);
+                        ui.close();
+                    }
+                });
+            });
+
+        match chosen {
+            Some(AnchorAction::SetAnchor(ax, ay)) => self.set_gui_anchor_point(ax, ay),
+            Some(AnchorAction::CenterInParent) => self.center_gui_in_parent(),
+            Some(AnchorAction::FillParent) => self.fill_gui_parent(),
+            None => {}
         }
     }
 
@@ -904,7 +1053,7 @@ fn apply_gui_visible_defaults(doc: &mut rustudio_core::doc::Document, r: rbx_dom
     use rbx_dom_weak::ustr;
     let size = match class {
         "TextLabel" | "TextButton" | "TextBox" => Some((200, 50)),
-        "Frame" | "ImageLabel" | "ImageButton" | "ScrollingFrame" | "CanvasGroup" | "ViewportFrame" => Some((100, 100)),
+        "Frame" | "ImageLabel" | "ImageButton" | "ScrollingFrame" | "CanvasGroup" | "ViewportFrame" | "VideoFrame" => Some((100, 100)),
         _ => None,
     };
     let Some((w, h)) = size else { return };

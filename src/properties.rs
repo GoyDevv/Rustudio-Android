@@ -168,7 +168,7 @@ fn color_variant(like: &Variant, c: [u8; 3]) -> Variant {
     }
 }
 
-fn has_prop(class: &str, name: &str) -> bool {
+pub(crate) fn has_prop(class: &str, name: &str) -> bool {
     doc::has_prop(class, name)
 }
 
@@ -1762,6 +1762,65 @@ impl Editor {
                 let spec = crate::prop_slider::spec_for(class, name).unwrap_or(crate::prop_slider::SliderSpec { min: 0.0, max: 1.0, ticks: 20.0, square: false });
                 self.slider_cell(p, name, other, mixed, spec, v, &resp, clicked_value, edits);
             }
+            Variant::ContentId(_) | Variant::Content(_) => {
+                let is_content = matches!(&value, Variant::Content(_));
+                let cur_uri = match &value {
+                    Variant::ContentId(c) => c.as_str().to_string(),
+                    Variant::Content(c) => c.as_uri().unwrap_or_default().to_string(),
+                    _ => String::new(),
+                };
+                let shown = if mixed { MIXED_LABEL.to_string() } else { cur_uri.clone() };
+                let col = if ro { READ_ONLY } else if mixed { MIXED_COLOR } else { TEXT };
+                if ro {
+                    Self::value_label(p, v, &shown, col);
+                } else {
+                    let btn_w = 22.0_f32.min((v.width() * 0.35).max(18.0));
+                    let btn_rect = Rect::from_min_max(
+                        Pos2::new((v.max.x - btn_w).max(v.min.x), v.min.y + 1.0),
+                        Pos2::new(v.max.x, v.max.y - 1.0),
+                    );
+                    let text_rect = Rect::from_min_max(
+                        v.min,
+                        Pos2::new((btn_rect.min.x - 3.0).max(v.min.x), v.max.y),
+                    );
+                    Self::value_label(p, text_rect, &shown, col);
+                    let btn_resp = p.ui.interact(
+                        btn_rect,
+                        p.ui.id().with(("asset_picker_btn", name)),
+                        Sense::click(),
+                    );
+                    let btn_bg = if btn_resp.hovered() {
+                        Color32::from_rgb(66, 70, 84)
+                    } else {
+                        Color32::from_rgb(48, 51, 61)
+                    };
+                    let painter = p.ui.painter();
+                    painter.rect_filled(btn_rect, 2.0, btn_bg);
+                    painter.rect_stroke(
+                        btn_rect,
+                        2.0,
+                        Stroke::new(1.0, Color32::from_rgb(76, 80, 94)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.text(
+                        btn_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "...",
+                        FontId::proportional(FONT),
+                        TEXT,
+                    );
+                    if clicked_value || btn_resp.clicked() {
+                        self.props.active_row = Some(name.to_string());
+                        self.asset_picker.open_for(
+                            sel.to_vec(),
+                            class.to_string(),
+                            name.to_string(),
+                            is_content,
+                            if mixed { String::new() } else { cur_uri },
+                        );
+                    }
+                }
+            }
             other => {
                 let shown = if mixed { MIXED_LABEL.to_string() } else { value_text(&self.game.doc, other) };
                 let init = if mixed {
@@ -2622,28 +2681,61 @@ impl Editor {
                         .collect();
                     self.game.doc.set_props("Set CustomPhysicalProperties", changes, None);
                 }
-                // Editing AudioContent on Sound / AudioPlayer keeps legacy
-                // SoundId / Asset in sync (Roblox treats the pair as one property).
-                Edit::Prop(name, Variant::Content(c))
-                    if name == "AudioContent"
+                // Editing AudioContent / SoundId / Asset on Sound / AudioPlayer keeps
+                // the paired Content & ContentId properties in sync.
+                Edit::Prop(name, v)
+                    if matches!(name.as_str(), "AudioContent" | "SoundId" | "Asset")
+                        && matches!(&v, Variant::Content(_) | Variant::ContentId(_))
                         && self.game.doc.class_of(first).is_some_and(|cl| matches!(cl.as_str(), "Sound" | "AudioPlayer")) =>
                 {
-                    let uri = c.as_uri().unwrap_or("").to_string();
+                    let uri = match &v {
+                        Variant::Content(c) => c.as_uri().unwrap_or("").to_string(),
+                        Variant::ContentId(c) => c.as_str().to_string(),
+                        _ => String::new(),
+                    };
+                    let content_val = Variant::Content(rbx_dom_weak::types::Content::from(uri.clone()));
+                    let cid_val = Variant::ContentId(uri.into());
                     let mut changes = Vec::new();
                     for &r in sel {
                         match self.game.doc.class_of(r).as_deref() {
                             Some("Sound") => {
-                                changes.push((r, ustr("AudioContent"), Variant::Content(c.clone())));
-                                changes.push((r, ustr("SoundId"), Variant::ContentId(uri.clone().into())));
+                                changes.push((r, ustr("AudioContent"), content_val.clone()));
+                                changes.push((r, ustr("SoundId"), cid_val.clone()));
                             }
                             Some("AudioPlayer") => {
-                                changes.push((r, ustr("AudioContent"), Variant::Content(c.clone())));
-                                changes.push((r, ustr("Asset"), Variant::ContentId(uri.clone().into())));
+                                changes.push((r, ustr("AudioContent"), content_val.clone()));
+                                changes.push((r, ustr("Asset"), cid_val.clone()));
                             }
                             _ => {}
                         }
                     }
-                    self.game.doc.set_props("Set AudioContent", changes, None);
+                    self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                }
+                // Editing MeshContent / MeshId keeps the paired properties in sync.
+                Edit::Prop(name, v)
+                    if matches!(name.as_str(), "MeshContent" | "MeshId")
+                        && matches!(&v, Variant::Content(_) | Variant::ContentId(_)) =>
+                {
+                    let uri = match &v {
+                        Variant::Content(c) => c.as_uri().unwrap_or("").to_string(),
+                        Variant::ContentId(c) => c.as_str().to_string(),
+                        _ => String::new(),
+                    };
+                    let content_val = Variant::Content(rbx_dom_weak::types::Content::from(uri.clone()));
+                    let cid_val = Variant::ContentId(uri.into());
+                    let mut changes = Vec::new();
+                    for &r in sel {
+                        let Some(c) = self.game.doc.class_of(r) else { continue };
+                        if has_prop(c.as_str(), "MeshContent") {
+                            changes.push((r, ustr("MeshContent"), content_val.clone()));
+                        }
+                        if has_prop(c.as_str(), "MeshId") {
+                            changes.push((r, ustr("MeshId"), cid_val.clone()));
+                        }
+                    }
+                    if !changes.is_empty() {
+                        self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                    }
                 }
                 Edit::Prop(name, v) => {
                     let targets: Vec<Ref> = sel

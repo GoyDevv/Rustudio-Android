@@ -10,10 +10,24 @@
 //! measured for an idle PluginMouse in Studio (ViewSizeX 1736 there: the
 //! viewport's size).
 
-use mlua::{Lua, Value};
+use mlua::{IntoLua, Lua, Value};
 use rbx_dom_weak::types::Ref;
 
 use super::*;
+
+/// Builds a right-handed Roblox CFrame rotation whose LookVector (-Z) points
+/// along `dir` (so `Mouse.Origin.LookVector` and `Mouse.Hit.LookVector` match
+/// `Mouse.UnitRay.Direction`, as in Roblox Studio).
+pub(crate) fn ray_look_rot(dir: glam::Vec3) -> glam::Mat3 {
+    let fwd = dir.normalize_or_zero();
+    if fwd.length_squared() < 1e-8 {
+        return glam::Mat3::IDENTITY;
+    }
+    let up_ref = if fwd.y.abs() > 0.999 { glam::Vec3::Z } else { glam::Vec3::Y };
+    let right = fwd.cross(up_ref).normalize_or_zero();
+    let up = right.cross(fwd).normalize_or_zero();
+    glam::Mat3::from_cols(right, up, -fwd)
+}
 
 /// Whether the pointer is over the 3D view (edit-mode input sets it).
 #[derive(Default)]
@@ -65,6 +79,32 @@ pub fn prop_get(lua: &Lua, _r: Ref, class: &str, key: &str) -> mlua::Result<Opti
                 Some(r) if world(lua).is_ok_and(|w| w.d().exists(r)) => Some(inst_value(lua, r)?),
                 _ => Some(Value::Nil),
             }
+        }
+        "UnitRay" => {
+            let ray = world(lua)?.input.mouse_ray;
+            let dir = ray.1.normalize_or_zero();
+            Some(Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LRay {
+                origin: ray.0,
+                direction: dir,
+            })?))
+        }
+        "Origin" => {
+            let ray = world(lua)?.input.mouse_ray;
+            let xf = rustudio_core::math::Xform {
+                pos: ray.0,
+                rot: ray_look_rot(ray.1),
+            };
+            Some(rustudio_engine::ltypes::LCFrame(xf).into_lua(lua)?)
+        }
+        "Hit" | "hit" => {
+            let (ray, hit) = {
+                let w = world(lua)?;
+                (w.input.mouse_ray, w.input.mouse_hit)
+            };
+            let rot = ray_look_rot(ray.1);
+            let pos = hit.map(|h| h.pos).unwrap_or_else(|| ray.0 + ray.1 * 1000.0);
+            let xf = rustudio_core::math::Xform { pos, rot };
+            Some(rustudio_engine::ltypes::LCFrame(xf).into_lua(lua)?)
         }
         _ => None,
     })

@@ -250,8 +250,12 @@ pub fn run(app: AndroidApp) {
         viewport: egui::ViewportBuilder::default().with_title("rustudio").with_app_id("rustudio"),
         // Vulkan first, GLES 3 where there is no usable Vulkan driver
         // (offscreen::wgpu_options_with, with Turnip's objects where
-        // crate::wgpu_setup made them); vsync.
-        wgpu_options: crate::offscreen::wgpu_options_with(false, crate::wgpu_setup),
+        // crate::wgpu_setup made them); uncapped (AutoNoVsync) unless the
+        // user explicitly selected Wait for vsync ("fifo") in Settings.
+        wgpu_options: crate::offscreen::wgpu_options_with(
+            rustudio_core::rustudio_settings::performance_value("present") != "fifo",
+            crate::wgpu_setup,
+        ),
         // eframe's own window state file would go through `directories`,
         // which has no Android folders.
         persistence_path: Some(files_dir().join("eframe.ron")),
