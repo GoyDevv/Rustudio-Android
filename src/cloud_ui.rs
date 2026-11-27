@@ -14,7 +14,7 @@ use egui::RichText;
 use rustudio_account::cloud::{CloudPlace, GroupInfo, RecentPlace, VersionInfo};
 use rustudio_account::{
     open_mode, parse_place_ref, CloudApi, CloudOrigin, OpenMode, Endpoints, Experience, ExperienceSource, PlaceCache,
-    SaveOutcome, TeamCreateStatus, UniverseCollaborator, VersionType,
+    SaveOutcome, TeamCreateStatus, UniverseCollaborator, UserSearchHit, VersionType,
 };
 
 use crate::app::{Editor, Level, PendingAction};
@@ -208,6 +208,11 @@ enum Msg {
         universe_id: u64,
         result: Result<UniverseCollaborator, String>,
     },
+    FriendsLoaded(Vec<UserSearchHit>),
+    UserSearchResults {
+        query: String,
+        hits: Vec<UserSearchHit>,
+    },
     CollaboratorRemoved {
         universe_id: u64,
         subject_type: String,
@@ -305,8 +310,14 @@ struct CollabManageState {
     loading: bool,
     busy: bool,
     collaborators: Vec<UniverseCollaborator>,
+    friends: Vec<UserSearchHit>,
+    friends_loaded: bool,
     invite_input: String,
     invite_edit: bool,
+    search_debounce_until: Option<std::time::Instant>,
+    search_pending_query: String,
+    search_inflight: bool,
+    search_hits: Vec<UserSearchHit>,
     feedback: Option<(bool, String)>,
 }
 
@@ -1110,6 +1121,18 @@ impl Editor {
                             self.cloud.collab_manage.feedback = Some((false, e.clone()));
                             self.error(e);
                         }
+                    }
+                    ctx.request_repaint();
+                }
+                Msg::FriendsLoaded(friends) => {
+                    self.cloud.collab_manage.friends = friends;
+                    self.cloud.collab_manage.friends_loaded = true;
+                    ctx.request_repaint();
+                }
+                Msg::UserSearchResults { query, hits } => {
+                    if self.cloud.collab_manage.invite_input.trim().eq_ignore_ascii_case(query.trim()) {
+                        self.cloud.collab_manage.search_hits = hits;
+                        self.cloud.collab_manage.search_inflight = false;
                     }
                     ctx.request_repaint();
                 }
@@ -2386,6 +2409,8 @@ impl Editor {
         let mut want_invite: Option<(u64, String, String)> = None;
         let mut want_remove: Option<(u64, String, u64, String)> = None;
         let mut want_publish = false;
+        let mut want_load_friends: Option<u64> = None;
+        let mut want_search: Option<String> = None;
 
         let live = self.cloud.live.as_ref();
         let peers: Vec<_> = live
@@ -2431,8 +2456,9 @@ impl Editor {
             .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.place_id));
         let is_live = self.cloud.live.is_some();
         let signed_in = self.game.account.signed_in();
+        let my_user_id = self.game.account.profile().map(|p| p.id).unwrap_or(0);
 
-        // Auto-fetch Team Create status + collaborators list when opening for a universe
+        // Auto-fetch Team Create status + collaborators + friends once when signed in
         if signed_in {
             if let Some(u) = universe {
                 if self.cloud.collab_manage.loaded_universe != Some(u) {
@@ -2442,6 +2468,25 @@ impl Editor {
                     self.cloud.collab_manage.feedback = None;
                     want_refresh = Some(u);
                 }
+            }
+            if !self.cloud.collab_manage.friends_loaded && my_user_id != 0 {
+                self.cloud.collab_manage.friends_loaded = true;
+                want_load_friends = Some(my_user_id);
+            }
+        }
+
+        // Fire debounced live player search
+        if let Some(until) = self.cloud.collab_manage.search_debounce_until {
+            if std::time::Instant::now() >= until {
+                self.cloud.collab_manage.search_debounce_until = None;
+                let q = self.cloud.collab_manage.invite_input.trim().to_string();
+                if q.len() >= 2 && signed_in {
+                    self.cloud.collab_manage.search_pending_query = q.clone();
+                    self.cloud.collab_manage.search_inflight = true;
+                    want_search = Some(q);
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
             }
         }
 
@@ -2462,8 +2507,8 @@ impl Editor {
         });
 
         let screen = ctx.content_rect();
-        let win_w = (screen.width() - 24.0).clamp(300.0, 480.0);
-        let win_h = (screen.height() - 24.0).clamp(240.0, 420.0);
+        let win_w = (screen.width() - 24.0).clamp(320.0, 520.0);
+        let win_h = (screen.height() - 24.0).clamp(260.0, 440.0);
         let win_size = egui::vec2(win_w, win_h);
 
         egui::Window::new("Collaborate — Team Create")
@@ -2478,66 +2523,100 @@ impl Editor {
             .constrain_to(screen.shrink(8.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                 egui::ScrollArea::vertical()
                     .id_salt("live_collaborators_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let Some(u) = universe else {
-                            ui.label(
-                                egui::RichText::new("Publish this place to Roblox first to enable Team Create and invite collaborators.")
-                                    .color(egui::Color32::from_rgb(215, 220, 232)),
-                            );
-                            ui.add_space(8.0);
-                            if ui.button("Publish to Roblox…").clicked() {
-                                want_publish = true;
-                            }
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(31, 35, 44))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(54, 60, 74)))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::same(14))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Publish to Roblox to Collaborate")
+                                            .strong()
+                                            .size(14.0),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Team Create requires a published Roblox experience. Publish this place first, then turn on Team Create and invite teammates.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                    ui.add_space(10.0);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Publish to Roblox…")
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(egui::Color32::from_rgb(38, 108, 224)),
+                                        )
+                                        .clicked()
+                                    {
+                                        want_publish = true;
+                                    }
+                                });
                             return;
                         };
 
                         if !signed_in {
                             ui.label(
-                                egui::RichText::new("Sign in to your Roblox account first to manage Team Create and collaborators.")
-                                    .color(egui::Color32::from_rgb(235, 175, 70)),
+                                egui::RichText::new(
+                                    "Sign in to your Roblox account first to manage Team Create and invite collaborators.",
+                                )
+                                .color(egui::Color32::from_rgb(235, 175, 70)),
                             );
                             ui.add_space(6.0);
                         }
 
-                        // ── Team Create Status & Toggle ──
+                        // ── Section 1: Team Create Status Card ──
                         egui::Frame::new()
-                            .fill(egui::Color32::from_rgb(32, 35, 43))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(52, 56, 68)))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::same(8))
+                            .fill(egui::Color32::from_rgb(31, 35, 44))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(54, 60, 74)))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
                             .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new("Team Create:").strong());
-                                    match tc_enabled {
-                                        Some(true) => {
-                                            ui.label(
-                                                egui::RichText::new("ON")
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(80, 215, 130)),
-                                            );
-                                        }
-                                        Some(false) => {
-                                            ui.label(
-                                                egui::RichText::new("OFF")
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(170, 176, 190)),
-                                            );
-                                        }
-                                        None => {
-                                            ui.label(egui::RichText::new("Checking…").weak());
-                                        }
+                                    let (dot_col, status_txt) = match tc_enabled {
+                                        Some(true) => (
+                                            egui::Color32::from_rgb(72, 215, 128),
+                                            "Team Create ON",
+                                        ),
+                                        Some(false) => (
+                                            egui::Color32::from_rgb(140, 146, 160),
+                                            "Team Create OFF",
+                                        ),
+                                        None => (
+                                            egui::Color32::from_rgb(190, 175, 100),
+                                            "Checking…",
+                                        ),
+                                    };
+                                    ui.label(egui::RichText::new("●").color(dot_col));
+                                    ui.label(egui::RichText::new(status_txt).strong());
+
+                                    if is_live {
+                                        ui.label(
+                                            egui::RichText::new("• Live Session")
+                                                .small()
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(90, 215, 140)),
+                                        );
                                     }
 
                                     let busy = self.cloud.collab_manage.busy;
                                     if signed_in {
                                         let next_state = !tc_enabled.unwrap_or(false);
                                         let btn_text = if next_state {
-                                            "Turn On Team Create"
+                                            "Turn On"
                                         } else {
-                                            "Turn Off Team Create"
+                                            "Turn Off"
                                         };
                                         if ui
                                             .add_enabled(!busy, egui::Button::new(btn_text))
@@ -2569,171 +2648,341 @@ impl Editor {
 
                         ui.add_space(8.0);
 
-                        // ── Invite Collaborator ──
-                        ui.label(egui::RichText::new("Invite Collaborator").strong());
-                        ui.label(
-                            egui::RichText::new(
-                                "Enter a Roblox username or User ID. For personal games, Roblox requires friends for Edit access.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            let busy = self.cloud.collab_manage.busy;
-                            let resp = ui.add_enabled(
-                                signed_in && !busy,
-                                egui::TextEdit::singleline(&mut self.cloud.collab_manage.invite_input)
-                                    .desired_width(180.0)
-                                    .hint_text("Username or User ID"),
-                            );
-                            ui.selectable_value(
-                                &mut self.cloud.collab_manage.invite_edit,
-                                true,
-                                "Edit",
-                            );
-                            ui.selectable_value(
-                                &mut self.cloud.collab_manage.invite_edit,
-                                false,
-                                "Play",
-                            );
-                            let action = if self.cloud.collab_manage.invite_edit {
-                                "Edit"
-                            } else {
-                                "Play"
-                            };
-                            let enter = resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let clicked = ui
-                                .add_enabled(
-                                    signed_in
-                                        && !busy
-                                        && !self.cloud.collab_manage.invite_input.trim().is_empty(),
-                                    egui::Button::new(
-                                        egui::RichText::new("Invite")
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(egui::Color32::from_rgb(38, 108, 224)),
-                                )
-                                .clicked();
-                            if (clicked || enter)
-                                && signed_in
-                                && !busy
-                                && !self.cloud.collab_manage.invite_input.trim().is_empty()
-                            {
-                                want_invite = Some((
-                                    u,
-                                    self.cloud.collab_manage.invite_input.trim().to_string(),
-                                    action.to_string(),
-                                ));
-                            }
-                            if busy {
-                                ui.spinner();
-                            }
-                        });
+                        // ── Section 2: Add Collaborator with Live Player Detection ──
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(28, 31, 39))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 53, 66)))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Add Collaborator").strong());
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let busy = self.cloud.collab_manage.busy;
+                                    let input_w = (ui.available_width() - 175.0).max(150.0);
+                                    let resp = ui.add_enabled(
+                                        signed_in && !busy,
+                                        egui::TextEdit::singleline(
+                                            &mut self.cloud.collab_manage.invite_input,
+                                        )
+                                        .desired_width(input_w)
+                                        .hint_text("Type Roblox username or User ID…"),
+                                    );
+                                    if resp.changed() {
+                                        let q = self.cloud.collab_manage.invite_input.trim();
+                                        if q.len() >= 2 {
+                                            self.cloud.collab_manage.search_debounce_until =
+                                                Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                                        } else {
+                                            self.cloud.collab_manage.search_debounce_until = None;
+                                            self.cloud.collab_manage.search_hits.clear();
+                                            self.cloud.collab_manage.search_inflight = false;
+                                        }
+                                    }
 
-                        if let Some((ok, msg)) = &self.cloud.collab_manage.feedback {
-                            ui.add_space(4.0);
-                            let col = if *ok {
-                                egui::Color32::from_rgb(90, 215, 135)
-                            } else {
-                                egui::Color32::from_rgb(235, 105, 105)
-                            };
-                            ui.label(egui::RichText::new(msg).small().color(col));
-                        }
+                                    ui.selectable_value(
+                                        &mut self.cloud.collab_manage.invite_edit,
+                                        true,
+                                        "Edit",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.cloud.collab_manage.invite_edit,
+                                        false,
+                                        "Play",
+                                    );
+                                    let action = if self.cloud.collab_manage.invite_edit {
+                                        "Edit"
+                                    } else {
+                                        "Play"
+                                    };
+                                    let enter = resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let clicked = ui
+                                        .add_enabled(
+                                            signed_in
+                                                && !busy
+                                                && !self.cloud.collab_manage.invite_input.trim().is_empty(),
+                                            egui::Button::new(
+                                                egui::RichText::new("Invite")
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(egui::Color32::from_rgb(38, 108, 224)),
+                                        )
+                                        .clicked();
+                                    if (clicked || enter)
+                                        && signed_in
+                                        && !busy
+                                        && !self.cloud.collab_manage.invite_input.trim().is_empty()
+                                    {
+                                        want_invite = Some((
+                                            u,
+                                            self.cloud.collab_manage.invite_input.trim().to_string(),
+                                            action.to_string(),
+                                        ));
+                                    }
+                                    if busy || self.cloud.collab_manage.search_inflight {
+                                        ui.spinner();
+                                    }
+                                });
+
+                                // Live player suggestions dropdown (instant Friends + debounced Roblox Users Search)
+                                let q_lower = self.cloud.collab_manage.invite_input.trim().trim_start_matches('@').to_ascii_lowercase();
+                                if q_lower.len() >= 2 && signed_in {
+                                    let mut suggestions: Vec<UserSearchHit> = Vec::new();
+                                    let mut seen_ids = std::collections::HashSet::new();
+                                    for f in &self.cloud.collab_manage.friends {
+                                        if f.username.to_ascii_lowercase().contains(&q_lower)
+                                            || f.display_name.to_ascii_lowercase().contains(&q_lower)
+                                        {
+                                            if seen_ids.insert(f.id) {
+                                                suggestions.push(f.clone());
+                                            }
+                                        }
+                                    }
+                                    for h in &self.cloud.collab_manage.search_hits {
+                                        if seen_ids.insert(h.id) {
+                                            suggestions.push(h.clone());
+                                        }
+                                    }
+                                    suggestions.truncate(6);
+
+                                    if !suggestions.is_empty() {
+                                        ui.add_space(6.0);
+                                        egui::Frame::new()
+                                            .fill(egui::Color32::from_rgb(22, 25, 32))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgb(56, 62, 78),
+                                            ))
+                                            .corner_radius(6.0)
+                                            .inner_margin(egui::Margin::symmetric(8, 5))
+                                            .show(ui, |ui| {
+                                                let busy = self.cloud.collab_manage.busy;
+                                                for hit in &suggestions {
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(egui::Align::Center),
+                                                        |ui| {
+                                                            ui.spacing_mut().button_padding =
+                                                                egui::vec2(7.0, 2.5);
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !busy,
+                                                                    egui::Button::new(
+                                                                        egui::RichText::new("Play").size(11.0),
+                                                                    ),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                want_invite = Some((
+                                                                    u,
+                                                                    hit.id.to_string(),
+                                                                    "Play".to_string(),
+                                                                ));
+                                                            }
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !busy,
+                                                                    egui::Button::new(
+                                                                        egui::RichText::new("Edit")
+                                                                            .size(11.0)
+                                                                            .strong()
+                                                                            .color(egui::Color32::WHITE),
+                                                                    )
+                                                                    .fill(egui::Color32::from_rgb(
+                                                                        38, 108, 224,
+                                                                    )),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                want_invite = Some((
+                                                                    u,
+                                                                    hit.id.to_string(),
+                                                                    "Edit".to_string(),
+                                                                ));
+                                                            }
+                                                            ui.with_layout(
+                                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                                |ui| {
+                                                                    let label_str = if hit.display_name.eq_ignore_ascii_case(&hit.username) {
+                                                                        format!("@{}", hit.username)
+                                                                    } else {
+                                                                        format!("{} (@{})", hit.display_name, hit.username)
+                                                                    };
+                                                                    if ui
+                                                                        .add(
+                                                                            egui::Label::new(
+                                                                                egui::RichText::new(label_str)
+                                                                                    .size(12.0)
+                                                                                    .strong(),
+                                                                            )
+                                                                            .truncate()
+                                                                            .sense(egui::Sense::click()),
+                                                                        )
+                                                                        .clicked()
+                                                                    {
+                                                                        self.cloud.collab_manage.invite_input =
+                                                                            hit.username.clone();
+                                                                    }
+                                                                    if hit.is_friend {
+                                                                        ui.label(
+                                                                            egui::RichText::new("Friend")
+                                                                                .size(10.0)
+                                                                                .strong()
+                                                                                .color(egui::Color32::from_rgb(
+                                                                                    84, 215, 138,
+                                                                                )),
+                                                                        );
+                                                                    }
+                                                                },
+                                                            );
+                                                        },
+                                                    );
+                                                }
+                                            });
+                                    }
+                                }
+
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Tip: Personal games require Roblox Friends for Edit access (anyone can be invited for Play).",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+
+                                if let Some((ok, msg)) = &self.cloud.collab_manage.feedback {
+                                    ui.add_space(4.0);
+                                    let col = if *ok {
+                                        egui::Color32::from_rgb(90, 215, 135)
+                                    } else {
+                                        egui::Color32::from_rgb(240, 110, 110)
+                                    };
+                                    ui.label(egui::RichText::new(msg).small().color(col));
+                                }
+                            });
 
                         ui.add_space(8.0);
-                        ui.separator();
 
-                        // ── Collaborators with Access ──
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Collaborators").strong());
-                            if ui
-                                .add_enabled(
-                                    signed_in && !self.cloud.collab_manage.loading,
-                                    egui::Button::new("Refresh").small(),
-                                )
-                                .clicked()
-                            {
-                                want_refresh = Some(u);
-                            }
-                            if self.cloud.collab_manage.loading {
-                                ui.spinner();
-                            }
-                        });
-
-                        if self.cloud.collab_manage.collaborators.is_empty()
-                            && !self.cloud.collab_manage.loading
-                        {
-                            ui.label(
-                                egui::RichText::new("No collaborators added yet.").small().weak(),
-                            );
-                        } else {
-                            let busy = self.cloud.collab_manage.busy;
-                            for c in &self.cloud.collab_manage.collaborators {
+                        // ── Section 3: Collaborators List ──
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(28, 31, 39))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 53, 66)))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
                                 ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Collaborators").strong());
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             if ui
                                                 .add_enabled(
-                                                    signed_in && !busy,
-                                                    egui::Button::new("Remove").small(),
+                                                    signed_in && !self.cloud.collab_manage.loading,
+                                                    egui::Button::new("Refresh").small(),
                                                 )
                                                 .clicked()
                                             {
-                                                want_remove = Some((
-                                                    u,
-                                                    c.subject_type.clone(),
-                                                    c.subject_id,
-                                                    c.action.clone(),
-                                                ));
+                                                want_refresh = Some(u);
                                             }
-                                            ui.with_layout(
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add(egui::Label::new(&c.name).truncate());
-                                                    ui.label(
-                                                        egui::RichText::new(format!("[{}]", c.action))
-                                                            .small()
-                                                            .color(egui::Color32::from_rgb(130, 180, 250)),
-                                                    );
-                                                },
-                                            );
+                                            if self.cloud.collab_manage.loading {
+                                                ui.spinner();
+                                            }
                                         },
                                     );
                                 });
-                            }
-                        }
+                                ui.add_space(4.0);
 
-                        // ── Live Session Peers ──
+                                if self.cloud.collab_manage.collaborators.is_empty()
+                                    && !self.cloud.collab_manage.loading
+                                {
+                                    ui.label(
+                                        egui::RichText::new("No collaborators added yet.")
+                                            .small()
+                                            .weak(),
+                                    );
+                                } else {
+                                    let busy = self.cloud.collab_manage.busy;
+                                    for c in &self.cloud.collab_manage.collaborators {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        signed_in && !busy,
+                                                        egui::Button::new("Remove").small(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    want_remove = Some((
+                                                        u,
+                                                        c.subject_type.clone(),
+                                                        c.subject_id,
+                                                        c.action.clone(),
+                                                    ));
+                                                }
+                                                ui.with_layout(
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.add(egui::Label::new(&c.name).truncate());
+                                                        let badge_col = if c.action.eq_ignore_ascii_case("Edit") {
+                                                            egui::Color32::from_rgb(110, 175, 255)
+                                                        } else {
+                                                            egui::Color32::from_rgb(100, 215, 190)
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(format!("[{}]", c.action))
+                                                                .small()
+                                                                .color(badge_col),
+                                                        );
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+
+                        // ── Section 4: Live Session Peers ──
                         if is_live {
                             ui.add_space(8.0);
-                            ui.separator();
-                            ui.label(egui::RichText::new("Live Session Peers").strong());
-                            for (name, own, frame, idle, guid, line) in peers {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "{name}{}{}",
-                                        if own { " (you)" } else { "" },
-                                        if idle { " · idle" } else { "" }
-                                    ));
-                                    if !own && frame.is_some() && ui.small_button("Fly to").clicked() {
-                                        fly = frame;
-                                    }
-                                    if !guid.is_empty()
-                                        && ui.small_button(format!("Script · line {line}")).clicked()
-                                    {
-                                        open_guid = Some(guid);
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(28, 31, 39))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 53, 66)))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Live Session Peers").strong());
+                                    ui.add_space(4.0);
+                                    for (name, own, frame, idle, guid, line) in peers {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!(
+                                                "{name}{}{}",
+                                                if own { " (you)" } else { "" },
+                                                if idle { " · idle" } else { "" }
+                                            ));
+                                            if !own
+                                                && frame.is_some()
+                                                && ui.small_button("Fly to").clicked()
+                                            {
+                                                fly = frame;
+                                            }
+                                            if !guid.is_empty()
+                                                && ui
+                                                    .small_button(format!("Script · line {line}"))
+                                                    .clicked()
+                                            {
+                                                open_guid = Some(guid);
+                                            }
+                                        });
                                     }
                                 });
-                            }
                         }
 
                         ui.add_space(8.0);
                         ui.hyperlink_to(
-                            "Open in Roblox Creator Hub ↗",
+                            "Manage in Roblox Creator Hub ↗",
                             format!(
                                 "https://create.roblox.com/dashboard/creations/experiences/{u}/collaborators"
                             ),
@@ -2745,20 +2994,48 @@ impl Editor {
             self.cloud.live_collaborators_open = false;
             self.open_roblox_destination(VersionType::Published);
         }
+        if let Some(uid) = want_load_friends {
+            let api = self.cloud.factory(self.game.account.shared_client());
+            self.cloud.spawn(api, move |a, tx| {
+                if let Some(a) = a {
+                    if let Ok(friends) = a.list_friends(uid) {
+                        let _ = tx.send(Msg::FriendsLoaded(friends));
+                    }
+                }
+            });
+        }
+        if let Some(q) = want_search {
+            let friend_ids: std::collections::HashSet<u64> = self
+                .cloud
+                .collab_manage
+                .friends
+                .iter()
+                .map(|f| f.id)
+                .collect();
+            let api = self.cloud.factory(self.game.account.shared_client());
+            self.cloud.spawn(api, move |a, tx| {
+                let hits = a
+                    .and_then(|a| a.search_users(&q, &friend_ids).ok())
+                    .unwrap_or_default();
+                let _ = tx.send(Msg::UserSearchResults { query: q, hits });
+            });
+        }
         if let Some((u, enabled)) = want_toggle_tc {
             self.cloud.collab_manage.busy = true;
             self.cloud.collab_manage.feedback = None;
             let api = self.cloud.factory(self.game.account.shared_client());
             self.cloud.spawn(api, move |a, tx| {
-                let result = if let Some(a) = a {
-                    a.set_team_create(u, enabled).map_err(|e| e.to_string())
+                if let Some(a) = a {
+                    let _ = tx.send(Msg::TeamCreateToggled {
+                        universe_id: u,
+                        result: a.set_team_create(u, enabled).map_err(|e| e.to_string()),
+                    });
                 } else {
-                    Err("Sign in to Roblox first.".into())
-                };
-                let _ = tx.send(Msg::TeamCreateToggled {
-                    universe_id: u,
-                    result,
-                });
+                    let _ = tx.send(Msg::TeamCreateToggled {
+                        universe_id: u,
+                        result: Err("Sign in to Roblox first.".into()),
+                    });
+                }
             });
         }
         if let Some((u, p)) = want_join_tc {
@@ -2788,16 +3065,19 @@ impl Editor {
             self.cloud.collab_manage.feedback = None;
             let api = self.cloud.factory(self.game.account.shared_client());
             self.cloud.spawn(api, move |a, tx| {
-                let result = if let Some(a) = a {
-                    a.invite_collaborator(u, &who, &action)
-                        .map_err(|e| e.to_string())
+                if let Some(a) = a {
+                    let _ = tx.send(Msg::CollaboratorInvited {
+                        universe_id: u,
+                        result: a
+                            .invite_collaborator(u, &who, &action)
+                            .map_err(|e| e.to_string()),
+                    });
                 } else {
-                    Err("Sign in to Roblox first.".into())
-                };
-                let _ = tx.send(Msg::CollaboratorInvited {
-                    universe_id: u,
-                    result,
-                });
+                    let _ = tx.send(Msg::CollaboratorInvited {
+                        universe_id: u,
+                        result: Err("Sign in to Roblox first.".into()),
+                    });
+                }
             });
         }
         if let Some((u, stype, sid, action)) = want_remove {
@@ -2805,18 +3085,23 @@ impl Editor {
             self.cloud.collab_manage.feedback = None;
             let api = self.cloud.factory(self.game.account.shared_client());
             self.cloud.spawn(api, move |a, tx| {
-                let result = if let Some(a) = a {
-                    a.remove_collaborator(u, &stype, sid, &action)
-                        .map_err(|e| e.to_string())
+                if let Some(a) = a {
+                    let _ = tx.send(Msg::CollaboratorRemoved {
+                        universe_id: u,
+                        subject_type: stype.clone(),
+                        subject_id: sid,
+                        result: a
+                            .remove_collaborator(u, &stype, sid, &action)
+                            .map_err(|e| e.to_string()),
+                    });
                 } else {
-                    Err("Sign in to Roblox first.".into())
-                };
-                let _ = tx.send(Msg::CollaboratorRemoved {
-                    universe_id: u,
-                    subject_type: stype,
-                    subject_id: sid,
-                    result,
-                });
+                    let _ = tx.send(Msg::CollaboratorRemoved {
+                        universe_id: u,
+                        subject_type: stype,
+                        subject_id: sid,
+                        result: Err("Sign in to Roblox first.".into()),
+                    });
+                }
             });
         }
         if let Some(frame) = fly {

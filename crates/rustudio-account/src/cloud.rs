@@ -204,6 +204,15 @@ pub struct VersionInfo {
 
 /// Team Create, as Studio's Start Page finds it for a universe.
 /// A collaborator entry returned by Roblox Develop API v2 universe permissions.
+/// A Roblox user hit returned by Friends or Users Search autocomplete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSearchHit {
+    pub id: u64,
+    pub username: String,
+    pub display_name: String,
+    pub is_friend: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniverseCollaborator {
     pub subject_type: String,
@@ -999,6 +1008,162 @@ impl CloudApi {
         Ok((uid, name))
     }
 
+    /// Fetches the signed-in user's Roblox friends list for instant collaborator autocomplete.
+    pub fn list_friends(&self, my_user_id: u64) -> Result<Vec<UserSearchHit>> {
+        if my_user_id == 0 {
+            return Ok(Vec::new());
+        }
+        let url = format!("https://friends.roblox.com/v1/users/{my_user_id}/friends");
+        let v = self.get_json(&url, "friends list")?;
+        let mut out = Vec::new();
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for item in arr {
+                let Some(id) = item.get("id").and_then(|i| i.as_u64()) else {
+                    continue;
+                };
+                let username = item
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if username.is_empty() {
+                    continue;
+                }
+                let display_name = item
+                    .get("displayName")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&username)
+                    .to_string();
+                out.push(UserSearchHit {
+                    id,
+                    username,
+                    display_name,
+                    is_friend: true,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Searches Roblox users by keyword (live autocomplete) + exact username match fallback.
+    pub fn search_users(
+        &self,
+        keyword: &str,
+        friend_ids: &std::collections::HashSet<u64>,
+    ) -> Result<Vec<UserSearchHit>> {
+        let q = keyword.trim().trim_start_matches('@');
+        if q.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<UserSearchHit> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // Exact numeric ID lookup
+        if let Ok(uid) = q.parse::<u64>() {
+            if let Ok((id, username)) = self.resolve_user(q) {
+                seen.insert(id);
+                out.push(UserSearchHit {
+                    id,
+                    display_name: username.clone(),
+                    username,
+                    is_friend: friend_ids.contains(&id),
+                });
+            }
+            return Ok(out);
+        }
+
+        // Exact username match first (so exact match always appears at top)
+        if !q.contains(' ') {
+            let body = serde_json::json!({
+                "usernames": [q],
+                "excludeBannedUsers": true
+            })
+            .to_string();
+            if let Ok((200..=299, text)) = self.session.post_csrf(
+                "https://users.roblox.com/v1/usernames/users",
+                "application/json",
+                body.as_bytes(),
+            ) {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                        for item in arr {
+                            if let Some(id) = item.get("id").and_then(|i| i.as_u64()) {
+                                let username = item
+                                    .get("name")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or(q)
+                                    .to_string();
+                                let display_name = item
+                                    .get("displayName")
+                                    .and_then(|s| s.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&username)
+                                    .to_string();
+                                if seen.insert(id) {
+                                    out.push(UserSearchHit {
+                                        id,
+                                        username,
+                                        display_name,
+                                        is_friend: friend_ids.contains(&id),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keyword search (live player detection)
+        let mut encoded = String::with_capacity(q.len() * 3);
+        for b in q.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                encoded.push(b as char);
+            } else {
+                encoded.push_str(&format!("%{b:02X}"));
+            }
+        }
+        let url = format!("https://users.roblox.com/v1/users/search?keyword={encoded}&limit=10");
+        if let Ok(v) = self.get_json(&url, "user search") {
+            if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                for item in arr {
+                    let Some(id) = item.get("id").and_then(|i| i.as_u64()) else {
+                        continue;
+                    };
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let username = item
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if username.is_empty() {
+                        continue;
+                    }
+                    let display_name = item
+                        .get("displayName")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&username)
+                        .to_string();
+                    out.push(UserSearchHit {
+                        id,
+                        username,
+                        display_name,
+                        is_friend: friend_ids.contains(&id),
+                    });
+                }
+            }
+        }
+
+        // Sort friends first while preserving search relevance order
+        out.sort_by_key(|u| !u.is_friend);
+        out.truncate(8);
+        Ok(out)
+    }
+
     /// Invites a Roblox user (by username or User ID) to a universe with `"Edit"` or `"Play"` access.
     pub fn invite_collaborator(
         &self,
@@ -1010,27 +1175,49 @@ impl CloudApi {
             return Err(Error::new("Missing universe ID"));
         }
         let (user_id, username) = self.resolve_user(username_or_id)?;
-        let url = format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop);
         let body = serde_json::json!([{
             "subjectType": "User",
             "subjectId": user_id.to_string(),
             "action": action,
         }])
         .to_string();
-        let (status, text) = self
-            .session
-            .send_csrf("POST", &url, "application/json", body.as_bytes())?;
-        if (200..300).contains(&status) {
-            Ok(UniverseCollaborator {
-                subject_type: "User".into(),
-                subject_id: user_id,
-                name: username,
-                action: action.into(),
-            })
+
+        // Try permissions_batched first (current Studio endpoint), then fall back to /permissions
+        let urls = [
+            format!("{}/v2/universes/{universe_id}/permissions_batched", self.ep.develop),
+            format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop),
+        ];
+        let mut last_err = String::new();
+        for url in &urls {
+            match self
+                .session
+                .send_csrf("POST", url, "application/json", body.as_bytes())
+            {
+                Ok((status, _text)) if (200..300).contains(&status) => {
+                    return Ok(UniverseCollaborator {
+                        subject_type: "User".into(),
+                        subject_id: user_id,
+                        name: username,
+                        action: action.into(),
+                    });
+                }
+                Ok((status, text)) => {
+                    let msg = parse_roblox_error_msg(&text)
+                        .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
+                    last_err = msg;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+
+        if last_err.contains("PermissionResolution") && action.eq_ignore_ascii_case("Edit") {
+            Err(Error(format!(
+                "Roblox blocked Edit access for {username} (on personal games, they must be on your Roblox Friends list and age-eligible — try Play access or add them as a friend first)."
+            )))
         } else {
-            let msg = parse_roblox_error_msg(&text)
-                .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
-            Err(Error(format!("Could not invite {username}: {msg}")))
+            Err(Error(format!("Could not invite {username}: {last_err}")))
         }
     }
 

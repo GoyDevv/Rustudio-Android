@@ -2001,7 +2001,7 @@ impl AssetPicker {
                                                     };
 
                                                     ui.allocate_ui_with_layout(
-                                                        Vec2::new(card_w, 170.0),
+                                                        Vec2::new(card_w, 178.0),
                                                         egui::Layout::top_down(egui::Align::LEFT),
                                                         |ui| {
                                                             ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
@@ -2020,7 +2020,7 @@ impl AssetPicker {
                                                                         let (thumb_rect, _) = ui
                                                                             .allocate_exact_size(
                                                                                 Vec2::new(
-                                                                                    inner_w, 92.0,
+                                                                                    inner_w, 82.0,
                                                                                 ),
                                                                                 Sense::hover(),
                                                                             );

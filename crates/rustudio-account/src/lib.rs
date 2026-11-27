@@ -30,7 +30,7 @@ pub use api::{
 };
 pub use cloud::{
     open_mode, parse_place_ref, CloudApi, CloudOrigin, CreatorKind, Endpoints, Experience, ExperienceSource, PlaceCache,
-    OpenMode, SaveOutcome, TeamCreateStatus, UniverseCollaborator,
+    OpenMode, SaveOutcome, TeamCreateStatus, UniverseCollaborator, UserSearchHit,
 };
 pub use config::{AccountConfig, Bookmark, SavedAccount};
 pub use session::{Cookie, CookieSource, Profile, ProfileCache, Session};
