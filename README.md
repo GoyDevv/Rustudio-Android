@@ -15,7 +15,7 @@ touch controls, and GUIs, directly on your Android device.
 
 > [!NOTE]
 > **Credits & Upstream Notice:**
-> - Full credit to **[rippelz](https://github.com/rippelz/rustudio)** and **[TouseefX](https://github.com/TouseefX/rustudio)** for their foundational work and development on rustudio!
+> - Full credit to **[rippelz](https://github.com/rippelz/rustudio)** for creating rustudio and maintaining the upstream PC edition!
 > - The **PC / desktop version** (Linux, Windows, macOS) is handled and maintained upstream by **[rippelz/rustudio](https://github.com/rippelz/rustudio)**. This repository focuses specifically on the Android port.
 
 Rustudio is very much a beta/prototype on Android, but provides a portable Roblox Studio experience in your pocket.
@@ -86,7 +86,6 @@ Everything works signed out. To open your cloud places or load private assets, s
 ## Credits & Acknowledgements
 
 - **[rippelz/rustudio](https://github.com/rippelz/rustudio)**: Creator of the original rustudio project, handling the PC/desktop edition.
-- **[TouseefX/rustudio](https://github.com/TouseefX/rustudio)**: Major developer and contributor to rustudio.
 - See [CREDITS.md](CREDITS.md) for full asset attributions, licenses, and vendored crate references.
 
 ## Contributing
