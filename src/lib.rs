@@ -56,6 +56,8 @@ pub mod crash;
 pub mod crash_dialog;
 pub mod explorer;
 pub mod export_3d;
+pub mod import_studio;
+pub mod luau_intellisense;
 pub mod file_dialog;
 pub mod hypr;
 pub mod studio_settings;

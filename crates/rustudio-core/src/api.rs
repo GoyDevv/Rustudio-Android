@@ -71,109 +71,174 @@ fn dump_path() -> std::path::PathBuf {
         .unwrap_or_else(|| crate::paths::resource("api-dump.json"))
 }
 
-/// The dump, parsed once; None when the file is missing.
+/// The dump, parsed once when available. Never permanently latches `None` if
+/// called before Android finishes unpacking `assets/api-dump.json`.
 pub fn get() -> Option<&'static Api> {
-    static API: OnceLock<Option<Api>> = OnceLock::new();
-    API.get_or_init(|| {
-        let text = std::fs::read_to_string(dump_path()).ok()?;
-        parse(&text)
-    })
-    .as_ref()
+    static API: OnceLock<Api> = OnceLock::new();
+    if let Some(api) = API.get() {
+        return Some(api);
+    }
+    let path = dump_path();
+    let file = std::fs::File::open(&path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let parsed = parse_reader(reader)?;
+    let _ = API.set(parsed);
+    API.get()
 }
 
-pub fn parse(text: &str) -> Option<Api> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+#[derive(serde::Deserialize)]
+struct RawDump {
+    #[serde(rename = "Classes", default)]
+    classes: Vec<RawClass>,
+    #[serde(rename = "Enums", default)]
+    enums: Vec<RawEnum>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawClass {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Superclass", default)]
+    superclass: Option<String>,
+    #[serde(rename = "Tags", default)]
+    tags: Vec<serde_json::Value>,
+    #[serde(rename = "Members", default)]
+    members: Vec<RawMember>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawSecurity {
+    Str(String),
+    Obj {
+        #[serde(rename = "Read", default)]
+        read: Option<String>,
+    },
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawSerialization {
+    #[serde(rename = "CanLoad", default)]
+    can_load: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct RawMember {
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
+    #[serde(rename = "MemberType", default)]
+    member_type: Option<String>,
+    #[serde(rename = "Security", default)]
+    security: Option<RawSecurity>,
+    #[serde(rename = "Tags", default)]
+    tags: Vec<serde_json::Value>,
+    #[serde(rename = "Serialization", default)]
+    serialization: RawSerialization,
+    #[serde(rename = "Category", default)]
+    category: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawEnum {
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
+    #[serde(rename = "Items", default)]
+    items: Vec<RawEnumItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawEnumItem {
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
+    #[serde(rename = "Value", default)]
+    value: Option<u64>,
+    #[serde(rename = "LegacyNames", default)]
+    legacy_names: Vec<String>,
+}
+
+fn has_tag(tags: &[serde_json::Value], needle: &str) -> bool {
+    tags.iter().any(|t| t.as_str() == Some(needle))
+}
+
+fn build_api(raw: RawDump) -> Option<Api> {
+    if raw.classes.is_empty() {
+        return None;
+    }
     let mut api = Api::default();
-    for c in v.get("Classes")?.as_array()? {
-        let name = c.get("Name")?.as_str()?.to_string();
-        let tags: Vec<&str> = c
-            .get("Tags")
-            .and_then(|t| t.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-            .unwrap_or_default();
+    api.classes.reserve(raw.classes.len());
+    api.class_order.reserve(raw.classes.len());
+    for c in raw.classes {
         let mut class = Class {
-            superclass: c
-                .get("Superclass")
-                .and_then(|s| s.as_str())
-                .filter(|s| *s != "<<<ROOT>>>")
-                .map(str::to_string),
-            creatable: !tags.contains(&"NotCreatable") && !tags.contains(&"Service"),
-            service: tags.contains(&"Service"),
+            superclass: c.superclass.filter(|s| s != "<<<ROOT>>>"),
+            creatable: !has_tag(&c.tags, "NotCreatable") && !has_tag(&c.tags, "Service"),
+            service: has_tag(&c.tags, "Service"),
             ..Default::default()
         };
-        for m in c.get("Members").and_then(|m| m.as_array()).into_iter().flatten() {
-            let Some(mname) = m.get("Name").and_then(|n| n.as_str()) else {
+        for m in c.members {
+            let Some(mname) = m.name else {
                 continue;
             };
-            let kind = match m.get("MemberType").and_then(|t| t.as_str()) {
+            let kind = match m.member_type.as_deref() {
                 Some("Property") => Kind::Property,
                 Some("Function") => Kind::Function,
                 Some("Event") => Kind::Event,
                 Some("Callback") => Kind::Callback,
                 _ => continue,
             };
-            let security = match m.get("Security") {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(o) => o
-                    .get("Read")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("None")
-                    .to_string(),
+            let security = match m.security {
+                Some(RawSecurity::Str(s)) => s,
+                Some(RawSecurity::Obj { read }) => read.unwrap_or_else(|| "None".into()),
                 None => "None".into(),
             };
-            let mtags: Vec<&str> = m
-                .get("Tags")
-                .and_then(|t| t.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-                .unwrap_or_default();
-            let can_load = m
-                .get("Serialization")
-                .and_then(|s| s.get("CanLoad"))
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
-            class.order.push(mname.to_string());
+            let read_only = has_tag(&m.tags, "ReadOnly");
+            let deprecated = has_tag(&m.tags, "Deprecated");
+            let hidden = has_tag(&m.tags, "Hidden") || has_tag(&m.tags, "NotBrowsable");
+            class.order.push(mname.clone());
             class.members.insert(
-                mname.to_string(),
+                mname,
                 Member {
                     kind,
                     security,
-                    can_load,
-                    read_only: mtags.contains(&"ReadOnly"),
-                    deprecated: mtags.contains(&"Deprecated"),
-                    category: m
-                        .get("Category")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    hidden: mtags.contains(&"Hidden") || mtags.contains(&"NotBrowsable"),
+                    can_load: m.serialization.can_load,
+                    read_only,
+                    deprecated,
+                    category: m.category.unwrap_or_default(),
+                    hidden,
                 },
             );
         }
-        api.class_order.push(name.clone());
-        api.classes.insert(name, class);
+        api.class_order.push(c.name.clone());
+        api.classes.insert(c.name, class);
     }
-    for e in v.get("Enums").and_then(|e| e.as_array()).into_iter().flatten() {
-        let Some(en) = e.get("Name").and_then(|n| n.as_str()) else {
+    for e in raw.enums {
+        let Some(en) = e.name else {
             continue;
         };
         // An enum with no items still exists (AudioCaptureMode in 0.744).
-        api.enums.entry(en.to_string()).or_default();
-        for it in e.get("Items").and_then(|i| i.as_array()).into_iter().flatten() {
-            let Some(name) = it.get("Name").and_then(|n| n.as_str()) else {
+        let entry = api.enums.entry(en.clone()).or_default();
+        for it in e.items {
+            let Some(name) = it.name else {
                 continue;
             };
-            if let Some(v) = it.get("Value").and_then(|v| v.as_u64()) {
-                api.enums.entry(en.to_string()).or_default().push((name.to_string(), v as u32));
+            if let Some(v) = it.value {
+                entry.push((name.clone(), v as u32));
             }
-            for old in it.get("LegacyNames").and_then(|l| l.as_array()).into_iter().flatten() {
-                if let Some(old) = old.as_str() {
-                    api.legacy_enum_items
-                        .insert((en.to_string(), old.to_string()), name.to_string());
-                }
+            for old in it.legacy_names {
+                api.legacy_enum_items.insert((en.clone(), old), name.clone());
             }
         }
     }
     Some(api)
+}
+
+fn parse_reader<R: std::io::Read>(reader: R) -> Option<Api> {
+    let raw: RawDump = serde_json::from_reader(reader).ok()?;
+    build_api(raw)
+}
+
+pub fn parse(text: &str) -> Option<Api> {
+    let raw: RawDump = serde_json::from_str(text).ok()?;
+    build_api(raw)
 }
 
 impl Api {

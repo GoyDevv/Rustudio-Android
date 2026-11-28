@@ -370,6 +370,7 @@ impl Editor {
             "documentation" | "tutorials" | "developer_forum" => (true, None),
             "manage_plugins" => (true, Some(self.plugin_store.ui.open)),
             a if a.starts_with("manage_plugins:") => (true, None),
+            "import_local_plugin" => (true, None),
             "plugins_folder" => (true, None),
             "save_local_plugin" | "publish_plugin" => (edit && sel, None),
             "command_bar" => (true, Some(self.is_tool_panel_open(crate::studio_panels::studio_tools_panels::ToolPanel::CommandBar))),
@@ -628,6 +629,10 @@ impl Editor {
                 self.cloud.refresh(client, tab);
             }
             "import_model" => self.insert_from_file(),
+            "import_animation" => self.import_animation_dialog(),
+            "import_image" => self.import_image_dialog(),
+            "import_audio" => self.import_audio_dialog(),
+            "import_script" => self.import_script_dialog(),
             "import_3d" => {
                 if cfg!(target_os = "android")
                     || !self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import"))
@@ -991,6 +996,7 @@ impl Editor {
                     self.plugin_store.set_enabled(client, id, on);
                 }
             }
+            "import_local_plugin" => self.import_local_plugin(),
             "plugins_folder" => crate::plugin_store::ui::open_plugins_folder(&mut self.plugin_store),
             "save_local_plugin" => self.save_local_plugin(),
             "publish_plugin" => self.publish_as_plugin(),
@@ -1109,6 +1115,30 @@ impl Editor {
         }
     }
 
+    /// Plugins > Import Plugin...: pick one or more local plugin files
+    /// (`.rbxm`, `.rbxmx`, `.lua`, `.luau`), copy them into the local Plugins
+    /// folder, and load them immediately.
+    pub fn import_local_plugin(&mut self) {
+        let _ = self.plugin_store.store.ensure_plugins_dir();
+        let req = crate::file_dialog::Request::new()
+            .set_title("Import Plugin")
+            .add_filter("Roblox Plugin", &["rbxm", "rbxmx", "lua", "luau"]);
+        self.dialogs.start_multi(crate::file_dialog::Purpose::ImportLocalPlugin, req);
+    }
+
+    /// Imports one or more local plugin files into the Plugins folder and loads them.
+    pub fn import_local_plugins_from(&mut self, paths: Vec<std::path::PathBuf>) {
+        for p in paths {
+            match self.plugin_store.import_local_file(&p) {
+                Ok((plugin, updated)) => {
+                    let verb = if updated { "Updated" } else { "Imported" };
+                    self.info(format!("{verb} plugin {} ({})", plugin.name, plugin.path.display()));
+                }
+                Err(e) => self.error(format!("Import Plugin: {e}")),
+            }
+        }
+    }
+
     /// Plugins > Publish as Plugin: the confirm dialog (name, description,
     /// creator; new plugin or overwrite one the account owns), then the
     /// upload through the session.
@@ -1190,8 +1220,8 @@ impl Editor {
                     None => String::new(),
                 };
                 let r = ui.label(RichText::new(format!("{}{dirty}{cloud} - rustudio", self.game.doc.title)).color(theme::TEXT_DIM));
-                if let Some((_, s)) = self.cloud.status.as_ref().filter(|_| self.game.doc.cloud.is_some()) {
-                    r.on_hover_text(s.describe());
+                if let Some((u, s)) = self.cloud.status.as_ref().filter(|_| self.game.doc.cloud.is_some()) {
+                    r.on_hover_text(self.describe_team_create_status(*u, s));
                 }
             });
         });

@@ -2332,7 +2332,15 @@ impl Game {
         let vp_render = rustudio_core::bench::scope("vp_render");
         let no_world_gui_or_fx = self.gui.world_batches.is_empty()
             && self.effects.drawn().is_none_or(|f| f.draws.is_empty());
-        let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
+        let cached_drag_tex = if sep_dragged && !self.is_playing() {
+            self.renderer.as_ref().and_then(|r| r.texture_id)
+        } else {
+            None
+        };
+        let tex = if let Some(cached) = cached_drag_tex {
+            Some(cached)
+        } else {
+            match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
                 r.defer_postfx = !(r.caps().is_powervr() && no_world_gui_or_fx);
                 r.render(
@@ -2361,6 +2369,7 @@ impl Game {
             )
             },
             _ => None,
+        }
         };
         drop(vp_render);
         if let Some(start) = quality_start {

@@ -7,7 +7,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "1.0.8"
+version = "1.0.9"
 
 [package]
 name = "rustudio"
@@ -54,7 +54,7 @@ rbx_reflection = "7"
 rbx_types = "3"
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tga"] }
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -194,6 +194,11 @@ rbx_dom_weak = { path = "vendor/rbx_dom_weak" }
 # what the narrow phase costs inside rapier's own pipeline
 # (checks/humanoid-physics/solver/HARNESS.md "The switch").
 rapier3d = { path = "vendor/rapier3d" }
+# winit 0.30.13 patched (src/platform_impl/android/mod.rs): emit
+# WindowEvent::ModifiersChanged from Android KeyEvent meta_state + modifier
+# key edges, clear on LostFocus/Pause, and suppress text when Ctrl/Alt/Super
+# is held so hardware keyboard shortcuts work on Android.
+winit = { path = "vendor/winit" }
 
 # Fast rebuilds for test runs by agents and for local iteration: release
 # optimisation, but compiled in many small units that are reused between

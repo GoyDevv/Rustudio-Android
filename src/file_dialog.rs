@@ -34,6 +34,8 @@ pub enum Purpose {
     SaveSelection(Vec<Ref>),
     /// Plugins > Save as Local Plugin: the selection when the dialog opened.
     SaveLocalPlugin(Vec<Ref>),
+    /// Plugins > Import Plugin...: one or more local plugin files (.rbxm/.rbxmx/.lua/.luau).
+    ImportLocalPlugin,
     /// Save as Project Folder: the "Create in" folder.
     ProjectParent,
     /// Terrain Editor > Import: a heightmap (true) or colormap image.
@@ -50,6 +52,14 @@ pub enum Purpose {
     TemplateReplace(String),
     /// File > Import (3D Models: .obj, .fbx, .glb, .gltf).
     Import3D,
+    /// File > Import Animation (.fbx, .glb, .gltf, .rbxm, .rbxmx).
+    ImportAnimation,
+    /// File > Import Image (.png, .jpg, .webp, .bmp, .tga).
+    ImportImage,
+    /// File > Import Audio (.mp3, .ogg, .wav, .flac).
+    ImportAudio,
+    /// File > Import Script (.luau, .lua, .txt).
+    ImportScript,
     /// File > Export as .obj (the selection when the dialog opened).
     ExportObj(Vec<Ref>),
     /// File > Export as glTF (the selection when the dialog opened).

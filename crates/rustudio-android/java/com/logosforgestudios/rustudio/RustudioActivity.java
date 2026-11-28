@@ -71,6 +71,7 @@ public class RustudioActivity extends NativeActivity {
     private BroadcastReceiver installReceiver = null;
     private boolean imeListenerInstalled = false;
     private boolean storagePromptScheduled = false;
+    private final java.util.HashSet<Integer> activeShortcutKeys = new java.util.HashSet<Integer>();
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -83,6 +84,7 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeImeDelete(int before, int after);
     static native void nativeImeKey(int keyCode, boolean down);
     static native void nativeImeAction(int action);
+    static native void nativeHardwareKey(int keyCode, int metaState, boolean down, boolean repeat);
     static native void nativeImeVisibility(boolean visible, int bottomInsetPx);
     static native void nativeOnLifecycle(int state);
     static native void nativeOnTrimMemory(int level);
@@ -195,7 +197,7 @@ public class RustudioActivity extends NativeActivity {
             int curW = currentMode != null ? currentMode.getPhysicalWidth() : 0;
             int curH = currentMode != null ? currentMode.getPhysicalHeight() : 0;
             Display.Mode bestMode = currentMode;
-            float maxRate = currentMode != null ? currentMode.getRefreshRate() : 0.0f;
+            float maxRate = currentMode != null ? currentMode.getRefreshRate() : 60.0f;
             for (int i = 0; i < modes.length; i++) {
                 Display.Mode m = modes[i];
                 if (m == null) {
@@ -228,10 +230,16 @@ public class RustudioActivity extends NativeActivity {
         unlockMaxRefreshRate();
         imeView = new ImeProxyView(this);
         imeView.setBackgroundColor(0);
-        imeView.setFocusable(true);
-        imeView.setFocusableInTouchMode(true);
+        imeView.setFocusable(false);
+        imeView.setFocusableInTouchMode(false);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
         addContentView(imeView, lp);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        nativeOnLifecycle(0);
     }
 
     @Override
@@ -300,6 +308,9 @@ public class RustudioActivity extends NativeActivity {
 
     @Override
     protected void onPause() {
+        if (imeView != null) {
+            imeView.resetComposing();
+        }
         nativeOnLifecycle(1);
         super.onPause();
     }
@@ -518,6 +529,18 @@ public class RustudioActivity extends NativeActivity {
         }
         if ("image/gif".equals(m)) {
             return "gif";
+        }
+        if ("image/x-tga".equals(m) || "image/tga".equals(m)) {
+            return "tga";
+        }
+        if ("model/obj".equals(m) || "text/plain+obj".equals(m)) {
+            return "obj";
+        }
+        if ("application/octet-stream+fbx".equals(m) || "model/fbx".equals(m)) {
+            return "fbx";
+        }
+        if ("text/x-lua".equals(m) || "application/x-lua".equals(m)) {
+            return "luau";
         }
         if ("model/gltf-binary".equals(m)) {
             return "glb";
@@ -750,6 +773,8 @@ public class RustudioActivity extends NativeActivity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
             applyDarkFullscreenWindow();
+        } else if (imeView != null) {
+            imeView.resetComposing();
         }
     }
 
@@ -762,6 +787,47 @@ public class RustudioActivity extends NativeActivity {
     @Override
     public void onBackPressed() {
         // Handled natively as Esc in Rust (src/android/lifecycle.rs); never finish() on Back.
+    }
+
+    private static boolean isShortcutKeyEvent(KeyEvent event) {
+        if (event == null) {
+            return false;
+        }
+        int code = event.getKeyCode();
+        if (code == KeyEvent.KEYCODE_VOLUME_UP
+                || code == KeyEvent.KEYCODE_VOLUME_DOWN
+                || code == KeyEvent.KEYCODE_VOLUME_MUTE
+                || code == KeyEvent.KEYCODE_BACK
+                || code == KeyEvent.KEYCODE_HOME) {
+            return false;
+        }
+        if (event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()) {
+            return true;
+        }
+        return (code >= KeyEvent.KEYCODE_F1 && code <= KeyEvent.KEYCODE_F12)
+                || code == KeyEvent.KEYCODE_ESCAPE;
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        // When ImeProxyView is focused (typing in Script Editor / Properties / Search),
+        // Android routes hardware keyboard shortcuts through the Java View hierarchy
+        // instead of NativeActivity's AInputQueue. Forward them directly to Rust so
+        // Ctrl+C/V/X/A/Z/Y/S/D/F/M, F5, Shift+F5, Alt+S, and Esc always work.
+        if (imeView != null && imeView.hasFocus() && event != null) {
+            int action = event.getAction();
+            int code = event.getKeyCode();
+            if (action == KeyEvent.ACTION_DOWN && isShortcutKeyEvent(event)) {
+                activeShortcutKeys.add(code);
+                nativeHardwareKey(code, event.getMetaState(), true, event.getRepeatCount() > 0);
+                return true;
+            } else if (action == KeyEvent.ACTION_UP && (isShortcutKeyEvent(event) || activeShortcutKeys.remove(code))) {
+                activeShortcutKeys.remove(code);
+                nativeHardwareKey(code, event.getMetaState(), false, false);
+                return true;
+            }
+        }
+        return super.dispatchKeyEvent(event);
     }
 
     /**
@@ -781,6 +847,8 @@ public class RustudioActivity extends NativeActivity {
                 }
                 if (open) {
                     imeView.resetComposing();
+                    imeView.setFocusable(true);
+                    imeView.setFocusableInTouchMode(true);
                     imeView.requestFocus();
                     imm.restartInput(imeView);
                     imm.showSoftInput(imeView, InputMethodManager.SHOW_IMPLICIT);
@@ -788,6 +856,8 @@ public class RustudioActivity extends NativeActivity {
                 } else {
                     imeView.resetComposing();
                     imeView.clearFocus();
+                    imeView.setFocusable(false);
+                    imeView.setFocusableInTouchMode(false);
                     imm.hideSoftInputFromWindow(imeView.getWindowToken(), 0);
                     applyDarkFullscreenWindow();
                 }
@@ -926,6 +996,19 @@ public class RustudioActivity extends NativeActivity {
 
             @Override
             public boolean sendKeyEvent(KeyEvent event) {
+                if (isShortcutKeyEvent(event)) {
+                    int a = event.getAction();
+                    if (a == KeyEvent.ACTION_DOWN || a == KeyEvent.ACTION_UP) {
+                        nativeHardwareKey(
+                                event.getKeyCode(),
+                                event.getMetaState(),
+                                a == KeyEvent.ACTION_DOWN,
+                                event.getRepeatCount() > 0
+                        );
+                        return true;
+                    }
+                }
+
                 int code = event.getKeyCode();
                 int action = event.getAction();
                 boolean down = (action == KeyEvent.ACTION_DOWN);
@@ -951,6 +1034,9 @@ public class RustudioActivity extends NativeActivity {
                         || code == KeyEvent.KEYCODE_DPAD_DOWN
                         || code == KeyEvent.KEYCODE_MOVE_HOME
                         || code == KeyEvent.KEYCODE_MOVE_END) {
+                    if (event.isShiftPressed()) {
+                        return super.sendKeyEvent(event);
+                    }
                     if (down && code == KeyEvent.KEYCODE_DEL && composingLen > 0) {
                         composingLen = Math.max(0, composingLen - 1);
                     }

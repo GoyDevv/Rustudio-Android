@@ -74,11 +74,15 @@ jobs:
       - name: Install Linux audio/input dev headers
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev
 
-      - name: Run core settings unit tests
+      - name: Run core, API, IntelliSense & import unit tests
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
           CARGO_INCREMENTAL: 0
-        run: cargo test -p rustudio-core --lib rustudio_settings
+        run: |
+          cargo test -p rustudio-core --lib api
+          cargo test -p rustudio-core --lib rustudio_settings
+          cargo test --lib luau_intellisense
+          cargo test --lib import_studio
 
   build-arch:
     name: Build Native Lib (${{ matrix.arch }})

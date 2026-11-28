@@ -96,6 +96,19 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeIme
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeHardwareKey(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    key_code: i32,
+    meta_state: i32,
+    down: u8,
+    repeat: u8,
+) {
+    rustudio::android::ime_bridge::on_hardware_key(key_code, meta_state, down != 0, repeat != 0);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
 pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeVisibility(
     _env: *mut c_void,
     _class: *mut c_void,

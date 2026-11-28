@@ -713,13 +713,30 @@ impl Editor {
             let r = Rect::from_min_size(egui::pos2(ox + d, strip.min.y + 4.0), Vec2::new(1.0, STRIP_H - 6.0));
             painter.rect_filled(r, 0.0, theme::DIVIDER);
         }
+        enum RibbonPluginAction {
+            SetEnabled { store_id: String, enabled: bool },
+            ReloadStore(String),
+            ReloadHost(super::PluginId),
+            UnloadHost(super::PluginId),
+            Permissions(String),
+            ManagePlugins,
+            ConfirmRemove(String),
+        }
+        let bridge_map: HashMap<super::PluginId, String> = self
+            .plugin_store
+            .runtime
+            .bridge()
+            .map(|b| b.ids.iter().map(|(sid, pid)| (*pid, sid.clone())).collect())
+            .unwrap_or_default();
         self.plugin_bar.rects.clear();
         let ctx = ui.ctx().clone();
         let mut clicked: Option<Ref> = None;
+        let mut action: Option<RibbonPluginAction> = None;
         for (gi, bi, cx, w, label) in cells {
-            let b = &groups[gi].buttons[bi];
+            let group = &groups[gi];
+            let b = &group.buttons[bi];
             let cell = Rect::from_min_size(egui::pos2(ox + cx, strip.min.y), Vec2::new(w, STRIP_H));
-            self.plugin_bar.rects.push((format!("{}/{}", groups[gi].name, b.id), cell));
+            self.plugin_bar.rects.push((format!("{}/{}", group.name, b.id), cell));
             if !cell.intersects(strip) {
                 continue;
             }
@@ -741,7 +758,61 @@ impl Editor {
                 font.clone(),
                 dim(theme::TEXT),
             );
-            if resp.hovered() {
+            resp.context_menu(|ui| {
+                let store_list = self.plugin_store.store.list();
+                let store_src = bridge_map
+                    .get(&group.plugin)
+                    .and_then(|sid| store_list.iter().find(|p| p.id == *sid))
+                    .or_else(|| store_list.iter().find(|p| p.id == group.plugin_name));
+                let header = store_src.map(|p| p.name.as_str()).unwrap_or(group.plugin_name.as_str());
+                ui.label(egui::RichText::new(header).small().color(theme::TEXT_DIM));
+                ui.separator();
+                if let Some(p) = store_src {
+                    let toggle_label = if p.enabled { "Shut Off / Disable" } else { "Enable" };
+                    if ui.button(toggle_label).clicked() {
+                        action = Some(RibbonPluginAction::SetEnabled {
+                            store_id: p.id.clone(),
+                            enabled: !p.enabled,
+                        });
+                        ui.close();
+                    }
+                    if ui.button("Reload").clicked() {
+                        action = Some(RibbonPluginAction::ReloadStore(p.id.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Permissions…").clicked() {
+                        action = Some(RibbonPluginAction::Permissions(p.id.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Manage Plugins…").clicked() {
+                        action = Some(RibbonPluginAction::ManagePlugins);
+                        ui.close();
+                    }
+                    ui.separator();
+                    let remove_label = match p.kind {
+                        crate::plugin_store::PluginKind::Installed => "Uninstall…",
+                        crate::plugin_store::PluginKind::Local => "Delete…",
+                    };
+                    if ui.button(egui::RichText::new(remove_label).color(theme::ERROR)).clicked() {
+                        action = Some(RibbonPluginAction::ConfirmRemove(p.id.clone()));
+                        ui.close();
+                    }
+                } else {
+                    if ui.button("Reload").clicked() {
+                        action = Some(RibbonPluginAction::ReloadHost(group.plugin));
+                        ui.close();
+                    }
+                    if ui.button("Shut Off (Unload)").clicked() {
+                        action = Some(RibbonPluginAction::UnloadHost(group.plugin));
+                        ui.close();
+                    }
+                    if ui.button("Manage Plugins…").clicked() {
+                        action = Some(RibbonPluginAction::ManagePlugins);
+                        ui.close();
+                    }
+                }
+            });
+            if resp.hovered() && !resp.context_menu_opened() {
                 self.plugin_tooltip(&ctx, cell, strip.max.y, b);
             }
             if usable && resp.clicked() {
@@ -750,6 +821,36 @@ impl Editor {
         }
         if let Some(r) = clicked {
             self.plugin_fire(r, "Click");
+        }
+        if let Some(act) = action {
+            match act {
+                RibbonPluginAction::SetEnabled { store_id, enabled } => {
+                    let client = self.game.account.shared_client();
+                    self.plugin_store.set_enabled(client, &store_id, enabled);
+                }
+                RibbonPluginAction::ReloadStore(store_id) => {
+                    self.plugin_store.reload(&store_id);
+                }
+                RibbonPluginAction::ReloadHost(pid) => {
+                    self.plugins.reload(pid);
+                }
+                RibbonPluginAction::UnloadHost(pid) => {
+                    self.plugins.unload(pid);
+                }
+                RibbonPluginAction::Permissions(store_id) => {
+                    self.plugin_store.ui.open = true;
+                    self.plugin_store.ui.find = false;
+                    self.plugin_store.ui.perms_page = Some(store_id);
+                }
+                RibbonPluginAction::ManagePlugins => {
+                    self.plugin_store.ui.open = true;
+                    self.plugin_store.ui.find = false;
+                    self.plugin_store.ui.perms_page = None;
+                }
+                RibbonPluginAction::ConfirmRemove(store_id) => {
+                    self.plugin_store.ui.confirm_remove = Some(store_id);
+                }
+            }
         }
     }
 

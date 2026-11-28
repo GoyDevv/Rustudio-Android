@@ -180,6 +180,14 @@ impl PluginManager {
             for p in self.store.enabled().into_iter().filter(|p| p.kind == PluginKind::Installed) {
                 self.startup.push_back(p);
             }
+            if user_id != 0 {
+                let loaded = self.runtime.loaded();
+                for p in self.store.enabled().into_iter().filter(|p| p.kind == PluginKind::Local && loaded.contains(&p.id)) {
+                    if let Err(e) = self.runtime.reload(&p) {
+                        self.error(format!("Plugin {} failed to reload: {e}", p.id));
+                    }
+                }
+            }
         }
     }
 
@@ -202,6 +210,7 @@ impl PluginManager {
                 }
             }
         }
+        if watcher::reload_on_change_setting() {
         if let Some(w) = self.watcher.as_mut() {
             let changes = w.tick();
             if !changes.is_empty() {
@@ -210,6 +219,7 @@ impl PluginManager {
                     self.lines.push(Line { level, text });
                 }
             }
+        }
         }
         // The account: check who is signed in about once a second.
         let check = self.last_user_check.is_none_or(|t| t.elapsed().as_millis() > 1000);
@@ -405,6 +415,61 @@ impl PluginManager {
         }
     }
 
+    /// Reloads a plugin from disk (unloads and runs it again).
+    pub fn reload(&mut self, id: &str) {
+        let Some(p) = self.store.resolve(id) else {
+            self.error(format!("Plugin {id} not found"));
+            return;
+        };
+        if !self.loading_on() {
+            return;
+        }
+        if !p.present {
+            self.error(format!("Plugin {} is not downloaded yet", p.name));
+            return;
+        }
+        let r = if self.runtime.loaded().contains(&p.id) {
+            self.runtime.reload(&p)
+        } else {
+            self.runtime.load(&p)
+        };
+        match r {
+            Ok(()) => self.info(format!("Reloaded plugin {}", p.name)),
+            Err(e) => self.error(format!("Plugin {} failed to reload: {e}", p.id)),
+        }
+    }
+
+    /// Removes a plugin by store id: uninstalls an installed plugin or deletes
+    /// a local plugin file, unloading it and clearing permissions.
+    pub fn remove_by_id(&mut self, id: &str) {
+        let Some(p) = self.store.resolve(id) else {
+            self.error(format!("Plugin {id} not found"));
+            return;
+        };
+        match (p.kind, p.asset_id) {
+            (PluginKind::Installed, Some(aid)) => self.remove(aid),
+            (PluginKind::Local, _) => {
+                if self.runtime.loaded().contains(&p.id) {
+                    self.runtime.unload(&p.id);
+                }
+                match self.store.remove_local(&p.id) {
+                    Ok(()) => {
+                        if let Ok(mut g) = permissions::global().lock() {
+                            g.forget(&p.id);
+                        }
+                        if let Some(w) = self.watcher.as_mut() {
+                            let _ = w.poll();
+                            let _ = w.poll();
+                        }
+                        self.info(format!("Deleted local plugin {}", p.name));
+                    }
+                    Err(e) => self.error(e),
+                }
+            }
+            _ => self.error(format!("Cannot remove plugin {}", p.id)),
+        }
+    }
+
     pub fn search(&mut self, client: Option<SharedClient>, query: String) {
         let Some(client) = client else {
             self.search = Some((query, Err(Failure::SignedOut.describe())));
@@ -560,6 +625,67 @@ impl PluginManager {
         self.info(format!("Saved local plugin {} ({})", p.name, path.display()));
         Ok(p)
     }
+
+    /// Imports a local plugin file (`.rbxm`, `.rbxmx`, `.lua`, or `.luau`) into
+    /// the local Plugins folder, ensures it is enabled, and loads/reloads it
+    /// immediately. Returns `(plugin, updated)`.
+    pub fn import_local_file(&mut self, src_path: &std::path::Path) -> Result<(PluginSource, bool), String> {
+        let raw_ext = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let target_ext = match raw_ext.as_str() {
+            "rbxm" => "rbxm",
+            "rbxmx" => "rbxmx",
+            "lua" | "luau" => "lua",
+            _ => {
+                return Err(format!(
+                    "Unsupported plugin file type '.{raw_ext}' (expected .rbxm, .rbxmx, .lua, or .luau)"
+                ));
+            }
+        };
+        let bytes = std::fs::read(src_path).map_err(|e| format!("{}: {e}", src_path.display()))?;
+        if matches!(target_ext, "rbxm" | "rbxmx") {
+            super::check_model_bytes(&bytes)?;
+        }
+        self.store.ensure_plugins_dir().map_err(|e| format!("Plugins folder: {e}"))?;
+        let stem = src_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Plugin".to_string());
+        let dest = self.store.local_save_path(&stem, target_ext);
+        let updated = dest.exists();
+        let tmp = dest.with_extension(format!("{target_ext}.tmp"));
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e}", dest.display()));
+        }
+        let id = super::local_id(&self.store.plugins_dir, &dest);
+        if self.store.meta.local.remove(&id).is_some() {
+            let _ = self.store.save();
+        }
+        let p = self
+            .store
+            .get(&id)
+            .ok_or_else(|| format!("{} is not in the Plugins folder", dest.display()))?;
+        if let Some(w) = self.watcher.as_mut() {
+            let _ = w.poll();
+            let _ = w.poll();
+        }
+        if p.enabled && self.loading_on() {
+            let r = if self.runtime.loaded().contains(&p.id) {
+                self.runtime.reload(&p)
+            } else {
+                self.runtime.load(&p)
+            };
+            r.map_err(|e| format!("imported, but it failed to load: {e}"))?;
+        }
+        let verb = if updated { "Updated" } else { "Imported" };
+        self.info(format!("{verb} local plugin {} ({})", p.name, dest.display()));
+        Ok((p, updated))
+    }
 }
 
 /// Install steps on a background thread: check it's a plugin, Get it when
@@ -658,5 +784,44 @@ mod tests {
         }
         // a, off (turned on), Saved; b is off and 9 was removed.
         assert_eq!(m.runtime.loaded(), ["user_a.lua", "user_off.lua", "user_Saved.rbxmx"]);
+    }
+
+    #[test]
+    fn reload_and_remove_by_id_handle_local_and_installed() {
+        let root = tmp("reload-remove-by-id");
+        let dir = root.join("Plugins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_path = dir.join("helper.lua");
+        std::fs::write(&local_path, "print('v1')").unwrap();
+        let mut store = Store::open(root.clone(), dir.clone(), 0);
+        store
+            .install_bytes(
+                InstalledMeta { plugin_asset_id: 12, asset_version_id: 120, enabled: true, ..Default::default() },
+                &tiny_rbxm(),
+            )
+            .unwrap();
+        let mut m = PluginManager::new(store, Box::new(NoRuntime::default()));
+        for f in 1..6 {
+            m.tick(None, f);
+        }
+        assert_eq!(m.runtime.loaded(), ["user_helper.lua", "cloud_12"]);
+
+        // Reload keeps both loaded and logs info.
+        m.lines.clear();
+        m.reload("user_helper.lua");
+        m.reload("cloud_12");
+        assert_eq!(m.runtime.loaded(), ["user_helper.lua", "cloud_12"]);
+        assert!(m.lines.iter().any(|l| l.text.contains("Reloaded plugin helper")));
+
+        // remove_by_id on local unloads, deletes file, and drops from store.
+        m.remove_by_id("user_helper.lua");
+        assert!(!m.runtime.loaded().contains(&"user_helper.lua".to_string()));
+        assert!(!local_path.exists());
+        assert!(m.store.get("user_helper.lua").is_none());
+
+        // remove_by_id on installed delegates to uninstall.
+        m.remove_by_id("cloud_12");
+        assert!(!m.runtime.loaded().contains(&"cloud_12".to_string()));
+        assert!(m.store.get("cloud_12").is_none());
     }
 }

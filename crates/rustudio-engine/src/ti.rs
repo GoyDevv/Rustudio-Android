@@ -98,15 +98,17 @@ pub fn paint(p: &Painter, r: Rect, name: &str, color: Color32) {
         paint_model(p, r);
         return;
     }
-    let name = if has(name) { name } else { "square" };
-    let Some((c, family)) = glyph(name) else {
+    let Some((c, family)) = glyph(name).or_else(|| glyph("square")) else {
         return;
     };
-    let size = r.width().min(r.height());
+    // Quantize icon font sizes to 2 pt steps so resizing panels/splitters doesn't
+    // thrash the egui font atlas on every 1px drag frame.
+    let size = ((r.width().min(r.height()) * 0.5).round() * 2.0).max(2.0);
+    let mut buf = [0u8; 4];
     p.text(
         r.center(),
         Align2::CENTER_CENTER,
-        c.to_string(),
+        c.encode_utf8(&mut buf),
         FontId::new(size, family),
         color,
     );

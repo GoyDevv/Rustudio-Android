@@ -19,7 +19,7 @@ rbx_dom_weak = "4"
 gilrs = "0.11"
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tga"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 pollster = "0.4"
 mlua = { version = "0.12", features = ["luau"] }

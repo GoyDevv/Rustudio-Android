@@ -80,267 +80,9 @@ const GLOBALS: &[&str] = &[
 
 // ------------------------------------------------------------------ autocomplete catalog
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcKind {
-    Keyword,
-    Stdlib,
-    Global,
-    Method,
-    Property,
-    Local,
-    Plugin,
-}
-
-impl AcKind {
-    fn badge(self) -> (&'static str, Color32) {
-        match self {
-            AcKind::Keyword => ("kw", Color32::from_rgb(198, 120, 221)),
-            AcKind::Stdlib => ("fn", Color32::from_rgb(97, 175, 239)),
-            AcKind::Global => ("cls", Color32::from_rgb(229, 192, 123)),
-            AcKind::Method => ("mth", Color32::from_rgb(86, 182, 194)),
-            AcKind::Property => ("prp", Color32::from_rgb(152, 195, 121)),
-            AcKind::Local => ("var", Color32::from_rgb(224, 108, 117)),
-            AcKind::Plugin => ("plg", Color32::from_rgb(180, 180, 195)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AcItem {
-    label: String,
-    insert: String,
-    kind: AcKind,
-    detail: &'static str,
-}
-
-const STDLIB_FUNCTIONS: &[(&str, &str)] = &[
-    ("task.wait", "(seconds?) -> number"),
-    ("task.spawn", "(f, ...) -> thread"),
-    ("task.defer", "(f, ...) -> thread"),
-    ("task.delay", "(duration, f, ...) -> thread"),
-    ("math.abs", "(x) -> number"),
-    ("math.clamp", "(x, min, max) -> number"),
-    ("math.floor", "(x) -> number"),
-    ("math.ceil", "(x) -> number"),
-    ("math.round", "(x) -> number"),
-    ("math.rad", "(deg) -> number"),
-    ("math.deg", "(rad) -> number"),
-    ("math.random", "(m?, n?) -> number"),
-    ("math.min", "(x, ...) -> number"),
-    ("math.max", "(x, ...) -> number"),
-    ("table.insert", "(t, pos?, value)"),
-    ("table.remove", "(t, pos?) -> any"),
-    ("table.find", "(t, value, init?) -> number?"),
-    ("table.clone", "(t) -> table"),
-    ("table.clear", "(t)"),
-    ("string.format", "(fmt, ...) -> string"),
-    ("string.sub", "(s, i, j?) -> string"),
-    ("string.find", "(s, pattern, init?, plain?)"),
-    ("string.gsub", "(s, pattern, repl, n?)"),
-    ("string.split", "(s, sep?) -> {string}"),
-    ("string.lower", "(s) -> string"),
-    ("string.upper", "(s) -> string"),
-    ("print", "(...)"),
-    ("warn", "(...)"),
-    ("error", "(message, level?)"),
-    ("pcall", "(f, ...) -> (boolean, ...)"),
-    ("xpcall", "(f, err, ...) -> (boolean, ...)"),
-    ("pairs", "(t)"),
-    ("ipairs", "(t)"),
-    ("next", "(t, index?)"),
-    ("typeof", "(value) -> string"),
-    ("tonumber", "(e, base?) -> number?"),
-    ("tostring", "(e) -> string"),
-    ("require", "(module) -> any"),
-    ("task", "Luau task library"),
-    ("math", "Luau math library"),
-    ("table", "Luau table library"),
-    ("string", "Luau string library"),
-];
-
-const ROBLOX_GLOBALS: &[(&str, &str)] = &[
-    ("game", "DataModel"),
-    ("workspace", "Workspace"),
-    ("script", "LuaSourceContainer"),
-    ("Instance.new", "(className, parent?) -> Instance"),
-    ("Vector3.new", "(x?, y?, z?) -> Vector3"),
-    ("Vector2.new", "(x?, y?) -> Vector2"),
-    ("CFrame.new", "(...) -> CFrame"),
-    ("CFrame.Angles", "(rx, ry, rz) -> CFrame"),
-    ("CFrame.lookAt", "(at, lookAt, up?) -> CFrame"),
-    ("Color3.fromRGB", "(r, g, b) -> Color3"),
-    ("Color3.new", "(r?, g?, b?) -> Color3"),
-    ("UDim2.new", "(xS, xO, yS, yO) -> UDim2"),
-    ("UDim2.fromScale", "(x, y) -> UDim2"),
-    ("UDim2.fromOffset", "(x, y) -> UDim2"),
-    ("UDim.new", "(scale?, offset?) -> UDim"),
-    ("BrickColor.new", "(val) -> BrickColor"),
-    ("TweenInfo.new", "(time?, style?, dir?, ...)"),
-    ("RaycastParams.new", "() -> RaycastParams"),
-    ("Enum", "Enums"),
-    ("Players", "Players service"),
-    ("RunService", "RunService"),
-    ("UserInputService", "UserInputService"),
-    ("ReplicatedStorage", "ReplicatedStorage"),
-    ("TweenService", "TweenService"),
-    ("CollectionService", "CollectionService"),
-    ("Debris", "Debris service"),
-    ("Lighting", "Lighting service"),
-    ("SoundService", "SoundService"),
-    ("StarterGui", "StarterGui"),
-    ("ServerScriptService", "ServerScriptService"),
-    ("ServerStorage", "ServerStorage"),
-    ("Instance", "Roblox Instance"),
-    ("Vector3", "3D vector"),
-    ("Vector2", "2D vector"),
-    ("CFrame", "Coordinate frame"),
-    ("Color3", "RGB color"),
-    ("UDim2", "2D UI dimension"),
-    ("UDim", "1D UI dimension"),
-    ("BrickColor", "Named brick color"),
-    ("TweenInfo", "Tween configuration"),
-    ("RaycastParams", "Raycast parameters"),
-];
-
-const MEMBER_METHODS: &[(&str, &str)] = &[
-    ("GetService", "(className) -> Instance"),
-    ("FindFirstChild", "(name, recursive?) -> Instance?"),
-    ("FindFirstChildOfClass", "(className) -> Instance?"),
-    ("WaitForChild", "(name, timeOut?) -> Instance"),
-    ("Clone", "() -> Instance"),
-    ("Destroy", "()"),
-    ("GetChildren", "() -> {Instance}"),
-    ("GetDescendants", "() -> {Instance}"),
-    ("IsA", "(className) -> boolean"),
-    ("Connect", "(func) -> RBXScriptConnection"),
-    ("Once", "(func) -> RBXScriptConnection"),
-    ("Wait", "() -> ..."),
-    ("FireServer", "(...)"),
-    ("FireClient", "(player, ...)"),
-    ("FireAllClients", "(...)"),
-    ("PivotTo", "(targetCFrame)"),
-    ("GetPivot", "() -> CFrame"),
-    ("MoveTo", "(position, part?)"),
-    ("GetAttribute", "(attribute) -> any"),
-    ("SetAttribute", "(attribute, value)"),
-];
-
-const MEMBER_PROPERTIES: &[(&str, &str)] = &[
-    ("OnServerEvent", "RBXScriptSignal"),
-    ("OnClientEvent", "RBXScriptSignal"),
-    ("Parent", "Instance?"),
-    ("Name", "string"),
-    ("Position", "Vector3"),
-    ("CFrame", "CFrame"),
-    ("Size", "Vector3"),
-    ("Color", "Color3"),
-    ("Transparency", "number"),
-    ("Anchored", "boolean"),
-    ("CanCollide", "boolean"),
-    ("Humanoid", "Humanoid"),
-    ("Character", "Model?"),
-    ("LocalPlayer", "Player"),
-    ("Touched", "RBXScriptSignal"),
-    ("Heartbeat", "RBXScriptSignal"),
-    ("RenderStepped", "RBXScriptSignal"),
-    ("Stepped", "RBXScriptSignal"),
-];
-
-/// Receiver-specific members for `foo.` completions (e.g. `task.`, `math.`, `CFrame.`).
-fn receiver_members(receiver: &str) -> Option<&'static [(&'static str, &'static str, AcKind)]> {
-    const TASK_M: &[(&str, &str, AcKind)] = &[
-        ("wait", "(seconds?) -> number", AcKind::Stdlib),
-        ("spawn", "(f, ...) -> thread", AcKind::Stdlib),
-        ("defer", "(f, ...) -> thread", AcKind::Stdlib),
-        ("delay", "(duration, f, ...) -> thread", AcKind::Stdlib),
-    ];
-    const MATH_M: &[(&str, &str, AcKind)] = &[
-        ("abs", "(x) -> number", AcKind::Stdlib),
-        ("clamp", "(x, min, max) -> number", AcKind::Stdlib),
-        ("floor", "(x) -> number", AcKind::Stdlib),
-        ("ceil", "(x) -> number", AcKind::Stdlib),
-        ("round", "(x) -> number", AcKind::Stdlib),
-        ("rad", "(deg) -> number", AcKind::Stdlib),
-        ("deg", "(rad) -> number", AcKind::Stdlib),
-        ("random", "(m?, n?) -> number", AcKind::Stdlib),
-        ("min", "(x, ...) -> number", AcKind::Stdlib),
-        ("max", "(x, ...) -> number", AcKind::Stdlib),
-    ];
-    const TABLE_M: &[(&str, &str, AcKind)] = &[
-        ("insert", "(t, pos?, value)", AcKind::Stdlib),
-        ("remove", "(t, pos?) -> any", AcKind::Stdlib),
-        ("find", "(t, value, init?) -> number?", AcKind::Stdlib),
-        ("clone", "(t) -> table", AcKind::Stdlib),
-        ("clear", "(t)", AcKind::Stdlib),
-    ];
-    const STRING_M: &[(&str, &str, AcKind)] = &[
-        ("format", "(fmt, ...) -> string", AcKind::Stdlib),
-        ("sub", "(s, i, j?) -> string", AcKind::Stdlib),
-        ("find", "(s, pattern, init?, plain?)", AcKind::Stdlib),
-        ("gsub", "(s, pattern, repl, n?)", AcKind::Stdlib),
-        ("split", "(s, sep?) -> {string}", AcKind::Stdlib),
-        ("lower", "(s) -> string", AcKind::Stdlib),
-        ("upper", "(s) -> string", AcKind::Stdlib),
-    ];
-    const INSTANCE_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(className, parent?) -> Instance", AcKind::Global),
-    ];
-    const VECTOR3_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(x?, y?, z?) -> Vector3", AcKind::Global),
-        ("zero", "Vector3(0, 0, 0)", AcKind::Property),
-        ("one", "Vector3(1, 1, 1)", AcKind::Property),
-    ];
-    const VECTOR2_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(x?, y?) -> Vector2", AcKind::Global),
-        ("zero", "Vector2(0, 0)", AcKind::Property),
-        ("one", "Vector2(1, 1)", AcKind::Property),
-    ];
-    const CFRAME_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(...) -> CFrame", AcKind::Global),
-        ("Angles", "(rx, ry, rz) -> CFrame", AcKind::Global),
-        ("lookAt", "(at, lookAt, up?) -> CFrame", AcKind::Global),
-        ("identity", "CFrame", AcKind::Property),
-    ];
-    const COLOR3_M: &[(&str, &str, AcKind)] = &[
-        ("fromRGB", "(r, g, b) -> Color3", AcKind::Global),
-        ("new", "(r?, g?, b?) -> Color3", AcKind::Global),
-    ];
-    const UDIM2_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(xS, xO, yS, yO) -> UDim2", AcKind::Global),
-        ("fromScale", "(x, y) -> UDim2", AcKind::Global),
-        ("fromOffset", "(x, y) -> UDim2", AcKind::Global),
-    ];
-    const UDIM_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(scale?, offset?) -> UDim", AcKind::Global),
-    ];
-    const BRICKCOLOR_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(val) -> BrickColor", AcKind::Global),
-    ];
-    const TWEENINFO_M: &[(&str, &str, AcKind)] = &[
-        ("new", "(time?, style?, dir?, ...)", AcKind::Global),
-    ];
-    const RAYCASTPARAMS_M: &[(&str, &str, AcKind)] = &[
-        ("new", "() -> RaycastParams", AcKind::Global),
-    ];
-
-    match receiver {
-        "task" => Some(TASK_M),
-        "math" => Some(MATH_M),
-        "table" => Some(TABLE_M),
-        "string" => Some(STRING_M),
-        "Instance" => Some(INSTANCE_M),
-        "Vector3" => Some(VECTOR3_M),
-        "Vector2" => Some(VECTOR2_M),
-        "CFrame" => Some(CFRAME_M),
-        "Color3" => Some(COLOR3_M),
-        "UDim2" => Some(UDIM2_M),
-        "UDim" => Some(UDIM_M),
-        "BrickColor" => Some(BRICKCOLOR_M),
-        "TweenInfo" => Some(TWEENINFO_M),
-        "RaycastParams" => Some(RAYCASTPARAMS_M),
-        _ => None,
-    }
-}
+use crate::luau_intellisense::{AcContext, AcItem};
+#[cfg(test)]
+use crate::luau_intellisense::AcKind;
 
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
@@ -434,189 +176,32 @@ fn scrape_dynamic_identifiers(src: &str) -> Vec<String> {
     found
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AcContext {
-    /// Char index where the replacement token starts.
-    replace_start: usize,
-    /// Typed prefix to match against (may be empty right after `.` or `:`).
-    prefix: String,
-    /// Optional member trigger (`'.'` or `':'`) and optional receiver identifier before it.
-    member_trigger: Option<(char, Option<String>)>,
+/// Builds ranked 1:1 Roblox Studio Luau IntelliSense completions for `src` at `cursor`.
+fn build_completions_with_doc(
+    src: &str,
+    cursor: usize,
+    doc: Option<&rustudio_core::doc::Document>,
+    script_ref: Option<Ref>,
+    plugin_items: &[(String, String)],
+) -> Option<(AcContext, Vec<AcItem>)> {
+    let dynamic = scrape_dynamic_identifiers(src);
+    crate::luau_intellisense::build_completions(
+        src,
+        cursor,
+        doc,
+        script_ref,
+        plugin_items,
+        &dynamic,
+    )
 }
 
-/// Computes the autocomplete context at `cursor` (char index) in `src`.
-/// Triggers when typing an identifier (>= 1 char) or immediately after `.` or `:`.
-fn autocomplete_context(src: &str, cursor: usize) -> Option<AcContext> {
-    let chars: Vec<char> = src.chars().collect();
-    if cursor > chars.len() {
-        return None;
-    }
-    let mut start = cursor;
-    while start > 0 && is_ident_char(chars[start - 1]) {
-        start -= 1;
-    }
-    let prefix: String = chars[start..cursor].iter().collect();
-
-    // Check if preceded by `.` or `:`.
-    if start > 0 && (chars[start - 1] == '.' || chars[start - 1] == ':') {
-        let trigger = chars[start - 1];
-        // Don't trigger on `..` (string concatenation) or numeric literals like `1.5`.
-        if trigger == '.' && start >= 2 && (chars[start - 2] == '.' || chars[start - 2].is_ascii_digit()) {
-            return None;
-        }
-        let mut recv_end = start - 1;
-        let mut recv_start = recv_end;
-        while recv_start > 0 && is_ident_char(chars[recv_start - 1]) {
-            recv_start -= 1;
-        }
-        // Only treat as a clean identifier receiver if it starts with a letter/underscore.
-        let receiver = if recv_start < recv_end && is_ident_start(chars[recv_start]) {
-            Some(chars[recv_start..recv_end].iter().collect())
-        } else {
-            None
-        };
-        let _ = &mut recv_end;
-        return Some(AcContext {
-            replace_start: start,
-            prefix,
-            member_trigger: Some((trigger, receiver)),
-        });
-    }
-
-    // Standard identifier trigger: at least 1 char starting with ident start.
-    if !prefix.is_empty() && prefix.chars().next().is_some_and(is_ident_start) {
-        return Some(AcContext {
-            replace_start: start,
-            prefix,
-            member_trigger: None,
-        });
-    }
-
-    None
-}
-
-/// Builds ranked autocomplete suggestions for `src` at `cursor`, merging any
-/// plugin-provided completions (`plugin_items`).
+#[cfg(test)]
 fn build_completions(
     src: &str,
     cursor: usize,
     plugin_items: &[(String, String)],
 ) -> Option<(AcContext, Vec<AcItem>)> {
-    let ctx = autocomplete_context(src, cursor)?;
-    let prefix_lower = ctx.prefix.to_ascii_lowercase();
-    let mut candidates: Vec<AcItem> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let mut add = |label: &str, insert: &str, kind: AcKind, detail: &'static str| {
-        if !prefix_lower.is_empty() {
-            let ll = label.to_ascii_lowercase();
-            if !ll.contains(&prefix_lower) {
-                return;
-            }
-            // Don't suggest an exact no-op completion unless there are other items.
-        }
-        if seen.insert(insert.to_string()) {
-            candidates.push(AcItem {
-                label: label.to_string(),
-                insert: insert.to_string(),
-                kind,
-                detail,
-            });
-        }
-    };
-
-    // Plugin completions first if available.
-    for (label, insert) in plugin_items {
-        add(label, insert, AcKind::Plugin, "plugin");
-    }
-
-    match &ctx.member_trigger {
-        Some((trigger, receiver)) => {
-            if *trigger == '.' {
-                if let Some(recv) = receiver.as_deref() {
-                    if let Some(members) = receiver_members(recv) {
-                        for &(name, detail, kind) in members {
-                            add(name, name, kind, detail);
-                        }
-                    }
-                }
-            }
-            if *trigger == ':' {
-                for &(name, detail) in MEMBER_METHODS {
-                    add(name, name, AcKind::Method, detail);
-                }
-                for &(name, detail) in MEMBER_PROPERTIES {
-                    add(name, name, AcKind::Property, detail);
-                }
-            } else {
-                for &(name, detail) in MEMBER_PROPERTIES {
-                    add(name, name, AcKind::Property, detail);
-                }
-                for &(name, detail) in MEMBER_METHODS {
-                    add(name, name, AcKind::Method, detail);
-                }
-            }
-        }
-        None => {
-            for &kw in KEYWORDS {
-                add(kw, kw, AcKind::Keyword, "keyword");
-            }
-            for &(name, detail) in STDLIB_FUNCTIONS {
-                add(name, name, AcKind::Stdlib, detail);
-            }
-            for &(name, detail) in ROBLOX_GLOBALS {
-                add(name, name, AcKind::Global, detail);
-            }
-            for ident in scrape_dynamic_identifiers(src) {
-                // Skip if it's solely the exact prefix being typed right now.
-                if ident == ctx.prefix {
-                    continue;
-                }
-                add(&ident, &ident, AcKind::Local, "local");
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // If the only match is identical to what's already typed, don't pop up.
-    if candidates.len() == 1 && candidates[0].insert == ctx.prefix {
-        return None;
-    }
-
-    // Rank: exact prefix match (case-sensitive) < case-insensitive prefix match < substring match,
-    // then prefer dynamic locals / keywords / stdlib / globals, then shorter / alphabetical.
-    candidates.sort_by(|a, b| {
-        let score = |item: &AcItem| -> (u8, u8, usize) {
-            let match_tier = if ctx.prefix.is_empty() {
-                0
-            } else if item.label.starts_with(&ctx.prefix) {
-                0
-            } else if item.label.to_ascii_lowercase().starts_with(&prefix_lower) {
-                1
-            } else {
-                2
-            };
-            let kind_tier = match item.kind {
-                AcKind::Plugin => 0,
-                AcKind::Local => 1,
-                AcKind::Method if matches!(ctx.member_trigger, Some((':', _))) => 1,
-                AcKind::Property if matches!(ctx.member_trigger, Some(('.', _))) => 1,
-                AcKind::Keyword => 2,
-                AcKind::Stdlib => 3,
-                AcKind::Global => 4,
-                AcKind::Method => 5,
-                AcKind::Property => 6,
-            };
-            (match_tier, kind_tier, item.label.len())
-        };
-        score(a).cmp(&score(b)).then_with(|| a.label.cmp(&b.label))
-    });
-
-    candidates.truncate(24);
-    Some((ctx, candidates))
+    build_completions_with_doc(src, cursor, None, None, plugin_items)
 }
 
 // ------------------------------------------------------------------ auto-closing & smart blocks
@@ -1310,6 +895,7 @@ struct GotoLineState {
 
 pub struct ScriptBuf {
     pub text: String,
+    last_doc_source: String,
     pub error: Option<(usize, String)>,
     checked: Option<String>,
     edited: Instant,
@@ -1487,7 +1073,8 @@ impl Editor {
         self.scripts.bufs.insert(
             r,
             ScriptBuf {
-                text: source,
+                text: source.clone(),
+                last_doc_source: source,
                 error: None,
                 checked: None,
                 edited: Instant::now(),
@@ -1562,6 +1149,7 @@ impl Editor {
         }
         let buf = self.scripts.bufs.entry(r).or_insert_with(|| ScriptBuf {
             text: source.clone(),
+            last_doc_source: source.clone(),
             error: None,
             checked: None,
             edited: Instant::now(),
@@ -1586,9 +1174,11 @@ impl Editor {
         if any_script_focus {
             crate::plugin_host::script_docs::set_active(Some(r));
         }
-        // Undo/redo or a script change elsewhere: follow the document.
-        if (!focused || follow_live_source) && buf.text != source {
+        // Undo/redo, plugin edit, or Team Create change elsewhere: follow the document,
+        // even while focused when the DataModel's Source diverged from our last seen doc source.
+        if source != buf.last_doc_source || ((!focused || follow_live_source) && buf.text != source) {
             buf.text = source.clone();
+            buf.last_doc_source = source.clone();
             buf.checked = None;
             buf.ac.open = false;
         }
@@ -2898,7 +2488,7 @@ impl Editor {
                                             ui.painter().text(
                                                 egui::pos2(rect.right() - 6.0, rect.center().y),
                                                 egui::Align2::RIGHT_CENTER,
-                                                item.detail,
+                                                &item.detail,
                                                 FontId::proportional(10.5),
                                                 theme::TEXT_DIM,
                                             );
@@ -2982,10 +2572,13 @@ impl Editor {
             st.clone().store(ui.ctx(), editor_id);
         }
 
-        // Update built-in autocomplete candidates whenever text changes.
-        if changed && accept_ac_idx.is_none() && doc_undo_label.is_none() {
+        // Manual Ctrl+Space autocomplete trigger (matches Roblox Studio).
+        let manual_ac = ui.ctx().memory(|m| m.has_focus(editor_id))
+            && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space));
+        // Update built-in autocomplete candidates whenever text changes or Ctrl+Space is pressed.
+        if (changed || manual_ac) && accept_ac_idx.is_none() && doc_undo_label.is_none() {
             if let Some(cur) = word_end {
-                if let Some((ac_ctx, items)) = build_completions(&buf.text, cur, &buf.completions) {
+                if let Some((ac_ctx, items)) = build_completions_with_doc(&buf.text, cur, Some(&self.game.doc), Some(r), &buf.completions) {
                     buf.ac.open = true;
                     buf.ac.replace_start = ac_ctx.replace_start;
                     buf.ac.cursor = cur;
@@ -3045,6 +2638,9 @@ impl Editor {
                 vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text.clone()))],
                 merge_key,
             );
+            if let Some(b) = self.scripts.bufs.get_mut(&r) {
+                b.last_doc_source = text.clone();
+            }
             let typing_word = word_end.is_some_and(|word_end| {
                 let c: Vec<char> = text.chars().collect();
                 let i = word_end.min(c.len());
@@ -3075,7 +2671,7 @@ impl Editor {
                 if !b.completions.is_empty() && accept_ac_idx.is_none() {
                     if let Some(cur) = word_end {
                         if let Some((ac_ctx, merged)) =
-                            build_completions(&b.text, cur, &b.completions)
+                            build_completions_with_doc(&b.text, cur, Some(&self.game.doc), Some(r), &b.completions)
                         {
                             b.ac.open = true;
                             b.ac.replace_start = ac_ctx.replace_start;

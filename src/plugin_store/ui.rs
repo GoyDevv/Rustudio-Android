@@ -26,9 +26,10 @@ pub struct ManageUi {
     pub details: Option<String>,
     /// The permissions page of this plugin id (Studio's edit icon).
     pub perms_page: Option<String>,
-    pub confirm_remove: Option<u64>,
+    pub confirm_remove: Option<String>,
     pub import_open: bool,
     pub import_report: Option<String>,
+    pub request_import_file: bool,
     pub publish: Option<PublishDialog>,
     icons: std::collections::HashMap<u64, egui::TextureHandle>,
 }
@@ -89,6 +90,7 @@ impl ManageUi {
 pub fn show(ctx: &egui::Context, m: &mut PluginManager, client: Option<SharedClient>) {
     prompts(ctx);
     publish_dialog(ctx, m, client.clone());
+    remove_confirm(ctx, m);
     if !m.ui.open {
         return;
     }
@@ -143,7 +145,6 @@ pub fn show(ctx: &egui::Context, m: &mut PluginManager, client: Option<SharedCli
         });
     m.ui.open = open;
     details_window(ctx, m);
-    remove_confirm(ctx, m);
     import_window(ctx, m);
 }
 
@@ -172,6 +173,9 @@ fn header(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>
             }
             if ui.small_button("Import from Studio…").clicked() {
                 m.ui.import_open = true;
+            }
+            if ui.small_button("Import Plugin…").clicked() {
+                m.ui.request_import_file = true;
             }
         });
     });
@@ -258,16 +262,20 @@ fn card(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>, 
                     }
                     ui.close();
                 }
-                match (p.kind, p.asset_id) {
-                    (PluginKind::Installed, Some(a)) => {
+                match p.kind {
+                    PluginKind::Installed => {
                         if ui.button("Uninstall").clicked() {
-                            m.ui.confirm_remove = Some(a);
+                            m.ui.confirm_remove = Some(p.id.clone());
                             ui.close();
                         }
                     }
-                    _ => {
+                    PluginKind::Local => {
                         if ui.button("Show in Plugins Folder").clicked() {
                             open_plugins_folder(m);
+                            ui.close();
+                        }
+                        if ui.button("Delete").clicked() {
+                            m.ui.confirm_remove = Some(p.id.clone());
                             ui.close();
                         }
                     }
@@ -477,14 +485,25 @@ fn details_window(ctx: &egui::Context, m: &mut PluginManager) {
 }
 
 fn remove_confirm(ctx: &egui::Context, m: &mut PluginManager) {
-    let Some(a) = m.ui.confirm_remove else { return };
-    let name = m.store.get(&super::cloud_id(a)).map(|p| p.name).unwrap_or_else(|| a.to_string());
-    egui::Window::new("Uninstall Plugin").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-        ui.label(format!("Uninstall {name}?"));
-        ui.label(RichText::new("Your Roblox account keeps it; install it again from Find Plugins.").small().color(theme::TEXT_DIM));
+    let Some(id) = m.ui.confirm_remove.clone() else { return };
+    let Some(p) = m.store.get(&id) else {
+        m.ui.confirm_remove = None;
+        return;
+    };
+    let is_local = p.kind == PluginKind::Local;
+    let title = if is_local { "Delete Local Plugin" } else { "Uninstall Plugin" };
+    let verb = if is_local { "Delete" } else { "Uninstall" };
+    let hint = if is_local {
+        format!("Deletes {} from the local Plugins folder.", p.path.display())
+    } else {
+        "Your Roblox account keeps it; install it again from Find Plugins.".to_string()
+    };
+    egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        ui.label(format!("{verb} {}?", p.name));
+        ui.label(RichText::new(hint).small().color(theme::TEXT_DIM));
         ui.horizontal(|ui| {
-            if ui.button("Uninstall").clicked() {
-                m.remove(a);
+            if ui.button(verb).clicked() {
+                m.remove_by_id(&id);
                 m.ui.confirm_remove = None;
             }
             if ui.button("Cancel").clicked() {
@@ -527,6 +546,13 @@ fn import_window(ctx: &egui::Context, m: &mut PluginManager) {
                 });
             });
         }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Import Plugin…").clicked() {
+                m.ui.request_import_file = true;
+            }
+            ui.label(RichText::new("Import a local .rbxm, .rbxmx, .lua, or .luau file.").small().color(theme::TEXT_DIM));
+        });
         if let Some(r) = &m.ui.import_report {
             ui.separator();
             ui.label(r);

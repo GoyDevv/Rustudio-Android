@@ -3761,9 +3761,16 @@ impl Game {
         // 1. Server script changes from last frame reach physics.
         let sc = rustudio_core::bench::scope("p1_physics_sync");
         {
-            let s = self.play.as_mut().expect("playing");
-            let w = s.server.as_mut().and_then(|server| server.world.as_mut()).expect("server world");
-            let vel = std::mem::take(&mut w.velocity_requests);
+            let Some(s) = self.play.as_mut() else {
+                drop(sc);
+                return false;
+            };
+            let vel = s
+                .server
+                .as_mut()
+                .and_then(|server| server.world.as_mut())
+                .map(|w| std::mem::take(&mut w.velocity_requests))
+                .unwrap_or_default();
             s.physics.sync(&mut self.doc);
             s.physics.set_streaming_visibility(
                 s.map.streaming_collider_revision(),

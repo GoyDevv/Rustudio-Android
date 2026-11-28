@@ -20,7 +20,10 @@ pub fn unpack(app: &AndroidApp) -> Result<(), String> {
     let stamp = dir.join(".apk-version");
     let version = env!("CARGO_PKG_VERSION");
     let fresh = std::fs::read_to_string(&stamp).is_ok_and(|v| v.trim() == version)
-        && FILES.iter().all(|f| dir.join(f).is_file());
+        && FILES.iter().all(|f| {
+            std::fs::metadata(dir.join(f))
+                .is_ok_and(|m| m.is_file() && m.len() >= 1_048_576)
+        });
     if fresh {
         return Ok(());
     }

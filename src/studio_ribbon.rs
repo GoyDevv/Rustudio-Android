@@ -283,7 +283,9 @@ impl Editor {
                 }
                 top_icon(ui, "bell", theme::TEXT, false).on_hover_text("Notifications: not in rustudio yet");
                 let tc = match (&self.game.doc.cloud, &self.cloud.status) {
-                    (Some(o), Some((u, s))) if *u == o.universe_id => s.describe(),
+                    (Some(o), Some((u, s))) if *u == o.universe_id => {
+                        self.describe_team_create_status(*u, s)
+                    }
                     _ => "Open a Team Create place to see its live collaborators".into(),
                 };
                 if top_icon(ui, "users-group", theme::TEXT, false).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
@@ -465,7 +467,11 @@ impl Editor {
                 }
                 // Only plugin toolbars, as Studio's (Manage Plugins and
                 // Plugins Folder are in the Plugins menu): src/plugin_host/ui_ribbon.rs.
-                RibbonTab::Plugins => self.plugins_ribbon(ui),
+                RibbonTab::Plugins => {
+                    self.rb(ui, "file-import", "Import Plugin", "import_local_plugin", false, a);
+                    divider(ui);
+                    self.plugins_ribbon(ui);
+                }
             }
         });
         });
@@ -596,15 +602,15 @@ impl Editor {
         rect
     }
 
-    /// Home > Import: native Import Roblox Model when built-in plugins are OFF;
-    /// split button for Studio's 3D Asset Importer + Import Roblox Model when ON.
+    /// Home > Import: unified split button for Import 3D, Roblox Model, Animation,
+    /// Image, Audio, and Script (always available on desktop & Android).
     fn import_button(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
-        if !self.builtin_tools.plugins_enabled || !self.action_state("import_3d").0 {
-            self.rb(ui, "file-import", "Import", "import_model", false, act);
-            return;
-        }
-        let active = self.action_state("import_3d").1 == Some(true);
-        let icon_uri = self.action_plugin_icon("import_3d");
+        let active = self.builtin_tools.plugins_enabled && self.action_state("import_3d").1 == Some(true);
+        let icon_uri = if self.builtin_tools.plugins_enabled {
+            self.action_plugin_icon("import_3d")
+        } else {
+            None
+        };
         let resp = self.rb_icon(ui, "file-import", icon_uri.as_deref(), "Import", active, true);
         self.ui_rects.insert("home.import", resp.rect);
         let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
@@ -620,6 +626,23 @@ impl Editor {
             }
             if ui.button("Import Roblox Model…").clicked() {
                 *act = Some("import_model".into());
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Import Animation…").clicked() {
+                *act = Some("import_animation".into());
+                ui.close();
+            }
+            if ui.button("Import Image…").clicked() {
+                *act = Some("import_image".into());
+                ui.close();
+            }
+            if ui.button("Import Audio…").clicked() {
+                *act = Some("import_audio".into());
+                ui.close();
+            }
+            if ui.button("Import Script…").clicked() {
+                *act = Some("import_script".into());
                 ui.close();
             }
         });
