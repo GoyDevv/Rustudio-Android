@@ -408,6 +408,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
         std::mem::take(&mut *q)
     };
 
+    let mut current_modifiers = ctx.input(|i| i.modifiers);
     for op in ops {
         match op {
             ImeOp::CommitText(s) => {
@@ -445,7 +446,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
             }
             ImeOp::HardwareKey { code, meta, down, repeat } => {
                 let modifiers = map_android_modifiers(meta);
-                raw.modifiers = modifiers;
+                current_modifiers = modifiers;
                 if let Some(key) = map_android_keycode(code) {
                     if down && !repeat && modifiers.command && !modifiers.shift && !modifiers.alt {
                         match key {
@@ -574,7 +575,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                     for (mask, button) in [
                         (BUTTON_PRIMARY, PointerButton::Primary),
                         (BUTTON_SECONDARY, PointerButton::Secondary),
-                        (BUTTON_TERTIARY, PointerButton::Tertiary),
+                        (BUTTON_TERTIARY, PointerButton::Middle),
                     ] {
                         let was = (prev_buttons & mask) != 0;
                         let now = (new_buttons & mask) != 0;
@@ -598,7 +599,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                                 pos: event_pos,
                                 button,
                                 pressed: now,
-                                modifiers: raw.modifiers,
+                                modifiers: current_modifiers,
                             });
                         }
                     }
@@ -612,7 +613,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                         unit: MouseWheelUnit::Line,
                         delta: egui::vec2(scroll_x, scroll_y),
                         phase: TouchPhase::Move,
-                        modifiers: raw.modifiers,
+                        modifiers: current_modifiers,
                     });
                 }
             }
