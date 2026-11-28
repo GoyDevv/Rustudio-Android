@@ -43,6 +43,10 @@ pub struct ImportedMesh {
     pub color: Option<[f32; 3]>,
     /// Optional embedded base-colour texture bytes (PNG/JPEG/etc.).
     pub texture: Option<Vec<u8>>,
+    /// Optional embedded normal map texture bytes.
+    pub normal_texture: Option<Vec<u8>>,
+    /// Optional embedded metallic-roughness texture bytes (G=Roughness, B=Metalness).
+    pub metallic_roughness_texture: Option<Vec<u8>>,
     /// Whether the glTF material requested double-sided rendering.
     pub double_sided: bool,
     /// Opacity in `0.0..=1.0` (`1.0` for OPAQUE/MASK; `baseColorFactor[3]` for BLEND).
@@ -1181,6 +1185,15 @@ fn extract_gltf_mesh(
         } else {
             base_name.to_string()
         };
+        let normal_texture = mat
+            .and_then(|m| m.get("normalTexture"))
+            .and_then(|ti| extract_gltf_texture_by_info(json, buffers, base_dir, ti))
+            .map(|(b, _)| b);
+        let metallic_roughness_texture = mat
+            .and_then(|m| m.get("pbrMetallicRoughness"))
+            .and_then(|p| p.get("metallicRoughnessTexture"))
+            .and_then(|ti| extract_gltf_texture_by_info(json, buffers, base_dir, ti))
+            .map(|(b, _)| b);
         out.push(ImportedMesh {
             name,
             positions,
@@ -1189,6 +1202,8 @@ fn extract_gltf_mesh(
             colors,
             color,
             texture,
+            normal_texture,
+            metallic_roughness_texture,
             double_sided,
             alpha,
         });
@@ -1210,6 +1225,15 @@ fn extract_material_texture_info(
                 .and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness"))
                 .and_then(|sg| sg.get("diffuseTexture"))
         })?;
+    extract_gltf_texture_by_info(json, buffers, base_dir, tex_info)
+}
+
+fn extract_gltf_texture_by_info(
+    json: &serde_json::Value,
+    buffers: &[Vec<u8>],
+    base_dir: &Path,
+    tex_info: &serde_json::Value,
+) -> Option<(Vec<u8>, usize)> {
     let tex_idx = tex_info.get("index")?.as_u64()? as usize;
     let tex_coord = tex_info.get("texCoord").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let tex = json.get("textures")?.as_array()?.get(tex_idx)?;

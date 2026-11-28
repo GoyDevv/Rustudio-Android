@@ -605,6 +605,18 @@ public class RustudioActivity extends NativeActivity {
         if ("image/gif".equals(m)) {
             return "gif";
         }
+        if ("image/x-tga".equals(m) || "image/tga".equals(m)) {
+            return "tga";
+        }
+        if ("model/obj".equals(m) || "text/plain+obj".equals(m)) {
+            return "obj";
+        }
+        if ("application/octet-stream+fbx".equals(m) || "model/fbx".equals(m)) {
+            return "fbx";
+        }
+        if ("text/x-lua".equals(m) || "application/x-lua".equals(m)) {
+            return "luau";
+        }
         if ("model/gltf-binary".equals(m)) {
             return "glb";
         }

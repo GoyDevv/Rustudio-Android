@@ -52,6 +52,14 @@ pub enum Purpose {
     TemplateReplace(String),
     /// File > Import (3D Models: .obj, .fbx, .glb, .gltf).
     Import3D,
+    /// File > Import Animation (.fbx, .glb, .gltf, .rbxm, .rbxmx).
+    ImportAnimation,
+    /// File > Import Image (.png, .jpg, .webp, .bmp, .tga).
+    ImportImage,
+    /// File > Import Audio (.mp3, .ogg, .wav, .flac).
+    ImportAudio,
+    /// File > Import Script (.luau, .lua, .txt).
+    ImportScript,
     /// File > Export as .obj (the selection when the dialog opened).
     ExportObj(Vec<Ref>),
     /// File > Export as glTF (the selection when the dialog opened).

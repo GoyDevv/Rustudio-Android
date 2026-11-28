@@ -629,6 +629,10 @@ impl Editor {
                 self.cloud.refresh(client, tab);
             }
             "import_model" => self.insert_from_file(),
+            "import_animation" => self.import_animation_dialog(),
+            "import_image" => self.import_image_dialog(),
+            "import_audio" => self.import_audio_dialog(),
+            "import_script" => self.import_script_dialog(),
             "import_3d" => {
                 if cfg!(target_os = "android")
                     || !self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import"))
