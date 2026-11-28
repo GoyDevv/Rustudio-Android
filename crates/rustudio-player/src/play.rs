@@ -1404,6 +1404,7 @@ impl Game {
             sh.microprofiler_req = None;
             sh.saved_quality = None;
         }
+        self.play_starting = None;
         self.cam.basis = None;
         let Some(mut s) = self.play.take() else {
             return;

@@ -3918,6 +3918,9 @@ impl RustudioApp {
         ed.game.poll_assets();
         ed.flush_output_changes();
         self.watchdog.stage("asset polling", "Play tick: scripts/physics");
+        if ed.game.is_starting_play() {
+            ed.poll_pending_play_start(&ctx);
+        }
         if ed.game.play.is_some() {
             let step = ed.game.play_step(dt);
             if ed.game.fixed_dt.is_some() && ed.harness.run.play_started.is_some() {

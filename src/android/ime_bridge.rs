@@ -656,10 +656,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                     if delta.x != 0.0 || delta.y != 0.0 {
                         raw.events.push(Event::MouseMoved(delta));
                     }
-                    if right_held {
-                        vm.drag_pos += delta;
-                        raw.events.push(Event::PointerMoved(vm.drag_pos));
-                    } else if target != vm.pos || delta.x != 0.0 || delta.y != 0.0 {
+                    if !right_held && !vm.cursor_hidden && (target != vm.pos || delta.x != 0.0 || delta.y != 0.0) {
                         vm.pos = target;
                         vm.drag_pos = vm.pos;
                         raw.events.push(Event::PointerMoved(vm.pos));
@@ -674,12 +671,10 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                         }
                         vm.drag_pos = vm.pos;
                         raw.events.push(Event::PointerMoved(vm.pos));
-                    } else if right_held {
-                        // Keep virtual cursor anchored at right-press position while
-                        // advancing egui's pointer delta unclamped for infinite camera orbit.
-                        vm.drag_pos += delta;
-                        raw.events.push(Event::PointerMoved(vm.drag_pos));
                     }
+                    // When right_held or cursor_hidden (camera orbit / FPS LockCenter):
+                    // keep vm.pos and egui's pointer strictly locked at anchor while
+                    // Event::MouseMoved(delta) feeds raw_mouse_delta() for infinite 360 look.
                 }
 
                 let prev_buttons = vm.buttons;
@@ -693,21 +688,18 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                         let now = (new_buttons & mask) != 0;
                         if was != now {
                             if mask == BUTTON_SECONDARY && !now {
-                                // Emit release at drag_pos FIRST so egui does not misclassify
-                                // a camera orbit drag as a 0px right-click context menu, then restore anchor.
-                                let release_pos = vm.drag_pos;
-                                raw.events.push(Event::PointerButton {
-                                    pos: release_pos,
-                                    button,
-                                    pressed: false,
-                                    modifiers: current_modifiers,
-                                });
                                 if let Some(anchor) = vm.right_press_pos.take() {
                                     vm.pos = anchor;
                                 }
                                 vm.drag_pos = vm.pos;
                                 vm.locked_look = false;
                                 raw.events.push(Event::PointerMoved(vm.pos));
+                                raw.events.push(Event::PointerButton {
+                                    pos: vm.pos,
+                                    button,
+                                    pressed: false,
+                                    modifiers: current_modifiers,
+                                });
                                 continue;
                             }
                             if mask == BUTTON_SECONDARY && now {

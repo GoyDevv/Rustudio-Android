@@ -30,6 +30,7 @@ pub struct Game {
     /// Edit-mode on-demand Sound loading and preview playback.
     pub edit_audio: crate::edit_audio::EditAudio,
     pub(crate) play_thread: Option<crate::play_worker::ThreadedPlay>,
+    pub(crate) play_starting: Option<crate::play_worker::PendingPlayStart>,
     /// A play-testing teleport's destination, loading (play_teleport.rs).
     pub(crate) teleport_job: Option<crate::play_teleport::TeleportJob>,
     /// The place the next `start_play` plays instead of the edit document,
@@ -180,6 +181,7 @@ impl Game {
             play: None,
             edit_audio: Default::default(),
             play_thread: None,
+            play_starting: None,
             teleport_job: None,
             teleport_to: None,
             quiet_stop: false,

@@ -103,7 +103,19 @@ impl Drop for PlayWorker {
     fn drop(&mut self) {
         self.jobs.take();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            #[cfg(target_os = "android")]
+            {
+                // Reap asynchronously on Android so stopping Play never blocks android_main's AInputQueue (ANR).
+                let _ = std::thread::Builder::new()
+                    .name("rustudio-play-reap".into())
+                    .spawn(move || {
+                        let _ = thread.join();
+                    });
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -537,6 +549,13 @@ struct Publication {
     publish_ui: Option<Box<dyn FnOnce() + Send>>,
 }
 
+pub(crate) struct PendingPlayStart {
+    worker: PlayWorker,
+    reply: mpsc::Receiver<(Publication, SnapshotSource)>,
+    mode: RunMode,
+    clear: bool,
+}
+
 pub(crate) struct ThreadedPlay {
     worker: PlayWorker,
     pending: Option<Receiver<(Publication, SnapshotSource)>>,
@@ -925,18 +944,68 @@ impl Game {
 
     /// Starts a session whose live DataModels stay on the gameplay worker.
     /// The edit document remains local; its copy only seeds the session.
+    pub fn is_starting_play(&self) -> bool {
+        self.play_starting.is_some()
+    }
+
+    pub fn poll_pending_play_start(&mut self, host: &mut dyn GameHost) -> bool {
+        let Some(pending) = self.play_starting.take() else {
+            return false;
+        };
+        match pending.reply.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {
+                self.play_starting = Some(pending);
+                return true;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.error("Play worker stopped during startup");
+                return false;
+            }
+            Ok((startup, source)) => {
+                self.finish_play_threaded_start(pending.worker, startup, source, pending.mode, pending.clear, host);
+                return false;
+            }
+        }
+    }
+
+    fn finish_play_threaded_start(
+        &mut self,
+        worker: PlayWorker,
+        startup: Publication,
+        source: SnapshotSource,
+        mode: RunMode,
+        clear: bool,
+        host: &mut dyn GameHost,
+    ) {
+        if clear {
+            self.log.clear();
+            self.log_cleared = true;
+            self.log_drained = 0;
+        }
+        if matches!(startup.frame, PublishedFrame::Stopped) {
+            self.append_play_output(startup.log);
+            return;
+        }
+        self.play_here = None;
+        let saved_sel = self.doc.selection.clone();
+        let saved_doc = std::mem::replace(&mut self.doc, Document::placeholder());
+        self.play = Some(PlaySession::new(mode, saved_doc, self.cam.clone(), saved_sel));
+        let mut receiver = SnapshotReceiver::default();
+        startup.apply(self, &mut receiver, host);
+        self.play_thread = Some(ThreadedPlay {
+            worker, pending: None, source: Some(source), receiver, follow_local_input: false,
+            deferred_dt: 0.0, queued_edits: None,
+        });
+    }
+
     pub fn start_play_threaded(&mut self, mode: RunMode, host: &mut dyn GameHost, clear: bool, live_ids: Option<(u64, u64)>) {
-        if self.play.is_some() {
+        if self.play.is_some() || self.play_starting.is_some() {
             return;
         }
         self.edit_audio.stop_playback();
+        #[cfg(not(target_os = "android"))]
         if mode == RunMode::Play {
-            let settle_wait = if cfg!(target_os = "android") {
-                std::time::Duration::from_secs(2)
-            } else {
-                std::time::Duration::from_secs(20)
-            };
-            for (level, text) in self.account.settle_for_play(settle_wait, true) {
+            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), true) {
                 self.push_log(level, text);
             }
         }
@@ -965,6 +1034,12 @@ impl Game {
             game.cam = cam;
             game.viewport_rect = viewport;
             game.account = account;
+            #[cfg(target_os = "android")]
+            if mode == RunMode::Play {
+                for (level, text) in game.account.settle_for_play(std::time::Duration::from_secs(2), true) {
+                    game.push_log(level, text);
+                }
+            }
             game.play_rig = play_rig;
             game.play_here = play_here;
             game.play_shows_client = show_client;
@@ -978,33 +1053,30 @@ impl Game {
                 return self.start_play(mode, host, clear, live_ids);
             }
         };
-        let Ok((startup, source)) = worker.submit(|game, host| {
+        let Ok(reply) = worker.submit(|game, host| {
             let mut source = SnapshotSource::default();
             let ui = host.hooks.capture_play_ui(game);
             (Publication::capture(game, &mut source, None, true, ui), source)
-        }).and_then(|reply| reply.recv()) else {
+        }) else {
             self.error("Play worker stopped during startup");
             return;
         };
-        if clear {
-            self.log.clear();
-            self.log_cleared = true;
-            self.log_drained = 0;
-        }
-        if matches!(startup.frame, PublishedFrame::Stopped) {
-            self.append_play_output(startup.log);
+        #[cfg(target_os = "android")]
+        {
+            // Never block android_main (Android's AInputQueue thread) during 5-9s Play startup
+            // or InputDispatcher triggers a 5000ms ANR. Poll completion per frame instead.
+            self.info("▶ Starting Play…");
+            self.play_starting = Some(PendingPlayStart { worker, reply, mode, clear });
             return;
         }
-        self.play_here = None;
-        let saved_sel = self.doc.selection.clone();
-        let saved_doc = std::mem::replace(&mut self.doc, Document::placeholder());
-        self.play = Some(PlaySession::new(mode, saved_doc, self.cam.clone(), saved_sel));
-        let mut receiver = SnapshotReceiver::default();
-        startup.apply(self, &mut receiver, host);
-        self.play_thread = Some(ThreadedPlay {
-            worker, pending: None, source: Some(source), receiver, follow_local_input: false,
-            deferred_dt: 0.0, queued_edits: None,
-        });
+        #[cfg(not(target_os = "android"))]
+        {
+            let Ok((startup, source)) = reply.recv() else {
+                self.error("Play worker stopped during startup");
+                return;
+            };
+            self.finish_play_threaded_start(worker, startup, source, mode, clear, host);
+        }
     }
 
     /// Joins the preceding publication only at the display boundary. The

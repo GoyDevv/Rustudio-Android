@@ -208,6 +208,13 @@ impl Editor {
         self.with_game_host(|game, host| game.show_play_side(side, host));
     }
 
+    pub fn poll_pending_play_start(&mut self, ctx: &egui::Context) {
+        let still_starting = self.with_game_host(|game, host| game.poll_pending_play_start(host));
+        if still_starting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32) {
         let (no_ui, shift) = (self.harness.run.no_ui, self.harness.run.input.shift);
         self.game.keep_game_settings = self.harness.keeps_game_settings();

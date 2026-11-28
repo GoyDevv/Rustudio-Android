@@ -352,7 +352,7 @@ public class RustudioActivity extends NativeActivity {
             public void run() {
                 if (capture) {
                     activateHardwareMouseCapture();
-                } else {
+                } else if (!hardwareMouseActive) {
                     releaseHardwareMouseCapture(false);
                 }
             }

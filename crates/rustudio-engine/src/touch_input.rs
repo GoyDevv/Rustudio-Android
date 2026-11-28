@@ -1069,7 +1069,7 @@ pub fn game_touch() -> bool {
     }
     match env_touch_override() {
         Some(v) => v,
-        None => cfg!(target_os = "android"),
+        None => cfg!(target_os = "android") && !kbm_active(),
     }
 }
 
