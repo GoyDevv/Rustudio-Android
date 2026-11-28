@@ -4,6 +4,8 @@
 
 - **[rippelz/rustudio](https://github.com/rippelz/rustudio)**: Creator of the original rustudio project and maintainer of the PC (Linux, Windows, macOS) version.
 
+> **Policy Notice:** This project strictly respects Roblox's Terms of Use and does not tolerate or associate with unauthorized live-server Roblox clients, game ripping, or any violation of Roblox's Terms of Use.
+
 ---
 
 rustudio is the person's own editor for their Roblox places. Nothing from

@@ -101,6 +101,10 @@ Interested in contributing? **Please read [CONTRIBUTING.md](CONTRIBUTING.md) fir
 - [docs/ENGINE-GAPS.md](docs/ENGINE-GAPS.md): Missing Luau engine API tracker.
 - [docs/TEAMCREATE.md](docs/TEAMCREATE.md): Team Create protocol and networking.
 
+## Roblox Terms of Use & Compliance Policy
+
+We strictly respect Roblox's Terms of Use and **do not tolerate** rule-breaking, unauthorized live-server Roblox clients, game ripping (`saveinstance`), or anti-cheat/DRM circumvention. This repository is strictly for legitimate local editing, local Play testing, and authorized Roblox Cloud / Team Create workflows. We do not support or associate with forks or contributors that violate Roblox's Terms of Use.
+
 ## Not affiliated with Roblox
 
 rustudio is an independent project. It is not made, endorsed or supported by Roblox Corporation. "Roblox" and "Roblox Studio" are trademarks of Roblox Corporation.
