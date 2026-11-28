@@ -97,7 +97,7 @@ fn browsable(chain: &[String], prop: &str) -> bool {
 /// The panel's categories and rows for `class` (`can_collide`: whether the
 /// selected part has CanCollide on, which hides CanQuery).
 fn fallback_rows_from_reflection(class: &str) -> Vec<Category> {
-    let db = rbx_reflection_database::get();
+    let db = rustudio_core::doc::db();
     let mut chain: Vec<&str> = Vec::new();
     let mut cur = Some(class);
     while let Some(name) = cur {

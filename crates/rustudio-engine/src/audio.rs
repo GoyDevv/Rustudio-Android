@@ -937,21 +937,20 @@ impl Audio {
     /// Suspends the idle AAudio/OS DeviceSink after 4 seconds of silence so the
     /// audio DSP thread does not drain battery when no sound is playing.
     pub fn maybe_suspend_idle(&mut self) {
-        if !matches!(self.out, Output::Ready(_)) {
+        if !matches!(self.out, Output::Ready(_)) || self.capture_thread.is_some() || !self.sounds.is_empty() {
             self.idle_since = None;
             return;
         }
         let now = rustudio_core::sim_clock::now();
-        let any_active = self.sounds.values().any(|s| !s.paused && !s.finished(now));
-        if any_active {
-            self.idle_since = None;
-            return;
-        }
         let since = *self.idle_since.get_or_insert(now);
         if now.duration_since(since) >= std::time::Duration::from_secs(4) {
+            self.buses.clear();
             self.hold = None;
             if let Some(h) = self.output_thread.take() {
+                #[cfg(not(target_os = "android"))]
                 let _ = h.join();
+                #[cfg(target_os = "android")]
+                drop(h);
             }
             self.out = Output::Unopened;
             self.idle_since = None;

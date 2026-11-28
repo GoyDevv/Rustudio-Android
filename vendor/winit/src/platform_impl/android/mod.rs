@@ -500,11 +500,21 @@ impl<T: 'static> EventLoop<T> {
                             );
                         }
 
-                        let key_char = keycodes::character_map_and_combine_key(
-                            android_app,
-                            key,
-                            &mut self.combining_accent,
-                        );
+                        // Skip KeyCharacterMap lookup when Ctrl/Alt/Super is held so Android
+                        // never turns Ctrl+C/S/Z/V into ASCII control characters instead of
+                        // logical Key::Character("c")/("s")/("z")/("v").
+                        let key_char = if modifiers.control_key()
+                            || modifiers.alt_key()
+                            || modifiers.super_key()
+                        {
+                            None
+                        } else {
+                            keycodes::character_map_and_combine_key(
+                                android_app,
+                                key,
+                                &mut self.combining_accent,
+                            )
+                        };
 
                         let logical_key = keycodes::to_logical(key_char, keycode);
                         let text = if state == event::ElementState::Pressed

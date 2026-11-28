@@ -1329,7 +1329,7 @@ impl Game {
         }
         rustudio_core::telemetry::flush();
         self.stop_all_sounds();
-        rustudio_engine::domains::media::trim_pcm_cache();
+        rustudio_engine::runtime::domains::media::trim_pcm_cache();
         {
             let mut sh = rustudio_engine::gui::share();
             sh.core_menu_open = false;
@@ -3764,7 +3764,7 @@ impl Game {
         {
             let Some(s) = self.play.as_mut() else {
                 drop(sc);
-                return;
+                return false;
             };
             let vel = s
                 .server

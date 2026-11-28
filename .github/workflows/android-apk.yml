@@ -1,0 +1,190 @@
+name: Android APK Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
+
+jobs:
+  desktop-check:
+    name: Desktop Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-check
+      - name: Install Linux deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev
+      - name: Cargo check workspace
+        run: cargo check --workspace --all-targets
+
+  android-apk:
+    name: Release APK (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-33 build-tools;33.0.2"
+
+      - name: Set up Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm pkg-config libasound2-dev zstd
+
+      - name: Cache Cargo & xbuild NDK
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-release-${{ matrix.arch }}
+          workspaces: ". -> target/x/release/android/${{ matrix.arch }}/cargo"
+          cache-directories: |
+            ~/.cache/x
+
+      - name: Cache xbuild binary
+        id: xbuild-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/x
+          key: xbuild-${{ runner.os }}-${{ env.XBUILD_REV }}
+
+      - name: Install xbuild
+        if: steps.xbuild-cache.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/rust-mobile/xbuild --rev "$XBUILD_REV" xbuild
+
+      - name: Compile RustudioActivity.java to classes.dex
+        run: |
+          set -euo pipefail
+          ANDROID_JAR="$ANDROID_HOME/platforms/android-33/android.jar"
+          D8="$ANDROID_HOME/build-tools/33.0.2/d8"
+          mkdir -p /tmp/java-classes /tmp/dex-out
+          javac --release 11 -classpath "$ANDROID_JAR" -d /tmp/java-classes \
+            crates/rustudio-android/java/com/logosforgestudios/rustudio/RustudioActivity.java
+          "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex-out \
+            /tmp/java-classes/com/logosforgestudios/rustudio/*.class
+          cp /tmp/dex-out/classes.dex crates/rustudio-android/classes.dex
+
+      - name: Build release APK
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: |
+          set -euo pipefail
+          x build -p rustudio-android --platform android --arch "${{ matrix.arch }}" --format apk --release
+          apk="target/x/release/android/rustudio-android.apk"
+          test -f "$apk"
+          mkdir -p dist
+          cp "$apk" "dist/raw-${{ matrix.arch }}.apk"
+
+      - name: Repack classes.dex, 4KB align & sign APK
+        env:
+          SIGNING_PEM: ${{ secrets.ANDROID_SIGNING_PEM }}
+        run: |
+          set -euo pipefail
+          ZIPALIGN="$ANDROID_HOME/build-tools/33.0.2/zipalign"
+          APKSIGNER="$ANDROID_HOME/build-tools/33.0.2/apksigner"
+          RAW="dist/raw-${{ matrix.arch }}.apk"
+          REPACKED="dist/repacked-${{ matrix.arch }}.apk"
+          FINAL="dist/rustudio-v1.0.9-${{ matrix.arch }}-release.apk"
+
+          python3 - "$RAW" "$REPACKED" "crates/rustudio-android/classes.dex" << 'PY'
+          import sys, zipfile
+          src, dst, dex_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          stored = (".so", ".arsc", "classes.dex")
+          with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w") as zout:
+              for item in zin.infolist():
+                  n = item.filename
+                  if n == "classes.dex":
+                      continue
+                  if n.startswith("META-INF/") and (
+                      n.endswith((".SF", ".RSA", ".DSA", ".EC")) or n == "META-INF/MANIFEST.MF"
+                  ):
+                      continue
+                  zi = zipfile.ZipInfo(n)
+                  zi.compress_type = zipfile.ZIP_STORED if n.endswith(stored) else zipfile.ZIP_DEFLATED
+                  zout.writestr(zi, zin.read(n))
+              zi = zipfile.ZipInfo("classes.dex")
+              zi.compress_type = zipfile.ZIP_STORED
+              with open(dex_path, "rb") as f:
+                  zout.writestr(zi, f.read())
+          PY
+
+          "$ZIPALIGN" -p -f 4 "$REPACKED" "$FINAL"
+
+          if [ -n "${SIGNING_PEM:-}" ]; then
+            printf '%s\n' "$SIGNING_PEM" > /tmp/signing.pem
+            openssl pkcs12 -export -in /tmp/signing.pem -inkey /tmp/signing.pem \
+              -out /tmp/signing.p12 -name rustudio -passout pass:rustudio_ci
+            "$APKSIGNER" sign --ks /tmp/signing.p12 --ks-type PKCS12 \
+              --ks-pass pass:rustudio_ci --key-pass pass:rustudio_ci \
+              --v1-signing-enabled true --v2-signing-enabled true "$FINAL"
+            rm -f /tmp/signing.pem /tmp/signing.p12
+          else
+            keytool -genkeypair -v -keystore /tmp/ci-test.jks -storepass android \
+              -keypass android -alias ci -keyalg RSA -keysize 2048 -validity 365 \
+              -dname "CN=Rustudio CI Test"
+            "$APKSIGNER" sign --ks /tmp/ci-test.jks --ks-pass pass:android \
+              --key-pass pass:android --v1-signing-enabled true --v2-signing-enabled true "$FINAL"
+            rm -f /tmp/ci-test.jks
+          fi
+
+          "$APKSIGNER" verify --verbose "$FINAL"
+          rm -f "$RAW" "$REPACKED"
+
+      - name: Verify APK contents
+        run: |
+          python3 - "dist/rustudio-v1.0.9-${{ matrix.arch }}-release.apk" << 'PY'
+          import sys, zipfile
+          apk = sys.argv[1]
+          with zipfile.ZipFile(apk, "r") as z:
+              names = z.namelist()
+              assert "assets/api-dump.json" in names, "assets/api-dump.json missing"
+              assert z.getinfo("assets/api-dump.json").file_size >= 1024 * 1024, "api-dump.json too small"
+              assert "classes.dex" in names, "classes.dex missing"
+              assert z.getinfo("classes.dex").compress_type == zipfile.ZIP_STORED, "classes.dex not stored"
+              sos = [n for n in names if n.endswith(".so")]
+              assert sos, "no .so libs in APK"
+              for s in sos:
+                  low = s.lower()
+                  assert not any(b in low for b in ("turnip", "freedreno", "panvk", "panfrost", "adrenotools", "hook_impl", "main_hook")), f"forbidden lib: {s}"
+                  assert z.getinfo(s).compress_type == zipfile.ZIP_STORED, f"{s} not stored"
+              print("VERIFIED:", apk, "libs:", sos)
+          PY
+
+      - name: Upload release test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustudio-v1.0.9-${{ matrix.arch }}-release
+          path: dist/rustudio-v1.0.9-${{ matrix.arch }}-release.apk
+          if-no-files-found: error
+          retention-days: 14

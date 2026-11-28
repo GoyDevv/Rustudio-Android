@@ -455,11 +455,6 @@ impl Default for WgpuConfiguration {
                     log::trace!("Skipping frame due to occlusion.");
                     SurfaceErrorAction::SkipFrame
                 }
-                wgpu::CurrentSurfaceTexture::OutOfMemory => {
-                    log::warn!("Dropped frame with OutOfMemory; recording surface OOM");
-                    record_surface_oom();
-                    SurfaceErrorAction::SkipFrame
-                }
                 wgpu::CurrentSurfaceTexture::Validation => {
                     log::warn!("Dropped frame with Validation error; recording surface OOM and recreating surface");
                     record_surface_oom();

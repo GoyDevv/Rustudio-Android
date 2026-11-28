@@ -8451,9 +8451,9 @@ impl Renderer {
                 c.idle();
             }
         }
-        for (_, target) in self.vf.targets.drain() {
-            rs.renderer.write().free_texture(&target.id);
-            crate::world_gui::unregister_native(target.id);
+        for id in self.vf.drain_target_ids() {
+            rs.renderer.write().free_texture(&id);
+            crate::world_gui::unregister_native(id);
         }
         self.clear_layered_items();
         self.vf = vf::Layers::default();
@@ -8465,11 +8465,11 @@ impl Renderer {
     /// ViewportFrame targets (including egui_wgpu TextureIds when `rs` is given),
     /// world_gui mip caches, and CPU render caches on place switch.
     pub fn reset_place_assets_with(&mut self, rs: Option<&egui_wgpu::RenderState>) {
-        for (_, target) in self.vf.targets.drain() {
+        for id in self.vf.drain_target_ids() {
             if let Some(rs) = rs {
-                rs.renderer.write().free_texture(&target.id);
+                rs.renderer.write().free_texture(&id);
             }
-            crate::world_gui::unregister_native(target.id);
+            crate::world_gui::unregister_native(id);
         }
         self.reset_place_assets();
     }
@@ -8477,8 +8477,8 @@ impl Renderer {
     /// Releases per-place GPU textures, meshes, slab pools, skinning buffers,
     /// ViewportFrame targets, world_gui mip caches, and CPU render caches on place switch.
     pub fn reset_place_assets(&mut self) {
-        for (_, target) in self.vf.targets.drain() {
-            crate::world_gui::unregister_native(target.id);
+        for id in self.vf.drain_target_ids() {
+            crate::world_gui::unregister_native(id);
         }
         self.clear_layered_items();
         self.clear_items();
