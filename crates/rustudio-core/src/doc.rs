@@ -1242,7 +1242,17 @@ impl Document {
                 || trimmed.starts_with(b"<?xml")
                 || trimmed.starts_with(b"<!--"));
         if xml {
-            rbx_xml::from_reader_default(Cursor::new(trimmed)).map_err(|e| e.to_string())
+            match rbx_xml::from_reader_default(Cursor::new(trimmed)) {
+                Ok(dom) => Ok(dom),
+                Err(first) => {
+                    let first = first.to_string();
+                    match crate::xml_repair::repair_cframes(trimmed) {
+                        Some(fixed) => rbx_xml::from_reader_default(Cursor::new(fixed))
+                            .map_err(|_| crate::xml_repair::explain(trimmed, &first)),
+                        None => Err(crate::xml_repair::explain(trimmed, &first)),
+                    }
+                }
+            }
         } else {
             rbx_binary::from_reader(Cursor::new(bytes)).map_err(|e| e.to_string())
         }

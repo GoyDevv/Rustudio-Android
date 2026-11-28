@@ -2,7 +2,10 @@
 //! observed on Windows, mapped to this renderer's passes.
 
 const MAX_LEVEL: u8 = 21;
-const START_LEVEL: u8 = 5;
+// A phone's tiler can't hold level 5's shadows and post passes at 30 fps, so
+// Automatic starts there at level 3 and climbs when frames allow (it
+// otherwise spends its first seconds of Play stuttering down from 5).
+const START_LEVEL: u8 = if cfg!(target_os = "android") { 3 } else { 5 };
 const HISTORY: usize = 32;
 // The Windows stepped profile is 34 ms through level 13, then
 // ramps to the 19 ms endpoint at level 16.
