@@ -120,6 +120,26 @@ fn canonical(open: &str, body: &str, tag: &str) -> (String, bool) {
     (s, !same)
 }
 
+pub fn explain(xml: &[u8], err: &str) -> String {
+    let line = err
+        .split("line ")
+        .nth(1)
+        .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse::<usize>().ok());
+    let Some(line) = line else { return err.to_string() };
+    let text = String::from_utf8_lossy(xml);
+    let lo = line.saturating_sub(8).max(1);
+    let mut out = format!("{err}\n[xml-repair could not fix this] lines {lo}-{}:", line + 3);
+    for (i, l) in text.lines().enumerate() {
+        let n = i + 1;
+        if n >= lo && n <= line + 3 {
+            let cut: String = l.trim().chars().take(110).collect();
+            out.push_str(&format!("\n{n}: {cut}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +187,22 @@ mod decode_tests {
             .find(|i| i.class == "Part")
             .expect("part kept");
         assert_eq!(part.name, "P");
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::explain;
+
+    #[test]
+    fn shows_lines_around_the_error() {
+        let xml = "<a>\n<b/>\n<c/>\n<d/>";
+        let out = explain(xml.as_bytes(), "line 3, column 0: boom");
+        assert!(out.contains("3: <c/>") && out.contains("1: <a>"));
+    }
+
+    #[test]
+    fn keeps_the_error_without_a_line() {
+        assert_eq!(explain(b"x", "no position"), "no position");
     }
 }
