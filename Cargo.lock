@@ -2149,12 +2149,23 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
  "tiff",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -4188,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "android_logger",
  "ash",
@@ -4255,7 +4266,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-account"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "android-native-keyring-store",
  "base64 0.23.1",
@@ -4274,14 +4285,14 @@ dependencies = [
 
 [[package]]
 name = "rustudio-android"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "rustudio",
 ]
 
 [[package]]
 name = "rustudio-core"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4311,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-engine"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "blake2",
  "blake3",
@@ -4348,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-net"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "base64 0.23.1",
  "blake2",
@@ -4369,7 +4380,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-physics"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "flate2",
  "glam 0.30.10",
@@ -4383,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-player"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4411,7 +4422,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-profiler-ui"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "eframe",
  "egui",
@@ -4427,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-render"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -6244,8 +6255,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
 dependencies = [
  "ahash",
  "android-activity",

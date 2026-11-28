@@ -328,7 +328,7 @@ pub struct CloudsGpu {
     /// True when initial Studio cloud DDS assets were unavailable and fell back to 1x1 dummies.
     missing_content: bool,
     /// Latched true once a reload with installed Studio content has been attempted.
-    attempted_reload: bool,
+    attempted_reload_gen: u64,
 }
 
 impl CloudsGpu {
@@ -502,7 +502,7 @@ impl CloudsGpu {
             have_cover: false,
             active: false,
             missing_content,
-            attempted_reload: false,
+            attempted_reload_gen: 0,
         }
     }
 
@@ -605,8 +605,9 @@ impl CloudsGpu {
             COVER.store(1.0f32.to_bits(), Ordering::Relaxed);
             return;
         }
-        if self.missing_content && !self.attempted_reload && rustudio_core::studio_content::installed().is_some() {
-            self.attempted_reload = true;
+        let content_gen = rustudio_core::studio_content::install_generation();
+        if self.missing_content && self.attempted_reload_gen != content_gen && rustudio_core::studio_content::installed().is_some() {
+            self.attempted_reload_gen = content_gen;
             let (dist, ok_dist) = content_texture(device, queue, "rbxasset://sky/clouds.dds", true);
             let (adv, ok_adv) = content_texture(device, queue, "rbxasset://sky/cloudAdvection.dds", false);
             let (detail, ok_detail) = content_texture(device, queue, "rbxasset://sky/cloudDetail3D.dds", true);

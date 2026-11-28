@@ -335,7 +335,7 @@ impl AutoSaveState {
             return;
         }
         if self.in_flight.load(Ordering::Acquire) {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_millis(300);
             while self.in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }

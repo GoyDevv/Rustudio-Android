@@ -141,10 +141,16 @@ impl Game {
         #[cfg(target_os = "android")]
         {
             let _ = ctx;
-            if let egui::ViewportCommand::CursorGrab(mode) = cmd {
-                let want = !matches!(mode, egui::viewport::CursorGrab::None)
-                    && rustudio_engine::touch_input::kbm_active();
-                rustudio_engine::mouse_lock::set_captured(want);
+            match cmd {
+                egui::ViewportCommand::CursorGrab(mode) => {
+                    let want = !matches!(mode, egui::viewport::CursorGrab::None)
+                        && rustudio_engine::touch_input::kbm_active();
+                    rustudio_engine::mouse_lock::set_captured(want);
+                }
+                egui::ViewportCommand::CursorVisible(visible) => {
+                    rustudio_engine::mouse_lock::set_cursor_visible(visible);
+                }
+                _ => {}
             }
             return;
         }

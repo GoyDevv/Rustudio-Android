@@ -122,7 +122,7 @@ pub fn remap_bone_name(raw: &str, rig: RigKind) -> Option<&'static str> {
 }
 
 fn cframe_from_pos_quat(pos: Vec3, q: Quat) -> CFrame {
-    let m = Mat3::from_quat(q.normalize());
+    let m = Mat3::from_quat(q.try_normalize().unwrap_or(Quat::IDENTITY));
     let cols = m.to_cols_array();
     // glam Mat3 is column-major: [x0, x1, x2, y0, y1, y2, z0, z1, z2]
     let rot = Matrix3::new(
@@ -845,7 +845,7 @@ impl Editor {
                 InstanceBuilder::new("Decal")
                     .with_name(stem)
                     .with_property("Texture", Variant::ContentId(tex_id.clone().into()))
-                    .with_property("ColorMapContent", Variant::Content(Content::from_uri(tex_id))),
+                    .with_property("TextureContent", Variant::Content(Content::from_uri(tex_id))),
             );
             self.explorer.expanded.insert(part_ref);
             self.select(vec![r]);
@@ -872,7 +872,7 @@ impl Editor {
             InstanceBuilder::new("Decal")
                 .with_name(stem)
                 .with_property("Texture", Variant::ContentId(tex_id.clone().into()))
-                .with_property("ColorMapContent", Variant::Content(Content::from_uri(tex_id))),
+                .with_property("TextureContent", Variant::Content(Content::from_uri(tex_id))),
         );
         self.explorer.expanded.insert(parent);
         self.explorer.expanded.insert(part);

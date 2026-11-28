@@ -15,6 +15,8 @@ enum ImeOp {
     Key { code: i32, down: bool },
     HardwareKey { code: i32, meta: i32, down: bool, repeat: bool },
     Action(i32),
+    HardwareMouseDetected(bool),
+    PointerCaptureChanged(bool),
     MouseCapture {
         action: i32,
         dx: f32,
@@ -75,9 +77,7 @@ impl egui::Plugin for VirtualCursorPlugin {
         for vp in output.viewport_output.values() {
             for cmd in &vp.commands {
                 if let egui::ViewportCommand::CursorVisible(visible) = cmd {
-                    if let Ok(mut vm) = VIRTUAL_MOUSE.lock() {
-                        vm.cursor_hidden = !*visible;
-                    }
+                    VIRTUAL_MOUSE.lock().unwrap_or_else(|e| e.into_inner()).cursor_hidden = !*visible;
                 }
             }
         }
@@ -86,7 +86,7 @@ impl egui::Plugin for VirtualCursorPlugin {
 
 fn paint_virtual_cursor(ctx: &egui::Context) {
     let (active, locked, pos) = {
-        let Ok(vm) = VIRTUAL_MOUSE.lock() else { return };
+        let vm = VIRTUAL_MOUSE.lock().unwrap_or_else(|e| e.into_inner());
         (vm.active && vm.is_captured && vm.initialized, vm.locked_look || vm.cursor_hidden, vm.pos)
     };
     if !active || locked {
@@ -181,20 +181,22 @@ pub fn on_hardware_key(code: i32, meta: i32, down: bool, repeat: bool) {
     push_op(ImeOp::HardwareKey { code, meta, down, repeat });
 }
 
+/// Updates virtual cursor visibility from `Game::cursor_cmd` (`ViewportCommand::CursorVisible`).
+pub fn set_cursor_hidden(hidden: bool) {
+    VIRTUAL_MOUSE.lock().unwrap_or_else(|e| e.into_inner()).cursor_hidden = hidden;
+}
+
 /// Called from JNI `RustudioActivity.nativeHardwareMouseDetected` when a hardware
 /// mouse is detected (or when real finger touch switches back to touch mode).
+/// Enqueued in `QUEUE` so mode transitions stay strictly ordered with queued `MouseCapture` ops.
 pub fn on_hardware_mouse_detected(active: bool) {
-    rustudio_engine::touch_input::set_captured_hardware_mouse(active);
-    if let Ok(mut vm) = VIRTUAL_MOUSE.lock() {
-        vm.active = active;
-        if !active {
-            vm.is_captured = false;
-            vm.buttons = 0;
-            vm.locked_look = false;
-            vm.right_press_pos = None;
-        }
-    }
-    super::lifecycle::wake();
+    push_op(ImeOp::HardwareMouseDetected(active));
+}
+
+/// Called from JNI `RustudioActivity.nativePointerCaptureChanged` when Android grants
+/// or revokes pointer capture (system gesture, Esc, notification shade, focus change).
+pub fn on_pointer_capture_changed(has_capture: bool) {
+    push_op(ImeOp::PointerCaptureChanged(has_capture));
 }
 
 /// Called from JNI `RustudioActivity.nativeMouseCapture` (API 26+ `OnCapturedPointerListener`).
@@ -458,7 +460,10 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
             }
             ImeOp::HardwareKey { code, meta, down, repeat } => {
                 let modifiers = map_android_modifiers(meta);
-                current_modifiers = modifiers;
+                if modifiers != current_modifiers {
+                    raw.events.push(Event::ModifiersChanged(modifiers));
+                    current_modifiers = modifiers;
+                }
                 if let Some(key) = map_android_keycode(code) {
                     if down && !repeat && modifiers.command && !modifiers.shift && !modifiers.alt {
                         match key {
@@ -521,6 +526,63 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                 }
                 _ => {}
             },
+            ImeOp::HardwareMouseDetected(active) => {
+                rustudio_engine::touch_input::set_captured_hardware_mouse(active);
+                let mut vm = VIRTUAL_MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+                vm.active = active;
+                if !active {
+                    let prev_buttons = vm.buttons;
+                    let release_pos = vm.drag_pos;
+                    vm.is_captured = false;
+                    vm.buttons = 0;
+                    vm.locked_look = false;
+                    vm.right_press_pos = None;
+                    for (mask, button) in [
+                        (1i32, PointerButton::Primary),
+                        (2i32, PointerButton::Secondary),
+                        (4i32, PointerButton::Middle),
+                    ] {
+                        if (prev_buttons & mask) != 0 {
+                            raw.events.push(Event::PointerButton {
+                                pos: release_pos,
+                                button,
+                                pressed: false,
+                                modifiers: current_modifiers,
+                            });
+                        }
+                    }
+                }
+            }
+            ImeOp::PointerCaptureChanged(has_capture) => {
+                let mut vm = VIRTUAL_MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+                vm.is_captured = has_capture;
+                if !has_capture {
+                    let prev_buttons = vm.buttons;
+                    let release_pos = vm.drag_pos;
+                    vm.buttons = 0;
+                    vm.locked_look = false;
+                    let anchor = vm.right_press_pos.take();
+                    for (mask, button) in [
+                        (1i32, PointerButton::Primary),
+                        (2i32, PointerButton::Secondary),
+                        (4i32, PointerButton::Middle),
+                    ] {
+                        if (prev_buttons & mask) != 0 {
+                            raw.events.push(Event::PointerButton {
+                                pos: release_pos,
+                                button,
+                                pressed: false,
+                                modifiers: current_modifiers,
+                            });
+                        }
+                    }
+                    if let Some(a) = anchor {
+                        vm.pos = a;
+                        vm.drag_pos = a;
+                        raw.events.push(Event::PointerMoved(a));
+                    }
+                }
+            }
             ImeOp::MouseCapture {
                 action,
                 dx,
@@ -533,8 +595,11 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                 abs_y,
                 is_captured,
             } => {
+                const ACTION_DOWN: i32 = 0;
+                const ACTION_UP: i32 = 1;
                 const ACTION_CANCEL: i32 = 3;
                 const ACTION_SCROLL: i32 = 8;
+                const ACTION_HOVER_EXIT: i32 = 10;
                 const ACTION_BUTTON_PRESS: i32 = 11;
                 const ACTION_BUTTON_RELEASE: i32 = 12;
                 const BUTTON_PRIMARY: i32 = 1;
@@ -547,7 +612,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
 
                 let ppp = ctx.pixels_per_point().max(0.5);
                 let delta = egui::vec2(dx / ppp, dy / ppp);
-                let Ok(mut vm) = VIRTUAL_MOUSE.lock() else { continue };
+                let mut vm = VIRTUAL_MOUSE.lock().unwrap_or_else(|e| e.into_inner());
                 vm.active = true;
                 vm.is_captured = is_captured;
                 if !vm.initialized && screen_rect.is_positive() {
@@ -558,6 +623,12 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                     };
                     vm.drag_pos = vm.pos;
                     vm.initialized = true;
+                    raw.events.push(Event::PointerMoved(vm.pos));
+                }
+
+                if !is_captured && action == ACTION_HOVER_EXIT {
+                    raw.events.push(Event::PointerGone);
+                    continue;
                 }
 
                 let mut new_buttons = button_state;
@@ -565,12 +636,16 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                     new_buttons |= action_button;
                 } else if action == ACTION_BUTTON_RELEASE && action_button != 0 {
                     new_buttons &= !action_button;
+                } else if !is_captured && action == ACTION_DOWN && button_state == 0 && action_button == 0 {
+                    new_buttons |= BUTTON_PRIMARY;
+                } else if !is_captured && action == ACTION_UP && button_state == 0 && action_button == 0 {
+                    new_buttons &= !BUTTON_PRIMARY;
                 } else if action == ACTION_CANCEL {
                     new_buttons = 0;
                 }
 
                 let right_held = (new_buttons & BUTTON_SECONDARY) != 0
-                    || (vm.buttons & BUTTON_SECONDARY) != 0;
+                    && (vm.buttons & BUTTON_SECONDARY) != 0;
 
                 if !is_captured && abs_x >= 0.0 && abs_y >= 0.0 {
                     let mut target = Pos2::new(abs_x / ppp, abs_y / ppp);
@@ -617,18 +692,28 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                         let was = (prev_buttons & mask) != 0;
                         let now = (new_buttons & mask) != 0;
                         if was != now {
-                            if mask == BUTTON_SECONDARY {
-                                if now {
-                                    vm.right_press_pos = Some(vm.pos);
-                                    vm.drag_pos = vm.pos;
-                                    vm.locked_look = true;
-                                } else {
-                                    if let Some(anchor) = vm.right_press_pos.take() {
-                                        vm.pos = anchor;
-                                    }
-                                    vm.drag_pos = vm.pos;
-                                    vm.locked_look = false;
+                            if mask == BUTTON_SECONDARY && !now {
+                                // Emit release at drag_pos FIRST so egui does not misclassify
+                                // a camera orbit drag as a 0px right-click context menu, then restore anchor.
+                                let release_pos = vm.drag_pos;
+                                raw.events.push(Event::PointerButton {
+                                    pos: release_pos,
+                                    button,
+                                    pressed: false,
+                                    modifiers: current_modifiers,
+                                });
+                                if let Some(anchor) = vm.right_press_pos.take() {
+                                    vm.pos = anchor;
                                 }
+                                vm.drag_pos = vm.pos;
+                                vm.locked_look = false;
+                                raw.events.push(Event::PointerMoved(vm.pos));
+                                continue;
+                            }
+                            if mask == BUTTON_SECONDARY && now {
+                                vm.right_press_pos = Some(vm.pos);
+                                vm.drag_pos = vm.pos;
+                                vm.locked_look = true;
                             }
                             let event_pos = vm.pos;
                             raw.events.push(Event::PointerMoved(event_pos));

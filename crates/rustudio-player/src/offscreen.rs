@@ -399,8 +399,18 @@ pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
     if is_android_powervr_gles() {
         return PresentMode::Fifo;
     }
-    if no_vsync || cfg!(target_os = "android") {
+    if no_vsync {
         return PresentMode::AutoNoVsync;
+    }
+    #[cfg(target_os = "android")]
+    {
+        return match rustudio_core::rustudio_settings::performance_value("present") {
+            "novsync" => PresentMode::AutoNoVsync,
+            "immediate" => PresentMode::Immediate,
+            "mailbox" => PresentMode::Mailbox,
+            "relaxed" => PresentMode::FifoRelaxed,
+            _ => PresentMode::Fifo,
+        };
     }
     match rustudio_core::rustudio_settings::performance_value("present") {
         "fifo" | "vsync" => PresentMode::AutoVsync,

@@ -1019,36 +1019,20 @@ pub fn hardware_input_devices() -> Result<HardwareInput> {
     })
 }
 
-/// Requests or releases Android API 26+ pointer capture on the activity's decor view.
+/// Requests or releases Android API 26+ pointer capture on RustudioActivity's captureView.
 pub fn set_pointer_capture(capture: bool) {
     if sdk_int() < 26 {
         return;
     }
-    let _ = on_main_thread(
-        move || {
-            with_activity(|env, activity| {
-                let win = env
-                    .call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[])?
-                    .l()?;
-                if win.is_null() {
-                    return Ok(());
-                }
-                let decor = env
-                    .call_method(&win, jni_str!("getDecorView"), jni_sig!("()Landroid/view/View;"), &[])?
-                    .l()?;
-                if decor.is_null() {
-                    return Ok(());
-                }
-                if capture {
-                    env.call_method(&decor, jni_str!("requestPointerCapture"), jni_sig!("()V"), &[])?;
-                } else {
-                    env.call_method(&decor, jni_str!("releasePointerCapture"), jni_sig!("()V"), &[])?;
-                }
-                Ok(())
-            })
-        },
-        std::time::Duration::from_millis(200),
-    );
+    let _ = with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            jni_str!("setPointerCapture"),
+            jni_sig!("(Z)V"),
+            &[JValue::Bool(capture)],
+        )?;
+        Ok(())
+    });
 }
 
 /// Requests Android's "Install unknown apps" permission if needed and launches

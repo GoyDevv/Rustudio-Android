@@ -159,10 +159,15 @@ pub fn run(app: AndroidApp) {
     }
     init_dirs(&app);
     export_env();
+    // Install crash hooks immediately after dirs/env so early JNI/GPU/startup crashes are captured,
+    // and export any pending crash reports from the previous session to Downloads right away.
+    crate::crash::install();
+    crate::crash::sync_unexported_crashes_to_downloads();
     // The motion sensors behind UserInputService (sensors.rs), for the
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());
     rustudio_engine::mouse_lock::install_capture(jni::set_pointer_capture);
+    rustudio_engine::mouse_lock::install_cursor_visible(|visible| ime_bridge::set_cursor_hidden(!visible));
     if jni::vibrator_info().present {
         rustudio_engine::runtime::domains::gui_input::set_haptic_handler(|ms, strength| {
             let res = if ms == 0 || strength <= 0.0 {
@@ -187,11 +192,7 @@ pub fn run(app: AndroidApp) {
         data_dir().display(),
         cache_dir().display()
     );
-    // A panic or fatal signal leaves a report in the cache folder, listed
-    // in Output at the next start (and logcat gets the panic message).
-    rustudio_core::crash::install();
-    crate::crash::install();
-    crate::crash::sync_unexported_crashes_to_downloads();
+    // Crash handlers & startup Downloads sync already installed right after export_env().
     // Studio's installations of the engine's start-up hooks (src/studio_hooks.rs).
     crate::studio_hooks::install();
     // Native Android graphics driver only (Vulkan with GLES 3 fallback).
@@ -220,6 +221,11 @@ pub fn run(app: AndroidApp) {
         rustudio_core::studio_content::spawn_background_install_if_missing();
     } else {
         log::warn!("no network yet: Studio content download waits for one");
+        if rustudio_core::studio_content::installed().is_none() {
+            rustudio_core::studio_content::set_offline_error(
+                "No internet connection detected. Connect to Wi-Fi or mobile data to download Roblox Studio's built-in assets (character rigs, player scripts, fonts, and textures).",
+            );
+        }
         let _ = std::thread::Builder::new().name("studio-content-wait".into()).spawn(|| {
             for _ in 0..180 {
                 std::thread::sleep(std::time::Duration::from_secs(10));
@@ -253,7 +259,7 @@ pub fn run(app: AndroidApp) {
         // crate::wgpu_setup made them); uncapped (AutoNoVsync) unless the
         // user explicitly selected Wait for vsync ("fifo") in Settings.
         wgpu_options: crate::offscreen::wgpu_options_with(
-            rustudio_core::rustudio_settings::performance_value("present") != "fifo",
+            rustudio_core::rustudio_settings::performance_value("present") == "novsync",
             crate::wgpu_setup,
         ),
         // eframe's own window state file would go through `directories`,

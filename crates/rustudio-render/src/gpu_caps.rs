@@ -528,6 +528,8 @@ mod tests {
             features: wgpu::Features::empty(),
             downlevel: wgpu::DownlevelFlags::compliant(),
             r8_storage: false,
+            hdr_float_rt: true,
+            r16_float_rt: true,
         };
         assert_eq!(caps.driver, "ARM");
         assert_eq!(caps.driver_info, "Vulkan 1.1.191");
@@ -553,6 +555,8 @@ mod tests {
             features: wgpu::Features::empty(),
             downlevel: wgpu::DownlevelFlags::empty(),
             r8_storage: false,
+            hdr_float_rt: true,
+            r16_float_rt: true,
         };
         assert_eq!(gl_caps.weak_reason().as_deref(), Some("OpenGL backend"));
         assert!(gl_caps.reduced_bindings());
@@ -569,6 +573,8 @@ mod tests {
             features: wgpu::Features::empty(),
             downlevel: wgpu::DownlevelFlags::compliant(),
             r8_storage: false,
+            hdr_float_rt: true,
+            r16_float_rt: true,
         };
         assert_eq!(cpu_caps.weak_reason().as_deref(), Some("software adapter"));
 
@@ -587,6 +593,8 @@ mod tests {
             features: wgpu::Features::empty(),
             downlevel: wgpu::DownlevelFlags::compliant(),
             r8_storage: false,
+            hdr_float_rt: true,
+            r16_float_rt: true,
         };
         assert!(downlevel_vk.weak_reason().is_some_and(|r| r.contains("downlevel limits")));
     }

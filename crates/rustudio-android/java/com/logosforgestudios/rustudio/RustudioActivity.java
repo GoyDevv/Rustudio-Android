@@ -1,7 +1,17 @@
 package com.logosforgestudios.rustudio;
 
 import android.Manifest;
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 import android.app.NativeActivity;
+import android.content.ContentValues;
+import android.provider.MediaStore;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.ComponentCallbacks2;
@@ -77,8 +87,11 @@ public class RustudioActivity extends NativeActivity {
     private boolean pointerCaptureListenerInstalled = false;
     private boolean hardwareMouseActive = false;
     private boolean imeOpen = false;
+    private static final String PREF_LAST_EXIT_TS = "last_exit_info_ts_v1";
     private float lastUncapturedMouseX = Float.NaN;
     private float lastUncapturedMouseY = Float.NaN;
+    private float lastTouchpadX = Float.NaN;
+    private float lastTouchpadY = Float.NaN;
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -94,6 +107,7 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeHardwareKey(int keyCode, int metaState, boolean down, boolean repeat);
     static native void nativeMouseCapture(int action, float dx, float dy, int buttonState, int actionButton, float scrollX, float scrollY, float absX, float absY, boolean isCaptured);
     static native void nativeHardwareMouseDetected(boolean active);
+    static native void nativePointerCaptureChanged(boolean hasCapture);
     static native void nativeImeVisibility(boolean visible, int bottomInsetPx);
     static native void nativeOnLifecycle(int state);
     static native void nativeOnTrimMemory(int level);
@@ -212,17 +226,50 @@ public class RustudioActivity extends NativeActivity {
                     return false;
                 }
                 int action = event.getActionMasked();
-                float dx = event.getX();
-                float dy = event.getY();
-                if (action == MotionEvent.ACTION_MOVE) {
-                    int history = event.getHistorySize();
-                    for (int i = 0; i < history; i++) {
-                        dx += event.getHistoricalX(i);
-                        dy += event.getHistoricalY(i);
+                int source = event.getSource();
+                boolean isRelative = (source & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE;
+                boolean isTouchpad = !isRelative && ((source & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD);
+                float dx = 0.0f;
+                float dy = 0.0f;
+                if (isRelative) {
+                    if (action == MotionEvent.ACTION_MOVE) {
+                        dx = event.getX();
+                        dy = event.getY();
+                        int history = event.getHistorySize();
+                        for (int i = 0; i < history; i++) {
+                            dx += event.getHistoricalX(i);
+                            dy += event.getHistoricalY(i);
+                        }
+                    }
+                } else if (isTouchpad) {
+                    if (action == MotionEvent.ACTION_DOWN) {
+                        lastTouchpadX = event.getX();
+                        lastTouchpadY = event.getY();
+                    } else if (action == MotionEvent.ACTION_MOVE) {
+                        float x = event.getX();
+                        float y = event.getY();
+                        if (!Float.isNaN(lastTouchpadX) && !Float.isNaN(lastTouchpadY)) {
+                            dx = x - lastTouchpadX;
+                            dy = y - lastTouchpadY;
+                        }
+                        lastTouchpadX = x;
+                        lastTouchpadY = y;
+                    } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                        lastTouchpadX = Float.NaN;
+                        lastTouchpadY = Float.NaN;
                     }
                 }
-                float scrollX = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
-                float scrollY = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+                float scrollX = 0.0f;
+                float scrollY = 0.0f;
+                if (action == MotionEvent.ACTION_SCROLL) {
+                    scrollX = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                    scrollY = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+                    int history = event.getHistorySize();
+                    for (int i = 0; i < history; i++) {
+                        scrollX += event.getHistoricalAxisValue(MotionEvent.AXIS_HSCROLL, i);
+                        scrollY += event.getHistoricalAxisValue(MotionEvent.AXIS_VSCROLL, i);
+                    }
+                }
                 int buttonState = event.getButtonState();
                 int actionButton = event.getActionButton();
                 nativeMouseCapture(action, dx, dy, buttonState, actionButton, scrollX, scrollY, -1.0f, -1.0f, true);
@@ -238,10 +285,19 @@ public class RustudioActivity extends NativeActivity {
         int action = event.getActionMasked();
         float absX = event.getX();
         float absY = event.getY();
-        float dx = Float.isNaN(lastUncapturedMouseX) ? 0.0f : (absX - lastUncapturedMouseX);
-        float dy = Float.isNaN(lastUncapturedMouseY) ? 0.0f : (absY - lastUncapturedMouseY);
-        lastUncapturedMouseX = absX;
-        lastUncapturedMouseY = absY;
+        float dx = 0.0f;
+        float dy = 0.0f;
+        if (action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_EXIT
+                || action == MotionEvent.ACTION_CANCEL) {
+            lastUncapturedMouseX = Float.NaN;
+            lastUncapturedMouseY = Float.NaN;
+        } else if (action != MotionEvent.ACTION_SCROLL) {
+            dx = Float.isNaN(lastUncapturedMouseX) ? 0.0f : (absX - lastUncapturedMouseX);
+            dy = Float.isNaN(lastUncapturedMouseY) ? 0.0f : (absY - lastUncapturedMouseY);
+            lastUncapturedMouseX = absX;
+            lastUncapturedMouseY = absY;
+        }
         float scrollX = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
         float scrollY = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
         int buttonState = event.getButtonState();
@@ -270,19 +326,49 @@ public class RustudioActivity extends NativeActivity {
     }
 
     private void releaseHardwareMouseCapture(boolean deactivateMouse) {
+        lastUncapturedMouseX = Float.NaN;
+        lastUncapturedMouseY = Float.NaN;
+        lastTouchpadX = Float.NaN;
+        lastTouchpadY = Float.NaN;
         if (Build.VERSION.SDK_INT >= 26 && captureView != null && captureView.hasPointerCapture()) {
             try {
                 captureView.releasePointerCapture();
             } catch (Throwable ignored) {
             }
         }
-        if (deactivateMouse) {
-            lastUncapturedMouseX = Float.NaN;
-            lastUncapturedMouseY = Float.NaN;
-            if (hardwareMouseActive) {
-                hardwareMouseActive = false;
-                nativeHardwareMouseDetected(false);
+        if (deactivateMouse && hardwareMouseActive) {
+            hardwareMouseActive = false;
+            nativeHardwareMouseDetected(false);
+        }
+    }
+
+    /** Called from Rust JNI (src/android/jni.rs) to request or release capture on captureView. */
+    public void setPointerCapture(final boolean capture) {
+        if (Build.VERSION.SDK_INT < 26) {
+            return;
+        }
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (capture) {
+                    activateHardwareMouseCapture();
+                } else {
+                    releaseHardwareMouseCapture(false);
+                }
             }
+        });
+    }
+
+    @Override
+    public void onPointerCaptureChanged(boolean hasCapture) {
+        super.onPointerCaptureChanged(hasCapture);
+        lastUncapturedMouseX = Float.NaN;
+        lastUncapturedMouseY = Float.NaN;
+        lastTouchpadX = Float.NaN;
+        lastTouchpadY = Float.NaN;
+        try {
+            nativePointerCaptureChanged(hasCapture);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -342,8 +428,195 @@ public class RustudioActivity extends NativeActivity {
         }
     }
 
+    private void installJvmCrashHandler() {
+        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        final File crashDir = new File(getFilesDir(), "crashes");
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread t, Throwable e) {
+                try {
+                    if (!crashDir.exists()) {
+                        crashDir.mkdirs();
+                    }
+                    StringWriter sw = new StringWriter();
+                    PrintWriter pw = new PrintWriter(sw);
+                    pw.println("=== Rustudio JVM Uncaught Exception Report ===");
+                    pw.println("Crash Type: Android JVM Exception");
+                    pw.println("TimestampMs: " + System.currentTimeMillis());
+                    pw.println("Device: " + Build.MANUFACTURER + " " + Build.MODEL + " (Android " + Build.VERSION.RELEASE + ", SDK " + Build.VERSION.SDK_INT + ")");
+                    pw.println("Thread: " + (t != null ? t.getName() : "<unknown>"));
+                    pw.println();
+                    if (e != null) {
+                        e.printStackTrace(pw);
+                    }
+                    pw.flush();
+                    byte[] data = sw.toString().getBytes(StandardCharsets.UTF_8);
+                    File out = new File(crashDir, "pending_java_crash.txt");
+                    FileOutputStream fos = new FileOutputStream(out, false);
+                    try {
+                        fos.write(data);
+                        fos.flush();
+                        fos.getFD().sync();
+                    } finally {
+                        fos.close();
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (previous != null) {
+                    previous.uncaughtException(t, e);
+                }
+            }
+        });
+    }
+
+    private boolean writeTextToMediaStoreDownloads(String fileName, byte[] data, String relativePath) {
+        if (Build.VERSION.SDK_INT < 29) {
+            return false;
+        }
+        ContentResolver resolver = getContentResolver();
+        Uri inserted = null;
+        try {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+            cv.put(MediaStore.Downloads.MIME_TYPE, "text/plain");
+            cv.put(MediaStore.Downloads.RELATIVE_PATH, relativePath);
+            cv.put(MediaStore.Downloads.IS_PENDING, 1);
+            inserted = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (inserted == null) {
+                return false;
+            }
+            OutputStream os = resolver.openOutputStream(inserted);
+            if (os == null) {
+                resolver.delete(inserted, null, null);
+                return false;
+            }
+            try {
+                os.write(data);
+                os.flush();
+            } finally {
+                os.close();
+            }
+            ContentValues clear = new ContentValues();
+            clear.put(MediaStore.Downloads.IS_PENDING, 0);
+            return resolver.update(inserted, clear, null, null) > 0;
+        } catch (Throwable t) {
+            if (inserted != null) {
+                try {
+                    resolver.delete(inserted, null, null);
+                } catch (Throwable ignored) {
+                }
+            }
+            return false;
+        }
+    }
+
+    private void exportExitInfoToDownloads(String fileName, String reportText) {
+        byte[] data = reportText.getBytes(StandardCharsets.UTF_8);
+        try {
+            File crashDir = new File(getFilesDir(), "crashes");
+            if (!crashDir.exists()) {
+                crashDir.mkdirs();
+            }
+            File privateFile = new File(crashDir, fileName);
+            FileOutputStream fos = new FileOutputStream(privateFile, false);
+            try {
+                fos.write(data);
+                fos.flush();
+                fos.getFD().sync();
+            } finally {
+                fos.close();
+            }
+        } catch (Throwable ignored) {
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            if (!writeTextToMediaStoreDownloads(fileName, data, "Download/Rustudio/crashes/")) {
+                writeTextToMediaStoreDownloads(fileName, data, "Download/");
+            }
+        }
+    }
+
+    /**
+     * API 30+ harvester for uncatchable OS terminations (LMK SIGKILL, ANR, early native crash)
+     * so Vivo/Funtouch OS silent kills still produce a readable .txt report in Downloads.
+     */
+    private void harvestHistoricalExitReasons() {
+        if (Build.VERSION.SDK_INT < 30) {
+            return;
+        }
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) {
+                return;
+            }
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            long lastSeenTs = prefs.getLong(PREF_LAST_EXIT_TS, 0L);
+            long newestTs = lastSeenTs;
+            List<ApplicationExitInfo> reasons = am.getHistoricalProcessExitReasons(getPackageName(), 0, 5);
+            if (reasons == null) {
+                return;
+            }
+            for (ApplicationExitInfo info : reasons) {
+                long ts = info.getTimestamp();
+                if (ts <= lastSeenTs) {
+                    continue;
+                }
+                if (ts > newestTs) {
+                    newestTs = ts;
+                }
+                int reason = info.getReason();
+                boolean interesting = reason == ApplicationExitInfo.REASON_CRASH
+                        || reason == ApplicationExitInfo.REASON_CRASH_NATIVE
+                        || reason == ApplicationExitInfo.REASON_ANR
+                        || reason == ApplicationExitInfo.REASON_LOW_MEMORY
+                        || reason == ApplicationExitInfo.REASON_SIGNALED;
+                if (!interesting) {
+                    continue;
+                }
+                StringBuilder sb = new StringBuilder();
+                sb.append("=== Rustudio Android Process Exit Report (ApplicationExitInfo) ===\n");
+                sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+                        .append(" (Android ").append(Build.VERSION.RELEASE)
+                        .append(", SDK ").append(Build.VERSION.SDK_INT).append(")\n");
+                sb.append("TimestampMs: ").append(ts).append("\n");
+                sb.append("PID: ").append(info.getPid()).append("\n");
+                sb.append("ReasonCode: ").append(reason).append("\n");
+                sb.append("Status: ").append(info.getStatus()).append("\n");
+                sb.append("Importance: ").append(info.getImportance()).append("\n");
+                sb.append("PSS_KB: ").append(info.getPss()).append("\n");
+                sb.append("RSS_KB: ").append(info.getRss()).append("\n");
+                sb.append("Description: ").append(info.getDescription()).append("\n");
+                try {
+                    InputStream trace = info.getTraceInputStream();
+                    if (trace != null) {
+                        sb.append("\n=== System Trace / Tombstone ===\n");
+                        BufferedReader br = new BufferedReader(new InputStreamReader(trace, StandardCharsets.UTF_8));
+                        try {
+                            String line;
+                            int lines = 0;
+                            while ((line = br.readLine()) != null && lines < 400) {
+                                sb.append(line).append("\n");
+                                lines++;
+                            }
+                        } finally {
+                            br.close();
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                String fileName = "rustudio-exit-" + (ts / 1000L) + "-r" + reason + ".txt";
+                exportExitInfoToDownloads(fileName, sb.toString());
+            }
+            if (newestTs > lastSeenTs) {
+                prefs.edit().putLong(PREF_LAST_EXIT_TS, newestTs).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        installJvmCrashHandler();
+        harvestHistoricalExitReasons();
         super.onCreate(savedInstanceState);
         applyDarkFullscreenWindow();
         unlockMaxRefreshRate();
@@ -1034,14 +1307,12 @@ public class RustudioActivity extends NativeActivity {
                     imeView.requestFocus();
                     imm.restartInput(imeView);
                     imm.showSoftInput(imeView, InputMethodManager.SHOW_IMPLICIT);
-                    applyDarkFullscreenWindow();
                 } else {
                     imeView.resetComposing();
                     imeView.clearFocus();
                     imeView.setFocusable(false);
                     imeView.setFocusableInTouchMode(false);
                     imm.hideSoftInputFromWindow(imeView.getWindowToken(), 0);
-                    applyDarkFullscreenWindow();
                     if (hardwareMouseActive) {
                         activateHardwareMouseCapture();
                     }

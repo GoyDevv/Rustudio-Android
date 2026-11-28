@@ -25,6 +25,7 @@ pub fn platform_locks() -> bool {
 
 static LOCKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static CAPTURE_FN: std::sync::OnceLock<fn(bool)> = std::sync::OnceLock::new();
+static CURSOR_VISIBLE_FN: std::sync::OnceLock<fn(bool)> = std::sync::OnceLock::new();
 
 /// Installs the platform pointer-capture callback (Android API 26+ View.requestPointerCapture).
 pub fn install_capture(f: fn(bool)) {
@@ -35,6 +36,18 @@ pub fn install_capture(f: fn(bool)) {
 pub fn set_captured(on: bool) {
     if let Some(f) = CAPTURE_FN.get() {
         f(on);
+    }
+}
+
+/// Installs the platform cursor-visibility callback (Android virtual cursor).
+pub fn install_cursor_visible(f: fn(bool)) {
+    let _ = CURSOR_VISIBLE_FN.set(f);
+}
+
+/// Updates virtual cursor visibility when a hook is installed.
+pub fn set_cursor_visible(visible: bool) {
+    if let Some(f) = CURSOR_VISIBLE_FN.get() {
+        f(visible);
     }
 }
 

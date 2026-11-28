@@ -1416,8 +1416,9 @@ impl PostFx {
         if need_blur && self.blur_pipes.is_none() {
             self.ensure_blur_pipes(device);
         }
-        let need_full_targets = need_dof || bloom_on || sr_on || (need_blur && !self.is_powervr);
-        let need_blur_only = self.is_powervr && need_blur && !need_dof && !bloom_on && !sr_on;
+        let light_blur = self.is_powervr || cfg!(target_os = "android");
+        let need_full_targets = need_dof || bloom_on || sr_on || (need_blur && !light_blur);
+        let need_blur_only = light_blur && need_blur && !need_dof && !bloom_on && !sr_on;
         if need_full_targets && self.targets.as_ref().is_some_and(|t| t.full.is_none()) {
             let (hdr_view, depth_view) = {
                 let t = self.targets.as_ref().expect("postfx targets");

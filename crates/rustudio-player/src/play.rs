@@ -1431,6 +1431,10 @@ impl Game {
                 s.time
             ));
         }
+        drop(s);
+        #[cfg(target_os = "android")]
+        rustudio_core::core_scripts::clear_patch_cache();
+        rustudio_core::heap::trim();
     }
 
     /// Server Scripts to start: under Workspace and ServerScriptService
@@ -3835,12 +3839,12 @@ impl Game {
                 drop(sc);
                 return false;
             };
-            let vel = s
-                .server
-                .as_mut()
-                .and_then(|server| server.world.as_mut())
-                .map(|w| std::mem::take(&mut w.velocity_requests))
-                .unwrap_or_default();
+            let Some(w) = s.server.as_mut().and_then(|server| server.world.as_mut()) else {
+                log::warn!("step_play: server world unavailable; skipping physics step");
+                drop(sc);
+                return false;
+            };
+            let vel = std::mem::take(&mut w.velocity_requests);
             s.physics.sync(&mut self.doc);
             s.physics.set_streaming_visibility(
                 s.map.streaming_collider_revision(),

@@ -309,6 +309,19 @@ fn refresh_signal_header(_header_text: &str) {}
 /// Pre-computed CString path to `<crash_dir>/pending_signal_crash.txt` so the
 /// signal handler never allocates.
 static SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
+#[cfg(unix)]
+const CAUGHT_SIGNALS: [libc::c_int; 6] = [
+    libc::SIGSEGV,
+    libc::SIGABRT,
+    libc::SIGBUS,
+    libc::SIGFPE,
+    libc::SIGILL,
+    libc::SIGTRAP,
+];
+#[cfg(unix)]
+static mut OLD_ACTIONS: [libc::sigaction; 6] = unsafe { std::mem::zeroed() };
+#[cfg(unix)]
+static OLD_ACTIONS_SAVED: AtomicBool = AtomicBool::new(false);
 /// Pre-computed CString path in public shared storage (`Download/Rustudio/crashes/`)
 /// so even a black-screen native crash leaves a user-visible `.txt`.
 static PUBLIC_SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
@@ -502,15 +515,8 @@ pub fn install() {
     }
 
     let sig_path = crash_dir.join(PENDING_SIGNAL_FILE);
-    #[cfg(target_os = "android")]
-    {
-        let dir = "/storage/emulated/0/Download/Rustudio/crashes";
-        let _ = std::fs::create_dir_all(dir);
-        let p = Path::new(dir).join("rustudio-crash-signal.txt");
-        if let Ok(c) = CString::new(p.to_string_lossy().as_bytes()) {
-            let _ = PUBLIC_SIGNAL_PATH.set(c);
-        }
-    }
+    // On Android 11+ Scoped Storage blocks raw /storage/emulated/0/Download writes;
+    // stage strictly into app-private filesDir and export via MediaStore.Downloads.
     let _ = SIGNAL_PATH.set(CString::new(sig_path.to_string_lossy().as_bytes()).unwrap_or_default());
 
     let default_hook = std::panic::take_hook();
@@ -585,20 +591,14 @@ pub fn install() {
             libc::sigaltstack(&ss, std::ptr::null_mut());
         }
 
-        for sig in [
-            libc::SIGSEGV,
-            libc::SIGABRT,
-            libc::SIGBUS,
-            libc::SIGFPE,
-            libc::SIGILL,
-            libc::SIGTRAP,
-        ] {
+        for (idx, &sig) in CAUGHT_SIGNALS.iter().enumerate() {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_signal as *const () as usize;
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESETHAND;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::sigaction(sig, &sa, std::ptr::addr_of_mut!(OLD_ACTIONS).cast::<libc::sigaction>().add(idx));
         }
+        OLD_ACTIONS_SAVED.store(true, Ordering::Release);
     }
 }
 
@@ -711,7 +711,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
             return;
         }
         if !WRITTEN.swap(true, Ordering::SeqCst) {
-            for p in [SIGNAL_PATH.get(), PUBLIC_SIGNAL_PATH.get()].into_iter().flatten() {
+            if let Some(p) = SIGNAL_PATH.get() {
                 let fd = libc::open(
                     p.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
@@ -740,17 +740,39 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
                     write_all_fd(fd, hdr_bytes);
                     write_all_fd(fd, b"\n");
 
+                    let _ = libc::fsync(fd);
                     libc::close(fd);
                 }
             }
         }
 
-        // Restore SIG_DFL and re-raise so Android / OS cleanly terminates and writes its tombstone.
-        let mut dfl: libc::sigaction = std::mem::zeroed();
-        dfl.sa_sigaction = libc::SIG_DFL;
-        libc::sigemptyset(&mut dfl.sa_mask);
-        libc::sigaction(sig, &dfl, std::ptr::null_mut());
-        libc::raise(sig);
+        // Chain to the previous handler (ART libsigchain / debuggerd) if saved, otherwise restore SIG_DFL.
+        let mut chained = false;
+        if OLD_ACTIONS_SAVED.load(Ordering::Acquire) {
+            if let Some(idx) = CAUGHT_SIGNALS.iter().position(|&s| s == sig) {
+                let prev = *std::ptr::addr_of!(OLD_ACTIONS).cast::<libc::sigaction>().add(idx);
+                libc::sigaction(sig, &prev, std::ptr::null_mut());
+                let prev_fn = prev.sa_sigaction;
+                if prev_fn != libc::SIG_DFL && prev_fn != libc::SIG_IGN && prev_fn != (on_signal as *const () as usize) {
+                    if (prev.sa_flags & libc::SA_SIGINFO) != 0 {
+                        let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                            std::mem::transmute(prev_fn);
+                        handler(sig, info, _ctx);
+                    } else {
+                        let handler: extern "C" fn(libc::c_int) = std::mem::transmute(prev_fn);
+                        handler(sig);
+                    }
+                    chained = true;
+                }
+            }
+        }
+        if !chained {
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut dfl.sa_mask);
+            libc::sigaction(sig, &dfl, std::ptr::null_mut());
+            libc::raise(sig);
+        }
     }
 }
 
@@ -979,6 +1001,23 @@ pub fn sync_unexported_crashes_to_downloads() {
                 let key = crash_export_key(&path, file_name);
                 if exported.contains(&key) || exported.contains(file_name) {
                     continue;
+                }
+                // Enrich pending signal crash tombstone with meminfo + logcat BEFORE exporting to Downloads.
+                if file_name == PENDING_SIGNAL_FILE {
+                    if let Ok(mut text) = std::fs::read_to_string(&path) {
+                        if !text.trim().is_empty() && !text.contains(STARTUP_ENRICHMENT_MARKER) {
+                            let ctx = snapshot_context();
+                            let enrichment = format!(
+                                "\n{STARTUP_ENRICHMENT_MARKER}\nEnriched At: {}\n{}\n\n=== Memory (/proc/meminfo) ===\n{}\n\n=== Android Logcat (last 500 lines) ===\n{}\n",
+                                stamp_human(),
+                                ctx.device_info.format_lines(),
+                                read_meminfo_summary(),
+                                capture_logcat(500),
+                            );
+                            text.push_str(&enrichment);
+                            let _ = std::fs::write(&path, &text);
+                        }
+                    }
                 }
                 let Ok(bytes) = std::fs::read(&path) else {
                     continue;

@@ -2961,6 +2961,51 @@ impl Editor {
         }
     }
 
+    fn studio_content_offline_modal(&mut self, ctx: &egui::Context) {
+        use rustudio_core::studio_content::{self, DownloadUiStatus};
+        static DISMISSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let status = studio_content::download_ui_status();
+        match status {
+            DownloadUiStatus::Ready | DownloadUiStatus::Idle => {
+                DISMISSED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            DownloadUiStatus::Downloading(_) => {}
+            DownloadUiStatus::OfflineError(ref err) => {
+                if DISMISSED.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let mut retry = false;
+                let mut dismiss = false;
+                egui::Window::new("Roblox Studio Assets Unavailable")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .max_width(420.0)
+                    .show(ctx, |ui| {
+                        ui.label("Rustudio could not download Roblox Studio's built-in assets (default character, player scripts, fonts, and textures) over the network.");
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(err).small().weak());
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Retry Download").clicked() {
+                                retry = true;
+                            }
+                            if ui.button("Continue Offline (Limited Mode)").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                if retry {
+                    DISMISSED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.game.assets.retry_failed();
+                    studio_content::retry_background_install();
+                } else if dismiss {
+                    DISMISSED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(action) = self.confirm_discard.clone() else {
             return;
@@ -3755,16 +3800,31 @@ impl RustudioApp {
         #[cfg(target_os = "android")]
         {
             if let Some(level) = crate::android::lifecycle::take_trim_level() {
-                // ComponentCallbacks2: RUNNING_CRITICAL = 15, MODERATE = 60, COMPLETE = 80.
-                // Normal backgrounding (UI_HIDDEN = 20, RUNNING_LOW = 10, BACKGROUND = 40)
-                // is non-critical and must not wipe active GUI textures or undo history.
-                let critical = level == 15 || level >= 60;
-                let rs = self.ed.game.render_state.clone();
-                self.ed.game.trim_memory(rs.as_ref(), critical);
-                self.ed.toolbox.thumbs.clear_mem();
-                crate::android::memory::log_trim(level, critical);
-                if critical {
-                    ctx.request_repaint();
+                // ComponentCallbacks2: RUNNING_CRITICAL = 15 (foreground), MODERATE = 60, COMPLETE = 80 (background).
+                // Never destroy active foreground viewport/GUI targets on level == 15: doing so stalls the UI
+                // thread and forces immediate GPU reallocation on the next frame (causing a RAM/FPS thrash loop).
+                static LAST_FG_TRIM_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let background_critical = level >= 60;
+                let should_run = if background_critical {
+                    true
+                } else {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let prev = LAST_FG_TRIM_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_ms.saturating_sub(prev) >= 5_000 {
+                        LAST_FG_TRIM_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_run {
+                    let rs = self.ed.game.render_state.clone();
+                    self.ed.game.trim_memory(rs.as_ref(), background_critical);
+                    self.ed.toolbox.thumbs.clear_mem();
+                    crate::android::memory::log_trim(level, background_critical);
                 }
             }
             self.poll_android_insets(&ctx);
@@ -4588,6 +4648,7 @@ impl RustudioApp {
         ed.cloud_windows(&ctx);
         ed.asset_picker_ui(&ctx);
         ed.autosave_recovery_modal(&ctx);
+        ed.studio_content_offline_modal(&ctx);
         ed.import_3d_settings_modal(&ctx);
         ed.mcp_windows(&ctx);
         ed.file_sync_popover_ui(&ctx);

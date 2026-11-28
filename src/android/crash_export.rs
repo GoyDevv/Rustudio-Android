@@ -254,8 +254,17 @@ fn write_content_uri(uri_str: &str, bytes: &[u8]) -> super::jni::Result<()> {
 #[cfg(target_os = "android")]
 pub fn save_to_downloads_android(file_name: &str, bytes: &[u8]) -> super::jni::Result<String> {
     if super::jni::sdk_int() >= 29 {
-        if let Ok(desc) = write_via_mediastore_downloads(file_name, bytes) {
-            return Ok(desc);
+        match write_via_mediastore_downloads(file_name, bytes, "Download/Rustudio/crashes/") {
+            Ok(desc) => return Ok(desc),
+            Err(e) => {
+                log::warn!("crash_export: MediaStore subfolder write failed ({e}); retrying root Download/");
+            }
+        }
+        match write_via_mediastore_downloads(file_name, bytes, "Download/") {
+            Ok(desc) => return Ok(desc),
+            Err(e) => {
+                log::warn!("crash_export: MediaStore root Download/ write failed ({e})");
+            }
         }
     }
     let dl_dir = std::path::PathBuf::from("/storage/emulated/0/Download/Rustudio/crashes");
@@ -266,7 +275,7 @@ pub fn save_to_downloads_android(file_name: &str, bytes: &[u8]) -> super::jni::R
 }
 
 #[cfg(target_os = "android")]
-fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::Result<String> {
+fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8], relative_path: &str) -> super::jni::Result<String> {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
@@ -285,7 +294,7 @@ fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::
         };
         put_str(env, "_display_name", file_name)?;
         put_str(env, "mime_type", "text/plain")?;
-        put_str(env, "relative_path", "Download/Rustudio/crashes/")?;
+        put_str(env, "relative_path", relative_path)?;
         {
             let jk = env.new_string("is_pending")?;
             let jone = env.call_static_method(jni_str!("java/lang/Integer"), jni_str!("valueOf"), jni_sig!("(I)Ljava/lang/Integer;"), &[JValue::Int(1)])?.l()?;
@@ -329,25 +338,45 @@ fn write_via_mediastore_downloads(file_name: &str, bytes: &[u8]) -> super::jni::
         if stream.is_null() {
             return Err(jni::errors::Error::NullPtr("openOutputStream returned null"));
         }
-        let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-        let jbytes = env.new_byte_array(signed.len())?;
-        jbytes.set_region(env, 0, &signed)?;
-        env.call_method(
-            &stream,
-            jni_str!("write"),
-            jni_sig!("([B)V"),
-            &[JValue::Object(&jbytes)],
-        )?;
-        env.call_method(&stream, jni_str!("flush"), jni_sig!("()V"), &[])?;
-        env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
+        let write_res: jni::errors::Result<()> = (|| {
+            let signed: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
+            let jbytes = env.new_byte_array(signed.len())?;
+            jbytes.set_region(env, 0, &signed)?;
+            env.call_method(
+                &stream,
+                jni_str!("write"),
+                jni_sig!("([B)V"),
+                &[JValue::Object(&jbytes)],
+            )?;
+            env.call_method(&stream, jni_str!("flush"), jni_sig!("()V"), &[])?;
+            env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = env.call_method(
+                &resolver,
+                jni_str!("delete"),
+                jni_sig!("(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I"),
+                &[JValue::Object(&inserted), JValue::Object(&jni::objects::JObject::null()), JValue::Object(&jni::objects::JObject::null())],
+            );
+            return Err(err);
+        }
         {
             let clear_cv = env.new_object(jni_str!("android/content/ContentValues"), jni_sig!("()V"), &[])?;
             let jk = env.new_string("is_pending")?;
             let jzero = env.call_static_method(jni_str!("java/lang/Integer"), jni_str!("valueOf"), jni_sig!("(I)Ljava/lang/Integer;"), &[JValue::Int(0)])?.l()?;
             env.call_method(&clear_cv, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/Integer;)V"), &[JValue::Object(&jk), JValue::Object(&jzero)])?;
-            let _ = env.call_method(&resolver, jni_str!("update"), jni_sig!("(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I"), &[JValue::Object(&inserted), JValue::Object(&clear_cv), JValue::Object(&jni::objects::JObject::null()), JValue::Object(&jni::objects::JObject::null())]);
+            let updated = env.call_method(
+                &resolver,
+                jni_str!("update"),
+                jni_sig!("(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I"),
+                &[JValue::Object(&inserted), JValue::Object(&clear_cv), JValue::Object(&jni::objects::JObject::null()), JValue::Object(&jni::objects::JObject::null())],
+            )?.i()?;
+            if updated <= 0 {
+                return Err(jni::errors::Error::NullPtr("MediaStore.Downloads is_pending=0 update returned 0"));
+            }
         }
-        Ok(format!("Download/Rustudio/crashes/{file_name}"))
+        Ok(format!("{relative_path}{file_name}"))
     })
 }
 

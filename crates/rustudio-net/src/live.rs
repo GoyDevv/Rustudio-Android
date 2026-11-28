@@ -513,7 +513,7 @@ async fn receive_lane(
             let _ = file.write_all(&rtcio::frame(&frame));
         }
         if frame[0] == packet_id::SET_GLOBALS {
-            initial.lock().unwrap().streaming = frame.get(1) == Some(&1);
+            initial.lock().unwrap_or_else(|e| e.into_inner()).streaming = frame.get(1) == Some(&1);
             match crate::replicator::assigned_peer_scope(&frame[1..]) {
                 Ok(scope) => {
                     next_id.store((u64::from(scope) << 32) | 1, Ordering::Release);
@@ -533,7 +533,7 @@ async fn receive_lane(
         if frame[0] == packet_id::PROTOCOL_SYNC {
             seen_sync.store(true, Ordering::Release);
         }
-        initial.lock().unwrap().delivering = true;
+        initial.lock().unwrap_or_else(|e| e.into_inner()).delivering = true;
         if frame[0] == packet_id::NEW_SCHEMA {
             schema_frame = frame.clone();
         }
@@ -561,7 +561,7 @@ async fn receive_lane(
         }
         if decoder.errors.len() != errors {
             if frame[0] == packet_id::TERRAIN {
-                initial.lock().unwrap().delivering = false;
+                initial.lock().unwrap_or_else(|e| e.into_inner()).delivering = false;
                 if !warned_terrain {
                     let error = decoder.errors.last().unwrap();
                     log::warn!("Team Create skipped an unreadable terrain packet (place={place}): {error}");
@@ -605,12 +605,12 @@ async fn receive_lane(
             return;
         }
         if frame[0] == packet_id::NEW_SCHEMA {
-            *shared_schema.lock().unwrap() = decoder.schema.clone();
+            *shared_schema.lock().unwrap_or_else(|e| e.into_inner()) = decoder.schema.clone();
         }
         reserve_seen_ids(&next_id, &ops);
         let instances = ops.iter().any(|op| matches!(op, RepOp::NewInstance { .. }));
         {
-            let mut state = initial.lock().unwrap();
+            let mut state = initial.lock().unwrap_or_else(|e| e.into_inner());
             if state.local_player.is_none() {
                 state.local_player = ops.iter().find_map(|op| match op {
                     RepOp::NewInstance { id, class, props, .. }
@@ -642,7 +642,7 @@ async fn receive_lane(
         if !pending.is_empty() && !emit(&tx, &cancel, LiveEvent::Batch(pending)).await {
             return;
         }
-        let mut state = initial.lock().unwrap();
+        let mut state = initial.lock().unwrap_or_else(|e| e.into_inner());
         state.schema |= decoder.schema.is_some();
         state.marker |= frame[0] == packet_id::MARKER;
         if instances || (decoder.initial_data_complete && !state.initial_data_complete) {
@@ -787,7 +787,7 @@ async fn run(
                     control_started = true;
                 }
                 let streaming_player = {
-                    let state = initial.lock().unwrap();
+                    let state = initial.lock().unwrap_or_else(|e| e.into_inner());
                     if !sent_stream_request && state.streaming && state.initial_data_complete {
                         state.local_player
                     } else {
@@ -795,7 +795,7 @@ async fn run(
                     }
                 };
                 if let Some(player) = streaming_player {
-                    let request = shared_schema.lock().unwrap().as_ref()
+                    let request = shared_schema.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
                         .map(|schema| initial_stream_request(schema, player));
                     match request {
                         Some(Ok(frame)) => {
@@ -817,7 +817,7 @@ async fn run(
                     }
                     let what = edit.describe();
                     let outcomes = {
-                        let schema = shared_schema.lock().unwrap();
+                        let schema = shared_schema.lock().unwrap_or_else(|e| e.into_inner());
                         gate.encode(schema.as_ref(), edit)
                     };
                     for outcome in outcomes {
@@ -848,7 +848,7 @@ async fn run(
                     if control_started { tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &REP_CONTROL)).await.map_err(|_| crate::error::NetError::Other("Team Create send timed out".into()))??; }
                     last_ping = Instant::now();
                 }
-                let can_finish = !ready && initial.lock().unwrap().can_finish(Instant::now());
+                let can_finish = !ready && initial.lock().unwrap_or_else(|e| e.into_inner()).can_finish(Instant::now());
                 if can_finish {
                     if !emit(&tx, &cancel, LiveEvent::Ready).await { break; }
                     ready = true;

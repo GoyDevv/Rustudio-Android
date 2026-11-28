@@ -162,8 +162,6 @@ pub fn on_trim_memory(level: i32) {
 }
 
 unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
-    crate::crash::begin_shutdown();
-    rustudio_core::crash::begin_shutdown();
     log::info!("activity destroyed: closing the editor");
     if let Some(ctx) = CTX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -187,6 +185,8 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
     // be seen: the window's state went to disk when the surface was lost
     // (App::save) and a fresh process serves the next launch.
     log::warn!("the editor's loop didn't end in {GRACE:?}: leaving the process cleanly");
+    crate::crash::begin_shutdown();
+    rustudio_core::crash::begin_shutdown();
     unsafe { libc::_exit(0) };
 }
 

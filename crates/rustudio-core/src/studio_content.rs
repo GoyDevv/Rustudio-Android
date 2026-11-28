@@ -25,7 +25,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// (package, folder it unpacks into, relative to the Studio root).
@@ -95,15 +95,28 @@ pub enum DownloadUiStatus {
 }
 
 static DOWNLOAD_STATUS: Mutex<DownloadUiStatus> = Mutex::new(DownloadUiStatus::Idle);
+static INSTALL_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic generation bumped whenever Studio content finishes installing or upgrading.
+pub fn install_generation() -> u64 {
+    INSTALL_GENERATION.load(Ordering::Acquire)
+}
+
+fn bump_install_generation() {
+    INSTALL_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
 
 pub fn download_ui_status() -> DownloadUiStatus {
-    DOWNLOAD_STATUS.lock().map(|g| g.clone()).unwrap_or(DownloadUiStatus::Idle)
+    DOWNLOAD_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn set_download_status(st: DownloadUiStatus) {
-    if let Ok(mut g) = DOWNLOAD_STATUS.lock() {
-        *g = st;
-    }
+    *DOWNLOAD_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = st;
+}
+
+/// Surfaces an explicit offline/network error to the top-level Studio Content dialog.
+pub fn set_offline_error(msg: impl Into<String>) {
+    set_download_status(DownloadUiStatus::OfflineError(msg.into()));
 }
 
 /// True when Roblox Studio's official BuiltInPlugins folder is present on disk.
@@ -180,6 +193,7 @@ pub fn spawn_background_install_if_missing() {
                     let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
                         let _guard = guard;
                         let a = agent();
+                        let mut first_err: Option<String> = None;
                         if !packages.is_empty() {
                             let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
                             set_download_status(DownloadUiStatus::Downloading(format!("Downloading {}…", names.join(", "))));
@@ -188,46 +202,68 @@ pub fn spawn_background_install_if_missing() {
                                 set_download_status(DownloadUiStatus::Downloading(msg.to_string()));
                             }) {
                                 Ok(()) => {
-                                    set_download_status(DownloadUiStatus::Ready);
                                     post(false, "Studio content: downloaded".into());
                                 }
-                                Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
-                            }
-                        }
-                        if need_vs {
-                            if let Err(e) = install_view_selector(&a, &version, &root) {
-                                post(true, format!("Couldn't download Studio's View Selector: {e}"));
-                            }
-                        }
-                        if need_lp {
-                            if let Err(e) = install_lua_package_assets(&a, &version, &root) {
-                                post(true, format!("Couldn't download Studio's LuaPackages assets: {e}"));
+                                Err(e) => {
+                                    post(true, format!("Couldn't download Studio content: {e}"));
+                                    first_err.get_or_insert(e);
+                                }
                             }
                         }
                         if need_ui {
+                            set_download_status(DownloadUiStatus::Downloading("Downloading Studio UI textures…".into()));
                             if let Err(e) = install_studio_ui_textures(&a, &version, &root) {
                                 post(true, format!("Couldn't download Studio's UI textures: {e}"));
+                                first_err.get_or_insert(e);
+                            }
+                        }
+                        if need_vs {
+                            set_download_status(DownloadUiStatus::Downloading("Downloading Studio View Selector…".into()));
+                            if let Err(e) = install_view_selector(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                                first_err.get_or_insert(e);
+                            }
+                        }
+                        if need_lp {
+                            set_download_status(DownloadUiStatus::Downloading("Downloading Studio LuaPackages assets…".into()));
+                            if let Err(e) = install_lua_package_assets(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's LuaPackages assets: {e}"));
+                                first_err.get_or_insert(e);
                             }
                         }
                         for (zip, file) in missing_single {
                             let url = format!("{CDN}/{version}-{zip}");
-                            if let Ok(bytes) = fetch_one(&a, &url, file) {
-                                let _ = write_file(&root, file, &bytes);
+                            match fetch_one(&a, &url, file) {
+                                Ok(bytes) => {
+                                    let _ = write_file(&root, file, &bytes);
+                                }
+                                Err(e) => {
+                                    first_err.get_or_insert(e);
+                                }
                             }
                         }
+                        if let Some(err) = first_err {
+                            set_download_status(DownloadUiStatus::OfflineError(err));
+                        } else {
+                            bump_install_generation();
+                            set_download_status(DownloadUiStatus::Ready);
+                        }
                     });
+                    return;
                 }
             }
         }
+        // Already installed and complete (or external Studio dir): clear any "Checking…" status.
+        bump_install_generation();
+        set_download_status(DownloadUiStatus::Ready);
         return;
     }
     let _ = std::thread::Builder::new().name("studio-content".into()).spawn(move || {
         let _guard = guard;
+        set_download_status(DownloadUiStatus::Downloading("Connecting to Roblox CDN…".into()));
         post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' icon font; about 70 MB) from Roblox's CDN…".into());
-        // The packages as they come, so a slow connection is seen to get
-        // somewhere (the retired textures are a hundred small fetches: one
-        // line for all of them).
         let step = |s: &str| {
+            set_download_status(DownloadUiStatus::Downloading(format!("Studio content: {s}")));
             if s.starts_with("downloading ") || (s.starts_with("fetching ") && !s.starts_with("fetching legacy ")) {
                 post(false, format!("Studio content: {s}…"));
             } else if s.starts_with("ready") || s.starts_with("couldn't ") {
@@ -240,6 +276,8 @@ pub fn spawn_background_install_if_missing() {
         for attempt in 1..=TRIES {
             match install(&step) {
                 Ok(v) => {
+                    bump_install_generation();
+                    set_download_status(DownloadUiStatus::Ready);
                     post(false, format!(
                         "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart rustudio to use Studio's fonts everywhere.",
                         install_dir().display()
@@ -247,12 +285,19 @@ pub fn spawn_background_install_if_missing() {
                     break;
                 }
                 Err(e) if attempt < TRIES => {
-                    post(false, format!("Studio content: {e}; trying again in 20 s"));
-                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    set_download_status(DownloadUiStatus::Downloading(format!(
+                        "Network error ({e}); retrying ({}/{TRIES})…",
+                        attempt + 1
+                    )));
+                    post(false, format!("Studio content: {e}; trying again in 10 s"));
+                    std::thread::sleep(std::time::Duration::from_secs(10));
                 }
-                Err(e) => post(true, format!(
-                    "Couldn't download Studio's built-in content: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now, or point RUSTUDIO_STUDIO_DIR at a Studio install."
-                )),
+                Err(e) => {
+                    set_download_status(DownloadUiStatus::OfflineError(e.clone()));
+                    post(true, format!(
+                        "Couldn't download Studio's built-in content: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now, or point RUSTUDIO_STUDIO_DIR at a Studio install."
+                    ));
+                }
             }
         }
     });
@@ -270,8 +315,9 @@ fn agent() -> ureq::Agent {
         let config = ureq::Agent::config_builder()
             .timeout_resolve(Some(Duration::from_secs(15)))
             .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_recv_response(Some(Duration::from_secs(60)))
-            .timeout_per_read(Some(Duration::from_secs(60)))
+            .timeout_recv_response(Some(Duration::from_secs(30)))
+            .timeout_per_read(Some(Duration::from_secs(20)))
+            .timeout_global(Some(Duration::from_secs(120)))
             .max_idle_connections_per_host(4)
             .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
             .build();
@@ -360,7 +406,15 @@ fn has_view_selector(root: &Path) -> bool {
 
 fn install_view_selector(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
     // Publish the body last so the renderer can pick up the complete cube.
+    let vs_textures_ready = ["front", "back", "left", "right", "top", "bottom"].iter().all(|face| {
+        ["", "_hover"].iter().all(|suffix| {
+            root.join(format!("StudioContent/textures/ViewSelector/{face}{suffix}.png")).is_file()
+        })
+    });
     for kind in ["textures", "models"] {
+        if kind == "textures" && vs_textures_ready {
+            continue;
+        }
         let url = format!("{CDN}/{version}-studiocontent-{kind}.zip");
         let bytes = get(agent, &url, None)?;
         let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
@@ -647,7 +701,12 @@ fn write_file(root: &Path, name: &str, data: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
+    let tmp = path.with_extension("rustudio_tmp");
+    std::fs::write(&tmp, data).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// One file out of a remote zip: the end record, the central directory and

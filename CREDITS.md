@@ -3,7 +3,8 @@
 ## Project Authors & Upstream
 
 - **[rippelz/rustudio](https://github.com/rippelz/rustudio)**: Creator of the original rustudio project and maintainer of the PC (Linux, Windows, macOS) version.
-- **[TouseefX/rustudio](https://github.com/TouseefX/rustudio)**: Developer and core contributor to rustudio.
+
+> **Policy Notice:** This project strictly respects Roblox's Terms of Use and does not tolerate or associate with unauthorized live-server Roblox clients, game ripping, or any violation of Roblox's Terms of Use.
 
 ---
 

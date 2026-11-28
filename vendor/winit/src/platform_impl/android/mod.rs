@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, Source, ToolType};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -401,6 +401,16 @@ impl<T: 'static> EventLoop<T> {
         let mut input_status = InputStatus::Handled;
         match event {
             InputEvent::MotionEvent(motion_event) => {
+                let is_hw_pointer = matches!(
+                    motion_event.source(),
+                    Source::Mouse | Source::MouseRelative | Source::Touchpad | Source::Trackball
+                ) || motion_event.pointers().any(|p| p.tool_type() == ToolType::Mouse);
+                if is_hw_pointer {
+                    // Forward hardware mouse/touchpad events to ViewPostImeInputStage
+                    // (RustudioActivity.dispatchGenericMotionEvent / dispatchTouchEvent / OnCapturedPointerListener)
+                    // instead of converting them into synthetic WindowEvent::Touch.
+                    return InputStatus::Unhandled;
+                }
                 let window_id = window::WindowId(WindowId);
                 let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
 
@@ -412,9 +422,12 @@ impl<T: 'static> EventLoop<T> {
                     MotionAction::Move => Some(event::TouchPhase::Moved),
                     MotionAction::Cancel => Some(event::TouchPhase::Cancelled),
                     _ => {
-                        None // TODO mouse events
+                        None // Hover, scroll, button press/release
                     },
                 };
+                if phase.is_none() {
+                    return InputStatus::Unhandled;
+                }
                 if let Some(phase) = phase {
                     let pointers: Box<dyn Iterator<Item = android_activity::input::Pointer<'_>>> =
                         match phase {

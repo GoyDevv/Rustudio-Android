@@ -149,6 +149,16 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeHar
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativePointerCaptureChanged(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    has_capture: u8,
+) {
+    rustudio::android::ime_bridge::on_pointer_capture_changed(has_capture != 0);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
 pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeVisibility(
     _env: *mut c_void,
     _class: *mut c_void,

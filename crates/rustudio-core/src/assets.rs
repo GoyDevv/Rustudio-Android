@@ -207,9 +207,24 @@ static GENERATED: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None
 pub fn register_generated(id: &str, bytes: Vec<u8>) {
     let mut g = GENERATED.lock().unwrap_or_else(|e| e.into_inner());
     let map = g.get_or_insert_with(HashMap::new);
-    let total: usize = map.values().map(|v| v.len()).sum();
+    // Evict only unreferenced entries (strong_count == 1) when above the soft budget
+    // so live imported scene meshes/textures/sounds are never wiped out from under the user.
+    let mut total: usize = map.values().map(|v| v.len()).sum();
     if total.saturating_add(bytes.len()) > GENERATED_MAX_BYTES {
-        map.clear();
+        let mut evictable: Vec<(String, usize)> = map
+            .iter()
+            .filter(|(k, v)| k.as_str() != id && Arc::strong_count(v) == 1)
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect();
+        evictable.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, sz) in evictable {
+            if total.saturating_add(bytes.len()) <= GENERATED_MAX_BYTES {
+                break;
+            }
+            if map.remove(&k).is_some() {
+                total = total.saturating_sub(sz);
+            }
+        }
     }
     map.insert(id.to_string(), Arc::new(bytes));
 }
@@ -1849,6 +1864,11 @@ impl AssetStore {
             }
         }
         done
+    }
+
+    /// Clears non-permanent asset failures so transient network drops can be retried.
+    pub fn retry_failed(&mut self) {
+        self.failed.clear();
     }
 
     pub fn busy(&self) -> bool {
@@ -3989,7 +4009,7 @@ pub fn clear_static_caches() {
         if let Some(m) = g.as_mut() {
             let total: usize = m.values().map(|v| v.len()).sum();
             if total > GENERATED_MAX_BYTES {
-                m.clear();
+                m.retain(|_, v| Arc::strong_count(v) > 1);
                 m.shrink_to_fit();
             }
         }

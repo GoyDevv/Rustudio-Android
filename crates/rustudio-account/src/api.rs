@@ -40,6 +40,22 @@ pub enum AssetDownloadError {
 }
 
 impl AssetDownloadError {
+    pub(crate) fn from_ureq(asset_id: u64, stage: &str, err: ureq::Error) -> Self {
+        let transient = matches!(
+            err,
+            ureq::Error::Timeout(_)
+                | ureq::Error::Io(_)
+                | ureq::Error::ConnectionFailed
+                | ureq::Error::HostNotFound
+        );
+        let wrapped = Error(format!("asset {asset_id}: {stage}: {err}"));
+        if transient {
+            Self::Transient { status: 0, retry_after: None, error: wrapped }
+        } else {
+            Self::Other(wrapped)
+        }
+    }
+
     pub(crate) fn transient_response(
         asset_id: u64,
         stage: &str,
@@ -110,7 +126,7 @@ fn public_asset_location(a: &ureq::Agent, asset_id: u64) -> std::result::Result<
         .max_redirects_will_error(false)
         .build()
         .call()
-        .map_err(Error::from)?;
+        .map_err(|e| AssetDownloadError::from_ureq(asset_id, "public asset delivery", e))?;
     if let Some(error) = AssetDownloadError::transient_response(asset_id, "public asset delivery", &r) {
         return Err(error);
     }

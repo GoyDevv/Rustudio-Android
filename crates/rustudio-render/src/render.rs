@@ -1594,7 +1594,13 @@ pub(crate) struct Slab {
     free: std::sync::Mutex<[Vec<(u64, u64)>; 2]>,
 }
 
+#[cfg(target_os = "android")]
+const SLAB_VERTEX_BYTES: u64 = 8 << 20;
+#[cfg(not(target_os = "android"))]
 const SLAB_VERTEX_BYTES: u64 = 32 << 20;
+#[cfg(target_os = "android")]
+const SLAB_INDEX_BYTES: u64 = 4 << 20;
+#[cfg(not(target_os = "android"))]
 const SLAB_INDEX_BYTES: u64 = 16 << 20;
 
 impl Slab {
@@ -8452,7 +8458,7 @@ impl Renderer {
         self.vf = vf::Layers::default();
         self.world_gui = [None, None, None];
         self.pool.evict_empty_trailing();
-        let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = rs.device.poll(wgpu::PollType::Poll);
     }
 
     /// Records ViewportFrame layer Refs whose targets were rendered so cleanup frees

@@ -341,6 +341,7 @@ impl Game {
         rustudio_core::assets::clear_static_caches();
         rustudio_engine::runtime::domains::media::clear_pcm_cache();
         rustudio_engine::bytecode_cache::clear_memory();
+        rustudio_core::core_scripts::clear_patch_cache();
         self.doc.gc_limbo();
         if critical {
             self.gui.clear_textures();

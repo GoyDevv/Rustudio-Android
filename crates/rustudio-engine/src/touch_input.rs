@@ -1025,9 +1025,12 @@ pub fn set_hardware_kbm(keyboard: bool, mouse: bool) {
 pub fn set_captured_hardware_mouse(active: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     CAPTURED_HW_MOUSE.store(active, Relaxed);
-    let kb = HAS_HW_KB.load(Relaxed);
-    set_hardware_kbm(kb, active);
-    ACTIVE_KBM.store(active, Relaxed);
+    if active {
+        HAS_HW_MOUSE.store(true, Relaxed);
+        ACTIVE_KBM.store(true, Relaxed);
+    } else {
+        ACTIVE_KBM.store(false, Relaxed);
+    }
 }
 
 pub fn captured_hardware_mouse() -> bool {
