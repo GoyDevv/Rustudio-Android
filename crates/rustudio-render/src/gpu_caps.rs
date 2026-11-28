@@ -518,6 +518,8 @@ mod tests {
         assert_eq!(asked.max_texture_dimension_2d, 8192);
 
         let caps = GpuCaps {
+            hdr_float_rt: true,
+            r16_float_rt: true,
             name: "Mali-G52 MC2".into(),
             vendor: 0x13b5,
             backend: wgpu::Backend::Vulkan,
@@ -543,6 +545,8 @@ mod tests {
         assert!(asked_gl.check_limits(&gles3_limits));
 
         let gl_caps = GpuCaps {
+            hdr_float_rt: true,
+            r16_float_rt: true,
             name: "Mali-G52 MC2".into(),
             vendor: 0x13b5,
             backend: wgpu::Backend::Gl,
@@ -559,6 +563,8 @@ mod tests {
         assert!(!gl_caps.sampled_msaa());
 
         let cpu_caps = GpuCaps {
+            hdr_float_rt: true,
+            r16_float_rt: true,
             name: "llvmpipe".into(),
             vendor: 0,
             backend: wgpu::Backend::Vulkan,
@@ -573,6 +579,8 @@ mod tests {
         assert_eq!(cpu_caps.weak_reason().as_deref(), Some("software adapter"));
 
         let downlevel_vk = GpuCaps {
+            hdr_float_rt: true,
+            r16_float_rt: true,
             name: "Mali-G52 MC2".into(),
             vendor: 0x13b5,
             backend: wgpu::Backend::Vulkan,
