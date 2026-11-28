@@ -2006,8 +2006,10 @@ impl Editor {
         for request in timed_out {live.script_commits.remove(&request);self.warn("The server has not confirmed the script commit; the local draft is retained");}
         if let Err(error)=live.drafts.flush_due() {self.warn(error);}
         if keep {
+            let active_sync = live.backlogged || !live.script_commits.is_empty() || live.last_activity.elapsed() < std::time::Duration::from_secs(2);
             self.cloud.live = Some(live);
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            let interval_ms = if active_sync { 16 } else { 200 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(interval_ms));
         } else {
             self.fail_live_save(&mut live, "Team Create disconnected before confirming the save; check Version History before retrying");
         }

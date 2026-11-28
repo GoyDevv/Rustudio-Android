@@ -1475,7 +1475,12 @@ impl MaterialArrays {
 
     fn with_params(device: &wgpu::Device, size: u32, capacity: u32, max_param_layers: usize, params: Vec<[f32; 4]>) -> Self {
         // (OpenGL: a one-layer array would be made a plain 2D texture)
-        let layers = if crate::gpu_caps::single_layer_arrays_break(device) { capacity.max(2) } else { capacity };
+        let max_layers = device.limits().max_texture_array_layers.max(1);
+        let layers = if crate::gpu_caps::single_layer_arrays_break(device) {
+            capacity.max(2).min(max_layers)
+        } else {
+            capacity.min(max_layers)
+        };
         let make = |label, format| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -3441,6 +3446,7 @@ pub struct Renderer {
     /// added, moved, scaled, or removed, so sun/light shadow cascades flush as
     /// soon as fast 3D editor moves settle instead of staying stale.
     dyn_caster_gen: u64,
+    sun_shadows_active: bool,
     /// Bumped when a mesh's vertices are rewritten in place (SunCache key).
     mesh_gen: u64,
     /// caster_gen bumps that came from in-place static writes (their
@@ -4354,6 +4360,7 @@ impl Renderer {
             static_gen: 0,
             caster_gen: 0,
             dyn_caster_gen: 0,
+            sun_shadows_active: false,
             mesh_gen: 0,
             caster_flushes: 0,
             sky_globals,
@@ -4627,6 +4634,37 @@ impl Renderer {
         width: u32, height: u32, rgba: &[u8],
         mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
+        let max_dim = device.limits().max_texture_dimension_2d.max(64);
+        let mut clamped_rgba: Option<(u32, u32, Vec<u8>)> = None;
+        if width > max_dim || height > max_dim {
+            let mut cw = width;
+            let mut ch = height;
+            let mut buf = rgba.to_vec();
+            while (cw > max_dim || ch > max_dim) && cw > 1 && ch > 1 {
+                let nw = (cw / 2).max(1);
+                let nh = (ch / 2).max(1);
+                let mut next = vec![0u8; (nw as usize) * (nh as usize) * 4];
+                for y in 0..nh {
+                    for x in 0..nw {
+                        let sx = (x * 2).min(cw - 1);
+                        let sy = (y * 2).min(ch - 1);
+                        let si = ((sy * cw + sx) * 4) as usize;
+                        let di = ((y * nw + x) * 4) as usize;
+                        if si + 4 <= buf.len() {
+                            next[di..di + 4].copy_from_slice(&buf[si..si + 4]);
+                        }
+                    }
+                }
+                cw = nw;
+                ch = nh;
+                buf = next;
+            }
+            clamped_rgba = Some((cw, ch, buf));
+        }
+        let (width, height, rgba): (u32, u32, &[u8]) = match &clamped_rgba {
+            Some((cw, ch, buf)) => (*cw, *ch, buf.as_slice()),
+            None => (width, height, rgba),
+        };
         let (sw, sh, sp): (u32, u32, &[u8]) = match surface {
             Some((w, h, p))
                 if w > 0
@@ -4728,7 +4766,10 @@ impl Renderer {
         if self.pending_upload_bytes >= 32 * 1024 * 1024 {
             queue.submit(std::iter::empty());
             if self.caps.is_powervr() {
-                let _ = device.poll(wgpu::PollType::Poll);
+                let _ = device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_millis(500)),
+                });
             } else {
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
             }
@@ -7519,7 +7560,16 @@ impl Renderer {
         if !self.caps.is_powervr()
             && frame.globals.ssao[3] >= 0.5
             && frame.quality.map_or_else(
-                || rustudio_core::rustudio_settings::performance_value("ssao") != "off",
+                || {
+                    if cfg!(target_os = "android")
+                        && rustudio_core::rustudio_settings::saved_value("ssao").is_none()
+                        && std::env::var_os("RUSTUDIO_PERF_SSAO").is_none()
+                    {
+                        false
+                    } else {
+                        rustudio_core::rustudio_settings::performance_value("ssao") != "off"
+                    }
+                },
                 |profile| profile.ssao(),
             ) {
             // On Android SSAO_FAST_APPLY uses direct multiplicative blending without
@@ -8401,15 +8451,9 @@ impl Renderer {
                 c.idle();
             }
         }
-        let vf_layers: Vec<Ref> = self.vf.layer_of.values().copied().collect();
-        let mut freed = HashSet::new();
-        for layer in vf_layers {
-            if freed.insert(layer) {
-                if let Some((id, _)) = self.vf_texture(layer) {
-                    rs.renderer.write().free_texture(&id);
-                    crate::world_gui::unregister_native(id);
-                }
-            }
+        for (_, target) in self.vf.targets.drain() {
+            rs.renderer.write().free_texture(&target.id);
+            crate::world_gui::unregister_native(target.id);
         }
         self.clear_layered_items();
         self.vf = vf::Layers::default();
@@ -8418,16 +8462,23 @@ impl Renderer {
     }
 
     /// Releases per-place GPU textures, meshes, slab pools, skinning buffers,
+    /// ViewportFrame targets (including egui_wgpu TextureIds when `rs` is given),
+    /// world_gui mip caches, and CPU render caches on place switch.
+    pub fn reset_place_assets_with(&mut self, rs: Option<&egui_wgpu::RenderState>) {
+        for (_, target) in self.vf.targets.drain() {
+            if let Some(rs) = rs {
+                rs.renderer.write().free_texture(&target.id);
+            }
+            crate::world_gui::unregister_native(target.id);
+        }
+        self.reset_place_assets();
+    }
+
+    /// Releases per-place GPU textures, meshes, slab pools, skinning buffers,
     /// ViewportFrame targets, world_gui mip caches, and CPU render caches on place switch.
     pub fn reset_place_assets(&mut self) {
-        let vf_layers: Vec<Ref> = self.vf.layer_of.values().copied().collect();
-        let mut freed = HashSet::new();
-        for layer in vf_layers {
-            if freed.insert(layer) {
-                if let Some((id, _)) = self.vf_texture(layer) {
-                    crate::world_gui::unregister_native(id);
-                }
-            }
+        for (_, target) in self.vf.targets.drain() {
+            crate::world_gui::unregister_native(target.id);
         }
         self.clear_layered_items();
         self.clear_items();
@@ -8447,7 +8498,8 @@ impl Renderer {
     }
 
     pub fn has_stale_shadows(&self) -> bool {
-        self.sun.as_ref().is_some_and(|s| s.has_stale_dyn(self.dyn_caster_gen))
+        self.sun_shadows_active
+            && self.sun.as_ref().is_some_and(|s| s.has_stale_dyn(self.dyn_caster_gen))
     }
 
     /// See `items_generation`.

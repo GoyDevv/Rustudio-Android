@@ -316,7 +316,7 @@ impl Game {
     /// Releases GPU/CPU caches and static asset/physics caches before loading a new place.
     pub fn reset_place_resources(&mut self) {
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_place_assets();
+            renderer.reset_place_assets_with(self.render_state.as_ref());
         }
         self.meshes = Default::default();
         self.textures = Default::default();

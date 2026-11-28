@@ -399,7 +399,7 @@ pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
     if is_android_powervr_gles() {
         return PresentMode::Fifo;
     }
-    if no_vsync || cfg!(target_os = "android") {
+    if no_vsync {
         return PresentMode::AutoNoVsync;
     }
     match rustudio_core::rustudio_settings::performance_value("present") {

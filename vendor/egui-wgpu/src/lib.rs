@@ -347,6 +347,18 @@ fn describe_adapters(adapters: &[wgpu::Adapter]) -> String {
     }
 }
 
+static SURFACE_OOM_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Records a surface OOM or validation failure so the app can trim GPU caches.
+pub fn record_surface_oom() {
+    SURFACE_OOM_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns true once if a surface OOM / validation error was recorded since the last call.
+pub fn take_surface_oom() -> bool {
+    SURFACE_OOM_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 /// Specifies which action should be taken as consequence of a surface error.
 pub enum SurfaceErrorAction {
     /// Do nothing and skip the current frame.
@@ -442,6 +454,16 @@ impl Default for WgpuConfiguration {
                     // App is hidden (minimized / behind another window). Skip silently.
                     log::trace!("Skipping frame due to occlusion.");
                     SurfaceErrorAction::SkipFrame
+                }
+                wgpu::CurrentSurfaceTexture::OutOfMemory => {
+                    log::warn!("Dropped frame with OutOfMemory; recording surface OOM");
+                    record_surface_oom();
+                    SurfaceErrorAction::SkipFrame
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    log::warn!("Dropped frame with Validation error; recording surface OOM and recreating surface");
+                    record_surface_oom();
+                    SurfaceErrorAction::RecreateSurface
                 }
                 _ => {
                     log::warn!("Dropped frame with error: {status:?}");

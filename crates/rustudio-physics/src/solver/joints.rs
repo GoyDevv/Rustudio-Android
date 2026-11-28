@@ -919,7 +919,7 @@ impl JointList {
                     Kind::BodyAngVel(c) if c.gyro.is_some() && self.a[k] != NONE => {
                         let s = self.a[k] as usize;
                         let r = bodies.mat[s] * c.gyro.as_ref().unwrap().part_rot;
-                        let i = match bodies.inertia_body[s] {
+                        let raw_i = match bodies.inertia_body[s] {
                             Some(m) => Vec3::new(m.x_axis.x, m.y_axis.y, m.z_axis.z),
                             None => {
                                 let inv = bodies.inv_inertia[s];
@@ -930,6 +930,11 @@ impl JointList {
                                 )
                             }
                         };
+                        let i = Vec3::new(
+                            if raw_i.x.is_finite() && raw_i.x > 1.0e-6 { raw_i.x } else { 1.0 },
+                            if raw_i.y.is_finite() && raw_i.y > 1.0e-6 { raw_i.y } else { 1.0 },
+                            if raw_i.z.is_finite() && raw_i.z > 1.0e-6 { raw_i.z } else { 1.0 },
+                        );
                         dual_rows::gyro_step(c, r, bodies.angvel[s], i, dual_rows::MOVER_DT);
                     }
                     _ => {}

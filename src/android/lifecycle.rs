@@ -166,6 +166,16 @@ pub fn on_trim_memory(level: i32) {
     }
 }
 
+/// Called from RustudioActivity's PowerManager.OnThermalStatusChangedListener (API 29+).
+/// 0=NONE, 1=LIGHT, 2=MODERATE (30 FPS / 0.85x / stop ADPF), 3=SEVERE+ (24 FPS / 0.70x).
+pub fn on_thermal_status(status: i32) {
+    rustudio_core::rustudio_settings::set_thermal_status(status);
+    if status >= 2 {
+        super::perf_hint::stop();
+    }
+    log::info!("android thermal status changed: {status}");
+}
+
 unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
     crate::crash::begin_shutdown();
     rustudio_core::crash::begin_shutdown();

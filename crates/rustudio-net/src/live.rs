@@ -752,14 +752,22 @@ async fn run(
     let mut dgram_capture = std::env::var("RUSTUDIO_TC_LANES_OUT").ok().and_then(|dir| {
         std::fs::File::create(std::path::Path::new(&dir).join("datagrams.bin")).ok()
     });
+    let mut dgram_open = true;
     loop {
         tokio::select! {
-            dgram = connection.read_datagram() => {
-                if let (Ok(d), Some(f)) = (&dgram, dgram_capture.as_mut()) {
-                    use std::io::Write;
-                    let _ = f.write_all(&rtcio::frame(d));
+            dgram = connection.read_datagram(), if dgram_open => {
+                match dgram {
+                    Ok(d) => {
+                        if let Some(f) = dgram_capture.as_mut() {
+                            use std::io::Write;
+                            let _ = f.write_all(&rtcio::frame(&d));
+                        }
+                    }
+                    Err(_) => {
+                        dgram_open = false;
+                        dgram_capture = None;
+                    }
                 }
-                if dgram.is_err() { dgram_capture = None; }
             }
             incoming = connection.accept_uni() => {
                 match incoming {
@@ -775,7 +783,7 @@ async fn run(
             _ = interval.tick() => {
                 if cancel.load(Ordering::Acquire) || lane_ended.load(Ordering::Acquire) { break; }
                 if seen_sync.swap(false, Ordering::AcqRel) {
-                    rtcio::send(&mut replication, &REP_CONTROL).await?;
+                    tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &REP_CONTROL).).await.map_err(|_| "Team Create send timed out".to_string())??;
                     control_started = true;
                 }
                 let streaming_player = {
@@ -791,7 +799,7 @@ async fn run(
                         .map(|schema| initial_stream_request(schema, player));
                     match request {
                         Some(Ok(frame)) => {
-                            rtcio::send(&mut replication, &frame).await?;
+                            tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &frame).).await.map_err(|_| "Team Create send timed out".to_string())??;
                             log::info!("Team Create requested initial terrain streaming (place={place})");
                         }
                         Some(Err(error)) => log::warn!("Team Create initial streaming request: {error}"),
@@ -819,7 +827,7 @@ async fn run(
                                 if recent.len() == RECENT_EDITS { recent.pop_front(); }
                                 recent.push_back((Instant::now(), format!("{what} ({} bytes)", frame.len())));
                                 log::debug!("Team Create wrote {what} ({} bytes)", frame.len());
-                                rtcio::send(&mut replication, &frame).await?;
+                                tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &frame).).await.map_err(|_| "Team Create send timed out".to_string())??;
                             }
                             Outcome::Failed { id, error } => {
                                 rejected_document_edit = true;
@@ -836,8 +844,8 @@ async fn run(
                 }
                 if last_ping.elapsed() >= Duration::from_secs(1) {
                     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
-                    rtcio::send(&mut ping, &rtcio::ping_message(timestamp)).await?;
-                    if control_started { rtcio::send(&mut replication, &REP_CONTROL).await?; }
+                    tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut ping, &rtcio::ping_message(timestamp)).).await.map_err(|_| "Team Create send timed out".to_string())??;
+                    if control_started { tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &REP_CONTROL).).await.map_err(|_| "Team Create send timed out".to_string())??; }
                     last_ping = Instant::now();
                 }
                 let can_finish = !ready && initial.lock().unwrap().can_finish(Instant::now());

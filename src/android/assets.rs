@@ -19,8 +19,14 @@ pub fn unpack(app: &AndroidApp) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let stamp = dir.join(".apk-version");
     let version = env!("CARGO_PKG_VERSION");
+    const MIN_API_DUMP_BYTES: u64 = 1024 * 1024;
     let fresh = std::fs::read_to_string(&stamp).is_ok_and(|v| v.trim() == version)
-        && FILES.iter().all(|f| dir.join(f).is_file());
+        && FILES.iter().all(|f| {
+            let p = dir.join(f);
+            std::fs::metadata(&p).is_ok_and(|m| {
+                m.is_file() && (*f != "api-dump.json" || m.len() >= MIN_API_DUMP_BYTES)
+            })
+        });
     if fresh {
         return Ok(());
     }
@@ -30,6 +36,12 @@ pub fn unpack(app: &AndroidApp) -> Result<(), String> {
         let mut asset = manager.open(&cname).ok_or_else(|| format!("assets/{name} is not in the APK"))?;
         let mut bytes = Vec::with_capacity(asset.length());
         asset.read_to_end(&mut bytes).map_err(|e| format!("assets/{name}: {e}"))?;
+        if *name == "api-dump.json" && (bytes.len() as u64) < MIN_API_DUMP_BYTES {
+            return Err(format!(
+                "assets/{name} is unexpectedly small ({} bytes; expected >= {MIN_API_DUMP_BYTES})",
+                bytes.len()
+            ));
+        }
         write_atomically(&dir.join(name), &bytes)?;
         log::info!("assets: unpacked {name} ({} bytes)", bytes.len());
     }

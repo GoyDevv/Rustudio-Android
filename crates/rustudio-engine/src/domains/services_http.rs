@@ -91,6 +91,24 @@ pub fn studio_headers(mut h: Vec<(String, String)>, place_id: i64) -> Vec<(Strin
     h
 }
 
+fn cancelled() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static CANCELLED: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    CANCELLED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Cancels an in-flight or completed HTTP request so orphaned responses are not leaked on VM Drop.
+pub fn cancel(id: u64) {
+    if let Ok(mut d) = done().lock() {
+        d.remove(&id);
+    }
+    if let Ok(mut c) = cancelled().lock() {
+        if c.len() > 4096 {
+            c.clear();
+        }
+        c.insert(id);
+    }
+}
+
 pub fn start(req: Request, repaint: Option<egui::Context>) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     std::thread::Builder::new()
@@ -100,9 +118,12 @@ pub fn start(req: Request, repaint: Option<egui::Context>) -> u64 {
                 let _p = rustudio_core::profiler::scope("http_request", rustudio_core::profiler::Cat::Network);
                 run(req)
             };
-            done().lock().unwrap().insert(id, r);
-            if let Some(ctx) = repaint {
-                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            let was_cancelled = cancelled().lock().map(|mut c| c.remove(&id)).unwrap_or(false);
+            if !was_cancelled {
+                done().lock().unwrap().insert(id, r);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
         })
         .ok();
@@ -121,9 +142,12 @@ pub fn start_internal(req: Request, repaint: Option<egui::Context>) -> u64 {
                 let _p = rustudio_core::profiler::scope("http_internal", rustudio_core::profiler::Cat::Network);
                 run_internal(req)
             };
-            done().lock().unwrap().insert(id, r);
-            if let Some(ctx) = repaint {
-                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            let was_cancelled = cancelled().lock().map(|mut c| c.remove(&id)).unwrap_or(false);
+            if !was_cancelled {
+                done().lock().unwrap().insert(id, r);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
         })
         .ok();
@@ -201,10 +225,15 @@ fn run(req: Request) -> Result<Response, String> {
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
         .collect();
+    let body_limit: u64 = if cfg!(target_os = "android") {
+        16 * 1024 * 1024
+    } else {
+        1 << 30
+    };
     let body = resp
         .body_mut()
         .with_config()
-        .limit(1 << 30)
+        .limit(body_limit)
         .read_to_vec()
         .map_err(describe)?;
     Ok(Response {

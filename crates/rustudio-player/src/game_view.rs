@@ -2299,13 +2299,14 @@ impl Game {
             if px > POWERVR_MAX_PX {
                 scale = (POWERVR_MAX_PX / px).sqrt().clamp(0.35, 1.0);
             }
-        } else if cfg!(target_os = "android") && self.is_playing() && scale >= 0.999 {
+        } else if cfg!(target_os = "android") && scale >= 0.999 {
             let px = (size[0] as f32) * (size[1] as f32);
-            const MOBILE_PLAY_MAX_PX: f32 = 1_250_000.0;
-            if px > MOBILE_PLAY_MAX_PX {
-                scale = (MOBILE_PLAY_MAX_PX / px).sqrt().clamp(0.55, 1.0);
+            const MOBILE_MAX_PX: f32 = 1_250_000.0;
+            if px > MOBILE_MAX_PX {
+                scale = (MOBILE_MAX_PX / px).sqrt().clamp(0.55, 1.0);
             }
         }
+        scale = (scale * rustudio_core::rustudio_settings::thermal_render_scale()).clamp(0.35, 1.0);
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
         let sep_dragged = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged")).unwrap_or(false));
         if sep_dragged && self.last_render_target[0] > 0 && self.last_render_target[1] > 0 {
@@ -2320,7 +2321,7 @@ impl Game {
         // Studio's scene environment probe (env_probe.rs): the PBR
         // technologies' 128 px indoor reflection cube.
         // Skip on PowerVR to avoid per-frame CPU raycasts + cubemap convolution passes.
-        let probe = (!is_powervr && quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+        let probe = (!cfg!(target_os = "android") && !is_powervr && quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
             let _p = rustudio_core::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
             let now = rustudio_core::sim_clock::since(started).as_secs_f64();
@@ -2334,7 +2335,7 @@ impl Game {
             && self.effects.drawn().is_none_or(|f| f.draws.is_empty());
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
-                r.defer_postfx = !(r.caps().is_powervr() && no_world_gui_or_fx);
+                r.defer_postfx = !no_world_gui_or_fx;
                 r.render(
                 rs,
                 size,

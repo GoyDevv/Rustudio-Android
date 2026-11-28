@@ -82,7 +82,7 @@ pub fn periods() -> u32 {
 /// Whether the log is wanted: always on a phone, by request elsewhere.
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_PERF_LOG").is_some())
+    *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("RUSTUDIO_PERF_LOG").is_some())
 }
 
 impl PerfLog {

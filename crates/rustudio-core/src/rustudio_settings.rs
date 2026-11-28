@@ -344,6 +344,7 @@ pub const OPTS: &[Opt] = &[
     Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(FPS_PRESETS) },
     Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Uncapped (Max FPS) disables vsync wait (Immediate / Mailbox when supported, safe FIFO fallback) to push every possible frame. Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit. Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("novsync", "Uncapped (Max FPS)"), ("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
     Opt { key: "idle", cat: "Performance", label: "Idle grass animation", desc: "Pauses grass animation redraws while the editor is idle.", env: "RUSTUDIO_PERF_IDLE", kind: OptKind::Choice(&[("animate", "Animate"), ("pause", "Pause when idle")]) },
+    Opt { key: "high_refresh", cat: "Performance", label: "High refresh rate (90/120 Hz)", desc: "Requests the display's maximum refresh rate on Android. Off caps display refresh at 60 Hz for lower heat and longer battery life.", env: "RUSTUDIO_PERF_HIGH_REFRESH", kind: OptKind::Choice(&[("off", "Off (60 Hz)"), ("on", "On (Max Hz)")]) },
     Opt { key: "background", cat: "Performance", label: "Hidden window", desc: "Keeps a running playtest and Team Create going while the window is on another workspace or minimized, without drawing (as Studio does behind other windows). Pause freezes them until the window shows again.", env: "RUSTUDIO_PERF_BACKGROUND", kind: OptKind::Choice(&[("run", "Keep running"), ("pause", "Pause")]) },
     Opt {
         key: "mobile_floating_windows",
@@ -1006,10 +1007,48 @@ fn choice_default(key: &str) -> Option<&'static str> {
 /// hands on every platform (including Android and low-end GPUs) — Graphics
 /// quality defaults to `"custom"` and 3D resolution defaults to `"100"`
 /// (100% Native) unless the user explicitly selects another preset or scale.
+static THERMAL_STATUS: AtomicU8 = AtomicU8::new(0);
+
+/// Records Android PowerManager thermal status (0=NONE, 1=LIGHT, 2=MODERATE, 3=SEVERE+).
+pub fn set_thermal_status(status: i32) {
+    THERMAL_STATUS.store(status.clamp(0, 6) as u8, Ordering::Relaxed);
+}
+
+pub fn thermal_status() -> u8 {
+    THERMAL_STATUS.load(Ordering::Relaxed)
+}
+
+/// Thermal FPS cap (MODERATE -> 30 FPS, SEVERE+ -> 24 FPS).
+pub fn thermal_fps_cap() -> Option<f32> {
+    match thermal_status() {
+        0 | 1 => None,
+        2 => Some(30.0),
+        _ => Some(24.0),
+    }
+}
+
+/// Thermal 3D resolution multiplier (MODERATE -> 0.85x, SEVERE+ -> 0.70x).
+pub fn thermal_render_scale() -> f32 {
+    match thermal_status() {
+        0 | 1 => 1.0,
+        2 => 0.85,
+        _ => 0.70,
+    }
+}
+
+/// Opt-in 90/120 Hz display refresh on Android (defaults to off / 60 Hz).
+pub fn high_refresh_enabled() -> bool {
+    performance_value("high_refresh") == "on"
+}
+
 fn choice_default_for(key: &str, _weak: bool, android: bool) -> Option<&'static str> {
     match key {
-        "quality" => Some("custom"),
-        "present" => Some(if android { "novsync" } else { "mailbox" }),
+        "quality" => Some(if android { "automatic" } else { "custom" }),
+        "present" => Some(if android { "fifo" } else { "mailbox" }),
+        "idle" if android => Some("pause"),
+        "ssao" if android => Some("off"),
+        "fps" if android => Some("60"),
+        "high_refresh" => Some("off"),
         _ => None,
     }
 }
@@ -1354,8 +1393,15 @@ pub const FPS_PRESETS: &[(&str, &str)] = &[
 /// The Editor frame limit in frames per second (None: Unlimited). A preset
 /// or a typed number, from RUSTUDIO_PERF_FPS or the saved setting.
 pub fn fps_limit() -> Option<f32> {
-    let v = env("RUSTUDIO_PERF_FPS").or_else(|| saved("fps")?.as_str().map(str::to_owned))?;
-    parse_fps(&v)
+    if let Some(v) = env("RUSTUDIO_PERF_FPS").or_else(|| saved("fps")?.as_str().map(str::to_owned)) {
+        return parse_fps(&v);
+    }
+    #[cfg(target_os = "android")]
+    {
+        return Some(60.0);
+    }
+    #[cfg(not(target_os = "android"))]
+    None
 }
 
 /// "144", "144 FPS", "97.5" → frames per second; "unlimited", 0 or junk → None.
@@ -1389,7 +1435,10 @@ mod tests {
     #[test]
     fn performance_defaults_follow_the_platform() {
         for (weak, android) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(choice_default_for("quality", weak, android), Some("custom"));
+            assert_eq!(
+                choice_default_for("quality", weak, android),
+                Some(if android { "automatic" } else { "custom" })
+            );
             assert_eq!(choice_default_for("resolution", weak, android), None);
             assert_eq!(choice_default_for("detail", weak, android), None);
             assert_eq!(choice_default_for("view_distance", weak, android), None);
@@ -1397,11 +1446,24 @@ mod tests {
             assert_eq!(choice_default_for("texture_quality", weak, android), None);
             assert_eq!(
                 choice_default_for("present", weak, android),
-                Some(if android { "novsync" } else { "mailbox" })
+                Some(if android { "fifo" } else { "mailbox" })
             );
+            assert_eq!(
+                choice_default_for("idle", weak, android),
+                if android { Some("pause") } else { None }
+            );
+            assert_eq!(
+                choice_default_for("ssao", weak, android),
+                if android { Some("off") } else { None }
+            );
+            assert_eq!(
+                choice_default_for("fps", weak, android),
+                if android { Some("60") } else { None }
+            );
+            assert_eq!(choice_default_for("high_refresh", weak, android), Some("off"));
         }
         // Every default is one of its row's choices.
-        for key in ["quality", "resolution", "view_distance", "aa", "texture_quality", "present"] {
+        for key in ["quality", "resolution", "view_distance", "aa", "texture_quality", "present", "idle", "ssao", "fps", "high_refresh"] {
             let OptKind::Choice(items) = opt(key).kind else { panic!("{key} is a choice") };
             for (weak, android) in [(false, false), (true, false), (false, true), (true, true)] {
                 if let Some(d) = choice_default_for(key, weak, android) {

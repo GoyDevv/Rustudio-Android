@@ -96,9 +96,42 @@ fn browsable(chain: &[String], prop: &str) -> bool {
 
 /// The panel's categories and rows for `class` (`can_collide`: whether the
 /// selected part has CanCollide on, which hides CanQuery).
+fn fallback_rows_from_reflection(class: &str) -> Vec<Category> {
+    let db = rbx_reflection_database::get();
+    let mut chain: Vec<&str> = Vec::new();
+    let mut cur = Some(class);
+    while let Some(name) = cur {
+        chain.push(name);
+        cur = db.classes.get(name).and_then(|c| c.superclass.as_deref());
+    }
+    let mut props: Vec<String> = Vec::new();
+    for c in &chain {
+        let Some(desc) = db.classes.get(*c) else { continue };
+        for (pname, pdesc) in &desc.properties {
+            if props.iter().any(|x| x == pname.as_ref()) || left_out(class, pname.as_ref()) {
+                continue;
+            }
+            let is_deprecated = pdesc.tags.contains(&rbx_reflection::PropertyTag::Deprecated);
+            let is_hidden = pdesc.tags.contains(&rbx_reflection::PropertyTag::Hidden);
+            if !is_deprecated && !is_hidden {
+                props.push(pname.to_string());
+            }
+        }
+    }
+    props.sort_by_key(|p| p.to_lowercase());
+    if props.is_empty() {
+        return Vec::new();
+    }
+    vec![Category {
+        name: "Data".to_string(),
+        rows: props.into_iter().map(|p| Row::Prop(p, false)).collect(),
+        collapsed: false,
+    }]
+}
+
 pub fn rows(class: &str, can_collide: bool) -> Vec<Category> {
     let Some(api) = rustudio_core::api::get() else {
-        return Vec::new();
+        return fallback_rows_from_reflection(class);
     };
     let mut chain: Vec<String> = Vec::new();
     let mut cur = Some(class.to_string());

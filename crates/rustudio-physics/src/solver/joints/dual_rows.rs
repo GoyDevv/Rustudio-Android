@@ -1116,7 +1116,9 @@ pub fn gyro_step(c: &mut BodyAngVel, r: Mat3, w: Vec3, i: Vec3, dt: f32) {
         tau += r * Vec3::new(0.0, ty, 0.0);
     }
     let t = rt * tau;
-    c.target = Vec3::new(t.x / i.x, t.y / i.y, t.z / i.z) * dt + wl;
+    let safe_div = |num: f32, den: f32| if den.is_finite() && den.abs() > 1.0e-12 { num / den } else { 0.0 };
+    let target = Vec3::new(safe_div(t.x, i.x), safe_div(t.y, i.y), safe_div(t.z, i.z)) * dt + wl;
+    c.target = if target.is_finite() { target } else { Vec3::ZERO };
     let cf = |x: f32| x.max(-3.4028235e38).min(3.4028235e38);
     let m = g.max_torque * i;
     c.hi = Vec3::new(cf(m.x), cf(m.y), cf(m.z));

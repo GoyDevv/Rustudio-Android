@@ -594,7 +594,11 @@ impl RustudioApp {
             beta_features_open: false,
             beta_features_changed: false,
             configs_window_open: false,
-            autosave: crate::autosave::AutoSaveState::new(),
+            autosave: {
+                let mut a = crate::autosave::AutoSaveState::new();
+                a.check_untitled_recovery();
+                a
+            },
         };
         ed.info(format!(
             "rustudio {} ready. Reflection database has {} classes.",
@@ -3426,7 +3430,11 @@ impl eframe::App for RustudioApp {
         }
         let is_start = self.ed.start.visible && self.ed.game.doc.id == self.ed.start.doc_id;
         if !is_start {
-            self.ed.autosave.flush_sync(&self.ed.game.doc, self.ed.game.play.is_some());
+            if let Some(saved_doc) = self.ed.game.play_saved_doc() {
+                self.ed.autosave.flush_sync(saved_doc, false);
+            } else {
+                self.ed.autosave.flush_sync(&self.ed.game.doc, self.ed.game.play.is_some());
+            }
         }
         if crate::android::lifecycle::is_backgrounded() {
             self.watchdog.hidden();
@@ -4004,6 +4012,7 @@ impl RustudioApp {
         // The Start Page replaces the editor's chrome until something opens.
         if ed.start_page_ui(ui) {
             ed.sync_orientation(false);
+            ed.autosave_recovery_modal(&ctx);
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
             ed.cloud_windows(&ctx);
@@ -4649,7 +4658,7 @@ impl RustudioApp {
             self.watchdog.complete();
             return;
         }
-        if ed.drag.is_some()
+        let needs_continuous = ed.drag.is_some()
             || ed.game.play.is_some()
             || ed.ui.anim.playing
             || (ed.game.play.is_none() && ed.game.edit_audio.has_active())
@@ -4663,8 +4672,31 @@ impl RustudioApp {
             || ed.harness.run.screenshot.is_some()
             || ed.harness.selftest.is_some()
             || ed.game.account.busy()
-            || ed.asset_picker.busy()
-        {
+            || ed.asset_picker.busy();
+        if needs_continuous {
+            #[cfg(target_os = "android")]
+            {
+                let user_cap = rustudio_core::rustudio_settings::fps_limit();
+                let thermal_cap = rustudio_core::rustudio_settings::thermal_fps_cap();
+                let effective_cap = match (user_cap, thermal_cap) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                if let Some(cap) = effective_cap {
+                    let period = std::time::Duration::from_secs_f32((1.0 / cap).max(0.001));
+                    let elapsed = frame_start.elapsed();
+                    if elapsed < period {
+                        ctx.request_repaint_after(period - elapsed);
+                    } else {
+                        ctx.request_repaint();
+                    }
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+            #[cfg(not(target_os = "android"))]
             ctx.request_repaint();
         } else if ed.fps >= 0.5 {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));

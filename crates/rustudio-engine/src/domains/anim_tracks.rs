@@ -908,11 +908,13 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
                     let end = frames.partition_point(|f| f.t < hi || (include_hi && f.t == hi));
                     out.extend((first..end).rev());
                 };
-                if st.looped {
+                if !st.speed.is_finite() || !after.is_finite() {
+                    st.speed = if st.speed.is_finite() { st.speed } else { 0.0 };
+                } else if st.looped {
                     if st.speed >= 0.0 {
-                        let wraps = (after / length).floor().max(0.0) as i64;
+                        let wraps = ((after / length).floor().max(0.0) as i64).min(64);
                         let rem = after.rem_euclid(length);
-                        st.time = rem;
+                        st.time = if rem.is_finite() { rem } else { 0.0 };
                         let mut lo = before_f64;
                         for _ in 0..wraps {
                             events_fwd(lo, length, true, &mut crossed);
@@ -931,9 +933,15 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
                         // Studio includes the departure and excludes the destination
                         // during reverse playback. Landing exactly at zero leaves
                         // both endpoint events for the next step, which wraps.
-                        let wraps = (-(after / length).floor()).max(0.0) as i64;
+                        let wraps = ((-(after / length).floor()).max(0.0) as i64).min(64);
                         let rem = after.rem_euclid(length);
-                        st.time = if rem == 0.0 && wraps > 0 { length } else { rem };
+                        st.time = if !rem.is_finite() {
+                            0.0
+                        } else if rem == 0.0 && wraps > 0 {
+                            length
+                        } else {
+                            rem
+                        };
                         let mut hi = before_f64;
                         for _ in 0..wraps {
                             events_rev(0.0, hi, true, true, &mut crossed);

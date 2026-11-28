@@ -542,12 +542,18 @@ impl Editor {
         let _p = rustudio_core::bench::scope("properties_build");
         // Studio: the filter field always, its shortcut in the hint; the
         // selection's class and name are in the panel's title.
-        ui.add(
-            egui::TextEdit::singleline(&mut self.props.filter)
-                .id(egui::Id::new(PROPS_FILTER_ID))
-                .hint_text(format!("Filter Properties ({})", crate::studio_ui::shortcut_label("Ctrl+Shift+P")))
-                .desired_width(f32::INFINITY),
-        );
+        ui.horizontal(|ui| {
+            let clear_w = if self.props.filter.is_empty() { 0.0 } else { 24.0 };
+            ui.add(
+                egui::TextEdit::singleline(&mut self.props.filter)
+                    .id(egui::Id::new(PROPS_FILTER_ID))
+                    .hint_text(format!("Filter Properties ({})", crate::studio_ui::shortcut_label("Ctrl+Shift+P")))
+                    .desired_width((ui.available_width() - clear_w).max(60.0)),
+            );
+            if !self.props.filter.is_empty() && ui.small_button("×").on_hover_text("Clear filter").clicked() {
+                self.props.filter.clear();
+            }
+        });
         ui.add_space(2.0);
         self.props.drawn.clear();
         self.ui_rects.insert("props.panel", ui.max_rect());
@@ -660,10 +666,20 @@ impl Editor {
         }
         let filter = self.props.filter.trim().to_lowercase();
         let mut edits: Vec<Edit> = Vec::new();
-        egui::ScrollArea::vertical()
+        let prev_sel_id = egui::Id::new("props_scroll_last_sel");
+        let last_sel: Option<Ref> = ui.ctx().data(|d| d.get_temp(prev_sel_id));
+        let sel_changed = last_sel != Some(first);
+        if sel_changed {
+            ui.ctx().data_mut(|d| d.insert_temp(prev_sel_id, first));
+        }
+        let mut scroll_area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .scroll_source(egui::scroll_area::ScrollSource { drag: if cfg!(target_os = "android") { egui::scroll_area::DragScroll::Never } else { egui::scroll_area::DragScroll::OnTouch }, ..Default::default() })
-            .id_salt("props_scroll")
+            .id_salt("props_scroll");
+        if sel_changed {
+            scroll_area = scroll_area.vertical_scroll_offset(0.0);
+        }
+        scroll_area
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let width = ui.available_width();

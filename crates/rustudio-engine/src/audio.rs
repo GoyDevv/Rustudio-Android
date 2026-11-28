@@ -459,6 +459,7 @@ pub struct Audio {
     capture_thread: Option<std::thread::JoinHandle<()>>,
     routes: HashMap<u64, (u64, Control)>,
     buses: HashMap<u64, (Mixer, Control)>,
+    idle_since: Option<Instant>,
 }
 
 impl Drop for Audio {
@@ -522,6 +523,7 @@ impl Audio {
             capture_thread: None,
             routes: HashMap::new(),
             buses: HashMap::new(),
+            idle_since: None,
         }
     }
 
@@ -932,6 +934,30 @@ impl Audio {
         decoder(&Arc::new(bytes.to_vec())).ok().and_then(length_of)
     }
 
+    /// Suspends the idle AAudio/OS DeviceSink after 4 seconds of silence so the
+    /// audio DSP thread does not drain battery when no sound is playing.
+    pub fn maybe_suspend_idle(&mut self) {
+        if !matches!(self.out, Output::Ready(_)) {
+            self.idle_since = None;
+            return;
+        }
+        let now = rustudio_core::sim_clock::now();
+        let any_active = self.sounds.values().any(|s| !s.paused && !s.finished(now));
+        if any_active {
+            self.idle_since = None;
+            return;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        if now.duration_since(since) >= std::time::Duration::from_secs(4) {
+            self.hold = None;
+            if let Some(h) = self.output_thread.take() {
+                let _ = h.join();
+            }
+            self.out = Output::Unopened;
+            self.idle_since = None;
+        }
+    }
+
     /// Keys of sounds that reached their end (not looped) since the last call, for
     /// Sound.Ended. Finished sounds are dropped, so they read as stopped afterwards.
     pub fn poll_finished(&mut self) -> Vec<u64> {
@@ -947,6 +973,14 @@ impl Audio {
             self.sounds.remove(k);
             self.routes.remove(k);
         }
+        if self.sounds.is_empty() && !self.buses.is_empty() {
+            self.buses.clear();
+        } else if self.buses.len() > 32 {
+            let active_buses: std::collections::HashSet<u64> =
+                self.routes.values().map(|(b, _)| *b).collect();
+            self.buses.retain(|id, _| active_buses.contains(id));
+        }
+        self.maybe_suspend_idle();
         done
     }
 
@@ -984,6 +1018,7 @@ impl Audio {
     pub fn stop_all(&mut self) {
         self.sounds.clear();
         self.routes.clear();
+        self.buses.clear();
     }
 }
 
