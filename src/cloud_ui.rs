@@ -292,6 +292,8 @@ struct LiveView {
     sent: std::collections::VecDeque<(std::time::Instant,String)>,
     /// Edits that were not sent at all this session.
     unsynced: Vec<String>,
+    /// Referents sent via `LiveOp::Create` so failed creates can be unbound.
+    created_ids: HashSet<u64>,
     collaborators: HashSet<rbx_types::Ref>,
     players: HashMap<u64,u64>,
     selections: HashMap<u64,Vec<u64>>,
@@ -302,6 +304,14 @@ struct LiveView {
     /// brought a Terrain without any (`saved_terrain`).
     saved_terrain: Option<std::sync::mpsc::Receiver<SavedPlaceTerrain>>,
     terrain_lods: HashMap<[i32; 3], u8>,
+}
+
+impl LiveView {
+    fn record_unsynced(&mut self, message: String) {
+        if !self.unsynced.contains(&message) {
+            self.unsynced.push(message);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1283,7 +1293,7 @@ impl Editor {
                     session, model: rustudio_net::model::LiveModel::new(),
                     origin: self.cloud.live_origin.take(), place, universe, document_id: None, requested_document_id: self.game.doc.id,
                     owner_user: None, own_player: None, publish_service: None, save_pending: None, sync_failed: false, backlogged: false, drafts: crate::live_drafts::DraftStore::for_place(place), script_service: None, script_configuration_sent: false, next_script_request: 1, script_commits: HashMap::new(),
-                    last_presence: std::time::Instant::now(), last_camera: None, labels: HashMap::new(), deleted: HashMap::new(), sent: Default::default(), unsynced: Vec::new(), collaborators: HashSet::new(), players: HashMap::new(), selections: HashMap::new(), last_selection: None, last_activity: std::time::Instant::now(), last_active: None, saved_terrain: None, terrain_lods: HashMap::new(),
+                    last_presence: std::time::Instant::now(), last_camera: None, labels: HashMap::new(), deleted: HashMap::new(), sent: Default::default(), unsynced: Vec::new(), created_ids: HashSet::new(), collaborators: HashSet::new(), players: HashMap::new(), selections: HashMap::new(), last_selection: None, last_activity: std::time::Instant::now(), last_active: None, saved_terrain: None, terrain_lods: HashMap::new(),
                 });
                 self.info(format!("Joining live Team Create place {place}…"));
             }
@@ -1397,12 +1407,12 @@ impl Editor {
         let plan = crate::live_sync::plan(&self.game.doc, &mut live.model, marks, &mut || session.allocate_id().map_err(|e| e.to_string()));
         for message in plan.skipped {
             self.warn(format!("Team Create: not synchronized: {message}"));
-            live.unsynced.push(message);
+            live.record_unsynced(message);
         }
         for message in plan.unsynced {
             live.sync_failed = true;
             self.warn(format!("Team Create: not synchronized: {message}"));
-            live.unsynced.push(message);
+            live.record_unsynced(message);
         }
         for op in plan.ops {
             let (label, result) = match op {
@@ -1413,6 +1423,7 @@ impl Editor {
                         if let Err(error) = live.drafts.register(id, guid.as_deref(), source.clone()) { self.warn(error); }
                     }
                     live.labels.insert(id, crate::live_sync::path(&self.game.doc, reference));
+                    live.created_ids.insert(id);
                     log::info!("Team Create: {label} ({class} {id:#x} under {parent:#x})");
                     (label, live.session.send_create(id, class, parent, props))
                 }
@@ -1438,7 +1449,7 @@ impl Editor {
                 Err(error) => {
                     live.sync_failed = true;
                     self.warn(format!("Team Create: {label} was not sent: {error}"));
-                    live.unsynced.push(label);
+                    live.record_unsynced(label);
                 }
             }
         }
@@ -1509,7 +1520,7 @@ impl Editor {
                 // The journal overflowed: which edits were made is unknown.
                 rustudio_core::doc::Marks::All => {
                     live.sync_failed = true;
-                    live.unsynced.push("a burst of edits too large for the change journal".into());
+                    live.record_unsynced("a burst of edits too large for the change journal".into());
                     self.error("Team Create: too many edits at once to synchronize; keep a local copy and reopen the live place");
                 }
             }
@@ -1648,7 +1659,7 @@ impl Editor {
                                 log::warn!("Team Create (place={}): {message} ({id:#x})", live.place);
                                 self.error(format!("Team Create: {message}"));
                                 live.sync_failed = true;
-                                live.unsynced.push(message);
+                                live.record_unsynced(message);
                             }
                         }
                         if let rustudio_net::replicator::RepOp::Event {id,name,args} = &op {
@@ -1886,14 +1897,26 @@ impl Editor {
                 }
                 LiveEvent::EditFailed { id, error } => {
                     live.sync_failed = true;
+                    if live.created_ids.contains(&id)
+                        && (error.starts_with("Class ")
+                            || error.contains("was not created")
+                            || error == "The live schema is not ready")
+                    {
+                        live.created_ids.remove(&id);
+                        if let Some(r) = live.model.reference(id) {
+                            live.model.unbind(r);
+                        }
+                    }
                     let what = live.labels.get(&id).cloned().unwrap_or_else(|| format!("instance {id:#x}"));
                     self.error(format!("Team Create: {what} did not reach the server: {error}"));
-                    live.unsynced.push(format!("{what}: {error}"));
+                    live.record_unsynced(format!("{what}: {error}"));
                 }
                 LiveEvent::PropertySkipped { id, name, reason } => {
                     let what = live.labels.get(&id).cloned().unwrap_or_else(|| format!("instance {id:#x}"));
                     self.warn(format!("Team Create: {what} was created without {name}: {reason}"));
-                    live.unsynced.push(format!("{what}.{name}: {reason}"));
+                    if !reason.ends_with("is not replicated by this server") {
+                        live.record_unsynced(format!("{what}.{name}: {reason}"));
+                    }
                 }
                 LiveEvent::Notice(message) => self.warn(format!("Team Create: {message}")),
                 LiveEvent::Error(e) => {

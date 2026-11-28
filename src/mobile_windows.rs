@@ -1600,7 +1600,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(input, |ui| {
-            let actions = mgr.show(ui.ctx(), bounds, |body_ui, tab| {
+            let actions = mgr.show(ui.ctx(), bounds, false, |body_ui, tab| {
                 rendered_tabs.push(*tab);
                 body_ui.label("panel body");
             });

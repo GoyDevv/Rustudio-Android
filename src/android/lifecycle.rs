@@ -120,23 +120,28 @@ pub fn take_low_memory() -> bool {
     LOW_MEMORY.swap(false, Ordering::SeqCst)
 }
 
-/// True while the Android Activity is paused/stopped in the background.
+/// True while the Android Activity is stopped (hidden/backgrounded).
 pub fn is_backgrounded() -> bool {
     BACKGROUNDED.load(Ordering::Relaxed)
 }
 
-/// Called from RustudioActivity.onPause(1) / onStop(2) / onResume(3).
+/// Called from RustudioActivity.onStart(0) / onPause(1) / onStop(2) / onResume(3).
 pub fn on_java_lifecycle(state: i32) {
     match state {
-        1 | 2 => {
-            let was = BACKGROUNDED.swap(true, Ordering::SeqCst);
+        // onPause: unfocused but still visible (e.g. overlay browser or split-screen).
+        1 => {
             super::sensors::set_backgrounded(true);
-            if state == 2 || !was {
-                super::perf_hint::stop();
-                rustudio_core::heap::trim();
-            }
+            super::perf_hint::stop();
         }
-        3 => {
+        // onStop: truly hidden/backgrounded.
+        2 => {
+            BACKGROUNDED.store(true, Ordering::SeqCst);
+            super::sensors::set_backgrounded(true);
+            super::perf_hint::stop();
+            rustudio_core::heap::trim();
+        }
+        // onStart / onResume: visible again.
+        0 | 3 => {
             BACKGROUNDED.store(false, Ordering::SeqCst);
             super::sensors::set_backgrounded(false);
         }

@@ -228,8 +228,8 @@ public class RustudioActivity extends NativeActivity {
         unlockMaxRefreshRate();
         imeView = new ImeProxyView(this);
         imeView.setBackgroundColor(0);
-        imeView.setFocusable(true);
-        imeView.setFocusableInTouchMode(true);
+        imeView.setFocusable(false);
+        imeView.setFocusableInTouchMode(false);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
         addContentView(imeView, lp);
     }
@@ -300,6 +300,9 @@ public class RustudioActivity extends NativeActivity {
 
     @Override
     protected void onPause() {
+        if (imeView != null) {
+            imeView.resetComposing();
+        }
         nativeOnLifecycle(1);
         super.onPause();
     }
@@ -750,6 +753,8 @@ public class RustudioActivity extends NativeActivity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
             applyDarkFullscreenWindow();
+        } else if (imeView != null) {
+            imeView.resetComposing();
         }
     }
 
@@ -781,6 +786,8 @@ public class RustudioActivity extends NativeActivity {
                 }
                 if (open) {
                     imeView.resetComposing();
+                    imeView.setFocusable(true);
+                    imeView.setFocusableInTouchMode(true);
                     imeView.requestFocus();
                     imm.restartInput(imeView);
                     imm.showSoftInput(imeView, InputMethodManager.SHOW_IMPLICIT);
@@ -788,6 +795,8 @@ public class RustudioActivity extends NativeActivity {
                 } else {
                     imeView.resetComposing();
                     imeView.clearFocus();
+                    imeView.setFocusable(false);
+                    imeView.setFocusableInTouchMode(false);
                     imm.hideSoftInputFromWindow(imeView.getWindowToken(), 0);
                     applyDarkFullscreenWindow();
                 }
@@ -926,6 +935,10 @@ public class RustudioActivity extends NativeActivity {
 
             @Override
             public boolean sendKeyEvent(KeyEvent event) {
+                if (event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()) {
+                    return super.sendKeyEvent(event);
+                }
+
                 int code = event.getKeyCode();
                 int action = event.getAction();
                 boolean down = (action == KeyEvent.ACTION_DOWN);
@@ -951,6 +964,9 @@ public class RustudioActivity extends NativeActivity {
                         || code == KeyEvent.KEYCODE_DPAD_DOWN
                         || code == KeyEvent.KEYCODE_MOVE_HOME
                         || code == KeyEvent.KEYCODE_MOVE_END) {
+                    if (event.isShiftPressed()) {
+                        return super.sendKeyEvent(event);
+                    }
                     if (down && code == KeyEvent.KEYCODE_DEL && composingLen > 0) {
                         composingLen = Math.max(0, composingLen - 1);
                     }

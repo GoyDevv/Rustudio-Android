@@ -1456,12 +1456,15 @@ fn http_start_inner(lua: &Lua, (hs, method, url, headers, body): (LInst, String,
         Some(Variant::Int32(n)) => n as i64,
         _ => 0,
     };
-    Ok(http::start(http::Request {
-        method,
-        url,
-        headers: http::studio_headers(hv, place_id),
-        body: body.map(|b| b.as_bytes().to_vec()),
-    }))
+    Ok(http::start(
+        http::Request {
+            method,
+            url,
+            headers: http::studio_headers(hv, place_id),
+            body: body.map(|b| b.as_bytes().to_vec()),
+        },
+        lua.app_data_ref::<egui::Context>().as_deref().cloned(),
+    ))
 }
 
 /// `__svc_http_internal_start(method, url, headers, body)` → request id (CoreScript / built-in plugin only).
@@ -1500,12 +1503,15 @@ fn http_internal_start(
         Value::String(b) => Some(b.as_bytes().to_vec()),
         _ => None,
     };
-    let id = http::start_internal(http::Request {
-        method,
-        url,
-        headers: hv,
-        body: body_bytes,
-    });
+    let id = http::start_internal(
+        http::Request {
+            method,
+            url,
+            headers: hv,
+            body: body_bytes,
+        },
+        lua.app_data_ref::<egui::Context>().as_deref().cloned(),
+    );
     Ok((Some(id), None))
 }
 

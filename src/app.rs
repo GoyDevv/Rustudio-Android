@@ -3520,8 +3520,8 @@ impl eframe::App for RustudioApp {
         }
         // eframe can run logic without a UI pass when the root is hidden.
         if ctx.input(|i| i.viewport().visible() == Some(false)) {
-            Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, Instant::now());
-            Self::schedule_plugin_repaint(&self.ed, ctx);
+            let mutated = Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, Instant::now());
+            Self::schedule_plugin_repaint(&self.ed, ctx, mutated);
         }
     }
 
@@ -3640,9 +3640,17 @@ impl RustudioApp {
             PLUGIN_IDLE_INTERVAL
         };
         if now >= self.last_plugin_tick + interval {
-            Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, now);
+            let mutated = Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, now);
             self.ed.edit_audio_tick();
             self.plugins_ticked_between_frames = true;
+            if mutated {
+                if let Some(ctx) = self.egui_ctx.clone() {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    if self.ed.live_session_open() {
+                        self.ed.cloud_poll(&ctx);
+                    }
+                }
+            }
         }
         let still_audio = self.ed.game.play.is_none() && self.ed.game.edit_audio.has_active();
         (!self.ed.place_loading() && (self.ed.plugins.needs_idle_tick() || still_audio))
@@ -3656,14 +3664,31 @@ impl RustudioApp {
             })
     }
 
-    fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) {
+    fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) -> bool {
         let _p = rustudio_core::bench::scope("plugin_tick");
         let dt = now.saturating_duration_since(std::mem::replace(last_tick, now)).as_secs_f32();
         let step = ed.game.fixed_dt.map_or_else(|| frame_grid(dt) as f64, f64::from);
+        let before = (
+            ed.game.doc.revision,
+            ed.game.doc.tree_revision,
+            ed.game.log.len(),
+            ed.plugins.ui_rev(),
+        );
         ed.plugin_tick(step);
+        let after = (
+            ed.game.doc.revision,
+            ed.game.doc.tree_revision,
+            ed.game.log.len(),
+            ed.plugins.ui_rev(),
+        );
+        after != before
     }
 
-    fn schedule_plugin_repaint(ed: &Editor, ctx: &egui::Context) {
+    fn schedule_plugin_repaint(ed: &Editor, ctx: &egui::Context, mutated: bool) {
+        if mutated {
+            ctx.request_repaint();
+            return;
+        }
         if !ed.place_loading() && ed.plugins.needs_idle_tick() {
             // When an interactive plugin widget like Roblox's AnimationClipEditor
             // is open, keep RunService.Heartbeat ticking smoothly at display refresh
@@ -3821,11 +3846,12 @@ impl RustudioApp {
         if !self.play_fills_screen() {
             let ed = &mut self.ed;
             if ctx.input(|i| i.viewport().visible() != Some(false)) {
+                let mut mutated = false;
                 if !std::mem::take(&mut self.plugins_ticked_between_frames) {
-                    Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
+                    mutated = Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
                     ed.edit_audio_tick();
                 }
-                Self::schedule_plugin_repaint(ed, &ctx);
+                Self::schedule_plugin_repaint(ed, &ctx, mutated);
             }
             self.watchdog.stage("plugins", "project and scene synchronization");
             ed.project_tick();

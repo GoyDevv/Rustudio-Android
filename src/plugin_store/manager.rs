@@ -413,6 +413,61 @@ impl PluginManager {
         }
     }
 
+    /// Reloads a plugin from disk (unloads and runs it again).
+    pub fn reload(&mut self, id: &str) {
+        let Some(p) = self.store.resolve(id) else {
+            self.error(format!("Plugin {id} not found"));
+            return;
+        };
+        if !self.loading_on() {
+            return;
+        }
+        if !p.present {
+            self.error(format!("Plugin {} is not downloaded yet", p.name));
+            return;
+        }
+        let r = if self.runtime.loaded().contains(&p.id) {
+            self.runtime.reload(&p)
+        } else {
+            self.runtime.load(&p)
+        };
+        match r {
+            Ok(()) => self.info(format!("Reloaded plugin {}", p.name)),
+            Err(e) => self.error(format!("Plugin {} failed to reload: {e}", p.id)),
+        }
+    }
+
+    /// Removes a plugin by store id: uninstalls an installed plugin or deletes
+    /// a local plugin file, unloading it and clearing permissions.
+    pub fn remove_by_id(&mut self, id: &str) {
+        let Some(p) = self.store.resolve(id) else {
+            self.error(format!("Plugin {id} not found"));
+            return;
+        };
+        match (p.kind, p.asset_id) {
+            (PluginKind::Installed, Some(aid)) => self.remove(aid),
+            (PluginKind::Local, _) => {
+                if self.runtime.loaded().contains(&p.id) {
+                    self.runtime.unload(&p.id);
+                }
+                match self.store.remove_local(&p.id) {
+                    Ok(()) => {
+                        if let Ok(mut g) = permissions::global().lock() {
+                            g.forget(&p.id);
+                        }
+                        if let Some(w) = self.watcher.as_mut() {
+                            let _ = w.poll();
+                            let _ = w.poll();
+                        }
+                        self.info(format!("Deleted local plugin {}", p.name));
+                    }
+                    Err(e) => self.error(e),
+                }
+            }
+            _ => self.error(format!("Cannot remove plugin {}", p.id)),
+        }
+    }
+
     pub fn search(&mut self, client: Option<SharedClient>, query: String) {
         let Some(client) = client else {
             self.search = Some((query, Err(Failure::SignedOut.describe())));
@@ -727,5 +782,44 @@ mod tests {
         }
         // a, off (turned on), Saved; b is off and 9 was removed.
         assert_eq!(m.runtime.loaded(), ["user_a.lua", "user_off.lua", "user_Saved.rbxmx"]);
+    }
+
+    #[test]
+    fn reload_and_remove_by_id_handle_local_and_installed() {
+        let root = tmp("reload-remove-by-id");
+        let dir = root.join("Plugins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_path = dir.join("helper.lua");
+        std::fs::write(&local_path, "print('v1')").unwrap();
+        let mut store = Store::open(root.clone(), dir.clone(), 0);
+        store
+            .install_bytes(
+                InstalledMeta { plugin_asset_id: 12, asset_version_id: 120, enabled: true, ..Default::default() },
+                &tiny_rbxm(),
+            )
+            .unwrap();
+        let mut m = PluginManager::new(store, Box::new(NoRuntime::default()));
+        for f in 1..6 {
+            m.tick(None, f);
+        }
+        assert_eq!(m.runtime.loaded(), ["user_helper.lua", "cloud_12"]);
+
+        // Reload keeps both loaded and logs info.
+        m.lines.clear();
+        m.reload("user_helper.lua");
+        m.reload("cloud_12");
+        assert_eq!(m.runtime.loaded(), ["user_helper.lua", "cloud_12"]);
+        assert!(m.lines.iter().any(|l| l.text.contains("Reloaded plugin helper")));
+
+        // remove_by_id on local unloads, deletes file, and drops from store.
+        m.remove_by_id("user_helper.lua");
+        assert!(!m.runtime.loaded().contains(&"user_helper.lua".to_string()));
+        assert!(!local_path.exists());
+        assert!(m.store.get("user_helper.lua").is_none());
+
+        // remove_by_id on installed delegates to uninstall.
+        m.remove_by_id("cloud_12");
+        assert!(!m.runtime.loaded().contains(&"cloud_12".to_string()));
+        assert!(m.store.get("cloud_12").is_none());
     }
 }

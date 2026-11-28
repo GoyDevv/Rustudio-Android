@@ -91,7 +91,7 @@ pub fn studio_headers(mut h: Vec<(String, String)>, place_id: i64) -> Vec<(Strin
     h
 }
 
-pub fn start(req: Request) -> u64 {
+pub fn start(req: Request, repaint: Option<egui::Context>) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("rustudio-http".into())
@@ -101,6 +101,9 @@ pub fn start(req: Request) -> u64 {
                 run(req)
             };
             done().lock().unwrap().insert(id, r);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
         })
         .ok();
     id
@@ -109,7 +112,7 @@ pub fn start(req: Request) -> u64 {
 /// Starts an internal Studio/CoreScript HTTP request (`HttpService:RequestInternal`,
 /// `HttpRbxApiService`). Uses the signed-in Roblox session (cookie + CSRF) for
 /// `*.roblox.com` URLs when signed in, falling back to unauthenticated HTTP.
-pub fn start_internal(req: Request) -> u64 {
+pub fn start_internal(req: Request, repaint: Option<egui::Context>) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("rustudio-http-internal".into())
@@ -119,6 +122,9 @@ pub fn start_internal(req: Request) -> u64 {
                 run_internal(req)
             };
             done().lock().unwrap().insert(id, r);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
         })
         .ok();
     id

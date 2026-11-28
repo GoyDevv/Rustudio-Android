@@ -1310,6 +1310,7 @@ struct GotoLineState {
 
 pub struct ScriptBuf {
     pub text: String,
+    last_doc_source: String,
     pub error: Option<(usize, String)>,
     checked: Option<String>,
     edited: Instant,
@@ -1487,7 +1488,8 @@ impl Editor {
         self.scripts.bufs.insert(
             r,
             ScriptBuf {
-                text: source,
+                text: source.clone(),
+                last_doc_source: source,
                 error: None,
                 checked: None,
                 edited: Instant::now(),
@@ -1562,6 +1564,7 @@ impl Editor {
         }
         let buf = self.scripts.bufs.entry(r).or_insert_with(|| ScriptBuf {
             text: source.clone(),
+            last_doc_source: source.clone(),
             error: None,
             checked: None,
             edited: Instant::now(),
@@ -1586,9 +1589,11 @@ impl Editor {
         if any_script_focus {
             crate::plugin_host::script_docs::set_active(Some(r));
         }
-        // Undo/redo or a script change elsewhere: follow the document.
-        if (!focused || follow_live_source) && buf.text != source {
+        // Undo/redo, plugin edit, or Team Create change elsewhere: follow the document,
+        // even while focused when the DataModel's Source diverged from our last seen doc source.
+        if source != buf.last_doc_source || ((!focused || follow_live_source) && buf.text != source) {
             buf.text = source.clone();
+            buf.last_doc_source = source.clone();
             buf.checked = None;
             buf.ac.open = false;
         }
@@ -3045,6 +3050,9 @@ impl Editor {
                 vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text.clone()))],
                 merge_key,
             );
+            if let Some(b) = self.scripts.bufs.get_mut(&r) {
+                b.last_doc_source = text.clone();
+            }
             let typing_word = word_end.is_some_and(|word_end| {
                 let c: Vec<char> = text.chars().collect();
                 let i = word_end.min(c.len());
