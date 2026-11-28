@@ -204,7 +204,7 @@ public class RustudioActivity extends NativeActivity {
         pointerCaptureListenerInstalled = true;
         decor.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
             @Override
-            public boolean onCapturedPointerEvent(View view, MotionEvent event) {
+            public boolean onCapturedPointer(View view, MotionEvent event) {
                 if (event == null) {
                     return false;
                 }
