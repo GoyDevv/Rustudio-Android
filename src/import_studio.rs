@@ -424,36 +424,38 @@ impl Editor {
                             .with_property("Loop", true)
                             .with_property("Priority", Variant::Enum(Enum::from_u32(2))),
                     );
-                    for kf in &clip.frames {
+                    for (fi, &time) in clip.times.iter().enumerate() {
                         let kf_ref = self.game.doc.insert(
                             kfs,
                             InstanceBuilder::new("Keyframe")
-                                .with_name("Keyframe")
-                                .with_property("Time", kf.time as f32),
+                                .with_name(if fi + 1 == clip.times.len() { "End" } else { "Keyframe" })
+                                .with_property("Time", time as f32),
                         );
-                        let root_pose = self.game.doc.insert(
-                            kf_ref,
-                            InstanceBuilder::new("Pose")
-                                .with_name("HumanoidRootPart")
-                                .with_property("Weight", 1.0f32),
-                        );
-                        for p in &kf.poses {
-                            let mapped = remap_bone_name(&p.joint, rig).unwrap_or(&p.joint);
-                            let cf = CFrame::new(
-                                Vector3::new(p.cf.pos.x, p.cf.pos.y, p.cf.pos.z),
-                                Matrix3::new(
-                                    Vector3::new(p.cf.rot.x_axis.x, p.cf.rot.y_axis.x, p.cf.rot.z_axis.x),
-                                    Vector3::new(p.cf.rot.x_axis.y, p.cf.rot.y_axis.y, p.cf.rot.z_axis.y),
-                                    Vector3::new(p.cf.rot.x_axis.z, p.cf.rot.y_axis.z, p.cf.rot.z_axis.z),
-                                ),
+                        let mut made_poses: Vec<Ref> = Vec::with_capacity(clip.bones.len());
+                        for bone in &clip.bones {
+                            let parent_ref = bone
+                                .parent
+                                .and_then(|pi| made_poses.get(pi).copied())
+                                .unwrap_or(kf_ref);
+                            let mapped = remap_bone_name(&bone.name, rig).unwrap_or(&bone.name);
+                            let cf = bone.poses.get(fi).map_or_else(
+                                || CFrame::new(Vector3::new(0.0, 0.0, 0.0), Matrix3::identity()),
+                                |xf| {
+                                    rustudio_core::math::Xform {
+                                        pos: xf.pos.as_vec3(),
+                                        rot: xf.rot.as_mat3(),
+                                    }
+                                    .to_cframe()
+                                },
                             );
-                            let _ = self.game.doc.insert(
-                                root_pose,
+                            let pose_ref = self.game.doc.insert(
+                                parent_ref,
                                 InstanceBuilder::new("Pose")
                                     .with_name(mapped)
                                     .with_property("CFrame", cf)
                                     .with_property("Weight", 1.0f32),
                             );
+                            made_poses.push(pose_ref);
                         }
                     }
                     self.explorer.expanded.insert(parent);
@@ -461,7 +463,7 @@ impl Editor {
                     self.select(vec![kfs]);
                     self.info(format!(
                         "Imported FBX animation ({} keyframes) from {}",
-                        clip.frames.len(),
+                        clip.times.len(),
                         path.display()
                     ));
                 }
