@@ -689,7 +689,7 @@ pub fn autocomplete_context(src: &str, cursor: usize) -> Option<AcContext> {
             if ch == q {
                 in_str = None;
             }
-        } else if ch == '"' || ch == ''' {
+        } else if ch == '"' || ch == '\'' {
             in_str = Some(ch);
         } else if ch == '-' && i + 1 < cursor && chars[i + 1] == '-' {
             return None;
