@@ -931,7 +931,12 @@ impl Game {
         }
         self.edit_audio.stop_playback();
         if mode == RunMode::Play {
-            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), true) {
+            let settle_wait = if cfg!(target_os = "android") {
+                std::time::Duration::from_secs(2)
+            } else {
+                std::time::Duration::from_secs(20)
+            };
+            for (level, text) in self.account.settle_for_play(settle_wait, true) {
                 self.push_log(level, text);
             }
         }

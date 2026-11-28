@@ -119,6 +119,9 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeMou
     action_button: i32,
     scroll_x: f32,
     scroll_y: f32,
+    abs_x: f32,
+    abs_y: f32,
+    is_captured: u8,
 ) {
     rustudio::android::ime_bridge::on_mouse_capture(
         action,
@@ -128,6 +131,9 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeMou
         action_button,
         scroll_x,
         scroll_y,
+        abs_x,
+        abs_y,
+        is_captured != 0,
     );
 }
 

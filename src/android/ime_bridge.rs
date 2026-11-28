@@ -23,6 +23,9 @@ enum ImeOp {
         action_button: i32,
         scroll_x: f32,
         scroll_y: f32,
+        abs_x: f32,
+        abs_y: f32,
+        is_captured: bool,
     },
 }
 
@@ -32,6 +35,7 @@ struct VirtualMouseState {
     initialized: bool,
     buttons: i32,
     active: bool,
+    is_captured: bool,
     locked_look: bool,
     cursor_hidden: bool,
     right_press_pos: Option<Pos2>,
@@ -45,6 +49,7 @@ impl VirtualMouseState {
             initialized: false,
             buttons: 0,
             active: false,
+            is_captured: false,
             locked_look: false,
             cursor_hidden: false,
             right_press_pos: None,
@@ -82,7 +87,7 @@ impl egui::Plugin for VirtualCursorPlugin {
 fn paint_virtual_cursor(ctx: &egui::Context) {
     let (active, locked, pos) = {
         let Ok(vm) = VIRTUAL_MOUSE.lock() else { return };
-        (vm.active && vm.initialized, vm.locked_look || vm.cursor_hidden, vm.pos)
+        (vm.active && vm.is_captured && vm.initialized, vm.locked_look || vm.cursor_hidden, vm.pos)
     };
     if !active || locked {
         return;
@@ -183,6 +188,7 @@ pub fn on_hardware_mouse_detected(active: bool) {
     if let Ok(mut vm) = VIRTUAL_MOUSE.lock() {
         vm.active = active;
         if !active {
+            vm.is_captured = false;
             vm.buttons = 0;
             vm.locked_look = false;
             vm.right_press_pos = None;
@@ -200,6 +206,9 @@ pub fn on_mouse_capture(
     action_button: i32,
     scroll_x: f32,
     scroll_y: f32,
+    abs_x: f32,
+    abs_y: f32,
+    is_captured: bool,
 ) {
     push_op(ImeOp::MouseCapture {
         action,
@@ -209,6 +218,9 @@ pub fn on_mouse_capture(
         action_button,
         scroll_x,
         scroll_y,
+        abs_x,
+        abs_y,
+        is_captured,
     });
 }
 
@@ -517,6 +529,9 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                 action_button,
                 scroll_x,
                 scroll_y,
+                abs_x,
+                abs_y,
+                is_captured,
             } => {
                 const ACTION_CANCEL: i32 = 3;
                 const ACTION_SCROLL: i32 = 8;
@@ -534,8 +549,13 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                 let delta = egui::vec2(dx / ppp, dy / ppp);
                 let Ok(mut vm) = VIRTUAL_MOUSE.lock() else { continue };
                 vm.active = true;
+                vm.is_captured = is_captured;
                 if !vm.initialized && screen_rect.is_positive() {
-                    vm.pos = screen_rect.center();
+                    vm.pos = if !is_captured && abs_x >= 0.0 && abs_y >= 0.0 {
+                        Pos2::new(abs_x / ppp, abs_y / ppp)
+                    } else {
+                        screen_rect.center()
+                    };
                     vm.drag_pos = vm.pos;
                     vm.initialized = true;
                 }
@@ -552,7 +572,24 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                 let right_held = (new_buttons & BUTTON_SECONDARY) != 0
                     || (vm.buttons & BUTTON_SECONDARY) != 0;
 
-                if delta.x != 0.0 || delta.y != 0.0 {
+                if !is_captured && abs_x >= 0.0 && abs_y >= 0.0 {
+                    let mut target = Pos2::new(abs_x / ppp, abs_y / ppp);
+                    if screen_rect.is_positive() {
+                        target.x = target.x.clamp(screen_rect.min.x, screen_rect.max.x);
+                        target.y = target.y.clamp(screen_rect.min.y, screen_rect.max.y);
+                    }
+                    if delta.x != 0.0 || delta.y != 0.0 {
+                        raw.events.push(Event::MouseMoved(delta));
+                    }
+                    if right_held {
+                        vm.drag_pos += delta;
+                        raw.events.push(Event::PointerMoved(vm.drag_pos));
+                    } else if target != vm.pos || delta.x != 0.0 || delta.y != 0.0 {
+                        vm.pos = target;
+                        vm.drag_pos = vm.pos;
+                        raw.events.push(Event::PointerMoved(vm.pos));
+                    }
+                } else if delta.x != 0.0 || delta.y != 0.0 {
                     raw.events.push(Event::MouseMoved(delta));
                     if !right_held && !vm.cursor_hidden {
                         vm.pos += delta;

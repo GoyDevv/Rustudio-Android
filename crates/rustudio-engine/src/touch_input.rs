@@ -355,32 +355,6 @@ impl Touch {
             }
             return;
         }
-        // When an Android hardware mouse is actively driving KBM mode, never
-        // convert mouse events into touch drags or delay them through the 320ms
-        // touch-hold gesture recognizer: release any lingering touch state and
-        // pass mouse/keyboard events straight through.
-        if kbm_active() && (has_hardware_mouse() || captured_hardware_mouse()) {
-            let mut out: Vec<Event> = Vec::with_capacity(raw.events.len() + 4);
-            if !self.active.is_empty()
-                || self.pointer.is_some()
-                || self.fling.is_some()
-                || self.stick.is_some()
-                || self.jump.is_some()
-            {
-                self.let_go(&mut out);
-                self.active.clear();
-            }
-            for ev in raw.events.drain(..) {
-                match ev {
-                    Event::Touch { .. } => {
-                        // Drop mouse-emulated touch events while captured hardware mouse is active.
-                    }
-                    other => out.push(other),
-                }
-            }
-            raw.events = out;
-            return;
-        }
         let mut out: Vec<Event> = Vec::with_capacity(raw.events.len() + 8);
         // Pointer events in a batch with touch events (or while a finger is
         // down) are egui-winit's stand-ins for the finger: ours replace them.
@@ -396,6 +370,9 @@ impl Touch {
                 }
                 Event::Touch { id, phase, pos, .. } => {
                     synthetic = true;
+                    if captured_hardware_mouse() {
+                        set_captured_hardware_mouse(false);
+                    }
                     set_kbm_active(false);
                     self.last_touch = Some(now);
                     let control = self.on_touch(ctx, id, phase, pos, now, frame_no, &mut out);

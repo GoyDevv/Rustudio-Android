@@ -73,8 +73,12 @@ public class RustudioActivity extends NativeActivity {
     private boolean imeListenerInstalled = false;
     private boolean storagePromptScheduled = false;
     private final java.util.HashSet<Integer> activeShortcutKeys = new java.util.HashSet<Integer>();
+    private View captureView = null;
     private boolean pointerCaptureListenerInstalled = false;
     private boolean hardwareMouseActive = false;
+    private boolean imeOpen = false;
+    private float lastUncapturedMouseX = Float.NaN;
+    private float lastUncapturedMouseY = Float.NaN;
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -88,7 +92,7 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeImeKey(int keyCode, boolean down);
     static native void nativeImeAction(int action);
     static native void nativeHardwareKey(int keyCode, int metaState, boolean down, boolean repeat);
-    static native void nativeMouseCapture(int action, float dx, float dy, int buttonState, int actionButton, float scrollX, float scrollY);
+    static native void nativeMouseCapture(int action, float dx, float dy, int buttonState, int actionButton, float scrollX, float scrollY, float absX, float absY, boolean isCaptured);
     static native void nativeHardwareMouseDetected(boolean active);
     static native void nativeImeVisibility(boolean visible, int bottomInsetPx);
     static native void nativeOnLifecycle(int state);
@@ -169,7 +173,6 @@ public class RustudioActivity extends NativeActivity {
                                 | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 );
             }
-            installCapturedPointerListenerIfNeeded(decor);
         }
     }
 
@@ -197,12 +200,12 @@ public class RustudioActivity extends NativeActivity {
                 && event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER;
     }
 
-    private void installCapturedPointerListenerIfNeeded(View decor) {
-        if (Build.VERSION.SDK_INT < 26 || decor == null || pointerCaptureListenerInstalled) {
+    private void installCapturedPointerListenerIfNeeded(View target) {
+        if (Build.VERSION.SDK_INT < 26 || target == null || pointerCaptureListenerInstalled) {
             return;
         }
         pointerCaptureListenerInstalled = true;
-        decor.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
+        target.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
             @Override
             public boolean onCapturedPointer(View view, MotionEvent event) {
                 if (event == null) {
@@ -222,10 +225,28 @@ public class RustudioActivity extends NativeActivity {
                 float scrollY = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
                 int buttonState = event.getButtonState();
                 int actionButton = event.getActionButton();
-                nativeMouseCapture(action, dx, dy, buttonState, actionButton, scrollX, scrollY);
+                nativeMouseCapture(action, dx, dy, buttonState, actionButton, scrollX, scrollY, -1.0f, -1.0f, true);
                 return true;
             }
         });
+    }
+
+    private void forwardUncapturedMouseEvent(MotionEvent event) {
+        if (event == null) {
+            return;
+        }
+        int action = event.getActionMasked();
+        float absX = event.getX();
+        float absY = event.getY();
+        float dx = Float.isNaN(lastUncapturedMouseX) ? 0.0f : (absX - lastUncapturedMouseX);
+        float dy = Float.isNaN(lastUncapturedMouseY) ? 0.0f : (absY - lastUncapturedMouseY);
+        lastUncapturedMouseX = absX;
+        lastUncapturedMouseY = absY;
+        float scrollX = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
+        float scrollY = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+        int buttonState = event.getButtonState();
+        int actionButton = (Build.VERSION.SDK_INT >= 23) ? event.getActionButton() : 0;
+        nativeMouseCapture(action, dx, dy, buttonState, actionButton, scrollX, scrollY, absX, absY, false);
     }
 
     private void activateHardwareMouseCapture() {
@@ -233,37 +254,35 @@ public class RustudioActivity extends NativeActivity {
             hardwareMouseActive = true;
             nativeHardwareMouseDetected(true);
         }
-        if (Build.VERSION.SDK_INT < 26) {
+        if (Build.VERSION.SDK_INT < 26 || captureView == null || imeOpen) {
             return;
         }
-        Window w = getWindow();
-        View decor = w != null ? w.getDecorView() : null;
-        if (decor == null) {
-            return;
-        }
-        installCapturedPointerListenerIfNeeded(decor);
-        if (hasWindowFocus() && !decor.hasPointerCapture()) {
+        installCapturedPointerListenerIfNeeded(captureView);
+        if (hasWindowFocus() && !captureView.hasPointerCapture()) {
             try {
-                decor.requestPointerCapture();
+                if (!captureView.hasFocus()) {
+                    captureView.requestFocus();
+                }
+                captureView.requestPointerCapture();
             } catch (Throwable ignored) {
             }
         }
     }
 
     private void releaseHardwareMouseCapture(boolean deactivateMouse) {
-        if (Build.VERSION.SDK_INT >= 26) {
-            Window w = getWindow();
-            View decor = w != null ? w.getDecorView() : null;
-            if (decor != null && decor.hasPointerCapture()) {
-                try {
-                    decor.releasePointerCapture();
-                } catch (Throwable ignored) {
-                }
+        if (Build.VERSION.SDK_INT >= 26 && captureView != null && captureView.hasPointerCapture()) {
+            try {
+                captureView.releasePointerCapture();
+            } catch (Throwable ignored) {
             }
         }
-        if (deactivateMouse && hardwareMouseActive) {
-            hardwareMouseActive = false;
-            nativeHardwareMouseDetected(false);
+        if (deactivateMouse) {
+            lastUncapturedMouseX = Float.NaN;
+            lastUncapturedMouseY = Float.NaN;
+            if (hardwareMouseActive) {
+                hardwareMouseActive = false;
+                nativeHardwareMouseDetected(false);
+            }
         }
     }
 
@@ -334,6 +353,13 @@ public class RustudioActivity extends NativeActivity {
         imeView.setFocusableInTouchMode(false);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(1, 1);
         addContentView(imeView, lp);
+        captureView = new View(this);
+        captureView.setBackgroundColor(0);
+        captureView.setFocusable(true);
+        captureView.setFocusableInTouchMode(true);
+        captureView.setClickable(false);
+        addContentView(captureView, new FrameLayout.LayoutParams(1, 1));
+        installCapturedPointerListenerIfNeeded(captureView);
     }
 
     @Override
@@ -890,9 +916,13 @@ public class RustudioActivity extends NativeActivity {
     public boolean dispatchGenericMotionEvent(MotionEvent ev) {
         if (isHardwareMouseEvent(ev)) {
             activateHardwareMouseCapture();
-            if (Build.VERSION.SDK_INT >= 26) {
-                return true;
+            boolean captured = Build.VERSION.SDK_INT >= 26
+                    && captureView != null
+                    && captureView.hasPointerCapture();
+            if (!captured) {
+                forwardUncapturedMouseEvent(ev);
             }
+            return true;
         }
         return super.dispatchGenericMotionEvent(ev);
     }
@@ -901,9 +931,13 @@ public class RustudioActivity extends NativeActivity {
     public boolean dispatchTouchEvent(MotionEvent ev) {
         if (isHardwareMouseEvent(ev)) {
             activateHardwareMouseCapture();
-            if (Build.VERSION.SDK_INT >= 26) {
-                return true;
+            boolean captured = Build.VERSION.SDK_INT >= 26
+                    && captureView != null
+                    && captureView.hasPointerCapture();
+            if (!captured) {
+                forwardUncapturedMouseEvent(ev);
             }
+            return true;
         } else if (isRealFingerTouchEvent(ev)) {
             releaseHardwareMouseCapture(true);
         }
@@ -991,7 +1025,9 @@ public class RustudioActivity extends NativeActivity {
                 if (imm == null) {
                     return;
                 }
+                imeOpen = open;
                 if (open) {
+                    releaseHardwareMouseCapture(false);
                     imeView.resetComposing();
                     imeView.setFocusable(true);
                     imeView.setFocusableInTouchMode(true);
@@ -1006,6 +1042,9 @@ public class RustudioActivity extends NativeActivity {
                     imeView.setFocusableInTouchMode(false);
                     imm.hideSoftInputFromWindow(imeView.getWindowToken(), 0);
                     applyDarkFullscreenWindow();
+                    if (hardwareMouseActive) {
+                        activateHardwareMouseCapture();
+                    }
                 }
             }
         });
