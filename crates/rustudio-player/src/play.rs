@@ -3530,7 +3530,7 @@ impl Game {
         let keyboard = PlayKeyboard::read(ctx, self.gui.focus.is_some(), no_ui, shift);
         if self.play_thread.is_some() {
             self.threaded_step(keyboard, dt, host);
-        } else {
+        } else if !self.play.as_ref().is_some_and(|s| s.presentation.is_some()) {
             self.step_play(dt, host, &keyboard, false);
         }
     }
@@ -3551,7 +3551,7 @@ impl Game {
         };
         if self.play_thread.is_some() {
             self.threaded_step(keyboard, dt, host);
-        } else {
+        } else if !self.play.as_ref().is_some_and(|s| s.presentation.is_some()) {
             self.step_play(dt, host, &keyboard, false);
         }
     }

@@ -190,13 +190,42 @@ pub fn studio_superclass(class: &str) -> Option<String> {
         .and_then(|c| c.superclass.as_ref().map(|s| s.to_string()))
 }
 
+/// Built-in Studio default ReflectionMetadata for standard DataModel services,
+/// used whenever `ReflectionMetadata.xml` has not finished downloading yet.
+pub fn builtin_service_meta(class: &str) -> Option<Meta> {
+    let (order, vis) = match class {
+        "Workspace" => (Some(5), None),
+        "Players" => (Some(20), None),
+        "Lighting" => (Some(30), None),
+        "MaterialService" => (Some(30), None),
+        "ReplicatedFirst" => (Some(30), None),
+        "ReplicatedStorage" => (Some(30), None),
+        "ServerScriptService" => (Some(30), None),
+        "ServerStorage" => (Some(30), None),
+        "StarterGui" => (Some(30), None),
+        "StarterPack" => (Some(30), None),
+        "StarterPlayer" => (Some(30), None),
+        "Teams" => (Some(140), None),
+        "SoundService" => (Some(500), None),
+        "TextChatService" => (Some(511), None),
+        "Chat" => (Some(510), Some(2)),
+        "VoiceChatService" => (Some(520), Some(2)),
+        "LocalizationService" => (Some(530), Some(2)),
+        "TestService" => (Some(1000), Some(2)),
+        "VRService" => (Some(1000), Some(2)),
+        "Packages" => (None, Some(1)),
+        _ => return None,
+    };
+    Some(Meta {
+        explorer_order: order,
+        service_visibility: vis,
+    })
+}
+
 /// The DataModel children Studio's Explorer lists (any order).
 pub fn listed_root_children(doc: &Document, prefs: Prefs) -> Vec<Ref> {
     let lists = PlaceLists::of(doc);
     let root = doc.dom.root();
-    // Without Studio's ReflectionMetadata (content not installed yet, or
-    // RUSTUDIO_NO_STUDIO_FETCH) step 4 would hide every service: list all but
-    // the ones Studio forces off, plus StudioService.
     let have_meta = !crate::studio_panels::class_meta().is_empty();
     root.children()
         .iter()
@@ -205,9 +234,7 @@ pub fn listed_root_children(doc: &Document, prefs: Prefs) -> Vec<Ref> {
             if have_meta {
                 return visible(i.class.as_str(), !i.children().is_empty(), &lists, prefs, &studio_meta, &studio_superclass);
             }
-            let c = i.class.as_str();
-            visible(c, !i.children().is_empty(), &lists, prefs, &|_| Some(Meta { explorer_order: Some(0), service_visibility: None }), &|_| None)
-                && (prefs.show_hidden || c != "StudioService")
+            visible(i.class.as_str(), !i.children().is_empty(), &lists, prefs, &builtin_service_meta, &studio_superclass)
         })
         .map(|i| i.referent())
         .collect()

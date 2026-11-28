@@ -4,7 +4,6 @@
 //! copied out of the APK into the app's files folder once per APK version,
 //! and `paths::resource` looks there.
 
-use std::io::Read;
 use std::path::Path;
 
 use super::AndroidApp;
@@ -31,10 +30,23 @@ pub fn unpack(app: &AndroidApp) -> Result<(), String> {
     for name in FILES {
         let cname = std::ffi::CString::new(*name).map_err(|e| e.to_string())?;
         let mut asset = manager.open(&cname).ok_or_else(|| format!("assets/{name} is not in the APK"))?;
-        let mut bytes = Vec::with_capacity(asset.length());
-        asset.read_to_end(&mut bytes).map_err(|e| format!("assets/{name}: {e}"))?;
-        write_atomically(&dir.join(name), &bytes)?;
-        log::info!("assets: unpacked {name} ({} bytes)", bytes.len());
+        let expected = asset.length() as u64;
+        let dest = dir.join(name);
+        let tmp = dest.with_extension("part");
+        let written = {
+            let f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            let mut w = std::io::BufWriter::with_capacity(64 * 1024, f);
+            let n = std::io::copy(&mut asset, &mut w).map_err(|e| format!("assets/{name}: {e}"))?;
+            let f = w.into_inner().map_err(|e| format!("{}: {e}", tmp.display()))?;
+            let _ = f.sync_all();
+            n
+        };
+        if written < 1_048_576 || (expected > 0 && written != expected) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("assets/{name}: short unpack ({written} bytes, expected {expected})"));
+        }
+        std::fs::rename(&tmp, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        log::info!("assets: unpacked {name} ({written} bytes)");
     }
     write_atomically(&stamp, version.as_bytes())
 }

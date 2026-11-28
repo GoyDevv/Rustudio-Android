@@ -288,7 +288,7 @@ impl Editor {
                     }
                     _ => "Open a Team Create place to see its live collaborators".into(),
                 };
-                if top_icon(ui, "users-group", theme::TEXT, false).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
+                if top_icon(ui, "users-group", theme::TEXT, true).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
                 top_icon(ui, "share", theme::TEXT, false).on_hover_text("Share: not in rustudio yet");
                 if ui.button("Collaborate").clicked() {self.cloud.live_collaborators_open=true;}
                 // (right to left: the MCP button sits left of Collaborate)

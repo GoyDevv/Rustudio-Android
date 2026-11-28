@@ -1146,8 +1146,13 @@ impl Game {
     pub(super) fn show_worker_side(&mut self, side: Side, host: &mut dyn GameHost) {
         let Some(mut threaded) = self.play_thread.take() else { return };
         threaded.queue_edits(EditorEdits::take(self));
-        if !matches!(threaded.receive(self, host, true), Receive::Available) {
-            return;
+        match threaded.receive(self, host, true) {
+            Receive::Available => {}
+            Receive::Pending => {
+                self.play_thread = Some(threaded);
+                return;
+            }
+            Receive::Stopped => return,
         }
         let edits = threaded.queued_edits.take().expect("edits scanned before side change");
         let mut source = threaded.source.take().expect("last snapshot was applied");
@@ -1162,8 +1167,11 @@ impl Game {
             return;
         };
         threaded.pending = Some(reply);
-        if matches!(threaded.receive(self, host, true), Receive::Available) {
-            self.play_thread = Some(threaded);
+        match threaded.receive(self, host, true) {
+            Receive::Available | Receive::Pending => {
+                self.play_thread = Some(threaded);
+            }
+            Receive::Stopped => {}
         }
     }
 

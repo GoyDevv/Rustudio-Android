@@ -150,7 +150,12 @@ pub fn spawn_background_install_if_missing() {
         let need_vs = !has_view_selector(&root);
         let need_lp = !has_lua_package_assets(&root);
         let need_ui = !has_studio_ui_textures(&root);
-        if root == install_dir() && (need_vs || need_lp || need_ui || !packages.is_empty()) {
+        let missing_single: Vec<(&'static str, &'static str)> = SINGLE_FILES
+            .iter()
+            .copied()
+            .filter(|(_, f)| !root.join(f).is_file())
+            .collect();
+        if root == install_dir() && (need_vs || need_lp || need_ui || !packages.is_empty() || !missing_single.is_empty()) {
             if let Some(marker) = std::fs::read_to_string(root.join(MARKER)).ok() {
                 if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
                     let version = version.to_owned();
@@ -183,6 +188,11 @@ pub fn spawn_background_install_if_missing() {
                         if need_ui {
                             if let Err(e) = install_studio_ui_textures(&a, &version, &root) {
                                 post(true, format!("Couldn't download Studio's UI textures: {e}"));
+                            }
+                        }
+                        for (zip, file) in missing_single {
+                            if let Ok(bytes) = fetch_one(&a, &version, zip, file) {
+                                let _ = write_file(&root.join(file), &bytes);
                             }
                         }
                     });

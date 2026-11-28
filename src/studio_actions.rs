@@ -74,7 +74,7 @@ impl Editor {
         let edit = !playing;
         let open = |n: &str| Some(self.ui.panels_open.contains(n));
         match a {
-            "new" | "open" | "open_roblox" | "open_folder" | "close_place" | "import_model" => (edit, None),
+            "new" | "open" | "open_roblox" | "open_folder" | "close_place" | "import_model" | "import_animation" | "import_image" | "import_audio" | "import_script" => (edit, None),
             "import_3d" => {
                 if self.builtin_tools.plugins_enabled {
                     let (en, ck) = self.builtin_button_state("AssetImporter", Some("Mesh Importer"), Some("Import"));
@@ -112,6 +112,7 @@ impl Editor {
                 }
             }
             "asset_manager" => (true, open("Asset Manager")),
+            "file_sync" => (true, open("File Sync")),
             "microprofiler" => (true, open("MicroProfiler")),
             a if a.starts_with("toolbox:") => (
                 self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox),
@@ -1098,7 +1099,7 @@ impl Editor {
         let d = crate::file_dialog::Request::new()
             .add_filter("Roblox model", &["rbxmx", "rbxm"])
             .set_directory(&self.plugin_store.store.plugins_dir)
-            .set_file_name(&default.file_name().unwrap().to_string_lossy());
+            .set_file_name(default.file_name().map(|n| n.to_string_lossy()).as_deref().unwrap_or("Plugin.rbxm"));
         self.dialogs.start(Purpose::SaveLocalPlugin(self.game.doc.selection.clone()), d, Kind::SaveFile);
     }
 

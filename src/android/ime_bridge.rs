@@ -303,6 +303,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
             }
             ImeOp::HardwareKey { code, meta, down, repeat } => {
                 let modifiers = map_android_modifiers(meta);
+                raw.modifiers = modifiers;
                 if let Some(key) = map_android_keycode(code) {
                     if down && !repeat && modifiers.command && !modifiers.shift && !modifiers.alt {
                         match key {

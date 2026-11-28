@@ -610,12 +610,16 @@ impl Editor {
         let can_collide = sel
             .iter()
             .all(|r| !matches!(self.game.doc.prop(*r, "CanCollide"), Some(Variant::Bool(false))));
-        let mut cats = self
-            .props
-            .cache
-            .entry((class.clone(), can_collide))
-            .or_insert_with(|| crate::props_layout::rows(&class, can_collide))
-            .clone();
+        let api_ready = rustudio_core::api::get().is_some();
+        let mut cats = if api_ready {
+            self.props
+                .cache
+                .entry((class.clone(), can_collide))
+                .or_insert_with(|| crate::props_layout::rows(&class, can_collide))
+                .clone()
+        } else {
+            crate::props_layout::rows(&class, can_collide)
+        };
         if sel.len() > 1 {
             let mut seen_classes: HashSet<String> = HashSet::new();
             seen_classes.insert(class.clone());

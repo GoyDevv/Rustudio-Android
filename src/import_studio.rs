@@ -201,7 +201,8 @@ fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<Simpl
         let base = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize
             + acc.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let stride = bv.get("byteStride").and_then(|v| v.as_u64()).unwrap_or((comps * 4) as u64) as usize;
-        let mut out = Vec::with_capacity(count * comps);
+        let max_items = bin.len().saturating_sub(base) / (comps * 4).max(1);
+    let mut out = Vec::with_capacity(count.min(max_items).saturating_mul(comps));
         for i in 0..count {
             let start = base + i * stride;
             if start + comps * 4 > bin.len() {

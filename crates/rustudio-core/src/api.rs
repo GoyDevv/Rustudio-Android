@@ -75,13 +75,32 @@ fn dump_path() -> std::path::PathBuf {
 /// called before Android finishes unpacking `assets/api-dump.json`.
 pub fn get() -> Option<&'static Api> {
     static API: OnceLock<Api> = OnceLock::new();
+    static INIT_LOCK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     if let Some(api) = API.get() {
         return Some(api);
     }
+    let mut last_fail = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(api) = API.get() {
+        return Some(api);
+    }
+    if last_fail.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)) {
+        return None;
+    }
     let path = dump_path();
-    let file = std::fs::File::open(&path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let parsed = parse_reader(reader)?;
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("api: failed to open {}: {e}", path.display());
+            *last_fail = Some(std::time::Instant::now());
+            return None;
+        }
+    };
+    let reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let Some(parsed) = parse_reader(reader) else {
+        log::error!("api: failed to parse {}", path.display());
+        *last_fail = Some(std::time::Instant::now());
+        return None;
+    };
     let _ = API.set(parsed);
     API.get()
 }

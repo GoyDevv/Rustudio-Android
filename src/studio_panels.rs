@@ -31,50 +31,69 @@ pub struct ClassMeta {
     pub service_visibility: Option<i32>,
 }
 
-/// Studio's ReflectionMetadata.xml, by class (empty when not found).
+/// Studio's ReflectionMetadata.xml, by class (empty until downloaded; never permanently latches empty).
 pub fn class_meta() -> &'static HashMap<String, ClassMeta> {
     static M: OnceLock<HashMap<String, ClassMeta>> = OnceLock::new();
-    M.get_or_init(|| {
-        let mut out = HashMap::new();
-        let Some(dir) = rustudio_core::default_scripts::studio_dir() else {
-            return out;
-        };
-        let Ok(text) = std::fs::read_to_string(dir.join("ReflectionMetadata.xml")) else {
-            return out;
-        };
-        let field = |chunk: &str, name: &str| -> Option<String> {
-            let key = format!("<string name=\"{name}\">");
-            let i = chunk.find(&key)? + key.len();
-            let j = chunk[i..].find("</string>")? + i;
-            Some(chunk[i..j].to_string())
-        };
-        let field_tok = |chunk: &str, name: &str| -> Option<String> {
-            let key = format!("<token name=\"{name}\">");
-            let i = chunk.find(&key)? + key.len();
-            let j = chunk[i..].find("</token>")? + i;
-            Some(chunk[i..j].to_string())
-        };
-        for chunk in text.split("<Item class=\"ReflectionMetadataClass\"").skip(1) {
-            let head = chunk.split("</Properties>").next().unwrap_or("");
-            let Some(name) = field(head, "Name") else {
-                continue;
+    static EMPTY: OnceLock<HashMap<String, ClassMeta>> = OnceLock::new();
+    static LAST_TRY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if let Some(m) = M.get() {
+        return m;
+    }
+    let mut guard = LAST_TRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = M.get() {
+        return m;
+    }
+    if guard.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2)) {
+        return EMPTY.get_or_init(HashMap::new);
+    }
+    *guard = Some(std::time::Instant::now());
+    let mut out = HashMap::new();
+    if let Some(dir) = rustudio_core::default_scripts::studio_dir() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("ReflectionMetadata.xml")) {
+            let field = |chunk: &str, name: &str| -> Option<String> {
+                let key = format!("<string name=\"{name}\">");
+                let i = chunk.find(&key)? + key.len();
+                let j = chunk[i..].find("</string>")? + i;
+                Some(chunk[i..j].to_string())
             };
-            out.insert(
-                name,
-                ClassMeta {
-                    category: field(head, "ClassCategory").unwrap_or_default(),
-                    explorer_order: field(head, "ExplorerOrder").and_then(|v| v.trim().parse().ok()),
-                    service_visibility: field_tok(head, "ServiceVisibility").and_then(|v| v.trim().parse().ok()),
-                },
-            );
+            let field_tok = |chunk: &str, name: &str| -> Option<String> {
+                let key = format!("<token name=\"{name}\">");
+                let i = chunk.find(&key)? + key.len();
+                let j = chunk[i..].find("</token>")? + i;
+                Some(chunk[i..j].to_string())
+            };
+            for chunk in text.split("<Item class=\"ReflectionMetadataClass\"").skip(1) {
+                let head = chunk.split("</Properties>").next().unwrap_or("");
+                let Some(name) = field(head, "Name") else {
+                    continue;
+                };
+                out.insert(
+                    name,
+                    ClassMeta {
+                        category: field(head, "ClassCategory").unwrap_or_default(),
+                        explorer_order: field(head, "ExplorerOrder").and_then(|v| v.trim().parse().ok()),
+                        service_visibility: field_tok(head, "ServiceVisibility").and_then(|v| v.trim().parse().ok()),
+                    },
+                );
+            }
         }
-        out
-    })
+    }
+    if !out.is_empty() {
+        let _ = M.set(out);
+        if let Some(m) = M.get() {
+            return m;
+        }
+    }
+    EMPTY.get_or_init(HashMap::new)
 }
 
 /// Studio's Explorer order for a class (lower first; classes without one last).
 pub fn explorer_order(class: &str) -> i32 {
-    class_meta().get(class).and_then(|m| m.explorer_order).unwrap_or(i32::MAX)
+    class_meta()
+        .get(class)
+        .and_then(|m| m.explorer_order)
+        .or_else(|| crate::service_visibility::builtin_service_meta(class).and_then(|m| m.explorer_order))
+        .unwrap_or(i32::MAX)
 }
 
 /// Per-member ReflectionMetadata: (PropertyOrder, Browsable), by (class, member).

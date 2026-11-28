@@ -308,6 +308,7 @@ public class RustudioActivity extends NativeActivity {
 
     @Override
     protected void onPause() {
+        activeShortcutKeys.clear();
         if (imeView != null) {
             imeView.resetComposing();
         }
@@ -802,6 +803,20 @@ public class RustudioActivity extends NativeActivity {
             return false;
         }
         if (event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()) {
+            return true;
+        }
+        if (event.isShiftPressed() && (
+                code == KeyEvent.KEYCODE_DPAD_LEFT
+                || code == KeyEvent.KEYCODE_DPAD_RIGHT
+                || code == KeyEvent.KEYCODE_DPAD_UP
+                || code == KeyEvent.KEYCODE_DPAD_DOWN
+                || code == KeyEvent.KEYCODE_MOVE_HOME
+                || code == KeyEvent.KEYCODE_MOVE_END
+                || code == KeyEvent.KEYCODE_TAB
+                || code == KeyEvent.KEYCODE_ENTER
+                || code == KeyEvent.KEYCODE_NUMPAD_ENTER
+                || code == KeyEvent.KEYCODE_DEL
+                || code == KeyEvent.KEYCODE_FORWARD_DEL)) {
             return true;
         }
         return (code >= KeyEvent.KEYCODE_F1 && code <= KeyEvent.KEYCODE_F12)

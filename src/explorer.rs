@@ -44,7 +44,7 @@ pub struct ExplorerState {
     drag_hover: Option<(Ref, Instant)>,
     /// Flattened rows and what they were built from (doc id, tree revision,
     /// expanded-set fingerprint, filter).
-    rows_cache: Option<((u64, u64, u64, String), std::rc::Rc<Vec<(Ref, usize)>>)>,
+    rows_cache: Option<((u64, u64, u64, u8, String), std::rc::Rc<Vec<(Ref, usize)>>)>,
     /// While searching: ancestors of a match, drawn open (caret down).
     forced_open: HashSet<Ref>,
     /// The search text last frame (clearing it reveals the selection).
@@ -480,10 +480,16 @@ impl Editor {
             self.explorer.last_filter = self.explorer.filter.clone();
         }
         ui.add_space(2.0);
+        let vis_prefs = crate::service_visibility::Prefs::current();
+        let vis_bits: u8 = (u8::from(!crate::studio_panels::class_meta().is_empty()))
+            | (u8::from(vis_prefs.show_hidden) << 1)
+            | (u8::from(vis_prefs.show_core_gui) << 2)
+            | (u8::from(vis_prefs.show_plugin_gui) << 3);
         let key = (
             self.game.doc.id,
             self.game.doc.tree_revision,
             expanded_key(&self.explorer),
+            vis_bits,
             self.explorer.filter.clone(),
         );
         let rows = match &self.explorer.rows_cache {

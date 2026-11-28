@@ -654,7 +654,7 @@ impl Dialog {
 
     fn matches_opt(&self, o: &rustudio_core::rustudio_settings::Opt) -> bool {
         let q = self.search.trim().to_lowercase();
-        q.is_empty() || (o.key == "resolution" && "quality preset".contains(&q)) || o.cat.to_lowercase().contains(&q) || o.label.to_lowercase().contains(&q) || RUSTUDIO_PAGE_NAME.contains(&q)
+        q.is_empty() || o.cat.to_lowercase().contains(&q) || o.label.to_lowercase().contains(&q) || RUSTUDIO_PAGE_NAME.contains(&q)
     }
 
     pub fn ui(&mut self, ctx: &egui::Context) {
@@ -1043,48 +1043,6 @@ impl Dialog {
                         self.collapsed.remove(&(self.page, cat));
                     }
                 }
-            }
-            if o.key == "resolution" && !self.collapsed.contains(&(self.page, o.cat)) {
-                // Each row lists its Low, Medium, and High values. Frame pacing is independent.
-                let qualities = [
-                    ("resolution", ["50", "75", "100"]),
-                    ("detail", ["low", "medium", "high"]),
-                    ("ssao", ["off", "on", "on"]),
-                    ("shadows", ["reduced", "reduced", "full"]),
-                    ("grass", ["reduced", "reduced", "full"]),
-                    ("bloom", ["off", "on", "on"]),
-                    ("idle", ["pause", "animate", "animate"]),
-                ];
-                let labels = ["Low", "Medium", "High"];
-                let qval = rs::quality_preset();
-                let selected = (qval == "custom").then(|| (0..labels.len()).find(|&level| qualities.iter().all(|(key, values)| {
-                    let OptKind::Choice(items) = rs::opt(key).kind else { return false };
-                    items[rs::performance_choice(key)].0 == values[level]
-                }))).flatten().or_else(|| match qval {
-                    "low" => Some(0),
-                    "medium" => Some(1),
-                    "high" => Some(2),
-                    _ => None,
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Quick preset");
-                    egui::ComboBox::from_id_salt("performance_quality_preset")
-                        .selected_text(if qval == "automatic" { "Automatic" } else { selected.map_or("Custom", |level| labels[level]) })
-                        .show_ui(ui, |ui| {
-                            for (level, label) in labels.iter().enumerate() {
-                                if ui.selectable_label(selected == Some(level), *label).clicked() {
-                                    rs::set_quality_preset("custom");
-                                    for (key, values) in qualities {
-                                        let option = rs::opt(key);
-                                        if rs::overridden_by(option).is_some() { continue; }
-                                        if let OptKind::Choice(items) = option.kind {
-                                            rs::set_choice(key, values[level], items[0].0);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                });
             }
             if self.collapsed.contains(&(self.page, o.cat)) {
                 continue;
