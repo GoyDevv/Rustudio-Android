@@ -674,8 +674,7 @@ pub fn autocomplete_context(src: &str, cursor: usize) -> Option<AcContext> {
     }
     // Skip autocomplete inside `--` line comments.
     let mut line_start = cursor;
-    while line_start > 0 && chars[line_start - 1] != '
-' {
+    while line_start > 0 && chars[line_start - 1] != '\n' {
         line_start -= 1;
     }
     let mut in_str: Option<char> = None;
@@ -683,7 +682,7 @@ pub fn autocomplete_context(src: &str, cursor: usize) -> Option<AcContext> {
     while i < cursor {
         let ch = chars[i];
         if let Some(q) = in_str {
-            if ch == '\' {
+            if ch == '\\' {
                 i += 2;
                 continue;
             }
