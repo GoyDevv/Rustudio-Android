@@ -3840,7 +3840,7 @@ impl Game {
                 return false;
             };
             let Some(w) = s.server.as_mut().and_then(|server| server.world.as_mut()) else {
-                log::warn!("step_play: server world unavailable; skipping physics step");
+                eprintln!("step_play: server world unavailable; skipping physics step");
                 drop(sc);
                 return false;
             };
