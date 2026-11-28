@@ -122,7 +122,7 @@ pub fn remap_bone_name(raw: &str, rig: RigKind) -> Option<&'static str> {
 }
 
 fn cframe_from_pos_quat(pos: Vec3, q: Quat) -> CFrame {
-    let m = Mat3::from_quat(q.try_normalize().unwrap_or(Quat::IDENTITY));
+    let m = Mat3::from_quat(if q.length_squared() > 1e-12 { q.normalize() } else { Quat::IDENTITY });
     let cols = m.to_cols_array();
     // glam Mat3 is column-major: [x0, x1, x2, y0, y1, y2, z0, z1, z2]
     let rot = Matrix3::new(
