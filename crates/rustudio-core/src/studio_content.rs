@@ -210,8 +210,9 @@ pub fn spawn_background_install_if_missing() {
                             }
                         }
                         for (zip, file) in missing_single {
-                            if let Ok(bytes) = fetch_one(&a, &version, zip, file) {
-                                let _ = write_file(&root.join(file), &bytes);
+                            let url = format!("{CDN}/{version}-{zip}");
+                            if let Ok(bytes) = fetch_one(&a, &url, file) {
+                                let _ = write_file(&root, file, &bytes);
                             }
                         }
                     });
