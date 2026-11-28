@@ -1010,7 +1010,6 @@ fn choice_default_for(key: &str, _weak: bool, android: bool) -> Option<&'static 
     match key {
         "quality" => Some("custom"),
         "present" => Some(if android { "novsync" } else { "mailbox" }),
-        "idle" if android => Some("pause"),
         _ => None,
     }
 }
@@ -1400,15 +1399,9 @@ mod tests {
                 choice_default_for("present", weak, android),
                 Some(if android { "novsync" } else { "mailbox" })
             );
-            assert_eq!(
-                choice_default_for("idle", weak, android),
-                if android { Some("pause") } else { None }
-            );
-            assert_eq!(choice_default_for("ssao", weak, android), None);
-            assert_eq!(choice_default_for("fps", weak, android), None);
         }
         // Every default is one of its row's choices.
-        for key in ["quality", "resolution", "view_distance", "aa", "texture_quality", "present", "idle", "ssao", "fps"] {
+        for key in ["quality", "resolution", "view_distance", "aa", "texture_quality", "present"] {
             let OptKind::Choice(items) = opt(key).kind else { panic!("{key} is a choice") };
             for (weak, android) in [(false, false), (true, false), (false, true), (true, true)] {
                 if let Some(d) = choice_default_for(key, weak, android) {

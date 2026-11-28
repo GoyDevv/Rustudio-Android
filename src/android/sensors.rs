@@ -11,7 +11,8 @@
 
 use std::ffi::{c_int, c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use ndk_sys as ffi;
 
@@ -57,8 +58,6 @@ struct Shared {
     want_gyro: AtomicBool,
     /// Bumped whenever the wanted set changes; the thread re-applies it.
     generation: AtomicU32,
-    wake_mu: Mutex<u32>,
-    wake_cv: Condvar,
     available: OnceLock<Available>,
 }
 
@@ -76,8 +75,6 @@ static SHARED: Shared = Shared {
     want_accel: AtomicBool::new(false),
     want_gyro: AtomicBool::new(false),
     generation: AtomicU32::new(0),
-    wake_mu: Mutex::new(0),
-    wake_cv: Condvar::new(),
     available: OnceLock::new(),
 };
 
@@ -132,10 +129,7 @@ pub fn set_enabled(accelerometer: bool, gyroscope: bool) {
     SHARED.want_accel.store(accelerometer, Ordering::Relaxed);
     SHARED.want_gyro.store(gyroscope, Ordering::Relaxed);
     if before != (accelerometer, gyroscope) {
-        let next = SHARED.generation.fetch_add(1, Ordering::Release).wrapping_add(1);
-        let mut guard = SHARED.wake_mu.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = next;
-        SHARED.wake_cv.notify_all();
+        SHARED.generation.fetch_add(1, Ordering::Release);
     }
     if (accelerometer || gyroscope) && THREAD.get().is_none() {
         THREAD.get_or_init(|| {
@@ -238,10 +232,7 @@ fn run() {
             log::info!("sensors: accelerometer {on_accel}, gyroscope {on_gyro}");
         }
         if !on_accel && !on_gyro {
-            let mut guard = SHARED.wake_mu.lock().unwrap_or_else(|e| e.into_inner());
-            while SHARED.generation.load(Ordering::Acquire) == applied {
-                guard = SHARED.wake_cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-            }
+            std::thread::sleep(Duration::from_millis(250));
             continue;
         }
         // SAFETY: a poll on this thread's looper; the out-pointers may be

@@ -6,7 +6,6 @@
 
 <p align="center">
   <a href="https://discord.gg/8EX6cpgsRx"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Join the rustudio Discord"></a>
-  <a href="https://discord.gg/3wAZfTq89t"><img src="https://img.shields.io/badge/Discord-PC%20VERSION-5865F2?logo=discord&logoColor=white" alt="Join the rustudio PC Version Discord"></a>
 </p>
 
 **A native Android Roblox Studio, written in Rust.** Open, edit and save
@@ -15,7 +14,7 @@ touch controls, and GUIs, directly on your Android device.
 
 > [!NOTE]
 > **Credits & Upstream Notice:**
-> - Full credit to **[rippelz](https://github.com/rippelz/rustudio)** for creating rustudio and maintaining the upstream PC edition!
+> - Full credit to **[rippelz](https://github.com/rippelz/rustudio)** and **[TouseefX](https://github.com/TouseefX/rustudio)** for their foundational work and development on rustudio!
 > - The **PC / desktop version** (Linux, Windows, macOS) is handled and maintained upstream by **[rippelz/rustudio](https://github.com/rippelz/rustudio)**. This repository focuses specifically on the Android port.
 
 Rustudio is very much a beta/prototype on Android, but provides a portable Roblox Studio experience in your pocket.
@@ -24,7 +23,7 @@ Rustudio is very much a beta/prototype on Android, but provides a portable Roblo
 
 ![Playing a test place in rustudio](docs/images/play.png)
 
-> Contributions are super welcome — **please read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing** so your PR follows our architecture, mobile rules, and test checklist. Come hang out, ask for help or report bugs on the [Discord](https://discord.gg/8EX6cpgsRx) (or the [PC Version Discord](https://discord.gg/3wAZfTq89t)).
+> Contributions are super welcome — **please read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing** so your PR follows our architecture, mobile rules, and test checklist. Come hang out, ask for help or report bugs on the [Discord](https://discord.gg/8EX6cpgsRx).
 
 ## Features
 
@@ -86,6 +85,7 @@ Everything works signed out. To open your cloud places or load private assets, s
 ## Credits & Acknowledgements
 
 - **[rippelz/rustudio](https://github.com/rippelz/rustudio)**: Creator of the original rustudio project, handling the PC/desktop edition.
+- **[TouseefX/rustudio](https://github.com/TouseefX/rustudio)**: Major developer and contributor to rustudio.
 - See [CREDITS.md](CREDITS.md) for full asset attributions, licenses, and vendored crate references.
 
 ## Contributing
@@ -100,10 +100,6 @@ Interested in contributing? **Please read [CONTRIBUTING.md](CONTRIBUTING.md) fir
 - [docs/MECHANICS.md](docs/MECHANICS.md): Every tuning number and where it comes from.
 - [docs/ENGINE-GAPS.md](docs/ENGINE-GAPS.md): Missing Luau engine API tracker.
 - [docs/TEAMCREATE.md](docs/TEAMCREATE.md): Team Create protocol and networking.
-
-## Roblox Terms of Use & Compliance Policy
-
-We strictly respect Roblox's Terms of Use and **do not tolerate** rule-breaking, unauthorized live-server Roblox clients, game ripping (`saveinstance`), or anti-cheat/DRM circumvention. This repository is strictly for legitimate local editing, local Play testing, and authorized Roblox Cloud / Team Create workflows. We do not support or associate with forks or contributors that violate Roblox's Terms of Use.
 
 ## Not affiliated with Roblox
 

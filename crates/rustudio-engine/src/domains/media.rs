@@ -399,7 +399,7 @@ fn media(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, Media>> {
 // ------------------------------------------------------------ decoded audio
 
 const PCM_CACHE_BUDGET: usize = if cfg!(target_os = "android") {
-    64 * 1024 * 1024
+    24 * 1024 * 1024
 } else {
     128 * 1024 * 1024
 };
@@ -492,32 +492,6 @@ pub fn clear_pcm_cache() {
     if let Ok(mut g) = PCM.lock() {
         if let Some(cache) = g.as_mut() {
             cache.clear();
-        }
-    }
-}
-
-/// Trims the decoded PCM cache down to half budget (or clears it on Android) on Play stop.
-pub fn trim_pcm_cache() {
-    if cfg!(target_os = "android") {
-        clear_pcm_cache();
-        return;
-    }
-    if let Ok(mut g) = PCM.lock() {
-        if let Some(cache) = g.as_mut() {
-            let target = PCM_CACHE_BUDGET / 2;
-            while cache.bytes > target {
-                let Some(oldest) = cache
-                    .map
-                    .iter()
-                    .min_by_key(|(_, e)| e.tick)
-                    .map(|(k, _)| k.clone())
-                else {
-                    break;
-                };
-                if let Some(removed) = cache.map.remove(&oldest) {
-                    cache.bytes = cache.bytes.saturating_sub(removed.bytes);
-                }
-            }
         }
     }
 }

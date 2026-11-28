@@ -6342,15 +6342,10 @@ impl Runtime {
                 if let Some(s) = b.start {
                     // Studio Settings > Debugger > Script Timeout Length
                     // (0 or less: no limit; the default without the store).
-                    let default_timeout = if cfg!(target_os = "android") {
-                        4.0
-                    } else {
-                        mech::SCRIPT_TIMEOUT_S as f64
-                    };
                     let limit = domains::settings_host::num(
                         "Studio",
                         "ScriptTimeoutLength",
-                        default_timeout,
+                        mech::SCRIPT_TIMEOUT_S as f64,
                     );
                     if limit > 0.0 && s.elapsed() > Duration::from_secs_f64(limit.min(1e9)) {
                         // Name the script and line that ran too long.

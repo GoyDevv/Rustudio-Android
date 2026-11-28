@@ -364,7 +364,6 @@ pub struct Editor {
     pub configs_window_open: bool,
     /// Per-place background auto-save and crash-recovery prompt state.
     pub autosave: crate::autosave::AutoSaveState,
-    pub import_3d_settings: crate::import_studio::Import3DSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -581,11 +580,7 @@ impl RustudioApp {
             project_export: None,
             project_settings: None,
             plugin_store: crate::plugin_store::manager::PluginManager::new(
-                crate::plugin_store::Store::open(
-                    crate::plugin_store::default_root(),
-                    crate::plugin_store::default_plugins_dir(),
-                    crate::plugin_store::current_user_id(),
-                ),
+                crate::plugin_store::Store::open(crate::plugin_store::default_root(), crate::plugin_store::default_plugins_dir(), 0),
                 Box::new(crate::plugin_store::runtime::HostBridge::default()),
             ),
             ui: crate::studio_ui::UiState::default(),
@@ -595,12 +590,7 @@ impl RustudioApp {
             beta_features_open: false,
             beta_features_changed: false,
             configs_window_open: false,
-            autosave: {
-                let mut a = crate::autosave::AutoSaveState::new();
-                a.check_untitled_recovery();
-                a
-            },
-            import_3d_settings: crate::import_studio::Import3DSettings::default(),
+            autosave: crate::autosave::AutoSaveState::new(),
         };
         ed.info(format!(
             "rustudio {} ready. Reflection database has {} classes.",
@@ -920,9 +910,6 @@ impl Editor {
     pub fn plugins_ui(&mut self, ctx: &egui::Context) {
         let client = self.game.account.shared_client();
         crate::plugin_store::ui::show(ctx, &mut self.plugin_store, client);
-        if std::mem::take(&mut self.plugin_store.ui.request_import_file) {
-            self.import_local_plugin();
-        }
         // Plugin menus (ShowAsync), Customize Shortcuts, bound plugin keys.
         self.plugin_popups(ctx);
         self.customize_shortcuts_window(ctx);
@@ -1175,12 +1162,8 @@ impl Editor {
     pub fn poll_file_dialogs(&mut self) {
         use crate::file_dialog::Purpose;
         if let Some((purpose, paths)) = self.dialogs.poll_multi() {
-            if !paths.is_empty() {
-                match purpose {
-                    Purpose::AssetManagerImport => self.asset_manager_import_files(paths),
-                    Purpose::ImportLocalPlugin => self.import_local_plugins_from(paths),
-                    _ => {}
-                }
+            if !paths.is_empty() && purpose == Purpose::AssetManagerImport {
+                self.asset_manager_import_files(paths);
             }
         }
         let Some((purpose, path)) = self.dialogs.poll() else {
@@ -1208,7 +1191,6 @@ impl Editor {
                 self.game.doc.selection = sel;
                 self.save_local_plugin_to(path);
             }
-            Purpose::ImportLocalPlugin => self.import_local_plugins_from(vec![path]),
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
             Purpose::FileSyncProject => self.file_sync.pick = path.display().to_string(),
             Purpose::ProjectParent => {
@@ -1218,22 +1200,7 @@ impl Editor {
             }
             Purpose::AssetManagerImport => self.asset_manager_import_files(vec![path]),
             Purpose::TemplateAdd | Purpose::TemplateThumb(_) | Purpose::TemplateReplace(_) => self.start_template_file(&purpose, path),
-            Purpose::Import3D => {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|s| s.to_ascii_lowercase())
-                    .unwrap_or_default();
-                if matches!(ext.as_str(), "rbxm" | "rbxmx" | "rbxl" | "rbxlx") {
-                    self.insert_model_file_into(path, None);
-                } else {
-                    self.import_3d_settings.pending_path = Some(path);
-                }
-            }
-            Purpose::ImportAnimation => self.import_animation_file(path),
-            Purpose::ImportImage => self.import_image_file(path),
-            Purpose::ImportAudio => self.import_audio_file(path),
-            Purpose::ImportScript => self.import_script_file(path),
+            Purpose::Import3D => self.import_3d_file(path),
             Purpose::ExportObj(sel) => {
                 let parts = crate::export_3d::collect_parts(&self.game.doc, &self.game.scene, &sel);
                 if parts.is_empty() {
@@ -1579,7 +1546,7 @@ impl Editor {
         self.dialogs.start(Purpose::ExportGltf(self.game.doc.selection.clone()), d, Kind::SaveFile);
     }
 
-    pub(crate) fn import_3d_file(&mut self, path: PathBuf) {
+    fn import_3d_file(&mut self, path: PathBuf) {
         use rbx_dom_weak::types::{CFrame, Color3, Color3uint8, Content, Matrix3, Variant, Vector3};
         use std::sync::atomic::{AtomicU64, Ordering};
         static IMPORT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1608,23 +1575,16 @@ impl Editor {
         // Spawn imported models right in front of the current camera and cleanly
         // above Y = 0 so small models are never buried inside the Baseplate or
         // placed off-screen.
-        let import_scale = self.import_3d_settings.scale.clamp(0.001, 100.0);
-        let import_anchored = self.import_3d_settings.anchored;
-        let import_pbr = self.import_3d_settings.import_pbr;
-        let insert_at_camera = self.import_3d_settings.insert_at_camera;
         let cam_pos = self.game.cam.pos;
         let cam_fwd = self.game.cam.forward();
         let placement_offset = |min_all: Vec3, max_all: Vec3| -> Vec3 {
-            if !insert_at_camera {
-                return Vec3::ZERO;
-            }
-            let extent = ((max_all - min_all) * import_scale).max(Vec3::splat(0.001));
+            let extent = (max_all - min_all).max(Vec3::splat(0.001));
             let radius = (extent.length() * 0.5).max(0.5);
             let dist = (radius * 3.0).clamp(6.0, 60.0);
             let target = cam_pos + cam_fwd * dist;
             let min_center_y = extent.y * 0.5 + 0.5;
             let target_center = Vec3::new(target.x, target.y.max(min_center_y), target.z);
-            target_center - ((min_all + max_all) * 0.5 * import_scale)
+            target_center - (min_all + max_all) * 0.5
         };
 
         match fmt {
@@ -1789,10 +1749,10 @@ impl Editor {
                             lo = lo.min(*pt);
                             hi = hi.max(*pt);
                         }
-                        let size = ((hi - lo) * import_scale).max(Vec3::splat(0.001));
+                        let size = (hi - lo).max(Vec3::splat(0.001));
                         let centre = (hi + lo) * 0.5;
-                        let pos = centre * import_scale + offset;
-                        let centered: Vec<Vec3> = m.positions.iter().map(|pt| (*pt - centre) * import_scale).collect();
+                        let pos = centre + offset;
+                        let centered: Vec<Vec3> = m.positions.iter().map(|pt| *pt - centre).collect();
                         let mesh_id = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}");
                         let v2 = crate::export_3d::mesh_data_to_v2_colored(
                             &centered,
@@ -1824,53 +1784,21 @@ impl Editor {
                                 CFrame::new(Vector3::new(pos.x, pos.y, pos.z), Matrix3::identity()),
                             )
                             .with_property("Color", color_u8)
-                            .with_property("Anchored", import_anchored);
+                            .with_property("Anchored", true);
                         if m.double_sided {
                             builder = builder.with_property("DoubleSided", Variant::Bool(true));
                         }
                         if m.alpha < 0.999 {
                             builder = builder.with_property("Transparency", (1.0 - m.alpha).clamp(0.0, 1.0));
                         }
-                        let mut color_tex_id: Option<String> = None;
                         if let Some(tex) = &m.texture {
                             let tex_id = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}.tex");
                             rustudio_core::assets::register_generated(&tex_id, tex.clone());
-                            color_tex_id = Some(tex_id.clone());
                             builder = builder
                                 .with_property("TextureID", Variant::ContentId(tex_id.clone().into()))
                                 .with_property("TextureContent", Variant::Content(Content::from_uri(tex_id)));
                         }
-                        let part_ref = self.game.doc.insert(target_parent, builder);
-                        if import_pbr && (m.normal_texture.is_some() || m.metallic_roughness_texture.is_some()) {
-                            let mut sa = InstanceBuilder::new("SurfaceAppearance").with_name("SurfaceAppearance");
-                            if let Some(cid) = &color_tex_id {
-                                sa = sa
-                                    .with_property("ColorMap", Variant::ContentId(cid.clone().into()))
-                                    .with_property("ColorMapContent", Variant::Content(Content::from_uri(cid.clone())));
-                            }
-                            if let Some(norm) = &m.normal_texture {
-                                let nid = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}.normal");
-                                rustudio_core::assets::register_generated(&nid, norm.clone());
-                                sa = sa
-                                    .with_property("NormalMap", Variant::ContentId(nid.clone().into()))
-                                    .with_property("NormalMapContent", Variant::Content(Content::from_uri(nid)));
-                            }
-                            if let Some(mr) = &m.metallic_roughness_texture {
-                                if let Some((rough_png, metal_png)) = crate::import_studio::split_gltf_metallic_roughness(mr) {
-                                    let rid = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}.rough");
-                                    let mid = format!("rbxtemp://rustudio/import/gltf/{seq}/{i}.metal");
-                                    rustudio_core::assets::register_generated(&rid, rough_png);
-                                    rustudio_core::assets::register_generated(&mid, metal_png);
-                                    sa = sa
-                                        .with_property("RoughnessMap", Variant::ContentId(rid.clone().into()))
-                                        .with_property("RoughnessMapContent", Variant::Content(Content::from_uri(rid)))
-                                        .with_property("MetalnessMap", Variant::ContentId(mid.clone().into()))
-                                        .with_property("MetalnessMapContent", Variant::Content(Content::from_uri(mid)));
-                                }
-                            }
-                            let _ = self.game.doc.insert(part_ref, sa);
-                        }
-                        inserted.push(part_ref);
+                        inserted.push(self.game.doc.insert(target_parent, builder));
                     }
                     rustudio_core::assets::bump_mesh_generation();
                     self.explorer.expanded.insert(parent);
@@ -3006,31 +2934,29 @@ impl Editor {
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new("Save As…").strong().color(egui::Color32::WHITE))
-                                            .fill(egui::Color32::from_rgb(0, 110, 230))
-                                            .min_size(egui::vec2(76.0, 28.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.save_as();
-                                }
-                                if ui
-                                    .add(egui::Button::new("Close anyway").min_size(egui::vec2(88.0, 28.0)))
-                                    .clicked()
-                                {
-                                    decided = Some(true);
-                                }
-                                if ui
-                                    .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
-                                    .clicked()
-                                {
-                                    decided = Some(false);
-                                }
-                            });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Save As…").strong().color(egui::Color32::WHITE))
+                                        .fill(egui::Color32::from_rgb(0, 110, 230))
+                                        .min_size(egui::vec2(76.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                self.save_as();
+                            }
+                            if ui
+                                .add(egui::Button::new("Close anyway").min_size(egui::vec2(88.0, 28.0)))
+                                .clicked()
+                            {
+                                decided = Some(true);
+                            }
+                            if ui
+                                .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                                .clicked()
+                            {
+                                decided = Some(false);
+                            }
                         });
                         return;
                     }
@@ -3044,32 +2970,30 @@ impl Editor {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Save first").strong().color(egui::Color32::WHITE))
-                                    .fill(egui::Color32::from_rgb(0, 110, 230))
-                                    .min_size(egui::vec2(76.0, 28.0)),
-                            )
-                            .clicked()
-                        {
-                            self.save();
-                            decided = Some(!self.game.doc.dirty());
-                        }
-                        if ui
-                            .add(egui::Button::new("Discard").min_size(egui::vec2(72.0, 28.0)))
-                            .clicked()
-                        {
-                            decided = Some(true);
-                        }
-                        if ui
-                            .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
-                            .clicked()
-                        {
-                            decided = Some(false);
-                        }
-                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Save first").strong().color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(0, 110, 230))
+                                .min_size(egui::vec2(76.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.save();
+                        decided = Some(!self.game.doc.dirty());
+                    }
+                    if ui
+                        .add(egui::Button::new("Discard").min_size(egui::vec2(72.0, 28.0)))
+                        .clicked()
+                    {
+                        decided = Some(true);
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 28.0)))
+                        .clicked()
+                    {
+                        decided = Some(false);
+                    }
                 });
             });
         if let Some(go) = decided {
@@ -3401,8 +3325,7 @@ impl RustudioApp {
                     } else {
                         let surface = self.dock.add_window(vec![tab]);
                         if let Some(w) = self.dock.get_window_state_mut(surface) {
-                            let size = egui::vec2(420.0, 320.0)
-                                .min((dock_rect.size() - egui::vec2(16.0, 16.0)).max(egui::vec2(260.0, 220.0)));
+                            let size = egui::vec2(420.0, 320.0);
                             w.set_position(dock_rect.center() - size * 0.5).set_size(size);
                         }
                     }
@@ -3486,11 +3409,7 @@ impl eframe::App for RustudioApp {
         }
         let is_start = self.ed.start.visible && self.ed.game.doc.id == self.ed.start.doc_id;
         if !is_start {
-            if let Some(saved_doc) = self.ed.game.play_saved_doc() {
-                self.ed.autosave.flush_sync(saved_doc, false);
-            } else {
-                self.ed.autosave.flush_sync(&self.ed.game.doc, self.ed.game.play.is_some());
-            }
+            self.ed.autosave.flush_sync(&self.ed.game.doc, self.ed.game.play.is_some());
         }
         if crate::android::lifecycle::is_backgrounded() {
             self.watchdog.hidden();
@@ -3584,8 +3503,8 @@ impl eframe::App for RustudioApp {
         }
         // eframe can run logic without a UI pass when the root is hidden.
         if ctx.input(|i| i.viewport().visible() == Some(false)) {
-            let mutated = Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, Instant::now());
-            Self::schedule_plugin_repaint(&self.ed, ctx, mutated);
+            Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, Instant::now());
+            Self::schedule_plugin_repaint(&self.ed, ctx);
         }
     }
 
@@ -3626,11 +3545,7 @@ impl eframe::App for RustudioApp {
     }
 }
 
-const PLUGIN_IDLE_INTERVAL: std::time::Duration = if cfg!(target_os = "android") {
-    std::time::Duration::from_millis(500)
-} else {
-    std::time::Duration::from_millis(100)
-};
+const PLUGIN_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Play's step while the window gets no redraws (Studio's 60 Hz).
 const HIDDEN_PLAY_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
 /// Team Create alone: often enough that edits keep arriving in order.
@@ -3708,17 +3623,9 @@ impl RustudioApp {
             PLUGIN_IDLE_INTERVAL
         };
         if now >= self.last_plugin_tick + interval {
-            let mutated = Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, now);
+            Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, now);
             self.ed.edit_audio_tick();
             self.plugins_ticked_between_frames = true;
-            if mutated {
-                if let Some(ctx) = self.egui_ctx.clone() {
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    if self.ed.live_session_open() {
-                        self.ed.cloud_poll(&ctx);
-                    }
-                }
-            }
         }
         let still_audio = self.ed.game.play.is_none() && self.ed.game.edit_audio.has_active();
         (!self.ed.place_loading() && (self.ed.plugins.needs_idle_tick() || still_audio))
@@ -3732,31 +3639,14 @@ impl RustudioApp {
             })
     }
 
-    fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) -> bool {
+    fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) {
         let _p = rustudio_core::bench::scope("plugin_tick");
         let dt = now.saturating_duration_since(std::mem::replace(last_tick, now)).as_secs_f32();
         let step = ed.game.fixed_dt.map_or_else(|| frame_grid(dt) as f64, f64::from);
-        let before = (
-            ed.game.doc.revision,
-            ed.game.doc.tree_revision,
-            ed.game.log.len(),
-            ed.plugins.ui_rev(),
-        );
         ed.plugin_tick(step);
-        let after = (
-            ed.game.doc.revision,
-            ed.game.doc.tree_revision,
-            ed.game.log.len(),
-            ed.plugins.ui_rev(),
-        );
-        after != before
     }
 
-    fn schedule_plugin_repaint(ed: &Editor, ctx: &egui::Context, mutated: bool) {
-        if mutated {
-            ctx.request_repaint();
-            return;
-        }
+    fn schedule_plugin_repaint(ed: &Editor, ctx: &egui::Context) {
         if !ed.place_loading() && ed.plugins.needs_idle_tick() {
             // When an interactive plugin widget like Roblox's AnimationClipEditor
             // is open, keep RunService.Heartbeat ticking smoothly at display refresh
@@ -3914,12 +3804,11 @@ impl RustudioApp {
         if !self.play_fills_screen() {
             let ed = &mut self.ed;
             if ctx.input(|i| i.viewport().visible() != Some(false)) {
-                let mut mutated = false;
                 if !std::mem::take(&mut self.plugins_ticked_between_frames) {
-                    mutated = Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
+                    Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
                     ed.edit_audio_tick();
                 }
-                Self::schedule_plugin_repaint(ed, &ctx, mutated);
+                Self::schedule_plugin_repaint(ed, &ctx);
             }
             self.watchdog.stage("plugins", "project and scene synchronization");
             ed.project_tick();
@@ -4072,7 +3961,6 @@ impl RustudioApp {
         // The Start Page replaces the editor's chrome until something opens.
         if ed.start_page_ui(ui) {
             ed.sync_orientation(false);
-            ed.autosave_recovery_modal(&ctx);
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
             ed.cloud_windows(&ctx);
@@ -4102,7 +3990,7 @@ impl RustudioApp {
             || ed.harness.run.bench.is_some()
             || ed.harness.ui_shots.is_some()
             || ed.harness.run.no_ui;
-        if !is_harness && !ctx.input(|i| i.pointer.any_down()) {
+        if !is_harness {
             ed.autosave.tick(&ed.game.doc, ed.game.play.is_some());
         }
         self.watchdog.stage("scene synchronization", "dock UI and GPU viewport preparation");
@@ -4311,8 +4199,7 @@ impl RustudioApp {
         self.ed.mobile_window_rects = self.mobile_windows.hit_rects();
         let mut drag_rects = self.mobile_windows.drag_handle_rects();
         let sep_rects = ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("egui_dock_separator_dragged_this_frame"), false);
-            d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging_this_frame"), false);
+            d.insert_temp(egui::Id::new("egui_dock_separator_dragged"), false);
             std::mem::take(d.get_temp_mut_or_default::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects")))
         });
         drag_rects.extend(sep_rects);
@@ -4364,10 +4251,6 @@ impl RustudioApp {
                     .show_inside(ui, &mut Viewer { ed: &mut self.ed, window: None, windows: &windows });
             });
         drop(_dock_scope);
-        ctx.data_mut(|d| {
-            let sep_now = d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged_this_frame")).unwrap_or(false);
-            d.insert_temp(egui::Id::new("egui_dock_separator_dragged"), sep_now);
-        });
         self.reset_document_tabs();
         self.panel_windows(&ctx, &windows, dock_rect);
         // Render touch-friendly in-viewport floating windows (draggable, resizable, click-to-collapse).
@@ -4412,10 +4295,6 @@ impl RustudioApp {
             let mut viewer = Viewer { ed: &mut self.ed, window: None, windows: &windows };
             self.mobile_windows.show(&ctx, dock_rect, modal_open, |ui, tab| viewer.ui(ui, tab))
         };
-        ctx.data_mut(|d| {
-            let dragging_now = d.get_temp::<bool>(egui::Id::new("rustudio_ui_layout_dragging_this_frame")).unwrap_or(false);
-            d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging"), dragging_now);
-        });
         for action in mobile_actions {
             match action {
                 crate::mobile_windows::MobileWindowAction::DockBack(tab) => {
@@ -4606,10 +4485,7 @@ impl RustudioApp {
         }
         let ed = &mut self.ed;
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
-        let pointer_down = ctx.input(|i| i.pointer.any_down());
-        if !pointer_down {
-            crate::panels::record_homes(&self.dock, &mut self.panels.homes);
-        }
+        crate::panels::record_homes(&self.dock, &mut self.panels.homes);
         self.ed.ui.popped = self.panels.popped.iter().map(|w| (w.key.clone(), w.tabs())).collect();
         // A script tab in front of the 3D view (plugin toolbar buttons
         // without ClickableWhenViewportHidden grey out: ui_ribbon.rs).
@@ -4621,10 +4497,8 @@ impl RustudioApp {
             .find_main_surface_tab(&Tab::Viewport)
             .and_then(|(n, _)| self.dock.main_surface()[n].tabs().map(|t| t.to_vec()))
             .unwrap_or_default();
-        if !pointer_down {
-            if let Some(s) = self.layout.as_mut() {
-                s.tick(&ctx, &self.dock, &self.panels, &self.mobile_windows, &self.ed);
-            }
+        if let Some(s) = self.layout.as_mut() {
+            s.tick(&ctx, &self.dock, &self.panels, &self.mobile_windows, &self.ed);
         }
         let ed = &mut self.ed;
         ed.insert_popup_ui(&ctx);
@@ -4644,7 +4518,6 @@ impl RustudioApp {
         ed.cloud_windows(&ctx);
         ed.asset_picker_ui(&ctx);
         ed.autosave_recovery_modal(&ctx);
-        ed.import_3d_settings_modal(&ctx);
         ed.mcp_windows(&ctx);
         ed.file_sync_popover_ui(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
@@ -4733,7 +4606,7 @@ impl RustudioApp {
             self.watchdog.complete();
             return;
         }
-        let needs_continuous = ed.drag.is_some()
+        if ed.drag.is_some()
             || ed.game.play.is_some()
             || ed.ui.anim.playing
             || (ed.game.play.is_none() && ed.game.edit_audio.has_active())
@@ -4747,8 +4620,8 @@ impl RustudioApp {
             || ed.harness.run.screenshot.is_some()
             || ed.harness.selftest.is_some()
             || ed.game.account.busy()
-            || ed.asset_picker.busy();
-        if needs_continuous {
+            || ed.asset_picker.busy()
+        {
             ctx.request_repaint();
         } else if ed.fps >= 0.5 {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));

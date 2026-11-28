@@ -45,12 +45,6 @@ pub struct Request {
 }
 
 /// Each frame's parts and how often they changed.
-impl Layers {
-    pub(super) fn drain_target_ids(&mut self) -> Vec<egui::TextureId> {
-        self.targets.drain().map(|(_, t)| t.id).collect()
-    }
-}
-
 #[derive(Default)]
 pub struct Layers {
     /// Item → the ViewportFrame it is drawn in.

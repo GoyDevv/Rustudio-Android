@@ -38,7 +38,7 @@ pub const TITLE_BAR_HEIGHT_TOUCH: f32 = 34.0;
 pub const TITLE_BAR_HEIGHT_DESKTOP: f32 = 28.0;
 /// Maximum pointer travel (in logical points) still treated as a title-bar tap
 /// rather than a drag gesture.
-pub const TITLE_TAP_SLOP: f32 = 5.0;
+pub const TITLE_TAP_SLOP: f32 = 10.0;
 /// Minimum width of a collapsed title strip.
 pub const COLLAPSED_MIN_WIDTH: f32 = 150.0;
 /// Maximum width of a collapsed title strip.
@@ -462,13 +462,7 @@ pub fn default_placement_for(
             );
             (pos, Vec2::new(w, h))
         }
-        "toolbox" => {
-            let w = (bounds.width() * 0.42).clamp(320.0, 440.0).min(w_avail);
-            let h = (h_avail * 0.72).clamp(260.0, 440.0).min(h_avail);
-            let pos = Pos2::new(bounds.min.x + PLACEMENT_MARGIN, bounds.min.y + PLACEMENT_MARGIN);
-            (pos, Vec2::new(w, h))
-        }
-        "terrain_editor" => {
+        "toolbox" | "terrain_editor" => {
             // Top-left, leaving vertical room for Output at bottom-left.
             let max_top_h = (h_avail - bottom_h - PLACEMENT_GAP).max(DEFAULT_MIN_SIZE[1].min(h_avail));
             let h = (h_avail * 0.56).clamp(180.0, 380.0).min(max_top_h).min(h_avail);
@@ -765,21 +759,7 @@ impl MobileWindowManager {
                     Pos2::new(r.max.x - edge_in, r.max.y - edge_in),
                     Pos2::new(r.max.x + edge_out, r.max.y + edge_out),
                 );
-                let right_edge = Rect::from_min_max(
-                    Pos2::new(r.max.x - edge_in, title_r.max.y),
-                    Pos2::new(r.max.x + edge_out, corner.min.y.max(title_r.max.y)),
-                );
-                let bottom_edge = Rect::from_min_max(
-                    Pos2::new(r.min.x, r.max.y - edge_in),
-                    Pos2::new(corner.min.x.max(r.min.x), r.max.y + edge_out),
-                );
                 out.push(corner);
-                if right_edge.is_positive() {
-                    out.push(right_edge);
-                }
-                if bottom_edge.is_positive() {
-                    out.push(bottom_edge);
-                }
             }
         }
         out
@@ -1121,9 +1101,6 @@ impl MobileWindowManager {
                     );
                     if title_resp.dragged() {
                         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                        ui.ctx().data_mut(|d| {
-                            d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging_this_frame"), true);
-                        });
                     } else if title_resp.hovered() {
                         ui.ctx().set_cursor_icon(CursorIcon::Grab);
                     }
@@ -1249,9 +1226,6 @@ impl MobileWindowManager {
                             ui.ctx().set_cursor_icon(CursorIcon::ResizeSouthEast);
                         }
                         if corner_resp.drag_started() || corner_resp.dragged() {
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging_this_frame"), true);
-                            });
                             to_focus = Some(win_id.clone());
                             self.windows[idx].resize_by(corner_resp.drag_delta(), bounds, title_h);
                             self.preferred_height.insert(win_id.clone(), self.windows[idx].size[1]);
@@ -1272,9 +1246,6 @@ impl MobileWindowManager {
                                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
                             }
                             if right_resp.drag_started() || right_resp.dragged() {
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging_this_frame"), true);
-                                });
                                 to_focus = Some(win_id.clone());
                                 self.windows[idx].resize_by(
                                     Vec2::new(right_resp.drag_delta().x, 0.0),
@@ -1299,9 +1270,6 @@ impl MobileWindowManager {
                                 ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
                             }
                             if bottom_resp.drag_started() || bottom_resp.dragged() {
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging_this_frame"), true);
-                                });
                                 to_focus = Some(win_id.clone());
                                 self.windows[idx].resize_by(
                                     Vec2::new(0.0, bottom_resp.drag_delta().y),
@@ -1626,7 +1594,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(input, |ui| {
-            let actions = mgr.show(ui.ctx(), bounds, false, |body_ui, tab| {
+            let actions = mgr.show(ui.ctx(), bounds, |body_ui, tab| {
                 rendered_tabs.push(*tab);
                 body_ui.label("panel body");
             });

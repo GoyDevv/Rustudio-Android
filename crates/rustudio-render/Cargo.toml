@@ -25,7 +25,7 @@ rbx_dom_weak = "4"
 rustc-hash = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
 # matpack's KTX2 / packed-map decoding, and grass_temporal's frame dumps.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tga"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 flate2 = "1"
 zstd = "0.13"
 # hsr's per-mesh content hash (the packed look's cache key).

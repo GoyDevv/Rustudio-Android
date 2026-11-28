@@ -2301,17 +2301,14 @@ impl Game {
             }
         } else if cfg!(target_os = "android") && self.is_playing() && scale >= 0.999 {
             let px = (size[0] as f32) * (size[1] as f32);
-            const MOBILE_MAX_PX: f32 = 1_250_000.0;
-            if px > MOBILE_MAX_PX {
-                scale = (MOBILE_MAX_PX / px).sqrt().clamp(0.55, 1.0);
+            const MOBILE_PLAY_MAX_PX: f32 = 1_250_000.0;
+            if px > MOBILE_PLAY_MAX_PX {
+                scale = (MOBILE_PLAY_MAX_PX / px).sqrt().clamp(0.55, 1.0);
             }
         }
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
-        let ui_layout_dragging = ctx.data(|d| {
-            d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged")).unwrap_or(false)
-                || d.get_temp::<bool>(egui::Id::new("rustudio_ui_layout_dragging")).unwrap_or(false)
-        });
-        if ui_layout_dragging && self.last_render_target[0] > 0 && self.last_render_target[1] > 0 {
+        let sep_dragged = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged")).unwrap_or(false));
+        if sep_dragged && self.last_render_target[0] > 0 && self.last_render_target[1] > 0 {
             size = self.last_render_target;
         }
         self.last_render_scale = scale;
@@ -2323,7 +2320,7 @@ impl Game {
         // Studio's scene environment probe (env_probe.rs): the PBR
         // technologies' 128 px indoor reflection cube.
         // Skip on PowerVR to avoid per-frame CPU raycasts + cubemap convolution passes.
-        let probe = (!cfg!(target_os = "android") && !is_powervr && quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+        let probe = (!is_powervr && quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
             let _p = rustudio_core::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
             let now = rustudio_core::sim_clock::since(started).as_secs_f64();
@@ -2335,20 +2332,9 @@ impl Game {
         let vp_render = rustudio_core::bench::scope("vp_render");
         let no_world_gui_or_fx = self.gui.world_batches.is_empty()
             && self.effects.drawn().is_none_or(|f| f.draws.is_empty());
-        // While dragging a dock separator or floating window in static Edit mode,
-        // reuse the last rendered 3D viewport texture instead of reallocating or
-        // re-rendering the entire 3D scene on every 1px drag frame.
-        let cached_drag_tex = if ui_layout_dragging && !self.is_playing() {
-            self.renderer.as_ref().and_then(|r| r.texture_id)
-        } else {
-            None
-        };
-        let tex = if let Some(cached) = cached_drag_tex {
-            Some(cached)
-        } else {
-            match (self.renderer.as_mut(), self.render_state.as_ref()) {
+        let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
-                r.defer_postfx = !no_world_gui_or_fx;
+                r.defer_postfx = !(r.caps().is_powervr() && no_world_gui_or_fx);
                 r.render(
                 rs,
                 size,
@@ -2375,7 +2361,6 @@ impl Game {
             )
             },
             _ => None,
-        }
         };
         drop(vp_render);
         if let Some(start) = quality_start {

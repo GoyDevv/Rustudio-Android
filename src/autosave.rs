@@ -137,16 +137,9 @@ pub fn write_recovery(key: &RecoveryKey, bytes: &[u8], meta: &RecoveryMeta) -> s
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_rbxl = key.tmp_rbxl_path(seq);
     let dst_rbxl = key.rbxl_path();
-    {
-        use std::io::Write;
-        let write_res = std::fs::File::create(&tmp_rbxl).and_then(|mut f| {
-            f.write_all(bytes)?;
-            f.sync_all()
-        });
-        if let Err(e) = write_res {
-            let _ = std::fs::remove_file(&tmp_rbxl);
-            return Err(e);
-        }
+    if let Err(e) = std::fs::write(&tmp_rbxl, bytes) {
+        let _ = std::fs::remove_file(&tmp_rbxl);
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp_rbxl, &dst_rbxl) {
         let _ = std::fs::remove_file(&tmp_rbxl);
@@ -210,7 +203,6 @@ pub fn find_recovery(key: &RecoveryKey) -> Option<(PathBuf, Option<RecoveryMeta>
 pub enum RecoveryTarget {
     Cloud(CloudOrigin),
     Local(PathBuf),
-    Untitled,
 }
 
 #[derive(Debug, Clone)]
@@ -277,7 +269,14 @@ impl AutoSaveState {
         }
 
         self.last_attempt = Instant::now();
-        let (dom, roots) = doc.save_snapshot();
+        let bytes = match doc.encode_all(false) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("autosave: encode failed: {e}");
+                return;
+            }
+        };
+
         let key = RecoveryKey::for_doc(doc);
         let meta = RecoveryMeta::for_doc(doc);
         self.last_saved_doc_id = doc.id;
@@ -288,16 +287,8 @@ impl AutoSaveState {
         let spawned = std::thread::Builder::new()
             .name("autosave".into())
             .spawn(move || {
-                let mut bytes = Vec::new();
-                match rbx_binary::to_writer(&mut bytes, &dom, &roots) {
-                    Ok(()) => {
-                        if let Err(e) = write_recovery(&key, &bytes, &meta) {
-                            log::warn!("autosave: write failed ({}): {e}", key.stem());
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("autosave: off-thread encode failed ({}): {e}", key.stem());
-                    }
+                if let Err(e) = write_recovery(&key, &bytes, &meta) {
+                    log::warn!("autosave: write failed ({}): {e}", key.stem());
                 }
                 in_flight.store(false, Ordering::Release);
             });
@@ -350,29 +341,6 @@ impl AutoSaveState {
                 title,
                 saved_unix_secs,
                 target: RecoveryTarget::Cloud(origin.clone()),
-            });
-        }
-    }
-
-    /// Checks for an untitled place crash-recovery snapshot (shown on the Start Page).
-    pub fn check_untitled_recovery(&mut self) {
-        if !rustudio_core::rustudio_settings::autosave_enabled() || self.pending_recovery.is_some() {
-            return;
-        }
-        let key = RecoveryKey::Untitled;
-        if let Some((rbxl_path, meta)) = find_recovery(&key) {
-            let title = meta
-                .as_ref()
-                .map(|m| m.title.clone())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "Untitled Place".to_string());
-            let saved_unix_secs = meta.map(|m| m.saved_unix_secs).filter(|&s| s > 0);
-            self.pending_recovery = Some(PendingRecovery {
-                key,
-                rbxl_path,
-                title,
-                saved_unix_secs,
-                target: RecoveryTarget::Untitled,
             });
         }
     }
@@ -448,9 +416,6 @@ impl Editor {
                         }
                         RecoveryTarget::Local(path) => {
                             format!("{} ({})", pending.title, path.display())
-                        }
-                        RecoveryTarget::Untitled => {
-                            format!("{} (Unsaved place)", pending.title)
                         }
                     };
                     ui.label(RichText::new(source_desc).strong());
@@ -558,24 +523,6 @@ impl Editor {
                         self.info(format!(
                             "Recovered unsaved changes for {} ({n} instances)",
                             path.display()
-                        ));
-                    }
-                    Err(e) => self.error(format!("Could not load auto-recovery snapshot: {e}")),
-                }
-            }
-            RecoveryTarget::Untitled => {
-                match Document::from_place_bytes(&bytes, pending.title.clone()) {
-                    Ok(mut d) => {
-                        d.mark_saved_at(0);
-                        let doc_id = d.id;
-                        let doc_rev = d.revision;
-                        let n = d.dom.descendants().count();
-                        self.start.visible = false;
-                        self.set_document(d);
-                        self.autosave.note_saved(doc_id, doc_rev);
-                        self.info(format!(
-                            "Recovered unsaved place {} ({n} instances)",
-                            pending.title
                         ));
                     }
                     Err(e) => self.error(format!("Could not load auto-recovery snapshot: {e}")),

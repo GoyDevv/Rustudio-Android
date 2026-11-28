@@ -689,7 +689,6 @@ impl Picker {
             .min_size(win_size)
             .max_size(win_size)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .constrain_to(screen.shrink(8.0))
             .frame(
                 egui::Frame::new()
                     .fill(BG_WINDOW)

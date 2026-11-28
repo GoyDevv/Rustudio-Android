@@ -156,8 +156,9 @@ impl Editor {
                             Event::PointerMoved(_)
                                 | Event::MouseMoved(_)
                                 | Event::PointerGone
+                                | Event::MouseWheel { .. }
                                 | Event::Screenshot { .. }
-                        ) || matches!(event, Event::Touch { pos, .. } if !area.contains(*pos))
+                        )
                     })
             })
             && match tab {

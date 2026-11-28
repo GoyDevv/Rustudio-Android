@@ -172,21 +172,7 @@ pub fn plan(
     // (a Model's PrimaryPart).
     for (r, name) in deferred {
         let (Some(id), Some(inst)) = (model.server_id(r), doc.dom.get_by_ref(r)) else { continue };
-        let prop = doc.prop(r, &name);
-        if let Some(&Variant::Ref(target)) = prop.as_ref() {
-            if !target.is_none()
-                && model.server_id(target).is_none()
-                && (!in_place(doc, target) || is_local_live_instance(doc, model, target))
-            {
-                log::warn!(
-                    "Team Create: skipping {}.{name}: target {} is unparented or local-only",
-                    path(doc, r),
-                    path(doc, target),
-                );
-                continue;
-            }
-        }
-        match prop.as_ref().and_then(|v| live_value(v, model)) {
+        match doc.prop(r, &name).as_ref().and_then(|v| live_value(v, model)) {
             Some(value) => out.ops.push(LiveOp::Property { reference: r, id, class: inst.class.to_string(), name, value }),
             None => out.unsynced.push(format!("{}.{name}: refers to an instance that is not on the Team Create server", path(doc, r))),
         }
@@ -210,9 +196,7 @@ pub fn plan(
         if name.as_str() == "ClockTime" && inst.class.as_str() == "Lighting" {
             continue;
         }
-        if server_owned(inst.class.as_str(), name.as_str())
-            || (name.as_str() == "IgnoreGuiInset" && inst.properties.contains_key(&"ScreenInsets".into()))
-        {
+        if server_owned(inst.class.as_str(), name.as_str()) {
             continue;
         }
         if name.as_str() == "Source" {
@@ -284,9 +268,7 @@ fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<Str
     let mut names: Vec<_> = inst.properties.iter().collect();
     names.sort_by_key(|(name, _)| name.as_str());
     for (name, value) in names {
-        if server_owned(inst.class.as_str(), name.as_str())
-            || (name.as_str() == "IgnoreGuiInset" && inst.properties.contains_key(&"ScreenInsets".into()))
-        {
+        if server_owned(inst.class.as_str(), name.as_str()) {
             continue;
         }
         let always = matches!(name.as_str(), "Source" | "ScriptGuid");
@@ -296,10 +278,8 @@ fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<Str
         if !always && rustudio_core::doc::class_default(inst.class.as_str(), name.as_str()).as_ref() == Some(value) {
             continue;
         }
-        if let Variant::Ref(target) = value {
-            if !target.is_none() {
-                deferred.push((r, name.to_string()));
-            }
+        if matches!(value, Variant::Ref(_)) {
+            deferred.push((r, name.to_string()));
             continue;
         }
         match live_value(value, model) {
@@ -368,18 +348,7 @@ pub fn renew_shared_script_guids(doc: &mut Document, model: &LiveModel, marks: &
 /// but the stream carries.
 pub fn server_owned(class: &str, name: &str) -> bool {
     use rbx_reflection::{PropertyKind, PropertySerialization, PropertyTag};
-    if matches!(
-        name,
-        "numExpectedDirectChildren"
-            | "NetworkOwnerV3"
-            | "NetworkOwnerV2"
-            | "NetworkIsSleeping"
-            | "HistoryId"
-            | "NeedsPivotMigration"
-            | "ModelMeshData"
-            | "IsPlaying"
-            | "TimePosition"
-    ) {
+    if matches!(name, "numExpectedDirectChildren" | "NetworkOwnerV3" | "NetworkOwnerV2" | "NetworkIsSleeping") {
         return true;
     }
     let db = rustudio_core::doc::db();
@@ -790,58 +759,6 @@ mod tests {
         assert!(plan.ops.is_empty(), "{plan:?}");
         assert_eq!(plan.unsynced.len(), 1);
         assert!(plan.unsynced[0].contains("still on the Team Create server"), "{:?}", plan.unsynced);
-    }
-
-    #[test]
-    fn non_replicated_props_nil_refs_and_local_deferred_refs_do_not_unsync() {
-        let (mut live, [server, ..]) = Live::new();
-        live.start();
-        for prop in ["HistoryId", "NeedsPivotMigration", "ModelMeshData", "IsPlaying", "TimePosition"] {
-            assert!(server_owned("Part", prop), "{prop} should be filtered");
-        }
-        // Unparented instance and local-only plugin instance as Ref targets.
-        let unparented = live.doc.dom.insert(Ref::none(), InstanceBuilder::new("Part").with_name("Detached"));
-        let plugin = live.doc.dom.insert(Ref::none(), InstanceBuilder::new("Plugin").with_name("Plug"));
-        let local_child = live.doc.dom.insert(plugin, InstanceBuilder::new("Folder").with_name("Local"));
-
-        let gui = live.new_inst(
-            InstanceBuilder::new("ScreenGui")
-                .with_name("Hud")
-                .with_property("ScreenInsets", rbx_types::Enum::from_u32(1))
-                .with_property("IgnoreGuiInset", true),
-        );
-        let obj_nil = live.new_inst(
-            InstanceBuilder::new("ObjectValue")
-                .with_name("NilRef")
-                .with_property("Value", Variant::Ref(Ref::none())),
-        );
-        let obj_unparented = live.new_inst(
-            InstanceBuilder::new("ObjectValue")
-                .with_name("UnparentedRef")
-                .with_property("Value", Variant::Ref(unparented)),
-        );
-        let obj_local = live.new_inst(
-            InstanceBuilder::new("ObjectValue")
-                .with_name("LocalRef")
-                .with_property("Value", Variant::Ref(local_child)),
-        );
-        live.set_parent(gui, server);
-        live.set_parent(obj_nil, server);
-        live.set_parent(obj_unparented, server);
-        live.set_parent(obj_local, server);
-
-        let plan = live.plan();
-        assert!(plan.unsynced.is_empty(), "{:?}", plan.unsynced);
-        let gui_create = plan.ops.iter().find_map(|op| match op {
-            LiveOp::Create { class, props, .. } if class == "ScreenGui" => Some(props),
-            _ => None,
-        }).expect("ScreenGui create");
-        assert!(!gui_create.iter().any(|(n, _)| n == "IgnoreGuiInset"), "{gui_create:?}");
-        assert!(
-            !plan.ops.iter().any(|op| matches!(op, LiveOp::Property { name, .. } if name == "Value")),
-            "nil, unparented, and local-only deferred refs should be skipped: {:?}",
-            plan.ops
-        );
     }
 }
 

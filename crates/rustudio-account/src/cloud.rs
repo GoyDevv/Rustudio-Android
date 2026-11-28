@@ -1232,37 +1232,20 @@ impl CloudApi {
         if universe_id == 0 {
             return Err(Error::new("Missing universe ID"));
         }
+        let url = format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop);
         let body = serde_json::json!([{
             "subjectType": subject_type,
             "subjectId": subject_id.to_string(),
             "action": action,
         }])
         .to_string();
-
-        // Try permissions_batched first (current Studio endpoint), then fall back to /permissions
-        let urls = [
-            format!("{}/v2/universes/{universe_id}/permissions_batched", self.ep.develop),
-            format!("{}/v2/universes/{universe_id}/permissions", self.ep.develop),
-        ];
-        let mut last_err = String::new();
-        for url in &urls {
-            match self
-                .session
-                .send_csrf("DELETE", url, "application/json", body.as_bytes())
-            {
-                Ok((status, _text)) if (200..300).contains(&status) => {
-                    return Ok(());
-                }
-                Ok((status, text)) => {
-                    last_err = parse_roblox_error_msg(&text)
-                        .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                }
-            }
+        let (status, text) = self
+            .session
+            .send_csrf("DELETE", &url, "application/json", body.as_bytes())?;
+        if (200..300).contains(&status) {
+            return Ok(());
         }
-        if subject_type == "User" && action.eq_ignore_ascii_case("Edit") {
+        if subject_type == "User" {
             let fb_url = format!(
                 "{}/v1/universes/{universe_id}/teamcreate/memberships",
                 self.ep.develop
@@ -1277,7 +1260,9 @@ impl CloudApi {
                 }
             }
         }
-        Err(Error(format!("Could not remove collaborator: {last_err}")))
+        let msg = parse_roblox_error_msg(&text)
+            .unwrap_or_else(|| format!("HTTP {status}: {}", text.trim()));
+        Err(Error(format!("Could not remove collaborator: {msg}")))
     }
 
     /// Saves (Saved) or publishes (Published) the place as a new version.

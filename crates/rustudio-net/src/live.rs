@@ -752,22 +752,14 @@ async fn run(
     let mut dgram_capture = std::env::var("RUSTUDIO_TC_LANES_OUT").ok().and_then(|dir| {
         std::fs::File::create(std::path::Path::new(&dir).join("datagrams.bin")).ok()
     });
-    let mut dgram_open = true;
     loop {
         tokio::select! {
-            dgram = connection.read_datagram(), if dgram_open => {
-                match dgram {
-                    Ok(d) => {
-                        if let Some(f) = dgram_capture.as_mut() {
-                            use std::io::Write;
-                            let _ = f.write_all(&rtcio::frame(&d));
-                        }
-                    }
-                    Err(_) => {
-                        dgram_open = false;
-                        dgram_capture = None;
-                    }
+            dgram = connection.read_datagram() => {
+                if let (Ok(d), Some(f)) = (&dgram, dgram_capture.as_mut()) {
+                    use std::io::Write;
+                    let _ = f.write_all(&rtcio::frame(d));
                 }
+                if dgram.is_err() { dgram_capture = None; }
             }
             incoming = connection.accept_uni() => {
                 match incoming {
@@ -783,7 +775,7 @@ async fn run(
             _ = interval.tick() => {
                 if cancel.load(Ordering::Acquire) || lane_ended.load(Ordering::Acquire) { break; }
                 if seen_sync.swap(false, Ordering::AcqRel) {
-                    tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &REP_CONTROL)).await.map_err(|_| crate::error::NetError::Other("Team Create send timed out".into()))??;
+                    rtcio::send(&mut replication, &REP_CONTROL).await?;
                     control_started = true;
                 }
                 let streaming_player = {
@@ -799,7 +791,7 @@ async fn run(
                         .map(|schema| initial_stream_request(schema, player));
                     match request {
                         Some(Ok(frame)) => {
-                            tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &frame)).await.map_err(|_| crate::error::NetError::Other("Team Create send timed out".into()))??;
+                            rtcio::send(&mut replication, &frame).await?;
                             log::info!("Team Create requested initial terrain streaming (place={place})");
                         }
                         Some(Err(error)) => log::warn!("Team Create initial streaming request: {error}"),
@@ -827,7 +819,7 @@ async fn run(
                                 if recent.len() == RECENT_EDITS { recent.pop_front(); }
                                 recent.push_back((Instant::now(), format!("{what} ({} bytes)", frame.len())));
                                 log::debug!("Team Create wrote {what} ({} bytes)", frame.len());
-                                tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &frame)).await.map_err(|_| crate::error::NetError::Other("Team Create send timed out".into()))??;
+                                rtcio::send(&mut replication, &frame).await?;
                             }
                             Outcome::Failed { id, error } => {
                                 rejected_document_edit = true;
@@ -844,8 +836,8 @@ async fn run(
                 }
                 if last_ping.elapsed() >= Duration::from_secs(1) {
                     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
-                    tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut ping, &rtcio::ping_message(timestamp))).await.map_err(|_| crate::error::NetError::Other("Team Create send timed out".into()))??;
-                    if control_started { tokio::time::timeout(Duration::from_secs(10), rtcio::send(&mut replication, &REP_CONTROL)).await.map_err(|_| crate::error::NetError::Other("Team Create send timed out".into()))??; }
+                    rtcio::send(&mut ping, &rtcio::ping_message(timestamp)).await?;
+                    if control_started { rtcio::send(&mut replication, &REP_CONTROL).await?; }
                     last_ping = Instant::now();
                 }
                 let can_finish = !ready && initial.lock().unwrap().can_finish(Instant::now());
@@ -890,18 +882,6 @@ struct EditGate {
     shared: crate::writer::SharedSent,
 }
 
-/// Returns true when `class` is present in the negotiated server schema
-/// but `name` (and its wire alias) is absent from that class's replicated
-/// property list. Such properties are benign editor-only/non-replicated
-/// state rather than a synchronization failure.
-fn is_non_replicated_prop(schema: &Schema, class: &str, name: &str) -> bool {
-    let Some(cls) = schema.classes.iter().find(|c| c.name == class) else {
-        return false;
-    };
-    let wire = crate::writer::wire_name(name);
-    !cls.props.iter().any(|p| p.name == wire || p.name == name)
-}
-
 impl EditGate {
     fn encode(&mut self, schema: Option<&Schema>, edit: LiveEdit) -> Vec<Outcome> {
         let Some(schema) = schema else {
@@ -930,10 +910,8 @@ impl EditGate {
                 }
                 vec![match crate::writer::property_with(schema, id, &class, &name, &value, &mut self.shared) {
                     Ok(frame) => Outcome::Frame(frame),
-                    Err(error) if !document || is_non_replicated_prop(schema, &class, &name) => {
-                        Outcome::Notice(error)
-                    }
-                    Err(error) => Outcome::Failed { id, error },
+                    Err(error) if document => Outcome::Failed { id, error },
+                    Err(error) => Outcome::Notice(error),
                 }]
             }
             LiveEdit::Create { id, class, parent, mut props } => {
@@ -951,13 +929,7 @@ impl EditGate {
                 });
                 match crate::writer::create_partial_with(schema, id, &class, parent, &props, &mut self.shared) {
                     Ok((frame, skipped)) => {
-                        out.extend(skipped.into_iter().map(|(name, reason)| {
-                            if is_non_replicated_prop(schema, &class, &name) {
-                                Outcome::Notice(reason)
-                            } else {
-                                Outcome::Skipped { id, name, reason }
-                            }
-                        }));
+                        out.extend(skipped.into_iter().map(|(name, reason)| Outcome::Skipped { id, name, reason }));
                         out.insert(0, Outcome::Frame(frame));
                     }
                     Err(error) => {
@@ -1087,9 +1059,7 @@ mod tests {
         ]));
         assert!(matches!(out[0], Outcome::Frame(_)), "{out:?}");
         let skipped: Vec<_> = out.iter().filter_map(|o| match o { Outcome::Skipped { name, .. } => Some(name.as_str()), _ => None }).collect();
-        assert_eq!(skipped, ["Capabilities"]);
-        let notices: Vec<_> = out.iter().filter_map(|o| match o { Outcome::Notice(msg) => Some(msg.as_str()), _ => None }).collect();
-        assert!(notices.iter().any(|m| m.contains("NotReplicated")), "{out:?}");
+        assert_eq!(skipped, ["Capabilities", "NotReplicated"]);
         let Outcome::Frame(frame) = &out[0] else { unreachable!() };
         let mut dec = crate::replicator::Decoder::new();
         dec.schema = Some(s.clone());
@@ -1100,48 +1070,6 @@ mod tests {
         gate.encode(Some(&s), create(21, "Nope", 1, vec![]));
         let out = gate.encode(Some(&s), create(22, "ObjectValue", 1, vec![("Value", PropValue::Ref(Some(21)))]));
         assert!(matches!(out[..], [Outcome::Frame(_), Outcome::Skipped { id: 22, .. }]), "{out:?}");
-    }
-
-    #[test]
-    fn non_replicated_props_are_benign_notices_while_real_errors_still_fail() {
-        let s = schema();
-        let mut gate = EditGate::default();
-        // Property absent from a known class's schema props -> Outcome::Notice (not Failed).
-        let out = gate.encode(Some(&s), LiveEdit::Property {
-            id: 5,
-            class: "Folder".into(),
-            name: "HistoryId".into(),
-            value: PropValue::String("abc".into()),
-        });
-        assert!(matches!(out.as_slice(), [Outcome::Notice(m)] if m.contains("HistoryId")), "{out:?}");
-
-        // Real wire-encoding error on a property present in the class's schema -> Outcome::Failed.
-        let out = gate.encode(Some(&s), LiveEdit::Property {
-            id: 5,
-            class: "Folder".into(),
-            name: "Capabilities".into(),
-            value: PropValue::Bool(true),
-        });
-        assert!(matches!(out.as_slice(), [Outcome::Failed { id: 5, .. }]), "{out:?}");
-
-        // Unknown class -> Outcome::Failed.
-        let out = gate.encode(Some(&s), LiveEdit::Property {
-            id: 5,
-            class: "NoSuchClass".into(),
-            name: "Name".into(),
-            value: PropValue::String("x".into()),
-        });
-        assert!(matches!(out.as_slice(), [Outcome::Failed { id: 5, .. }]), "{out:?}");
-
-        // Missing target instance -> Outcome::Failed even for a non-replicated prop name.
-        let _ = gate.encode(Some(&s), create(30, "NotAClass", 1, vec![]));
-        let out = gate.encode(Some(&s), LiveEdit::Property {
-            id: 30,
-            class: "Folder".into(),
-            name: "HistoryId".into(),
-            value: PropValue::String("abc".into()),
-        });
-        assert!(matches!(out.as_slice(), [Outcome::Failed { id: 30, .. }]), "{out:?}");
     }
 
     #[test]

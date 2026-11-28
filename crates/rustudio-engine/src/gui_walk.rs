@@ -654,7 +654,7 @@ impl Walk<'_, '_> {
         if !in_chat {
             return;
         }
-        let Some(pill) = self.hits.iter().rev().find(|h| h.r == tc).cloned() else { return };
+        let Some(pill) = self.hits.iter().rev().find(|h| h.r == group).cloned() else { return };
         self.seq += 1;
         self.hits.push(LocalHit { r: tb, button: false, textbox: true, sink: true, drag: false, painted: false, seq: self.seq, ..pill });
     }

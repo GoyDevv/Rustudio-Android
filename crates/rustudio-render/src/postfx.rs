@@ -981,7 +981,7 @@ impl PostFx {
             &self.black_view,
             &self.black_view,
         );
-        let full = if self.is_powervr || cfg!(target_os = "android") {
+        let full = if self.is_powervr {
             None
         } else {
             Some(self.build_full_targets(device, size, samples, hdr_view, depth_view))
@@ -1474,7 +1474,7 @@ impl PostFx {
         let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
         let load = wgpu::LoadOp::Load;
 
-        if (self.is_powervr || cfg!(target_os = "android")) && !need_dof && !bloom_on && !sr_on && !need_blur {
+        if self.is_powervr && !need_dof && !bloom_on && !sr_on && !need_blur {
             // Fast path: no optional PostFX active — run tone-mapping/CC directly without
             // touching optional DoF/Bloom/SunRays/Blur targets.
             let op = push_u(base_u);

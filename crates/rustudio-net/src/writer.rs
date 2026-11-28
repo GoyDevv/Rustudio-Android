@@ -99,31 +99,7 @@ pub fn wire_name(name: &str) -> &str {
         "CollisionGroup" => "CollisionGroupReplicate",
         "RenderFidelity" => "RenderFidelityReplicate",
         "MeshId" => "MeshContent",
-        "Image" => "ImageContent",
-        "TextureID" | "TextureId" | "Texture" => "TextureContent",
-        "ShirtTemplate" => "ShirtTemplateContent",
-        "PantsTemplate" => "PantsTemplateContent",
-        "Graphic" => "GraphicContent",
-        "HoverImage" => "HoverImageContent",
-        "PressedImage" => "PressedImageContent",
-        "TopImage" => "TopImageContent",
-        "MidImage" => "MidImageContent",
-        "BottomImage" => "BottomImageContent",
-        "ColorMap" => "ColorMapContent",
-        "NormalMap" => "NormalMapContent",
-        "MetalnessMap" => "MetalnessMapContent",
-        "RoughnessMap" => "RoughnessMapContent",
-        "SoundId" | "Asset" => "AudioContent",
-        "AnimationId" => "AnimationContent",
-        "SkyboxBk" => "SkyboxBackContent",
-        "SkyboxDn" => "SkyboxDownContent",
-        "SkyboxFt" => "SkyboxFrontContent",
-        "SkyboxLf" => "SkyboxLeftContent",
-        "SkyboxRt" => "SkyboxRightContent",
-        "SkyboxUp" => "SkyboxUpContent",
-        "Video" => "VideoContent",
-        "SunTextureId" => "SunTextureContent",
-        "MoonTextureId" => "MoonTextureContent",
+        "TextureID" => "TextureContent",
         // Script capabilities: the reflection DB's canonical Sandboxed is
         // DefinesCapabilities in files and on the wire (the server's own
         // NewObject carries DefinesCapabilities = true).
@@ -152,56 +128,6 @@ fn append_shared(out: &mut Vec<u8>, value: &PropValue, sent: &mut SharedSent) {
             out.extend_from_slice(hash);out.push(0);put_varstr(out,bytes);
         }
     }
-}
-
-/// Encode a 3x3 rotation matrix as a 6-byte smallest-three packed quaternion,
-/// matching `crate::replicator::rotation_compressed` (id 0).
-fn encode_rotation_compressed(out: &mut Vec<u8>, rot: &[f32; 9]) {
-    let [r00, r01, r02, r10, r11, r12, r20, r21, r22] = *rot;
-    let trace = r00 + r11 + r22;
-    let mut q = if trace > 0.0 {
-        let s = (trace + 1.0).max(0.0).sqrt() * 2.0;
-        [(r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s, 0.25 * s]
-    } else if r00 > r11 && r00 > r22 {
-        let s = (1.0 + r00 - r11 - r22).max(0.0).sqrt() * 2.0;
-        [0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s]
-    } else if r11 > r22 {
-        let s = (1.0 + r11 - r00 - r22).max(0.0).sqrt() * 2.0;
-        [(r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s]
-    } else {
-        let s = (1.0 + r22 - r00 - r11).max(0.0).sqrt() * 2.0;
-        [(r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s]
-    };
-    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    if len > 0.0 && len.is_finite() {
-        for v in &mut q {
-            *v /= len;
-        }
-    } else {
-        q = [0.0, 0.0, 0.0, 1.0];
-    }
-    let mut max_idx = 0usize;
-    for i in 1..4 {
-        if q[i].abs() > q[max_idx].abs() {
-            max_idx = i;
-        }
-    }
-    if q[max_idx] < 0.0 {
-        for v in &mut q {
-            *v = -*v;
-        }
-    }
-    const IDX: [[usize; 3]; 4] = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
-    let map = IDX[max_idx];
-    let inv_scale = 16383.0 / std::f32::consts::FRAC_1_SQRT_2;
-    let pack = |v: f32| -> u32 { ((v * inv_scale).round().clamp(-16383.0, 16383.0) as i32 as u32) & 0x7fff };
-    let u0 = pack(q[map[0]]);
-    let u1 = pack(q[map[1]]);
-    let u2 = pack(q[map[2]]);
-    let a = u0 as u16;
-    let b = ((max_idx as u32) << 30) | (u1 << 15) | u2;
-    out.extend_from_slice(&a.to_le_bytes());
-    out.extend_from_slice(&b.to_le_bytes());
 }
 
 /// Encode a ContentId string.
@@ -328,13 +254,6 @@ pub(crate) fn encode_value(
                 out.extend_from_slice(&f.to_le_bytes());
             }
         }
-        (0x1b, PropValue::CFrame { pos, rot }) => {
-            for f in pos {
-                out.extend_from_slice(&f.to_le_bytes());
-            }
-            out.push(0);
-            encode_rotation_compressed(out, rot);
-        }
         (0x1c | 0x45, PropValue::Ref(reference)) => match reference {
             Some(id) => {
                 put_reference(out, *id);
@@ -348,7 +267,6 @@ pub(crate) fn encode_value(
             put_varint(out, bytes.len() as u64);
             out.extend_from_slice(bytes);
         }
-        (0x08 | 0x02, PropValue::SharedString(bytes)) => put_varstr(out, bytes),
         (0x38, PropValue::BinaryString(bytes) | PropValue::Raw(bytes)) => {
             // Uncompressed buffer: comp_len = 0, decomp_len = len, raw bytes.
             put_varint(out, 0);
@@ -394,25 +312,6 @@ pub(crate) fn encode_value(
             for f in rot {
                 out.extend_from_slice(&f.to_le_bytes());
             }
-            for f in pos {
-                out.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        (0x33, PropValue::Raw(bytes)) if bytes.is_empty() => out.push(0),
-        (0x33, PropValue::Raw(bytes)) if bytes.len() == 48 => {
-            // Typed 0x32 stores [pos(12B), rot(36B)]; wire order is 0x80, compressed rot(6B), pos(12B).
-            out.push(0x80);
-            let mut rot = [0.0f32; 9];
-            for (i, slot) in rot.iter_mut().enumerate() {
-                let off = 12 + i * 4;
-                *slot = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            }
-            encode_rotation_compressed(out, &rot);
-            out.extend_from_slice(&bytes[0..12]);
-        }
-        (0x33, PropValue::CFrame { pos, rot }) => {
-            out.push(0x80);
-            encode_rotation_compressed(out, rot);
             for f in pos {
                 out.extend_from_slice(&f.to_le_bytes());
             }
@@ -499,7 +398,7 @@ pub fn create_partial_with(
     let mut out = vec![0x83, 2];
     put_reference(&mut out, id);
     out.extend_from_slice(&ci.to_le_bytes());
-    let mut encoded: Vec<(u8, u8, PropValue, bool)> = Vec::new();
+    let mut encoded=Vec::new();
     let mut skipped=Vec::new();
     for (name,value) in props {
         let find=|n: &str| cls.props.iter().enumerate().find(|(_,p)| p.name==n);
@@ -516,17 +415,7 @@ pub fn create_partial_with(
         // Encode once here so a value without a wire form drops only itself.
         let value=match prepare_value(prop.ty,value) {Ok(v)=>v,Err(e)=>{skipped.push((name.clone(),e));continue;}};
         if let Err(e)=encode_value(&mut Vec::new(),schema,prop.ty,&value,false) {skipped.push((name.clone(),format!("{class}.{name}: {e}")));continue;}
-        // Deduplicate by schema property index `pi`, preferring the canonical
-        // property name (`prop.name == *name`) over a legacy alias so we never
-        // emit the same index twice in one NewObject frame.
-        let canonical = prop.name == *name;
-        if let Some(existing) = encoded.iter_mut().find(|(epi, _, _, _)| *epi == pi as u8) {
-            if canonical && !existing.3 {
-                *existing = (pi as u8, prop.ty, value, true);
-            }
-        } else {
-            encoded.push((pi as u8, prop.ty, value, canonical));
-        }
+        encoded.push((pi as u8,prop.ty,value));
     }
     // Each group goes in ascending schema index, as the server's own
     // NewObject items do. The CloudEdit server drops the session ("Error
@@ -536,17 +425,17 @@ pub fn create_partial_with(
     // LocalScript with Disabled / RunContext reset Place A's session (verified
     // live on a test place, 2026-11-20: Name alone is accepted, Name + any of them
     // resets).
-    encoded.sort_by_key(|(pi,_,_,_)| *pi);
+    encoded.sort_by_key(|(pi,_,_)| *pi);
     // Protected source is serialized in NewObject's early group.
-    for &(pi,ty,ref value,_) in encoded.iter().filter(|(_,ty,_,_)| *ty==0x06) {
+    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06) {
         out.push(pi);encode_value(&mut out,schema,ty,value,true)?;
     }
     out.push(0xff);
-    for &(pi,ty,ref value,_) in encoded.iter().filter(|(_,ty,_,_)| *ty!=0x06) {
+    for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty!=0x06) {
         out.push(pi);encode_value(&mut out,schema,ty,value,false)?;
     }
     out.push(0xff);
-    for (_,_,value,_) in encoded.iter().filter(|(_,ty,_,_)| *ty==0x06).chain(encoded.iter().filter(|(_,ty,_,_)| *ty!=0x06)) {
+    for (_,_,value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06).chain(encoded.iter().filter(|(_,ty,_)| *ty!=0x06)) {
         append_shared(&mut out,value,sent);
     }
     put_reference(&mut out, parent);
@@ -1439,246 +1328,6 @@ mod tests {
                 schema.decode_value_bytes(bad_ty, &[0u8; 32], true).is_err(),
                 "type {bad_ty:#x} should be rejected"
             );
-        }
-    }
-
-    #[test]
-    fn wire_name_maps_legacy_content_properties() {
-        let cases = [
-            ("Image", "ImageContent"),
-            ("TextureID", "TextureContent"),
-            ("TextureId", "TextureContent"),
-            ("Texture", "TextureContent"),
-            ("ShirtTemplate", "ShirtTemplateContent"),
-            ("PantsTemplate", "PantsTemplateContent"),
-            ("Graphic", "GraphicContent"),
-            ("HoverImage", "HoverImageContent"),
-            ("PressedImage", "PressedImageContent"),
-            ("TopImage", "TopImageContent"),
-            ("MidImage", "MidImageContent"),
-            ("BottomImage", "BottomImageContent"),
-            ("ColorMap", "ColorMapContent"),
-            ("NormalMap", "NormalMapContent"),
-            ("MetalnessMap", "MetalnessMapContent"),
-            ("RoughnessMap", "RoughnessMapContent"),
-            ("SoundId", "AudioContent"),
-            ("Asset", "AudioContent"),
-            ("AnimationId", "AnimationContent"),
-            ("SkyboxBk", "SkyboxBackContent"),
-            ("SkyboxDn", "SkyboxDownContent"),
-            ("SkyboxFt", "SkyboxFrontContent"),
-            ("SkyboxLf", "SkyboxLeftContent"),
-            ("SkyboxRt", "SkyboxRightContent"),
-            ("SkyboxUp", "SkyboxUpContent"),
-            ("Video", "VideoContent"),
-            ("SunTextureId", "SunTextureContent"),
-            ("MoonTextureId", "MoonTextureContent"),
-        ];
-        for (legacy, canonical) in cases {
-            assert_eq!(wire_name(legacy), canonical, "legacy property {legacy}");
-        }
-    }
-
-    #[test]
-    fn compressed_cframe_and_optional_cframe_round_trip() {
-        use rbx_types as t;
-        let angle = 0.7f32;
-        let (s, c) = angle.sin_cos();
-        let rot = [
-            c, 0.0, s,
-            0.0, 1.0, 0.0,
-            -s, 0.0, c,
-        ];
-        let pos = [12.5f32, -3.25, 42.0];
-
-        // 0x1b compressed CoordinateFrame
-        let schema_1b = Schema {
-            classes: vec![SchemaClass {
-                name: "Part".into(),
-                props: vec![SchemaProp { name: "CFrame".into(), ty: 0x1b }],
-                events: vec![],
-            }],
-            global_props: vec![(0, 0)],
-            ..Default::default()
-        };
-        let frame = property(&schema_1b, 7, "Part", "CFrame", &PropValue::CFrame { pos, rot }).unwrap();
-        let mut dec = Decoder::new();
-        dec.schema = Some(schema_1b);
-        let ops = dec.decode_frame(frame[0], &frame[1..]);
-        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
-        let RepOp::ChangeProperty { value: PropValue::CFrame { pos: got_pos, rot: got_rot }, .. } = &ops[0] else {
-            panic!("expected CFrame, got {:?}", ops);
-        };
-        assert_eq!(*got_pos, pos);
-        for (a, b) in rot.iter().zip(got_rot.iter()) {
-            assert!((a - b).abs() < 1e-3, "rotation mismatch: expected {rot:?}, got {got_rot:?}");
-        }
-
-        // 0x33 compressed OptionalCoordinateFrame (None and Some)
-        let schema_33 = Schema {
-            classes: vec![SchemaClass {
-                name: "Model".into(),
-                props: vec![SchemaProp { name: "WorldPivotData".into(), ty: 0x33 }],
-                events: vec![],
-            }],
-            global_props: vec![(0, 0)],
-            ..Default::default()
-        };
-        let cf = t::CFrame::new(
-            t::Vector3::new(pos[0], pos[1], pos[2]),
-            t::Matrix3::new(
-                t::Vector3::new(rot[0], rot[1], rot[2]),
-                t::Vector3::new(rot[3], rot[4], rot[5]),
-                t::Vector3::new(rot[6], rot[7], rot[8]),
-            ),
-        );
-        for opt in [None, Some(cf)] {
-            let wire = crate::model::typed_value(&t::Variant::OptionalCFrame(opt)).unwrap();
-            let frame = property(&schema_33, 8, "Model", "WorldPivotData", &wire).unwrap();
-            let mut dec = Decoder::new();
-            dec.schema = Some(schema_33.clone());
-            let mut model = crate::model::LiveModel::new();
-            model.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
-            let create_frame = create(&schema_33, 8, "Model", 1, &[]).unwrap();
-            for op in dec.decode_frame(create_frame[0], &create_frame[1..]) { model.apply(op); }
-            for op in dec.decode_frame(frame[0], &frame[1..]) { model.apply(op); }
-            assert!(dec.errors.is_empty(), "{:?}", dec.errors);
-            let inst = model.dom().get_by_ref(model.reference(8).unwrap()).unwrap();
-            match (opt, inst.properties.get(&"WorldPivotData".into())) {
-                (None, Some(t::Variant::OptionalCFrame(None))) => {}
-                (Some(expected), Some(t::Variant::OptionalCFrame(Some(got)))) => {
-                    assert_eq!(got.position, expected.position);
-                    let e = [
-                        expected.orientation.x.x, expected.orientation.x.y, expected.orientation.x.z,
-                        expected.orientation.y.x, expected.orientation.y.y, expected.orientation.y.z,
-                        expected.orientation.z.x, expected.orientation.z.y, expected.orientation.z.z,
-                    ];
-                    let g = [
-                        got.orientation.x.x, got.orientation.x.y, got.orientation.x.z,
-                        got.orientation.y.x, got.orientation.y.y, got.orientation.y.z,
-                        got.orientation.z.x, got.orientation.z.y, got.orientation.z.z,
-                    ];
-                    for (a, b) in e.iter().zip(g.iter()) {
-                        assert!((a - b).abs() < 1e-3, "OptionalCFrame rot mismatch: {e:?} vs {g:?}");
-                    }
-                }
-                other => panic!("unexpected OptionalCFrame result: {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn skybox_video_content_and_tags_round_trip() {
-        use rbx_types as t;
-        // Skybox*Content and VideoContent wire renames
-        let content_cases = [
-            ("Sky", "SkyboxBk", "SkyboxBackContent"),
-            ("Sky", "SkyboxDn", "SkyboxDownContent"),
-            ("Sky", "SkyboxFt", "SkyboxFrontContent"),
-            ("Sky", "SkyboxLf", "SkyboxLeftContent"),
-            ("Sky", "SkyboxRt", "SkyboxRightContent"),
-            ("Sky", "SkyboxUp", "SkyboxUpContent"),
-            ("VideoFrame", "Video", "VideoContent"),
-        ];
-        for (class, legacy, canonical) in content_cases {
-            let schema = Schema {
-                classes: vec![SchemaClass {
-                    name: class.into(),
-                    props: vec![SchemaProp { name: canonical.into(), ty: 0x3d }],
-                    events: vec![],
-                }],
-                global_props: vec![(0, 0)],
-                ..Default::default()
-            };
-            let uri = "rbxassetid://987654";
-            let frame = property(&schema, 10, class, legacy, &PropValue::String(uri.into())).unwrap();
-            let mut dec = Decoder::new();
-            dec.schema = Some(schema);
-            let ops = dec.decode_frame(frame[0], &frame[1..]);
-            assert!(dec.errors.is_empty(), "{class}.{legacy}: {:?}", dec.errors);
-            assert!(
-                matches!(&ops[0], RepOp::ChangeProperty { name, value: PropValue::String(s), .. } if name == canonical && s == uri),
-                "{class}.{legacy} -> {ops:?}"
-            );
-        }
-
-        // Variant::Tags encoded as PropValue::SharedString on wire types 0x08 and 0x02
-        let tags = t::Tags::from(vec!["Enemy".to_string(), "Boss".to_string()]);
-        let wire = crate::model::typed_value(&t::Variant::Tags(tags.clone())).unwrap();
-        assert!(matches!(wire, PropValue::SharedString(_)));
-        for ty in [0x08u8, 0x02u8] {
-            let schema = Schema {
-                classes: vec![SchemaClass {
-                    name: "Part".into(),
-                    props: vec![SchemaProp { name: "Tags".into(), ty }],
-                    events: vec![],
-                }],
-                global_props: vec![(0, 0)],
-                ..Default::default()
-            };
-            let frame = property(&schema, 11, "Part", "Tags", &wire).unwrap();
-            let mut dec = Decoder::new();
-            dec.schema = Some(schema.clone());
-            let mut model = crate::model::LiveModel::new();
-            model.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
-            let create_frame = create(&schema, 11, "Part", 1, &[]).unwrap();
-            for op in dec.decode_frame(create_frame[0], &create_frame[1..]) { model.apply(op); }
-            for op in dec.decode_frame(frame[0], &frame[1..]) { model.apply(op); }
-            assert!(dec.errors.is_empty(), "Tags ty {ty:#x}: {:?}", dec.errors);
-            let inst = model.dom().get_by_ref(model.reference(11).unwrap()).unwrap();
-            assert_eq!(inst.properties.get(&"Tags".into()), Some(&t::Variant::Tags(tags.clone())), "Tags ty {ty:#x}");
-        }
-    }
-
-    #[test]
-    fn create_partial_with_deduplicates_pi_preferring_canonical() {
-        let schema = Schema {
-            classes: vec![SchemaClass {
-                name: "Decal".into(),
-                props: vec![
-                    SchemaProp { name: "Name".into(), ty: 0x31 },
-                    SchemaProp { name: "TextureContent".into(), ty: 0x3d },
-                ],
-                events: vec![],
-            }],
-            global_props: vec![(0, 0), (0, 1)],
-            ..Default::default()
-        };
-
-        let orders = [
-            vec![
-                ("Texture".into(), PropValue::String("rbxassetid://111".into())),
-                ("TextureContent".into(), PropValue::String("rbxassetid://222".into())),
-                ("Name".into(), PropValue::String("Poster".into())),
-            ],
-            vec![
-                ("TextureContent".into(), PropValue::String("rbxassetid://222".into())),
-                ("Texture".into(), PropValue::String("rbxassetid://111".into())),
-                ("Name".into(), PropValue::String("Poster".into())),
-            ],
-        ];
-
-        for props in orders {
-            let mut sent = SharedSent::default();
-            let (frame, skipped) =
-                create_partial_with(&schema, 9, "Decal", 1, &props, &mut sent).unwrap();
-            assert!(skipped.is_empty(), "unexpected skipped: {skipped:?}");
-            let mut dec = Decoder::new();
-            dec.schema = Some(schema.clone());
-            let ops = dec.decode_frame(frame[0], &frame[1..]);
-            assert!(dec.errors.is_empty(), "decode errors: {:?}", dec.errors);
-            assert_eq!(ops.len(), 1);
-            match &ops[0] {
-                RepOp::NewInstance { props, .. } => {
-                    let tex: Vec<_> = props
-                        .iter()
-                        .filter(|(k, _)| k == "TextureContent")
-                        .collect();
-                    assert_eq!(tex.len(), 1, "expected deduplicated TextureContent");
-                    assert_eq!(tex[0].1, PropValue::String("rbxassetid://222".into()));
-                }
-                other => panic!("expected NewInstance, got {other:?}"),
-            }
         }
     }
 }

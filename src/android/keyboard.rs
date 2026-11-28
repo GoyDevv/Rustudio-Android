@@ -249,16 +249,11 @@ impl Keyboard {
         if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false))) {
             self.shown = false;
             self.visible = false;
-            self.height_px = 0;
-            self.last_read = None;
-            self.last_pushed_ime = None;
-            self.over = false;
             self.last_want = None;
             self.suppress_reopen = None;
             self.unwanted_since = None;
             self.up_for = None;
             self.zero_since = None;
-            CHANGED.store(true, Ordering::Relaxed);
         }
         if let Some(pushed) = super::ime_bridge::ime_visibility() {
             if self.last_pushed_ime != Some(pushed) {
@@ -419,11 +414,6 @@ impl Keyboard {
         }
         match (want, self.shown) {
             (Some(w), false) => {
-                if rustudio_engine::touch_input::has_hardware_keyboard() {
-                    self.last_want = Some(w);
-                    self.unwanted_since = None;
-                    return;
-                }
                 self.shown = true;
                 self.last_want = Some(w);
                 self.unwanted_since = None;
@@ -437,9 +427,6 @@ impl Keyboard {
                 self.unwanted_since = None;
                 if self.last_want != Some(w) {
                     self.last_want = Some(w);
-                    super::ime_bridge::reset_composing();
-                } else if ctx.input(|i| i.pointer.any_pressed()) {
-                    // Same-field caret tap: clear Android IME composing span so Gboard doesn't corrupt text.
                     super::ime_bridge::reset_composing();
                 }
             }

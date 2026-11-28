@@ -340,10 +340,6 @@ struct TouchFinger {
     sunk: bool,
     /// The button it pressed (the top sinking object, when a button).
     pressed: Option<Ref>,
-    /// TextBox whose blur is deferred until this finger lifts (so tapping a
-    /// GuiButton like ExperienceChat's SendButton fires MouseButton1Click
-    /// and Activated before FocusLost clears or hides the box).
-    blur_on_end: Option<Ref>,
     /// Objects under it (MouseEnter / MouseLeave).
     under: HashSet<Ref>,
     /// The GuiButtons under it when it landed.

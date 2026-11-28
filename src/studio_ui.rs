@@ -222,12 +222,8 @@ pub const FILE: &[M] = &[
     S,
     I("Close Place", "Ctrl+F4", "close_place"),
     S,
-    I("Import 3D…", "Ctrl+M", "import_3d"),
-    I("Import Roblox Model…", "", "import_model"),
-    I("Import Animation…", "", "import_animation"),
-    I("Import Image…", "", "import_image"),
-    I("Import Audio…", "", "import_audio"),
-    I("Import Script…", "", "import_script"),
+    I("Import", "Ctrl+M", "import_3d"),
+    I("Import Roblox Model", "", "import_model"),
     I("Export as .obj", "", "export_obj"),
     I("Export as glTF", "", "export_gltf"),
     S,
@@ -327,7 +323,6 @@ pub const VIEW: &[M] = &[
 
 pub const PLUGINS: &[M] = &[
     I("Manage Plugins", "", "manage_plugins"),
-    I("Import Plugin...", "", "import_local_plugin"),
     I("Plugins Folder", "", "plugins_folder"),
     S,
     I("Save as Local Plugin", "", "save_local_plugin"),

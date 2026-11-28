@@ -136,11 +136,13 @@ impl Painter {
         if width == 0 || height == 0 {
             return;
         }
-        // rustudio: validate requested present mode against surface capabilities; fall back to Fifo.
-        let present_mode = match present_mode {
-            wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync => present_mode,
-            mode if surface_state.present_modes.contains(&mode) => mode,
-            _ => wgpu::PresentMode::Fifo,
+        // rustudio: Mailbox where the surface offers it, otherwise Fifo.
+        let present_mode = if present_mode == wgpu::PresentMode::Mailbox
+            && !surface_state.present_modes.contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Fifo
+        } else {
+            present_mode
         };
         if surface_state.is_root {
             ROOT_SURFACE_MAILBOX.store(
@@ -156,23 +158,16 @@ impl Painter {
             );
         });
 
-        let Some(default_config) = surface_state
-            .surface
-            .get_default_config(&render_state.adapter, width, height)
-        else {
-            log::warn!(
-                "egui-wgpu: surface not supported by adapter ({width}x{height}); skipping configure"
-            );
-            return;
-        };
-
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: render_state.target_format,
             present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
-            ..default_config
+            ..surface_state
+                .surface
+                .get_default_config(&render_state.adapter, width, height)
+                .expect("The surface isn't supported by this adapter")
         };
 
         if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
@@ -199,29 +194,23 @@ impl Painter {
         let Some(old_state) = self.surfaces.remove(&viewport_id) else {
             return Ok(());
         };
-        let old_w = old_state.width;
-        let old_h = old_state.height;
-        let old_resizing = old_state.resizing;
-        // Drop the old wgpu::Surface before creating a new one so Android's
-        // ANativeWindow is released cleanly prior to vkCreateAndroidSurfaceKHR / eglCreateWindowSurface.
-        drop(old_state);
 
         let surface = match self.instance.create_surface(Arc::clone(window)) {
             Ok(surface) => surface,
             Err(err) => {
+                let mut old_state = old_state;
+                old_state.needs_recreate = true;
+                self.surfaces.insert(viewport_id, old_state);
                 self.context.request_repaint_of(viewport_id);
                 return Err(err.into());
             }
         };
-        let sz = window.inner_size();
-        let width = if sz.width > 0 { sz.width } else { old_w };
-        let height = if sz.height > 0 { sz.height } else { old_h };
         self.install_surface(
             surface,
             viewport_id,
-            width,
-            height,
-            old_resizing,
+            old_state.width,
+            old_state.height,
+            old_state.resizing,
         );
         Ok(())
     }
@@ -699,11 +688,7 @@ impl Painter {
                         surface_state.needs_recreate = true;
                         self.context.request_repaint_of(viewport_id);
                     }
-                    SurfaceErrorAction::SkipFrame => {
-                        if matches!(other, wgpu::CurrentSurfaceTexture::Timeout) {
-                            self.context.request_repaint_of(viewport_id);
-                        }
-                    }
+                    SurfaceErrorAction::SkipFrame => {}
                 }
                 return vsync_sec;
             }

@@ -766,16 +766,6 @@ struct State {
     streams: Streams,
     /// DataModel:DefineFastFlag and friends (services_core.rs).
     fast_flags: core_members::FastFlags,
-    /// In-flight HttpService request IDs owned by this VM (cancelled on Drop).
-    pending_http: Vec<u64>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for id in self.pending_http.drain(..) {
-            http::cancel(id);
-        }
-    }
 }
 
 /// A WebStreamClient: its connection (`stream` module) and state.
@@ -1466,19 +1456,12 @@ fn http_start_inner(lua: &Lua, (hs, method, url, headers, body): (LInst, String,
         Some(Variant::Int32(n)) => n as i64,
         _ => 0,
     };
-    let id = http::start(
-        http::Request {
-            method,
-            url,
-            headers: http::studio_headers(hv, place_id),
-            body: body.map(|b| b.as_bytes().to_vec()),
-        },
-        lua.app_data_ref::<egui::Context>().as_deref().cloned(),
-    );
-    if let Ok(mut st) = state(lua) {
-        st.pending_http.push(id);
-    }
-    Ok(id)
+    Ok(http::start(http::Request {
+        method,
+        url,
+        headers: http::studio_headers(hv, place_id),
+        body: body.map(|b| b.as_bytes().to_vec()),
+    }))
 }
 
 /// `__svc_http_internal_start(method, url, headers, body)` → request id (CoreScript / built-in plugin only).
@@ -1517,27 +1500,18 @@ fn http_internal_start(
         Value::String(b) => Some(b.as_bytes().to_vec()),
         _ => None,
     };
-    let id = http::start_internal(
-        http::Request {
-            method,
-            url,
-            headers: hv,
-            body: body_bytes,
-        },
-        lua.app_data_ref::<egui::Context>().as_deref().cloned(),
-    );
-    if let Ok(mut st) = state(lua) {
-        st.pending_http.push(id);
-    }
+    let id = http::start_internal(http::Request {
+        method,
+        url,
+        headers: hv,
+        body: body_bytes,
+    });
     Ok((Some(id), None))
 }
 
 /// `__svc_http_poll(id)` → nil (pending), or (ok, status, message, headers, body | error).
 fn http_poll(lua: &Lua, id: u64) -> mlua::Result<MultiValue> {
     let Some(r) = http::poll(id) else { return Ok(MultiValue::new()) };
-    if let Ok(mut st) = state(lua) {
-        st.pending_http.retain(|&x| x != id);
-    }
     let mut out = MultiValue::new();
     match r {
         Ok(resp) => {
@@ -1801,16 +1775,8 @@ end
 local function simple(self, method, url, body, ct, compress, headers)
 	if headers ~= nil and type(headers) ~= "table" then fail("Unable to cast " .. cast_name(headers) .. " to Dictionary") end
 	local h = {}
-	local has_ct = false
-	if headers then
-		for k, v in headers do
-			h[k] = v
-			if type(k) == "string" and string.lower(k) == "content-type" then
-				has_ct = true
-			end
-		end
-	end
-	if method == "POST" and not has_ct then h["Content-Type"] = content_type(ct) end
+	if headers then for k, v in headers do h[k] = v end end
+	if method == "POST" and h["Content-Type"] == nil then h["Content-Type"] = content_type(ct) end
 	local id, err = begin(self, method, url, h, body)
 	if not id then fail(err) end
 	local okk, status, msg, _, resp = wait_for(id)

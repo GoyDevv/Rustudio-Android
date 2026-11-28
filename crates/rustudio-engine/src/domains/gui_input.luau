@@ -985,9 +985,6 @@ local function step_focus()
             if e.button == 0 then
                 io = input_object({ UserInputType = Enum.UserInputType.Keyboard, UserInputState = Enum.UserInputState.Begin,
                     KeyCode = e.enter and Enum.KeyCode.Return or Enum.KeyCode.Escape })
-            elseif e.button == 3 then
-                io = input_object({ UserInputType = Enum.UserInputType.Touch,
-                    UserInputState = Enum.UserInputState.Begin, Position = Vector3.new(e.x, e.y, 0) })
             elseif e.button then
                 io = input_object({ UserInputType = Enum.UserInputType["MouseButton" .. e.button],
                     UserInputState = Enum.UserInputState.Begin, Position = Vector3.new(e.x, e.y, 0) })

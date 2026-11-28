@@ -47,42 +47,6 @@ impl Editor {
                 }
             }
         }
-        // Keep StudioService:GetStudioUserId() current before plugins start or
-        // tick: live session id, falling back to the cached signed-in profile
-        // only while the session check is still in flight, else 0 when signed out.
-        let uid = self.game.account.user_id().unwrap_or_else(|| {
-            if matches!(self.game.account.state, crate::account_ui::SessionState::Checking(_))
-                && std::env::var_os("RUSTUDIO_NO_SESSION").is_none()
-            {
-                static CACHED_FALLBACK_UID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                *CACHED_FALLBACK_UID.get_or_init(crate::plugin_store::current_user_id)
-            } else {
-                0
-            }
-        });
-        super::settings::set_user_id(uid);
-        static LAST_APPLIED_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let prev_uid = LAST_APPLIED_UID.swap(uid, std::sync::atomic::Ordering::Relaxed);
-        if uid != 0 && prev_uid != uid {
-            let reload_ids: Vec<super::PluginId> = self
-                .plugins
-                .loaded()
-                .into_iter()
-                .filter(|p| {
-                    p.running
-                        && matches!(
-                            p.source,
-                            super::PluginSource::File(_)
-                                | super::PluginSource::Nested { .. }
-                                | super::PluginSource::Tree { asset_id: None, .. }
-                        )
-                })
-                .map(|p| p.id)
-                .collect();
-            for id in reload_ids {
-                self.plugins.reload(id);
-            }
-        }
         if self.plugins.is_idle() || self.place_loading() {
             self.plugin_ui_sync();
             return;
@@ -90,6 +54,19 @@ impl Editor {
         // Plugin GUI / viewport input since the last tick (widgets_ui.rs).
         self.plugin_ui.dt = dt as f32;
         let ui_flush = self.prepare_plugin_ui_flush();
+        // (Before the session check answers: the cached signed-in profile, as
+        // the plugin store uses; Studio has the id before plugins run.)
+        let uid = self.game.account.user_id().unwrap_or_else(|| {
+            static FALLBACK_UID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *FALLBACK_UID.get_or_init(|| {
+                if std::env::var_os("RUSTUDIO_NO_SESSION").is_some() {
+                    0
+                } else {
+                    crate::plugin_store::current_user_id()
+                }
+            })
+        });
+        super::settings::set_user_id(uid);
         // Plugin.GridSize / GetJoinMode read the editor's toolbar settings
         // (Play keeps them current while it runs).
         if self.game.play.is_none() {

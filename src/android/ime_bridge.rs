@@ -13,7 +13,6 @@ enum ImeOp {
     CommitText(String),
     Delete { before: i32, after: i32 },
     Key { code: i32, down: bool },
-    HardwareKey { code: i32, meta: i32, down: bool, repeat: bool },
     Action(i32),
 }
 
@@ -76,11 +75,6 @@ pub fn on_key(code: i32, down: bool) {
 /// Called from JNI `RustudioActivity.nativeImeAction`.
 pub fn on_action(action: i32) {
     push_op(ImeOp::Action(action));
-}
-
-/// Called from JNI `RustudioActivity.nativeHardwareKey` for hardware keyboard shortcuts.
-pub fn on_hardware_key(code: i32, meta: i32, down: bool, repeat: bool) {
-    push_op(ImeOp::HardwareKey { code, meta, down, repeat });
 }
 
 static IME_VISIBILITY_KNOWN: AtomicBool = AtomicBool::new(false);
@@ -159,98 +153,18 @@ fn push_key_tap(events: &mut Vec<Event>, key: Key) {
     });
 }
 
-fn map_android_modifiers(meta: i32) -> Modifiers {
-    const META_SHIFT_ON: i32 = 0x0000_0001;
-    const META_ALT_ON: i32 = 0x0000_0002;
-    const META_CTRL_ON: i32 = 0x0000_1000;
-    const META_META_ON: i32 = 0x0001_0000;
-    let ctrl = (meta & META_CTRL_ON) != 0;
-    let meta_key = (meta & META_META_ON) != 0;
-    Modifiers {
-        alt: (meta & META_ALT_ON) != 0,
-        ctrl,
-        shift: (meta & META_SHIFT_ON) != 0,
-        mac_cmd: false,
-        command: ctrl || meta_key,
-    }
-}
-
 fn map_android_keycode(code: i32) -> Option<Key> {
     match code {
-        7 => Some(Key::Num0),
-        8 => Some(Key::Num1),
-        9 => Some(Key::Num2),
-        10 => Some(Key::Num3),
-        11 => Some(Key::Num4),
-        12 => Some(Key::Num5),
-        13 => Some(Key::Num6),
-        14 => Some(Key::Num7),
-        15 => Some(Key::Num8),
-        16 => Some(Key::Num9),
-        29 => Some(Key::A),
-        30 => Some(Key::B),
-        31 => Some(Key::C),
-        32 => Some(Key::D),
-        33 => Some(Key::E),
-        34 => Some(Key::F),
-        35 => Some(Key::G),
-        36 => Some(Key::H),
-        37 => Some(Key::I),
-        38 => Some(Key::J),
-        39 => Some(Key::K),
-        40 => Some(Key::L),
-        41 => Some(Key::M),
-        42 => Some(Key::N),
-        43 => Some(Key::O),
-        44 => Some(Key::P),
-        45 => Some(Key::Q),
-        46 => Some(Key::R),
-        47 => Some(Key::S),
-        48 => Some(Key::T),
-        49 => Some(Key::U),
-        50 => Some(Key::V),
-        51 => Some(Key::W),
-        52 => Some(Key::X),
-        53 => Some(Key::Y),
-        54 => Some(Key::Z),
-        55 => Some(Key::Comma),
-        56 => Some(Key::Period),
-        61 => Some(Key::Tab),
-        62 => Some(Key::Space),
-        66 | 160 => Some(Key::Enter),
-        67 => Some(Key::Backspace),
-        68 => Some(Key::Backtick),
-        69 => Some(Key::Minus),
-        70 => Some(Key::Equals),
-        71 => Some(Key::OpenBracket),
-        72 => Some(Key::CloseBracket),
-        73 => Some(Key::Backslash),
-        74 => Some(Key::Semicolon),
-        75 => Some(Key::Quote),
-        76 => Some(Key::Slash),
-        92 => Some(Key::PageUp),
-        93 => Some(Key::PageDown),
-        111 => Some(Key::Escape),
-        112 => Some(Key::Delete),
-        122 => Some(Key::Home),
-        123 => Some(Key::End),
-        124 => Some(Key::Insert),
-        131 => Some(Key::F1),
-        132 => Some(Key::F2),
-        133 => Some(Key::F3),
-        134 => Some(Key::F4),
-        135 => Some(Key::F5),
-        136 => Some(Key::F6),
-        137 => Some(Key::F7),
-        138 => Some(Key::F8),
-        139 => Some(Key::F9),
-        140 => Some(Key::F10),
-        141 => Some(Key::F11),
-        142 => Some(Key::F12),
-        19 => Some(Key::ArrowUp),
-        20 => Some(Key::ArrowDown),
-        21 => Some(Key::ArrowLeft),
-        22 => Some(Key::ArrowRight),
+        67 => Some(Key::Backspace),   // KEYCODE_DEL
+        112 => Some(Key::Delete),     // KEYCODE_FORWARD_DEL
+        66 | 160 => Some(Key::Enter), // KEYCODE_ENTER / KEYCODE_NUMPAD_ENTER
+        61 => Some(Key::Tab),         // KEYCODE_TAB
+        21 => Some(Key::ArrowLeft),   // KEYCODE_DPAD_LEFT
+        22 => Some(Key::ArrowRight),  // KEYCODE_DPAD_RIGHT
+        19 => Some(Key::ArrowUp),     // KEYCODE_DPAD_UP
+        20 => Some(Key::ArrowDown),   // KEYCODE_DPAD_DOWN
+        122 => Some(Key::Home),       // KEYCODE_MOVE_HOME
+        123 => Some(Key::End),        // KEYCODE_MOVE_END
         _ => None,
     }
 }
@@ -298,40 +212,6 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                         pressed: down,
                         repeat: false,
                         modifiers: Modifiers::NONE,
-                    });
-                }
-            }
-            ImeOp::HardwareKey { code, meta, down, repeat } => {
-                let modifiers = map_android_modifiers(meta);
-                if let Some(key) = map_android_keycode(code) {
-                    if down && !repeat && modifiers.command && !modifiers.shift && !modifiers.alt {
-                        match key {
-                            Key::C => {
-                                raw.events.push(Event::Copy);
-                                continue;
-                            }
-                            Key::X => {
-                                raw.events.push(Event::Cut);
-                                continue;
-                            }
-                            Key::V => {
-                                let text = super::clipboard::text_now()
-                                    .or_else(super::clipboard::text)
-                                    .unwrap_or_default();
-                                if !text.is_empty() {
-                                    raw.events.push(Event::Paste(text));
-                                }
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    raw.events.push(Event::Key {
-                        key,
-                        physical_key: Some(key),
-                        pressed: down,
-                        repeat,
-                        modifiers,
                     });
                 }
             }

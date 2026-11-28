@@ -487,22 +487,6 @@ impl Store {
         self.save().map_err(|e| e.to_string())
     }
 
-    /// Deletes a local plugin file from the Plugins folder and removes its
-    /// metadata entry.
-    pub fn remove_local(&mut self, id: &str) -> Result<(), String> {
-        let p = self.resolve(id).ok_or_else(|| format!("no plugin {id:?}"))?;
-        if p.kind != PluginKind::Local {
-            return Err(format!("plugin {} is not a local plugin", p.id));
-        }
-        if let Err(e) = std::fs::remove_file(&p.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!("{}: {e}", p.path.display()));
-            }
-        }
-        self.meta.local.remove(&p.id);
-        self.save().map_err(|e| e.to_string())
-    }
-
     /// Merges the account's list from Roblox: new rows are added with the
     /// account's flags, rows gone from the account are dropped (unless
     /// rustudio installed them), versions and names refresh; the enabled
@@ -739,33 +723,5 @@ pub(crate) mod tests {
         std::fs::write(&m, tiny_rbxm()).unwrap();
         assert_eq!(read_plugin_file(&m).unwrap().root().children().len(), 1);
         assert_eq!(check_model_bytes(&tiny_rbxm()).unwrap(), 1);
-    }
-
-    #[test]
-    fn remove_local_deletes_file_and_metadata() {
-        let root = tmp("remove-local");
-        let dir = root.join("Plugins");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("my_tool.lua");
-        std::fs::write(&file, "print('tool')").unwrap();
-        let mut s = Store::open(root.clone(), dir.clone(), 0);
-        s.set_enabled("user_my_tool.lua", false).unwrap();
-        s.install_bytes(
-            InstalledMeta { plugin_asset_id: 77, asset_version_id: 770, enabled: true, ..Default::default() },
-            &tiny_rbxm(),
-        )
-        .unwrap();
-        assert!(s.meta.local.contains_key("user_my_tool.lua"));
-        // Refuses installed or missing plugins.
-        assert!(s.remove_local("cloud_77").is_err());
-        assert!(s.remove_local("user_missing.lua").is_err());
-        // Deletes local file and clears metadata entry.
-        s.remove_local("user_my_tool.lua").unwrap();
-        assert!(!file.exists());
-        assert!(!s.meta.local.contains_key("user_my_tool.lua"));
-        assert!(s.get("user_my_tool.lua").is_none());
-        let reopened = Store::open(root, dir, 0);
-        assert!(!reopened.meta.local.contains_key("user_my_tool.lua"));
-        assert!(reopened.get("user_my_tool.lua").is_none());
     }
 }
