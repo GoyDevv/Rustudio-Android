@@ -209,8 +209,10 @@ impl Editor {
     }
 
     pub fn poll_pending_play_start(&mut self, ctx: &egui::Context) {
-        let still_starting = self.with_game_host(|game, host| game.poll_pending_play_start(host));
-        if still_starting {
+        self.with_game_host(|game, host| {
+            let _ = game.poll_pending_play_start(host);
+        });
+        if self.game.is_starting_play() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
