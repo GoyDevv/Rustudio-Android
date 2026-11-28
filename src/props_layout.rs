@@ -108,7 +108,8 @@ fn fallback_rows_from_reflection(class: &str) -> Vec<Category> {
     for c in &chain {
         let Some(desc) = db.classes.get(*c) else { continue };
         for (pname, pdesc) in &desc.properties {
-            if props.iter().any(|x| x.as_str() == pname.as_ref()) || left_out(class, pname.as_ref()) {
+            let pname: &str = pname.as_ref();
+            if props.iter().any(|x| x == pname) || left_out(class, pname) {
                 continue;
             }
             let is_deprecated = pdesc.tags.contains(&rbx_reflection::PropertyTag::Deprecated);
