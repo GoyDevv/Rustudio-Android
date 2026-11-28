@@ -140,16 +140,6 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnT
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnThermalStatus(
-    _env: *mut c_void,
-    _class: *mut c_void,
-    status: i32,
-) {
-    rustudio::android::lifecycle::on_thermal_status(status);
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeOnSafDocumentCreated(
     env: *mut c_void,
     _class: *mut c_void,

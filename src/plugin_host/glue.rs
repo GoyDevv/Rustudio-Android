@@ -54,7 +54,8 @@ impl Editor {
             if matches!(self.game.account.state, crate::account_ui::SessionState::Checking(_))
                 && std::env::var_os("RUSTUDIO_NO_SESSION").is_none()
             {
-                crate::plugin_store::current_user_id()
+                static CACHED_FALLBACK_UID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                *CACHED_FALLBACK_UID.get_or_init(crate::plugin_store::current_user_id)
             } else {
                 0
             }

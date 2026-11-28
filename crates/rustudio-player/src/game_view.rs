@@ -2299,17 +2299,19 @@ impl Game {
             if px > POWERVR_MAX_PX {
                 scale = (POWERVR_MAX_PX / px).sqrt().clamp(0.35, 1.0);
             }
-        } else if cfg!(target_os = "android") && scale >= 0.999 {
+        } else if cfg!(target_os = "android") && self.is_playing() && scale >= 0.999 {
             let px = (size[0] as f32) * (size[1] as f32);
             const MOBILE_MAX_PX: f32 = 1_250_000.0;
             if px > MOBILE_MAX_PX {
                 scale = (MOBILE_MAX_PX / px).sqrt().clamp(0.55, 1.0);
             }
         }
-        scale = (scale * rustudio_core::rustudio_settings::thermal_render_scale()).clamp(0.35, 1.0);
         size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
-        let sep_dragged = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged")).unwrap_or(false));
-        if sep_dragged && self.last_render_target[0] > 0 && self.last_render_target[1] > 0 {
+        let ui_layout_dragging = ctx.data(|d| {
+            d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged")).unwrap_or(false)
+                || d.get_temp::<bool>(egui::Id::new("rustudio_ui_layout_dragging")).unwrap_or(false)
+        });
+        if ui_layout_dragging && self.last_render_target[0] > 0 && self.last_render_target[1] > 0 {
             size = self.last_render_target;
         }
         self.last_render_scale = scale;
@@ -2333,7 +2335,18 @@ impl Game {
         let vp_render = rustudio_core::bench::scope("vp_render");
         let no_world_gui_or_fx = self.gui.world_batches.is_empty()
             && self.effects.drawn().is_none_or(|f| f.draws.is_empty());
-        let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
+        // While dragging a dock separator or floating window in static Edit mode,
+        // reuse the last rendered 3D viewport texture instead of reallocating or
+        // re-rendering the entire 3D scene on every 1px drag frame.
+        let cached_drag_tex = if ui_layout_dragging && !self.is_playing() {
+            self.renderer.as_ref().and_then(|r| r.texture_id)
+        } else {
+            None
+        };
+        let tex = if let Some(cached) = cached_drag_tex {
+            Some(cached)
+        } else {
+            match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
                 r.defer_postfx = !no_world_gui_or_fx;
                 r.render(
@@ -2362,6 +2375,7 @@ impl Game {
             )
             },
             _ => None,
+        }
         };
         drop(vp_render);
         if let Some(start) = quality_start {

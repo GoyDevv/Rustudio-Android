@@ -6100,6 +6100,7 @@ impl Renderer {
             writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
         }
         let shadows_on = frame.shadows && self.caps.hdr_float_rt && !self.caps.is_powervr();
+        self.sun_shadows_active = shadows_on;
         let max_lights = if self.caps.storage_lights() { rustudio_core::mech::MAX_LIGHTS } else { 64 };
         let n_lights = frame.lights.len().min(max_lights);
         self.update_sky_env(queue, &mut globals);
@@ -7560,16 +7561,7 @@ impl Renderer {
         if !self.caps.is_powervr()
             && frame.globals.ssao[3] >= 0.5
             && frame.quality.map_or_else(
-                || {
-                    if cfg!(target_os = "android")
-                        && rustudio_core::rustudio_settings::saved_value("ssao").is_none()
-                        && std::env::var_os("RUSTUDIO_PERF_SSAO").is_none()
-                    {
-                        false
-                    } else {
-                        rustudio_core::rustudio_settings::performance_value("ssao") != "off"
-                    }
-                },
+                || rustudio_core::rustudio_settings::performance_value("ssao") != "off",
                 |profile| profile.ssao(),
             ) {
             // On Android SSAO_FAST_APPLY uses direct multiplicative blending without

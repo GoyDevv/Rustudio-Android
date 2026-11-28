@@ -728,16 +728,6 @@ impl Editor {
             .bridge()
             .map(|b| b.ids.iter().map(|(sid, pid)| (*pid, sid.clone())).collect())
             .unwrap_or_default();
-        let store_list = self.plugin_store.store.list();
-        let group_sources: Vec<Option<crate::plugin_store::PluginSource>> = groups
-            .iter()
-            .map(|g| {
-                bridge_map
-                    .get(&g.plugin)
-                    .and_then(|sid| store_list.iter().find(|p| p.id == *sid).cloned())
-                    .or_else(|| store_list.iter().find(|p| p.id == g.plugin_name).cloned())
-            })
-            .collect();
         self.plugin_bar.rects.clear();
         let ctx = ui.ctx().clone();
         let mut clicked: Option<Ref> = None;
@@ -768,8 +758,12 @@ impl Editor {
                 font.clone(),
                 dim(theme::TEXT),
             );
-            let store_src = group_sources[gi].as_ref();
             resp.context_menu(|ui| {
+                let store_list = self.plugin_store.store.list();
+                let store_src = bridge_map
+                    .get(&group.plugin)
+                    .and_then(|sid| store_list.iter().find(|p| p.id == *sid))
+                    .or_else(|| store_list.iter().find(|p| p.id == group.plugin_name));
                 let header = store_src.map(|p| p.name.as_str()).unwrap_or(group.plugin_name.as_str());
                 ui.label(egui::RichText::new(header).small().color(theme::TEXT_DIM));
                 ui.separator();

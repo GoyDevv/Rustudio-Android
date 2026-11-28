@@ -210,6 +210,7 @@ impl PluginManager {
                 }
             }
         }
+        if watcher::reload_on_change_setting() {
         if let Some(w) = self.watcher.as_mut() {
             let changes = w.tick();
             if !changes.is_empty() {
@@ -218,6 +219,7 @@ impl PluginManager {
                     self.lines.push(Line { level, text });
                 }
             }
+        }
         }
         // The account: check who is signed in about once a second.
         let check = self.last_user_check.is_none_or(|t| t.elapsed().as_millis() > 1000);

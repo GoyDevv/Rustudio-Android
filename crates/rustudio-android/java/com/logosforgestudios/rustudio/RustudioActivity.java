@@ -33,7 +33,6 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.PowerManager;
 import android.text.InputType;
 import android.view.Display;
 import android.view.Window;
@@ -72,8 +71,6 @@ public class RustudioActivity extends NativeActivity {
     private BroadcastReceiver installReceiver = null;
     private boolean imeListenerInstalled = false;
     private boolean storagePromptScheduled = false;
-    private boolean highRefreshRequested = false;
-    private Object thermalListener = null;
     private final java.util.HashSet<Integer> activeShortcutKeys = new java.util.HashSet<Integer>();
 
     static {
@@ -91,7 +88,6 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeImeVisibility(boolean visible, int bottomInsetPx);
     static native void nativeOnLifecycle(int state);
     static native void nativeOnTrimMemory(int level);
-    static native void nativeOnThermalStatus(int status);
     static native void nativeOnSafDocumentCreated(String uri);
     static native void nativeOnSafDocumentOpened(String uri);
 
@@ -201,102 +197,30 @@ public class RustudioActivity extends NativeActivity {
             int curW = currentMode != null ? currentMode.getPhysicalWidth() : 0;
             int curH = currentMode != null ? currentMode.getPhysicalHeight() : 0;
             Display.Mode bestMode = currentMode;
-            float chosenRate = currentMode != null ? currentMode.getRefreshRate() : 60.0f;
-            if (highRefreshRequested) {
-                float maxRate = chosenRate;
-                for (int i = 0; i < modes.length; i++) {
-                    Display.Mode m = modes[i];
-                    if (m == null) {
-                        continue;
-                    }
-                    if (curW > 0 && curH > 0
-                            && (m.getPhysicalWidth() != curW || m.getPhysicalHeight() != curH)) {
-                        continue;
-                    }
-                    float rate = m.getRefreshRate();
-                    if (rate > maxRate) {
-                        maxRate = rate;
-                        bestMode = m;
-                    }
+            float maxRate = currentMode != null ? currentMode.getRefreshRate() : 60.0f;
+            for (int i = 0; i < modes.length; i++) {
+                Display.Mode m = modes[i];
+                if (m == null) {
+                    continue;
                 }
-                chosenRate = maxRate;
-            } else {
-                float bestDiff = Float.MAX_VALUE;
-                for (int i = 0; i < modes.length; i++) {
-                    Display.Mode m = modes[i];
-                    if (m == null) {
-                        continue;
-                    }
-                    if (curW > 0 && curH > 0
-                            && (m.getPhysicalWidth() != curW || m.getPhysicalHeight() != curH)) {
-                        continue;
-                    }
-                    float rate = m.getRefreshRate();
-                    if (rate <= 61.0f) {
-                        float diff = Math.abs(60.0f - rate);
-                        if (diff < bestDiff) {
-                            bestDiff = diff;
-                            bestMode = m;
-                            chosenRate = rate;
-                        }
-                    }
+                if (curW > 0 && curH > 0
+                        && (m.getPhysicalWidth() != curW || m.getPhysicalHeight() != curH)) {
+                    continue;
+                }
+                float rate = m.getRefreshRate();
+                if (rate > maxRate) {
+                    maxRate = rate;
+                    bestMode = m;
                 }
             }
-            if (bestMode != null && chosenRate > 0.0f) {
+            if (bestMode != null && maxRate > 0.0f) {
                 WindowManager.LayoutParams lp = w.getAttributes();
                 lp.preferredDisplayModeId = bestMode.getModeId();
-                lp.preferredRefreshRate = chosenRate;
+                lp.preferredRefreshRate = maxRate;
                 w.setAttributes(lp);
             }
         } catch (Throwable ignored) {
         }
-    }
-
-    public void setHighRefreshRate(final boolean enable) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                if (highRefreshRequested != enable) {
-                    highRefreshRequested = enable;
-                    unlockMaxRefreshRate();
-                }
-            }
-        });
-    }
-
-    private void registerThermalListener() {
-        if (Build.VERSION.SDK_INT < 29 || thermalListener != null) {
-            return;
-        }
-        try {
-            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm == null) {
-                return;
-            }
-            nativeOnThermalStatus(pm.getCurrentThermalStatus());
-            thermalListener = new PowerManager.OnThermalStatusChangedListener() {
-                @Override
-                public void onThermalStatusChanged(int status) {
-                    nativeOnThermalStatus(status);
-                }
-            };
-            pm.addThermalStatusListener((PowerManager.OnThermalStatusChangedListener) thermalListener);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void unregisterThermalListener() {
-        if (Build.VERSION.SDK_INT < 29 || thermalListener == null) {
-            return;
-        }
-        try {
-            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm != null) {
-                pm.removeThermalStatusListener((PowerManager.OnThermalStatusChangedListener) thermalListener);
-            }
-        } catch (Throwable ignored) {
-        }
-        thermalListener = null;
     }
 
     @Override
@@ -304,7 +228,6 @@ public class RustudioActivity extends NativeActivity {
         super.onCreate(savedInstanceState);
         applyDarkFullscreenWindow();
         unlockMaxRefreshRate();
-        registerThermalListener();
         imeView = new ImeProxyView(this);
         imeView.setBackgroundColor(0);
         imeView.setFocusable(false);
@@ -684,7 +607,6 @@ public class RustudioActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
-        unregisterThermalListener();
         if (installReceiver != null) {
             try {
                 unregisterReceiver(installReceiver);

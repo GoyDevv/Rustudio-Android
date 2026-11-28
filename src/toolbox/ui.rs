@@ -253,6 +253,9 @@ impl Editor {
             self.toolbox_cmd(ui.ctx(), c);
         }
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if self.toolbox.ui_ms.len() >= 256 {
+            self.toolbox.ui_ms.remove(0);
+        }
         self.toolbox.ui_ms.push(ms);
     }
 

@@ -150,10 +150,14 @@ impl WindowState {
                 let win_size = clamped_size
                     .or_else(|| self.screen_rect.map(|r| r.size()))
                     .unwrap_or(Vec2::ZERO);
-                let max_x = (bounds.max.x - win_size.x).max(bounds.min.x);
-                let max_y = (bounds.max.y - win_size.y).max(bounds.min.y);
+                // Keep at least 64 pt of the title bar reachable on-screen while allowing
+                // free dragging near/partially past screen edges instead of rigidly trapping.
+                let keep_visible = 64.0_f32.min(win_size.x.max(64.0));
+                let min_x = bounds.min.x - (win_size.x - keep_visible).max(0.0);
+                let max_x = (bounds.max.x - keep_visible).max(bounds.min.x);
+                let max_y = (bounds.max.y - 36.0).max(bounds.min.y);
                 Pos2::new(
-                    position.x.clamp(bounds.min.x, max_x),
+                    position.x.clamp(min_x, max_x),
                     position.y.clamp(bounds.min.y, max_y),
                 )
             } else {

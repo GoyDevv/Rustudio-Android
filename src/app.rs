@@ -3626,7 +3626,11 @@ impl eframe::App for RustudioApp {
     }
 }
 
-const PLUGIN_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const PLUGIN_IDLE_INTERVAL: std::time::Duration = if cfg!(target_os = "android") {
+    std::time::Duration::from_millis(500)
+} else {
+    std::time::Duration::from_millis(100)
+};
 /// Play's step while the window gets no redraws (Studio's 60 Hz).
 const HIDDEN_PLAY_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
 /// Team Create alone: often enough that edits keep arriving in order.
@@ -4098,7 +4102,7 @@ impl RustudioApp {
             || ed.harness.run.bench.is_some()
             || ed.harness.ui_shots.is_some()
             || ed.harness.run.no_ui;
-        if !is_harness {
+        if !is_harness && !ctx.input(|i| i.pointer.any_down()) {
             ed.autosave.tick(&ed.game.doc, ed.game.play.is_some());
         }
         self.watchdog.stage("scene synchronization", "dock UI and GPU viewport preparation");
@@ -4307,7 +4311,8 @@ impl RustudioApp {
         self.ed.mobile_window_rects = self.mobile_windows.hit_rects();
         let mut drag_rects = self.mobile_windows.drag_handle_rects();
         let sep_rects = ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("egui_dock_separator_dragged"), false);
+            d.insert_temp(egui::Id::new("egui_dock_separator_dragged_this_frame"), false);
+            d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging_this_frame"), false);
             std::mem::take(d.get_temp_mut_or_default::<Vec<egui::Rect>>(egui::Id::new("egui_dock_separator_rects")))
         });
         drag_rects.extend(sep_rects);
@@ -4359,6 +4364,10 @@ impl RustudioApp {
                     .show_inside(ui, &mut Viewer { ed: &mut self.ed, window: None, windows: &windows });
             });
         drop(_dock_scope);
+        ctx.data_mut(|d| {
+            let sep_now = d.get_temp::<bool>(egui::Id::new("egui_dock_separator_dragged_this_frame")).unwrap_or(false);
+            d.insert_temp(egui::Id::new("egui_dock_separator_dragged"), sep_now);
+        });
         self.reset_document_tabs();
         self.panel_windows(&ctx, &windows, dock_rect);
         // Render touch-friendly in-viewport floating windows (draggable, resizable, click-to-collapse).
@@ -4403,6 +4412,10 @@ impl RustudioApp {
             let mut viewer = Viewer { ed: &mut self.ed, window: None, windows: &windows };
             self.mobile_windows.show(&ctx, dock_rect, modal_open, |ui, tab| viewer.ui(ui, tab))
         };
+        ctx.data_mut(|d| {
+            let dragging_now = d.get_temp::<bool>(egui::Id::new("rustudio_ui_layout_dragging_this_frame")).unwrap_or(false);
+            d.insert_temp(egui::Id::new("rustudio_ui_layout_dragging"), dragging_now);
+        });
         for action in mobile_actions {
             match action {
                 crate::mobile_windows::MobileWindowAction::DockBack(tab) => {
@@ -4593,7 +4606,10 @@ impl RustudioApp {
         }
         let ed = &mut self.ed;
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
-        crate::panels::record_homes(&self.dock, &mut self.panels.homes);
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        if !pointer_down {
+            crate::panels::record_homes(&self.dock, &mut self.panels.homes);
+        }
         self.ed.ui.popped = self.panels.popped.iter().map(|w| (w.key.clone(), w.tabs())).collect();
         // A script tab in front of the 3D view (plugin toolbar buttons
         // without ClickableWhenViewportHidden grey out: ui_ribbon.rs).
@@ -4605,8 +4621,10 @@ impl RustudioApp {
             .find_main_surface_tab(&Tab::Viewport)
             .and_then(|(n, _)| self.dock.main_surface()[n].tabs().map(|t| t.to_vec()))
             .unwrap_or_default();
-        if let Some(s) = self.layout.as_mut() {
-            s.tick(&ctx, &self.dock, &self.panels, &self.mobile_windows, &self.ed);
+        if !pointer_down {
+            if let Some(s) = self.layout.as_mut() {
+                s.tick(&ctx, &self.dock, &self.panels, &self.mobile_windows, &self.ed);
+            }
         }
         let ed = &mut self.ed;
         ed.insert_popup_ui(&ctx);
@@ -4731,29 +4749,6 @@ impl RustudioApp {
             || ed.game.account.busy()
             || ed.asset_picker.busy();
         if needs_continuous {
-            #[cfg(target_os = "android")]
-            {
-                let user_cap = rustudio_core::rustudio_settings::fps_limit();
-                let thermal_cap = rustudio_core::rustudio_settings::thermal_fps_cap();
-                let effective_cap = match (user_cap, thermal_cap) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-                if let Some(cap) = effective_cap {
-                    let period = std::time::Duration::from_secs_f32((1.0 / cap).max(0.001));
-                    let elapsed = frame_start.elapsed();
-                    if elapsed < period {
-                        ctx.request_repaint_after(period - elapsed);
-                    } else {
-                        ctx.request_repaint();
-                    }
-                } else {
-                    ctx.request_repaint();
-                }
-            }
-            #[cfg(not(target_os = "android"))]
             ctx.request_repaint();
         } else if ed.fps >= 0.5 {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));

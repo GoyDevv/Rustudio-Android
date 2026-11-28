@@ -144,7 +144,6 @@ impl Editor {
         // state even outside the panel. Scroll inertia and animations that
         // continue on their own prevent capture by requesting a repaint.
         !egui::Popup::is_any_open(ctx)
-            && !ctx.has_requested_repaint()
             && !crate::explorer::explorer_drag_active(ctx)
             && ctx.input(|i| {
                 let area = area.expand(4.0);
@@ -158,7 +157,7 @@ impl Editor {
                                 | Event::MouseMoved(_)
                                 | Event::PointerGone
                                 | Event::Screenshot { .. }
-                        )
+                        ) || matches!(event, Event::Touch { pos, .. } if !area.contains(*pos))
                     })
             })
             && match tab {

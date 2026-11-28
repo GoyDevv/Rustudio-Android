@@ -108,12 +108,6 @@ pub fn frame(actual: Duration, target: Duration) {
     if !wanted() || target.is_zero() {
         return;
     }
-    if rustudio_core::rustudio_settings::thermal_status() >= 2 {
-        stop();
-        return;
-    }
-    // Clamp ADPF frame budget >= 16.67 ms (60 Hz floor) to avoid unnecessary 120 Hz clock boosts.
-    let target = target.max(Duration::from_nanos(16_666_667));
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if matches!(*state, State::Untried | State::Paused) {
         if matches!(*state, State::Untried) {
