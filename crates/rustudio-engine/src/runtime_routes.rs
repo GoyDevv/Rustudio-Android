@@ -695,6 +695,9 @@ unsafe fn fast_index(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> std
             let Some(&key) = ATOMS.names.get(atom as usize) else { return -1 };
             key
         } else {
+            if ffi::lua_type(l, 2) != ffi::LUA_TSTRING {
+                return -1;
+            }
             let mut len = 0usize;
             let p = ffi::lua_tolstring(l, 2, &mut len);
             if p.is_null() {

@@ -181,6 +181,25 @@ fn decode_dds(bytes: &[u8]) -> Result<Rgba, String> {
     })
 }
 
+const MAX_DDS_DIM: usize = 8192;
+const MAX_DDS_RGBA_BYTES: usize = 64 << 20;
+
+fn checked_rgba_len(w: usize, h: usize) -> Result<usize, String> {
+    if w > MAX_DDS_DIM || h > MAX_DDS_DIM {
+        return Err(format!("dds: dimensions {w}x{h} exceed limit {MAX_DDS_DIM}"));
+    }
+    let out_len = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or("dds: image too large")?;
+    if out_len > MAX_DDS_RGBA_BYTES {
+        return Err(format!(
+            "dds: decoded size {out_len} bytes exceeds limit {MAX_DDS_RGBA_BYTES}"
+        ));
+    }
+    Ok(out_len)
+}
+
 /// Decodes a block-compressed image: `block_bytes` per 4x4 block, rows of
 /// blocks top to bottom. Edge blocks are clipped to the image size.
 fn decode_bc(
@@ -190,6 +209,7 @@ fn decode_bc(
     block_bytes: usize,
     block: impl Fn(&[u8], &mut [[u8; 4]; 16]),
 ) -> Result<Vec<u8>, String> {
+    let out_len = checked_rgba_len(w, h)?;
     let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
     let need = bw
         .checked_mul(bh)
@@ -201,7 +221,7 @@ fn decode_bc(
             data.len()
         ));
     }
-    let mut out = vec![0u8; w * h * 4];
+    let mut out = vec![0u8; out_len];
     let mut texels = [[0u8; 4]; 16];
     for (bi, src) in data[..need].chunks_exact(block_bytes).enumerate() {
         let (bx, by) = (bi % bw * 4, bi / bw * 4);
@@ -303,6 +323,7 @@ fn decode_masked(
     masks: [u32; 4],
     luminance: bool,
 ) -> Result<Vec<u8>, String> {
+    let out_len = checked_rgba_len(w, h)?;
     let need = w
         .checked_mul(h)
         .and_then(|n| n.checked_mul(bpp))
@@ -313,7 +334,7 @@ fn decode_masked(
             data.len()
         ));
     }
-    let mut out = Vec::with_capacity(w * h * 4);
+    let mut out = Vec::with_capacity(out_len);
     for src in data[..need].chunks_exact(bpp) {
         let mut word = [0u8; 4];
         word[..bpp].copy_from_slice(src);
@@ -571,6 +592,9 @@ pub type Decoded = Result<(Rgba, Option<Vec<u8>>, Option<Waiting>), String>;
 /// load's hundreds of images (each with its mip chain, ~10 MB at 1024²)
 /// otherwise all sat in memory at once.
 static WAITING_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_os = "android")]
+const WAITING_LIMIT: usize = 48 << 20;
+#[cfg(not(target_os = "android"))]
 const WAITING_LIMIT: usize = 192 << 20;
 
 /// A decoded image's share of WAITING_BYTES, given back when it is dropped

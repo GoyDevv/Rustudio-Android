@@ -201,13 +201,17 @@ fn path_map(
 
 /// Content made while the program runs (meshes and textures from imported
 /// FBX models), under `rbxtemp://rustudio/...` ids.
+const GENERATED_MAX_BYTES: usize = 64 << 20;
 static GENERATED: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None);
 
 pub fn register_generated(id: &str, bytes: Vec<u8>) {
-    if let Ok(mut g) = GENERATED.lock() {
-        g.get_or_insert_with(HashMap::new)
-            .insert(id.to_string(), Arc::new(bytes));
+    let mut g = GENERATED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    let total: usize = map.values().map(|v| v.len()).sum();
+    if total.saturating_add(bytes.len()) > GENERATED_MAX_BYTES {
+        map.clear();
     }
+    map.insert(id.to_string(), Arc::new(bytes));
 }
 
 /// Release content whose owning Play DataModel has ended.
@@ -1040,11 +1044,11 @@ struct DownloadPermit<'a> {
 
 impl Drop for DownloadPermit<'_> {
     fn drop(&mut self) {
-        let mut state = self.downloads.state.lock().unwrap();
+        let mut state = self.downloads.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(until) = self.pause_until {
             state.not_before = state.not_before.max(until);
         }
-        state.active -= 1;
+        state.active = state.active.saturating_sub(1);
         self.downloads.changed.notify_all();
     }
 }
@@ -1062,10 +1066,10 @@ impl AssetDownloads {
     }
 
     fn acquire(&self, ready_at: Instant) -> DownloadPermit<'_> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if state.active == MAX_ASSET_DOWNLOADS {
-                state = self.changed.wait(state).unwrap();
+            if state.active >= MAX_ASSET_DOWNLOADS {
+                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             }
             let wait = state
@@ -1079,7 +1083,10 @@ impl AssetDownloads {
                     pause_until: None,
                 };
             }
-            (state, _) = self.changed.wait_timeout(state, wait).unwrap();
+            (state, _) = self
+                .changed
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -1416,6 +1423,37 @@ const RBXTHUMB_MAX_ENTRIES: usize = 512;
 
 static RBXTHUMB_STATES: Mutex<Option<HashMap<String, RbxThumbState>>> = Mutex::new(None);
 
+const MAX_BG_FETCH_THREADS: usize = 8;
+static BG_FETCH_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct BgFetchGuard;
+
+impl BgFetchGuard {
+    fn try_acquire() -> Option<Self> {
+        let mut cur = BG_FETCH_THREADS.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if cur >= MAX_BG_FETCH_THREADS {
+                return None;
+            }
+            match BG_FETCH_THREADS.compare_exchange_weak(
+                cur,
+                cur + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(BgFetchGuard),
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+impl Drop for BgFetchGuard {
+    fn drop(&mut self) {
+        BG_FETCH_THREADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 fn rbxthumb_insert(map: &mut HashMap<String, RbxThumbState>, key: String, state: RbxThumbState) {
     if map.len() >= RBXTHUMB_MAX_ENTRIES && !map.contains_key(&key) {
         map.retain(|_, v| matches!(v, RbxThumbState::Pending));
@@ -1506,49 +1544,58 @@ fn fetch_rbxthumb(uri: &str) -> Fetch {
             ),
             _ => return Fetch::Unavailable(format!("unsupported rbxthumb type '{kind}'")),
         };
+        let Some(bg_guard) = BgFetchGuard::try_acquire() else {
+            return Fetch::Pending;
+        };
         rbxthumb_insert(map, key.clone(), RbxThumbState::Pending);
-        std::thread::spawn(move || {
-            let state = (|| -> Result<RbxThumbState, String> {
-                let agent = rustudio_account::api::agent();
-                let mut resp = agent.get(&api_url).call().map_err(|e| e.to_string())?;
-                if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status().as_u16()));
-                }
-                let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-                let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-                let img_url = v
-                    .get("data")
-                    .and_then(|d| d.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|e| e.get("imageUrl"))
-                    .and_then(|u| u.as_str())
-                    .filter(|u| !u.is_empty())
-                    .ok_or_else(|| "thumbnail not ready".to_string())?;
-                let mut img_resp = agent.get(img_url).call().map_err(|e| e.to_string())?;
-                if !img_resp.status().is_success() {
-                    return Err(format!("image HTTP {}", img_resp.status().as_u16()));
-                }
-                let bytes = img_resp
-                    .body_mut()
-                    .with_config()
-                    .limit(8 * 1024 * 1024)
-                    .read_to_vec()
-                    .map_err(|e| e.to_string())?;
-                if let Some(parent) = disk.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if std::fs::write(&disk, &bytes).is_ok() {
-                    Ok(RbxThumbState::OnDisk)
-                } else {
-                    Ok(RbxThumbState::InRam(Arc::new(bytes)))
-                }
-            })()
-            .unwrap_or_else(RbxThumbState::Failed);
-            if let Ok(mut g) = RBXTHUMB_STATES.lock() {
+        let key_for_thread = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rbxthumb".into())
+            .spawn(move || {
+                let _bg_guard = bg_guard;
+                let state = (|| -> Result<RbxThumbState, String> {
+                    let agent = rustudio_account::api::agent();
+                    let mut resp = agent.get(&api_url).call().map_err(|e| e.to_string())?;
+                    if !resp.status().is_success() {
+                        return Err(format!("HTTP {}", resp.status().as_u16()));
+                    }
+                    let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+                    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                    let img_url = v
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("imageUrl"))
+                        .and_then(|u| u.as_str())
+                        .filter(|u| !u.is_empty())
+                        .ok_or_else(|| "thumbnail not ready".to_string())?;
+                    let mut img_resp = agent.get(img_url).call().map_err(|e| e.to_string())?;
+                    if !img_resp.status().is_success() {
+                        return Err(format!("image HTTP {}", img_resp.status().as_u16()));
+                    }
+                    let bytes = img_resp
+                        .body_mut()
+                        .with_config()
+                        .limit(8 * 1024 * 1024)
+                        .read_to_vec()
+                        .map_err(|e| e.to_string())?;
+                    if let Some(parent) = disk.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&disk, &bytes).is_ok() {
+                        Ok(RbxThumbState::OnDisk)
+                    } else {
+                        Ok(RbxThumbState::InRam(Arc::new(bytes)))
+                    }
+                })()
+                .unwrap_or_else(RbxThumbState::Failed);
+                let mut g = RBXTHUMB_STATES.lock().unwrap_or_else(|e| e.into_inner());
                 let map = g.get_or_insert_with(HashMap::new);
-                rbxthumb_insert(map, key, state);
-            }
-        });
+                rbxthumb_insert(map, key_for_thread, state);
+            });
+        if spawned.is_err() {
+            map.remove(&key);
+        }
     }
     Fetch::Pending
 }
@@ -1578,28 +1625,51 @@ pub fn product_info(id: u64, kind: &str) -> Fetch {
         // the experience's universe; an empty record, as before round 26.
         _ => return Fetch::Ready(Arc::new(b"{}".to_vec())),
     };
-    map.insert(key.clone(), None);
-    std::thread::spawn(move || {
-        let r = (|| {
-            let mut r = rustudio_account::api::agent()
-                .get(&url)
-                .call()
-                .map_err(|e| e.to_string())?;
-            let status = r.status();
-            if !status.is_success() {
-                return Err(format!(
-                    "HTTP {} ({})",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Error")
-                ));
-            }
-            let body = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
-            Ok(Arc::new(body.into_bytes()))
-        })();
-        if let Ok(mut g) = STATES.lock() {
-            g.get_or_insert_with(HashMap::new).insert(key, Some(r));
+    const PRODUCT_INFO_MAX_ENTRIES: usize = 2048;
+    let Some(bg_guard) = BgFetchGuard::try_acquire() else {
+        return Fetch::Pending;
+    };
+    if map.len() >= PRODUCT_INFO_MAX_ENTRIES && !map.contains_key(&key) {
+        map.retain(|_, v| v.is_none());
+        if map.len() >= PRODUCT_INFO_MAX_ENTRIES {
+            map.clear();
         }
-    });
+    }
+    map.insert(key.clone(), None);
+    let key_for_thread = key.clone();
+    let spawned = std::thread::Builder::new()
+        .name("product-info".into())
+        .spawn(move || {
+            let _bg_guard = bg_guard;
+            let r = (|| {
+                let mut r = rustudio_account::api::agent()
+                    .get(&url)
+                    .call()
+                    .map_err(|e| e.to_string())?;
+                let status = r.status();
+                if !status.is_success() {
+                    return Err(format!(
+                        "HTTP {} ({})",
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or("Error")
+                    ));
+                }
+                let body = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+                Ok(Arc::new(body.into_bytes()))
+            })();
+            let mut g = STATES.lock().unwrap_or_else(|e| e.into_inner());
+            let map = g.get_or_insert_with(HashMap::new);
+            if map.len() >= PRODUCT_INFO_MAX_ENTRIES && !map.contains_key(&key_for_thread) {
+                map.retain(|_, v| v.is_none());
+                if map.len() >= PRODUCT_INFO_MAX_ENTRIES {
+                    map.clear();
+                }
+            }
+            map.insert(key_for_thread, Some(r));
+        });
+    if spawned.is_err() {
+        map.remove(&key);
+    }
     Fetch::Pending
 }
 
@@ -3914,6 +3984,18 @@ pub fn clear_static_caches() {
             m.shrink_to_fit();
         }
     }
+    {
+        let mut g = GENERATED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.as_mut() {
+            let total: usize = m.values().map(|v| v.len()).sum();
+            if total > GENERATED_MAX_BYTES {
+                m.clear();
+                m.shrink_to_fit();
+            }
+        }
+    }
+    crate::mesh_bvh::clear_cache();
+    crate::core_scripts::clear_patch_cache();
     bump_mesh_generation();
 }
 

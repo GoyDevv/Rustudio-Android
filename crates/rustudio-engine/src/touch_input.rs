@@ -355,6 +355,32 @@ impl Touch {
             }
             return;
         }
+        // When an Android hardware mouse is actively driving KBM mode, never
+        // convert mouse events into touch drags or delay them through the 320ms
+        // touch-hold gesture recognizer: release any lingering touch state and
+        // pass mouse/keyboard events straight through.
+        if kbm_active() && (has_hardware_mouse() || captured_hardware_mouse()) {
+            let mut out: Vec<Event> = Vec::with_capacity(raw.events.len() + 4);
+            if !self.active.is_empty()
+                || self.pointer.is_some()
+                || self.fling.is_some()
+                || self.stick.is_some()
+                || self.jump.is_some()
+            {
+                self.let_go(&mut out);
+                self.active.clear();
+            }
+            for ev in raw.events.drain(..) {
+                match ev {
+                    Event::Touch { .. } => {
+                        // Drop mouse-emulated touch events while captured hardware mouse is active.
+                    }
+                    other => out.push(other),
+                }
+            }
+            raw.events = out;
+            return;
+        }
         let mut out: Vec<Event> = Vec::with_capacity(raw.events.len() + 8);
         // Pointer events in a batch with touch events (or while a finger is
         // down) are egui-winit's stand-ins for the finger: ours replace them.
@@ -1003,18 +1029,32 @@ impl Touch {
 /// reports UserInputService.TouchEnabled and PreferredInput Touch too).
 static HAS_HW_KB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HAS_HW_MOUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAPTURED_HW_MOUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ACTIVE_KBM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_hardware_kbm(keyboard: bool, mouse: bool) {
     use std::sync::atomic::Ordering::Relaxed;
-    let prev = HAS_HW_KB.swap(keyboard, Relaxed) || HAS_HW_MOUSE.swap(mouse, Relaxed);
-    let now = keyboard || mouse;
+    let effective_mouse = mouse || CAPTURED_HW_MOUSE.load(Relaxed);
+    let prev = HAS_HW_KB.swap(keyboard, Relaxed) || HAS_HW_MOUSE.swap(effective_mouse, Relaxed);
+    let now = keyboard || effective_mouse;
     // Do not auto-enable ACTIVE_KBM on boot (many Android phones expose phantom
     // virtual keyboard/mouse devices like fingerprint/media sensors); only clear
     // it when hardware KBM disconnects, and let real external KBM events turn it on.
     if !now && prev {
         ACTIVE_KBM.store(false, Relaxed);
     }
+}
+
+pub fn set_captured_hardware_mouse(active: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CAPTURED_HW_MOUSE.store(active, Relaxed);
+    let kb = HAS_HW_KB.load(Relaxed);
+    set_hardware_kbm(kb, active);
+    ACTIVE_KBM.store(active, Relaxed);
+}
+
+pub fn captured_hardware_mouse() -> bool {
+    CAPTURED_HW_MOUSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn has_hardware_keyboard() -> bool {

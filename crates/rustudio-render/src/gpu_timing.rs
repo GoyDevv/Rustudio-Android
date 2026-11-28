@@ -21,6 +21,7 @@ const RING: usize = 4;
 const FREE: u8 = 0;
 const MAPPING: u8 = 1;
 const MAPPED: u8 = 2;
+const MAP_FAILED: u8 = 3;
 
 fn benchmark_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -193,7 +194,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
             slot.state.store(MAPPING, Ordering::Release);
             let state = slot.state.clone();
             slot.read.slice(..slot.used as u64 * 8).map_async(wgpu::MapMode::Read, move |r| {
-                state.store(if r.is_ok() { MAPPED } else { FREE }, Ordering::Release);
+                state.store(if r.is_ok() { MAPPED } else { MAP_FAILED }, Ordering::Release);
             });
         } else {
             slot.used = 0;
@@ -206,7 +207,15 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
     let _ = device.poll(wgpu::PollType::Poll);
     let period = st.period_ns;
     for slot in st.slots.iter_mut() {
-        if slot.state.load(Ordering::Acquire) != MAPPED {
+        let state = slot.state.load(Ordering::Acquire);
+        if state == MAP_FAILED {
+            slot.used = 0;
+            slot.spans.clear();
+            slot.scene_span = None;
+            slot.state.store(FREE, Ordering::Release);
+            continue;
+        }
+        if state != MAPPED {
             continue;
         }
         if let Ok(data) = slot.read.slice(..slot.used as u64 * 8).get_mapped_range() {

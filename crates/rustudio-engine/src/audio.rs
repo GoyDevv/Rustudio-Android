@@ -19,7 +19,7 @@
 use crate::audio_dsp::{self as dsp, Control, Process, Settings};
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -116,6 +116,35 @@ fn length_of(dec: Dec) -> Option<f64> {
     let rate = dec.sample_rate().get() as f64;
     let n = dec.count();
     (n > 0).then(|| n as f64 / ch / rate)
+}
+
+/// Cap concurrent background length-scanner threads so a burst of un-indexed
+/// sounds never spawns an unbounded number of decoder threads.
+const MAX_LEN_SCANNERS: usize = 4;
+static ACTIVE_LEN_SCANNERS: AtomicUsize = AtomicUsize::new(0);
+
+struct LenScannerGuard;
+
+impl Drop for LenScannerGuard {
+    fn drop(&mut self) {
+        ACTIVE_LEN_SCANNERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_len_scanner() -> Option<LenScannerGuard> {
+    let mut cur = ACTIVE_LEN_SCANNERS.load(Ordering::Acquire);
+    while cur < MAX_LEN_SCANNERS {
+        match ACTIVE_LEN_SCANNERS.compare_exchange_weak(
+            cur,
+            cur + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(LenScannerGuard),
+            Err(next) => cur = next,
+        }
+    }
+    None
 }
 
 /// Lazily computed length shared by all plays of the same byte buffer.
@@ -454,6 +483,7 @@ pub struct Audio {
     /// Keeps the device thread (and its output stream) alive; dropped with `Audio`.
     hold: Option<Sender<()>>,
     output_thread: Option<std::thread::JoinHandle<()>>,
+    output_done: Option<Receiver<()>>,
     /// Length cache keyed by the byte buffer's address (validated through the `Weak`).
     lengths: HashMap<usize, (Weak<Vec<u8>>, Arc<LenCell>)>,
     capture_thread: Option<std::thread::JoinHandle<()>>,
@@ -470,11 +500,26 @@ impl Drop for Audio {
         self.out = Output::Unopened;
         self.hold.take();
         #[cfg(not(target_os = "android"))]
-        if let Some(t) = self.output_thread.take() {
-            let _ = t.join();
+        {
+            self.output_done.take();
+            if let Some(t) = self.output_thread.take() {
+                let _ = t.join();
+            }
         }
         #[cfg(target_os = "android")]
-        let _ = self.output_thread.take();
+        {
+            // Wait briefly for the output thread to close its AAudio stream so rapid
+            // Stop->Play doesn't race old stream close against new stream open, while
+            // bounding the wait so a wedged AAudio close cannot ANR the UI thread.
+            if let Some(done) = self.output_done.take() {
+                let _ = done.recv_timeout(Duration::from_millis(250));
+            }
+            if let Some(t) = self.output_thread.take() {
+                if t.is_finished() {
+                    let _ = t.join();
+                }
+            }
+        }
         if let Some(t) = self.capture_thread.take() {
             let _ = t.join();
         }
@@ -518,6 +563,7 @@ impl Audio {
             out: Output::Disabled,
             hold: None,
             output_thread: None,
+            output_done: None,
             lengths: HashMap::new(),
             capture_thread: None,
             routes: HashMap::new(),
@@ -549,6 +595,7 @@ impl Audio {
     fn spawn_open(&mut self) -> Output {
         let (tx, rx) = mpsc::channel();
         let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("rustudio-audio".into())
             .spawn(move || {
@@ -558,16 +605,19 @@ impl Audio {
                         if tx.send(Ok(sink.mixer().clone())).is_ok() {
                             let _ = hold_rx.recv(); // returns when `Audio` is dropped
                         }
+                        drop(sink);
                     }
                     Err(e) => {
                         let _ = tx.send(Err(format!("no audio output device: {e}")));
                     }
                 }
+                let _ = done_tx.send(());
             });
         match spawned {
             Ok(handle) => {
                 self.hold = Some(hold_tx);
                 self.output_thread = Some(handle);
+                self.output_done = Some(done_rx);
                 Output::Opening { rx, waited: false }
             }
             Err(e) => Output::Failed(format!("cannot start audio thread: {e}")),
@@ -718,14 +768,23 @@ impl Audio {
             }
             Some(mixer) => {
                 if len.secs.get().is_none() && !len.scanning.swap(true, Ordering::AcqRel) {
-                    let (cell, data) = (len.clone(), bytes.clone());
-                    let _ = std::thread::Builder::new()
-                        .name("rustudio-audio-len".into())
-                        .spawn(move || {
-                            if let Some(l) = decoder(&data).ok().and_then(length_of) {
-                                let _ = cell.secs.set(l);
-                            }
-                        });
+                    if let Some(guard) = try_acquire_len_scanner() {
+                        let (cell, data) = (len.clone(), bytes.clone());
+                        if std::thread::Builder::new()
+                            .name("rustudio-audio-len".into())
+                            .spawn(move || {
+                                let _guard = guard;
+                                if let Some(l) = decoder(&data).ok().and_then(length_of) {
+                                    let _ = cell.secs.set(l);
+                                }
+                            })
+                            .is_err()
+                        {
+                            len.scanning.store(false, Ordering::Release);
+                        }
+                    } else {
+                        len.scanning.store(false, Ordering::Release);
+                    }
                 }
                 let target = self.buses.get(&bus).map(|b| &b.0).unwrap_or(&mixer);
                 let (player, output) = Player::new();
@@ -984,6 +1043,7 @@ impl Audio {
     pub fn stop_all(&mut self) {
         self.sounds.clear();
         self.routes.clear();
+        self.buses.clear();
     }
 }
 

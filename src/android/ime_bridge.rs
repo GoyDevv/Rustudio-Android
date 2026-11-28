@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 
-use egui::{Event, Key, Modifiers};
+use egui::{Color32, Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, Shape, Stroke, TouchPhase};
 use jni::objects::JValue;
 use jni::{jni_sig, jni_str};
 
@@ -15,6 +15,99 @@ enum ImeOp {
     Key { code: i32, down: bool },
     HardwareKey { code: i32, meta: i32, down: bool, repeat: bool },
     Action(i32),
+    MouseCapture {
+        action: i32,
+        dx: f32,
+        dy: f32,
+        button_state: i32,
+        action_button: i32,
+        scroll_x: f32,
+        scroll_y: f32,
+    },
+}
+
+struct VirtualMouseState {
+    pos: Pos2,
+    drag_pos: Pos2,
+    initialized: bool,
+    buttons: i32,
+    active: bool,
+    locked_look: bool,
+    cursor_hidden: bool,
+    right_press_pos: Option<Pos2>,
+}
+
+impl VirtualMouseState {
+    const fn new() -> Self {
+        Self {
+            pos: Pos2::ZERO,
+            drag_pos: Pos2::ZERO,
+            initialized: false,
+            buttons: 0,
+            active: false,
+            locked_look: false,
+            cursor_hidden: false,
+            right_press_pos: None,
+        }
+    }
+}
+
+static VIRTUAL_MOUSE: Mutex<VirtualMouseState> = Mutex::new(VirtualMouseState::new());
+static CURSOR_PLUGIN_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+struct VirtualCursorPlugin;
+
+impl egui::Plugin for VirtualCursorPlugin {
+    fn debug_name(&self) -> &'static str {
+        "android_virtual_cursor"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        paint_virtual_cursor(ui.ctx());
+    }
+
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+        for vp in output.viewport_output.values() {
+            for cmd in &vp.commands {
+                if let egui::ViewportCommand::CursorVisible(visible) = cmd {
+                    if let Ok(mut vm) = VIRTUAL_MOUSE.lock() {
+                        vm.cursor_hidden = !*visible;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn paint_virtual_cursor(ctx: &egui::Context) {
+    let (active, locked, pos) = {
+        let Ok(vm) = VIRTUAL_MOUSE.lock() else { return };
+        (vm.active && vm.initialized, vm.locked_look || vm.cursor_hidden, vm.pos)
+    };
+    if !active || locked {
+        return;
+    }
+    if ctx.output(|o| o.cursor_icon == egui::CursorIcon::None) {
+        return;
+    }
+    let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("android_virtual_cursor"));
+    let painter = ctx.layer_painter(layer);
+    let p0 = pos;
+    let p1 = pos + egui::vec2(0.0, 17.0);
+    let p2 = pos + egui::vec2(4.2, 13.0);
+    let p3 = pos + egui::vec2(7.0, 19.0);
+    let p4 = pos + egui::vec2(9.6, 17.8);
+    let p5 = pos + egui::vec2(6.8, 12.0);
+    let p6 = pos + egui::vec2(12.2, 12.0);
+    let fill = Color32::WHITE;
+    painter.add(Shape::convex_polygon(vec![p0, p1, p2], fill, Stroke::NONE));
+    painter.add(Shape::convex_polygon(vec![p0, p2, p5], fill, Stroke::NONE));
+    painter.add(Shape::convex_polygon(vec![p0, p5, p6], fill, Stroke::NONE));
+    painter.add(Shape::convex_polygon(vec![p2, p3, p4, p5], fill, Stroke::NONE));
+    painter.add(Shape::closed_line(
+        vec![p0, p1, p2, p3, p4, p5, p6],
+        Stroke::new(1.5, Color32::from_rgb(15, 15, 20)),
+    ));
 }
 
 static QUEUE: Mutex<Vec<ImeOp>> = Mutex::new(Vec::new());
@@ -81,6 +174,42 @@ pub fn on_action(action: i32) {
 /// Called from JNI `RustudioActivity.nativeHardwareKey` for hardware keyboard shortcuts.
 pub fn on_hardware_key(code: i32, meta: i32, down: bool, repeat: bool) {
     push_op(ImeOp::HardwareKey { code, meta, down, repeat });
+}
+
+/// Called from JNI `RustudioActivity.nativeHardwareMouseDetected` when a hardware
+/// mouse is detected (or when real finger touch switches back to touch mode).
+pub fn on_hardware_mouse_detected(active: bool) {
+    rustudio_engine::touch_input::set_captured_hardware_mouse(active);
+    if let Ok(mut vm) = VIRTUAL_MOUSE.lock() {
+        vm.active = active;
+        if !active {
+            vm.buttons = 0;
+            vm.locked_look = false;
+            vm.right_press_pos = None;
+        }
+    }
+    super::lifecycle::wake();
+}
+
+/// Called from JNI `RustudioActivity.nativeMouseCapture` (API 26+ `OnCapturedPointerListener`).
+pub fn on_mouse_capture(
+    action: i32,
+    dx: f32,
+    dy: f32,
+    button_state: i32,
+    action_button: i32,
+    scroll_x: f32,
+    scroll_y: f32,
+) {
+    push_op(ImeOp::MouseCapture {
+        action,
+        dx,
+        dy,
+        button_state,
+        action_button,
+        scroll_x,
+        scroll_y,
+    });
 }
 
 static IME_VISIBILITY_KNOWN: AtomicBool = AtomicBool::new(false);
@@ -258,6 +387,19 @@ fn map_android_keycode(code: i32) -> Option<Key> {
 /// Drains queued native Android IME operations into `egui::RawInput::events`
 /// inside `App::raw_input_hook`.
 pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
+    if !CURSOR_PLUGIN_INSTALLED.swap(true, Ordering::Relaxed) {
+        ctx.add_plugin(VirtualCursorPlugin);
+    }
+    let screen_rect = raw.screen_rect.unwrap_or_else(|| ctx.content_rect());
+    if screen_rect.is_positive() {
+        if let Ok(mut vm) = VIRTUAL_MOUSE.lock() {
+            if !vm.initialized {
+                vm.pos = screen_rect.center();
+                vm.drag_pos = vm.pos;
+                vm.initialized = true;
+            }
+        }
+    }
     let ops = {
         let Ok(mut q) = QUEUE.lock() else { return };
         if q.is_empty() {
@@ -366,6 +508,114 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
                 }
                 _ => {}
             },
+            ImeOp::MouseCapture {
+                action,
+                dx,
+                dy,
+                button_state,
+                action_button,
+                scroll_x,
+                scroll_y,
+            } => {
+                const ACTION_CANCEL: i32 = 3;
+                const ACTION_SCROLL: i32 = 8;
+                const ACTION_BUTTON_PRESS: i32 = 11;
+                const ACTION_BUTTON_RELEASE: i32 = 12;
+                const BUTTON_PRIMARY: i32 = 1;
+                const BUTTON_SECONDARY: i32 = 2;
+                const BUTTON_TERTIARY: i32 = 4;
+
+                if !rustudio_engine::touch_input::captured_hardware_mouse() {
+                    rustudio_engine::touch_input::set_captured_hardware_mouse(true);
+                }
+
+                let ppp = ctx.pixels_per_point().max(0.5);
+                let delta = egui::vec2(dx / ppp, dy / ppp);
+                let Ok(mut vm) = VIRTUAL_MOUSE.lock() else { continue };
+                vm.active = true;
+                if !vm.initialized && screen_rect.is_positive() {
+                    vm.pos = screen_rect.center();
+                    vm.drag_pos = vm.pos;
+                    vm.initialized = true;
+                }
+
+                let mut new_buttons = button_state;
+                if action == ACTION_BUTTON_PRESS && action_button != 0 {
+                    new_buttons |= action_button;
+                } else if action == ACTION_BUTTON_RELEASE && action_button != 0 {
+                    new_buttons &= !action_button;
+                } else if action == ACTION_CANCEL {
+                    new_buttons = 0;
+                }
+
+                let right_held = (new_buttons & BUTTON_SECONDARY) != 0
+                    || (vm.buttons & BUTTON_SECONDARY) != 0;
+
+                if delta.x != 0.0 || delta.y != 0.0 {
+                    raw.events.push(Event::MouseMoved(delta));
+                    if !right_held && !vm.cursor_hidden {
+                        vm.pos += delta;
+                        if screen_rect.is_positive() {
+                            vm.pos.x = vm.pos.x.clamp(screen_rect.min.x, screen_rect.max.x);
+                            vm.pos.y = vm.pos.y.clamp(screen_rect.min.y, screen_rect.max.y);
+                        }
+                        vm.drag_pos = vm.pos;
+                        raw.events.push(Event::PointerMoved(vm.pos));
+                    } else if right_held {
+                        // Keep virtual cursor anchored at right-press position while
+                        // advancing egui's pointer delta unclamped for infinite camera orbit.
+                        vm.drag_pos += delta;
+                        raw.events.push(Event::PointerMoved(vm.drag_pos));
+                    }
+                }
+
+                let prev_buttons = vm.buttons;
+                if new_buttons != prev_buttons {
+                    for (mask, button) in [
+                        (BUTTON_PRIMARY, PointerButton::Primary),
+                        (BUTTON_SECONDARY, PointerButton::Secondary),
+                        (BUTTON_TERTIARY, PointerButton::Tertiary),
+                    ] {
+                        let was = (prev_buttons & mask) != 0;
+                        let now = (new_buttons & mask) != 0;
+                        if was != now {
+                            if mask == BUTTON_SECONDARY {
+                                if now {
+                                    vm.right_press_pos = Some(vm.pos);
+                                    vm.drag_pos = vm.pos;
+                                    vm.locked_look = true;
+                                } else {
+                                    if let Some(anchor) = vm.right_press_pos.take() {
+                                        vm.pos = anchor;
+                                    }
+                                    vm.drag_pos = vm.pos;
+                                    vm.locked_look = false;
+                                }
+                            }
+                            let event_pos = vm.pos;
+                            raw.events.push(Event::PointerMoved(event_pos));
+                            raw.events.push(Event::PointerButton {
+                                pos: event_pos,
+                                button,
+                                pressed: now,
+                                modifiers: raw.modifiers,
+                            });
+                        }
+                    }
+                    vm.buttons = new_buttons;
+                }
+
+                if (action == ACTION_SCROLL || scroll_x != 0.0 || scroll_y != 0.0)
+                    && (scroll_x != 0.0 || scroll_y != 0.0)
+                {
+                    raw.events.push(Event::MouseWheel {
+                        unit: MouseWheelUnit::Line,
+                        delta: egui::vec2(scroll_x, scroll_y),
+                        phase: TouchPhase::Move,
+                        modifiers: raw.modifiers,
+                    });
+                }
+            }
         }
     }
     ctx.request_repaint();

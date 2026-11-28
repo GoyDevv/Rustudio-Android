@@ -143,6 +143,12 @@ struct CachedPatch {
 
 static PATCH_CACHE: Mutex<Option<CachedPatch>> = Mutex::new(None);
 
+/// Clears the process-wide decoded DataModelPatch cache to reclaim memory.
+pub fn clear_patch_cache() {
+    let mut guard = PATCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
 /// Reads (or reuses the process-wide decoded cache of) `path` and installs it
 /// into `doc`. Returns `(installed, from_cache)`.
 pub fn install_cached(doc: &mut Document, path: &Path) -> Result<(Installed, bool), String> {

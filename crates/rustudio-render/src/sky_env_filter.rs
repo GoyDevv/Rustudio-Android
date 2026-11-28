@@ -33,7 +33,7 @@ impl CubeLevel {
                 .collect();
             faces
                 .into_iter()
-                .flat_map(|face| face.join().unwrap())
+                .flat_map(|face| face.join().unwrap_or_else(|_| vec![Vec3::ZERO; width * width]))
                 .collect()
         });
         Self { width, pixels }

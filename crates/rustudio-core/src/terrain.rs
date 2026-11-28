@@ -311,6 +311,7 @@ impl Voxels {
                 "SmoothGrid: unsupported version {version} (only version 1 is known)"
             ));
         }
+        const MAX_DECODE_CHUNKS: usize = 4096;
         let exp = bytes[1] as u32;
         if exp > 8 {
             return Err(format!(
@@ -371,6 +372,11 @@ impl Voxels {
                         water = 0;
                     }
                     if exp == CHUNK_SHIFT {
+                        if !out.chunks.contains_key(&cur) && out.chunks.len() >= MAX_DECODE_CHUNKS {
+                            return Err(format!(
+                                "SmoothGrid: exceeds maximum chunk limit ({MAX_DECODE_CHUNKS})"
+                            ));
+                        }
                         out.chunk_mut(cur).write(i, n, mat, occ, water);
                     } else {
                         for j in i..i + n {
@@ -380,7 +386,13 @@ impl Voxels {
                                 origin[1] + l[1] as i32,
                                 origin[2] + l[2] as i32,
                             ];
-                            out.chunk_mut(chunk_key(v))
+                            let k = chunk_key(v);
+                            if !out.chunks.contains_key(&k) && out.chunks.len() >= MAX_DECODE_CHUNKS {
+                                return Err(format!(
+                                    "SmoothGrid: exceeds maximum chunk limit ({MAX_DECODE_CHUNKS})"
+                                ));
+                            }
+                            out.chunk_mut(k)
                                 .write(local_index(v), 1, mat, occ, water);
                         }
                     }
@@ -1957,7 +1969,10 @@ pub fn grass_geometry_density(v: &Voxels, key: [i32; 3], length: f32, density: f
                 // height leaves regular tips above sloping terrain at full fade.
                 let encoded = grass_pack::emit(p.to_array(), base_axis.to_array(), tip_axis.to_array(), half_width, h);
                 // Each side receives light according to its actual blade plane.
-                let face = (side * 2.0).cross(tip - p).normalize();
+                let face = {
+                    let n = (side * 2.0).cross(tip - p).normalize_or_zero();
+                    if n == glam::Vec3::ZERO { glam::Vec3::Y } else { n }
+                };
                 let vert = |index: usize, corner: i8, flag: u8, sign: f32| {
                     let pos = glam::Vec3::from_array(encoded[index][..3].try_into().unwrap()) + origin;
                     TerrainVertex {

@@ -2342,7 +2342,7 @@ impl Game {
         } else {
             match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
-                r.defer_postfx = !(r.caps().is_powervr() && no_world_gui_or_fx);
+                r.defer_postfx = !no_world_gui_or_fx;
                 r.render(
                 rs,
                 size,
@@ -2601,6 +2601,7 @@ impl Game {
             let mut reqs = self.gui.vf_requests(&self.doc);
             reqs.extend(extra.iter().map(|(k, v)| (*k, *v)));
             r.render_viewport_frames(rs, &reqs);
+            r.track_vf_layers(reqs.keys().copied());
             self.gui.set_vf_textures(|vf| r.vf_texture(vf));
         }
     }
@@ -2863,13 +2864,12 @@ impl Game {
         }
         let faces = rustudio_render::lighting::sky_faces(&self.doc);
         let orient = rustudio_render::lighting::sky_orientation(&self.doc);
-        // Whether scripts run and whether Studio content is installed are part
-        // of the key so skyboxes automatically retry once content finishes installing.
+        // Whether Studio content is installed is part of the key so skyboxes
+        // automatically retry once content finishes installing.
         let key = format!(
-            "{}|{:?}|{}|{}",
+            "{}|{:?}|{}",
             faces.join("|"),
             orient.to_array(),
-            rustudio_core::assets::scripts_running(),
             rustudio_core::studio_content::installed().is_some(),
         );
         if key == self.lighting.sky_key && !self.lighting.sky_failed {

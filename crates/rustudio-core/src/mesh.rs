@@ -89,8 +89,10 @@ pub struct Skin {
 /// 5.00, and the chunked 6.00/7.00) or Wavefront OBJ text.
 /// Returns Err(String) for unsupported versions/encodings (e.g. Draco-compressed
 /// v7 geometry) or malformed data; never panics on bad input.
+const MAX_WRAPPER_DEPTH: usize = 16;
+
 pub fn parse(bytes: &[u8]) -> Result<MeshData, String> {
-    parse_impl(bytes, None)
+    parse_impl(bytes, None, 0)
 }
 
 /// Metadata for a multi-LOD render mesh. Each consecutive pair of offsets
@@ -106,23 +108,26 @@ pub struct MeshLods {
 /// Meshes without a valid LOD table return the normal geometry and empty offsets.
 pub fn parse_with_lods(bytes: &[u8]) -> Result<(MeshData, MeshLods), String> {
     let mut lods = MeshLods::default();
-    let mesh = parse_impl(bytes, Some(&mut lods))?;
+    let mesh = parse_impl(bytes, Some(&mut lods), 0)?;
     Ok((mesh, lods))
 }
 
-fn parse_impl(bytes: &[u8], lods: Option<&mut MeshLods>) -> Result<MeshData, String> {
+fn parse_impl(bytes: &[u8], lods: Option<&mut MeshLods>, depth: usize) -> Result<MeshData, String> {
+    if depth >= MAX_WRAPPER_DEPTH {
+        return Err("mesh: wrapper nesting depth limit exceeded".into());
+    }
     if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(bytes).take(64 * 1024 * 1024).read_to_end(&mut decoded).map_err(|e| e.to_string())?;
-        return parse_impl(&decoded, lods);
+        return parse_impl(&decoded, lods, depth + 1);
     }
     if bytes.starts_with(b"<roblox!") {
         let dom = rbx_binary::from_reader(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
         for inst in dom.descendants() {
             if inst.class != "PartOperationAsset" { continue; }
             if let Some(rbx_dom_weak::types::Variant::BinaryString(blob)) = inst.properties.get(&"MeshData".into()) {
-                return parse_impl(blob.as_ref(), lods);
+                return parse_impl(blob.as_ref(), lods, depth + 1);
             }
         }
         return Err("PartOperationAsset: missing MeshData".into());
@@ -143,11 +148,18 @@ fn parse_impl(bytes: &[u8], lods: Option<&mut MeshLods>) -> Result<MeshData, Str
 /// PartOperationAsset, the CSG / solid-model formats), not one only rustudio
 /// reads for local files (Wavefront OBJ). The same dispatch as `parse`.
 pub fn studio_format(bytes: &[u8]) -> bool {
+    studio_format_depth(bytes, 0)
+}
+
+fn studio_format_depth(bytes: &[u8], depth: usize) -> bool {
+    if depth >= MAX_WRAPPER_DEPTH {
+        return false;
+    }
     if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
         let mut head = Vec::new();
         let _ = flate2::read::GzDecoder::new(bytes).take(64).read_to_end(&mut head);
-        return studio_format(&head) || !head.is_empty() && head.starts_with(b"<roblox!");
+        return studio_format_depth(&head, depth + 1) || !head.is_empty() && head.starts_with(b"<roblox!");
     }
     bytes.starts_with(b"<roblox!")
         || solid_mesh_start(bytes).is_some()
@@ -174,11 +186,18 @@ pub struct Stored {
 /// The stored vertices and faces of a binary Roblox mesh (2.00 to 7.00),
 /// None for anything else (text 1.xx, CSG, OBJ).
 pub fn stored(bytes: &[u8]) -> Option<Stored> {
+    stored_depth(bytes, 0)
+}
+
+fn stored_depth(bytes: &[u8], depth: usize) -> Option<Stored> {
+    if depth >= MAX_WRAPPER_DEPTH {
+        return None;
+    }
     if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(bytes).take(64 * 1024 * 1024).read_to_end(&mut decoded).ok()?;
-        return stored(&decoded);
+        return stored_depth(&decoded, depth + 1);
     }
     let nl = bytes.iter().position(|&b| b == b'\n')?;
     let line = std::str::from_utf8(&bytes[..nl]).ok()?;
@@ -607,10 +626,10 @@ fn parse_chunked(body: &[u8], render_lods: Option<&mut MeshLods>) -> Result<Mesh
     let (mut m, render_faces) = build_lods(&verts, &faces, lods, render_lods, lod_type, high_quality_count)?;
     // SKINNING v1: u32 envelope count, envelopes, u32 bone count, bones,
     // u32 name bytes, names, u32 subset count, subsets.
-    if let Some(d) = skinning {
+    if let Some(d) = skinning.filter(|d| d.len() >= 4) {
         let n_env = u32_at(d, 0) as usize;
-        let bones_count_at = 4 + n_env.saturating_mul(8);
-        if n_env == verts.len() && bones_count_at + 4 <= d.len() {
+        let bones_count_at = 4usize.saturating_add(n_env.saturating_mul(8));
+        if n_env == verts.len() && bones_count_at.saturating_add(4) <= d.len() {
             let num_bones = u32_at(d, bones_count_at) as usize;
             let bones_at = bones_count_at + 4;
             let names_count_at = bones_at.saturating_add(num_bones.saturating_mul(60));
@@ -688,7 +707,10 @@ fn decode_draco_core(data: &[u8]) -> Result<(Vec<Vertex>, Vec<[u32; 3]>), String
     let len = c.u32().map_err(|_| {
         "mesh: truncated Draco length (COREMESH chunk too small to hold the compressed mesh data size)"
     })? as usize;
-    let bytes = data.get(head..head + len).ok_or(
+    let end = head.checked_add(len).ok_or(
+        "mesh: truncated Draco data (Compressed mesh data size exceeds COREMESH chunk size)",
+    )?;
+    let bytes = data.get(head..end).ok_or(
         "mesh: truncated Draco data (Compressed mesh data size exceeds COREMESH chunk size)",
     )?;
     let mut buf = draco_core::decoder_buffer::DecoderBuffer::new(bytes);

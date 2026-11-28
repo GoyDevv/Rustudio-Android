@@ -1,9 +1,22 @@
 //! Stereo DSP graph used by both the device and the silent WAV renderer.
 //! Reverb is a Schroeder approximation, not FMOD's proprietary SFX implementation.
 use rodio::{ChannelCount, SampleRate, Source};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const RATE: u32 = 48000;
+/// Cap EchoSoundEffect delay buffer to 2.0 s (96,000 stereo frames ≈ 768 KB) so creating
+/// an echo effect on the audio callback thread never triggers a multi-MB allocation spike.
+const MAX_ECHO_SECS: f32 = 2.0;
+const MAX_ECHO_FRAMES: usize = RATE as usize * 2;
+
+fn audio_rms_path() -> Option<&'static std::ffi::OsString> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUSTUDIO_AUDIO_RMS").is_some()) {
+        return None;
+    }
+    PATH.get_or_init(|| std::env::var_os("RUSTUDIO_AUDIO_RMS")).as_ref()
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Effect {
     pub id: u64,
@@ -60,7 +73,7 @@ struct State {
 impl State {
     fn new(spec: Effect) -> Self {
         let n = match spec.kind.as_str() {
-            "EchoSoundEffect" => RATE as usize * 5,
+            "EchoSoundEffect" => MAX_ECHO_FRAMES,
             "ReverbSoundEffect" => RATE as usize / 5 * 4,
             "ChorusSoundEffect" | "FlangeSoundEffect" | "PitchShiftSoundEffect" => {
                 RATE as usize / 10
@@ -82,7 +95,7 @@ impl State {
         let v = |i: usize, d: f32| p.get(i).copied().filter(|x| x.is_finite()).unwrap_or(d);
         match self.spec.kind.as_str() {
             "EchoSoundEffect" => {
-                let n = (v(0, 1.).clamp(0.001, 5.) * RATE as f32) as usize;
+                let n = (v(0, 1.).clamp(0.001, MAX_ECHO_SECS) * RATE as f32) as usize;
                 let j = (self.cursor + self.delay.len() - n.min(self.delay.len() - 1))
                     % self.delay.len();
                 let old = self.delay[j];
@@ -241,28 +254,32 @@ impl<S: Source> Iterator for Process<S> {
         if let Some(r) = self.right.take() {
             return Some(r);
         }
+        if self.continuous && Arc::strong_count(&self.control) <= 1 {
+            return None;
+        }
         if self.frames % 128 == 0 {
-            let settings = self.control.lock().unwrap().clone();
-            if settings.effects != self.settings.effects {
-                let mut old = std::mem::take(&mut self.states);
-                self.states = settings
-                    .effects
-                    .iter()
-                    .map(|e| {
-                        if let Some(i) = old
-                            .iter()
-                            .position(|s| s.spec.id == e.id && s.spec.kind == e.kind)
-                        {
-                            let mut state = old.remove(i);
-                            state.spec = e.clone();
-                            state
-                        } else {
-                            State::new(e.clone())
-                        }
-                    })
-                    .collect();
+            if let Some(settings) = self.control.try_lock().ok().map(|g| g.clone()) {
+                if settings.effects != self.settings.effects {
+                    let mut old = std::mem::take(&mut self.states);
+                    self.states = settings
+                        .effects
+                        .iter()
+                        .map(|e| {
+                            if let Some(i) = old
+                                .iter()
+                                .position(|s| s.spec.id == e.id && s.spec.kind == e.kind)
+                            {
+                                let mut state = old.remove(i);
+                                state.spec = e.clone();
+                                state
+                            } else {
+                                State::new(e.clone())
+                            }
+                        })
+                        .collect();
+                }
+                self.settings = settings;
             }
-            self.settings = settings;
         }
         let left = match self.inner.next() {
             Some(s) => s,
@@ -282,7 +299,7 @@ impl<S: Source> Iterator for Process<S> {
         self.energy += x.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
         self.peak = self.peak.max(x[0].abs()).max(x[1].abs());
         if self.frames % RATE == RATE - 1 {
-            if let (Some(key), Some(path)) = (self.key, std::env::var_os("RUSTUDIO_AUDIO_RMS")) {
+            if let (Some(key), Some(path)) = (self.key, audio_rms_path()) {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)

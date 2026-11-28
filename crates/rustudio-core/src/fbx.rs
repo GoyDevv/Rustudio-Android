@@ -13,7 +13,7 @@
 //! "turned 180 degrees about Y"). Materials give the part its Color; an
 //! embedded texture (Video content) becomes the MeshPart's TextureID.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use glam::{DMat4, DVec3, Vec2, Vec3};
@@ -119,6 +119,7 @@ impl Reader<'_> {
         if depth > 64 {
             return Err("FBX: nodes nested too deeply".into());
         }
+        let record_start = o;
         let (end, nprops, mut o) = if self.wide {
             (self.u64(o)? as usize, self.u64(o + 8)? as usize, o + 24)
         } else {
@@ -129,11 +130,14 @@ impl Reader<'_> {
         if end == 0 {
             return Ok((None, o + name_len));
         }
-        if end > self.b.len() || end < o {
+        if end > self.b.len() || end <= record_start || end < o {
             return Err("FBX: node runs past the end of the file".into());
         }
         let name = String::from_utf8_lossy(self.slice(o, name_len)?).into_owned();
         o += name_len;
+        if o > end {
+            return Err("FBX: node name runs past record end".into());
+        }
         let mut props = Vec::with_capacity(nprops.min(64));
         for _ in 0..nprops {
             let t = *self.b.get(o).ok_or("FBX: truncated")?;
@@ -141,10 +145,16 @@ impl Reader<'_> {
             let (p, n) = self.prop(t, o)?;
             props.push(p);
             o += n;
+            if o > end {
+                return Err("FBX: node properties run past record end".into());
+            }
         }
         let mut kids = Vec::new();
         while o < end {
             let (k, next) = self.node(o, depth + 1)?;
+            if next <= o {
+                return Err("FBX: node did not advance".into());
+            }
             o = next;
             match k {
                 Some(k) => kids.push(k),
@@ -197,11 +207,20 @@ impl Reader<'_> {
                     b'd' | b'l' => 8,
                     _ => 1,
                 };
+                const MAX_FBX_ARRAY_BYTES: u64 = 128 * 1024 * 1024;
                 let data = if enc == 1 {
-                    let mut out = Vec::with_capacity(count.saturating_mul(elem).min(1 << 28));
+                    let expected = count.saturating_mul(elem);
+                    if expected as u64 > MAX_FBX_ARRAY_BYTES {
+                        return Err("FBX: compressed array exceeds 128 MiB limit".into());
+                    }
+                    let mut out = Vec::with_capacity(expected.min(1 << 24));
                     flate2::read::ZlibDecoder::new(raw)
+                        .take(MAX_FBX_ARRAY_BYTES + 1)
                         .read_to_end(&mut out)
                         .map_err(|e| format!("FBX: bad compressed array: {e}"))?;
+                    if out.len() as u64 > MAX_FBX_ARRAY_BYTES {
+                        return Err("FBX: compressed array exceeds 128 MiB limit".into());
+                    }
                     out
                 } else {
                     raw.to_vec()
@@ -260,6 +279,9 @@ pub fn parse(bytes: &[u8]) -> Result<(u32, Vec<Node>), String> {
     let mut top = Vec::new();
     while o + 13 < bytes.len() {
         let (n, next) = r.node(o, 0)?;
+        if next <= o {
+            return Err("FBX: node did not advance".into());
+        }
         match n {
             Some(n) => top.push(n),
             None => break,
@@ -522,8 +544,12 @@ pub fn import(bytes: &[u8]) -> Result<Vec<ImportNode>, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let mut visited: HashSet<i64> = HashSet::new();
     while let Some((id, up, parent_m)) = stack.pop() {
-        let node = by_id[&id];
+        if !visited.insert(id) {
+            continue;
+        }
+        let Some(node) = by_id.get(&id).copied() else { continue };
         let props = node.props70();
         let world = parent_m * local_matrix(&props);
         let kids = children.get(&id).cloned().unwrap_or_default();
@@ -576,7 +602,9 @@ pub fn import(bytes: &[u8]) -> Result<Vec<ImportNode>, String> {
         });
         let me = out.len() - 1;
         for k in kids.iter().rev().filter(|k| is(**k, "Model")) {
-            stack.push((*k, Some(me), world));
+            if !visited.contains(k) {
+                stack.push((*k, Some(me), world));
+            }
         }
     }
     if out.is_empty() {

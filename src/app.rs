@@ -3573,6 +3573,14 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // (a lost GPU device or one out of memory: save and restart,
+        // src/android/mod.rs gpu_watch — must run BEFORE gpu_health::check()
+        // so Vulkan device loss triggers Android's clean save & recovery
+        // instead of panicking with a desktop message.)
+        #[cfg(target_os = "android")]
+        if crate::android::gpu_watch(&mut self.ed) {
+            return;
+        }
         rustudio_render::gpu_health::check();
         // The driver's pipeline cache goes to disk once a burst of pipeline
         // builds is over (pipeline_cache.rs): the next start skips them.
@@ -3592,12 +3600,6 @@ impl eframe::App for RustudioApp {
             self.egui_ctx = Some(ui.ctx().clone());
         }
         self.cpu_usage = frame.info().cpu_usage;
-        // (a lost GPU device or one out of memory: save and restart,
-        // src/android/mod.rs gpu_watch)
-        #[cfg(target_os = "android")]
-        if crate::android::gpu_watch(&mut self.ed) {
-            return;
-        }
         self.frame(ui);
         if first {
             eprintln!(

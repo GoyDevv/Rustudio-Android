@@ -656,54 +656,115 @@ impl Drop for Runtime {
 }
 
 /// Luau calls the interrupt callback at every call and loop edge while one is
-/// set. The timeout check needs it only now and then, so the callback stays
-/// unset and a watchdog thread sets it every WATCHDOG_MS; the callback unsets
-/// itself when it runs. (Before, mlua's interrupt wrapper ran on every edge:
-/// a large share of tight Luau loops.) Luau supports setting it from another
-/// thread; Roblox arms its script timeout the same way.
+/// set. To avoid running mlua's full interrupt wrapper on every edge — while
+/// keeping `(*cb).interrupt` strictly VM-thread-owned with zero cross-thread
+/// data races — a tiny C-ABI shim stays installed on the VM thread and checks
+/// an atomic watchdog tick (`TICK`) against a thread-local `LAST_TICK`. The
+/// background `lua-watchdog` thread only increments `TICK` every `WATCHDOG_MS`;
+/// it never touches `lua_Callbacks`. Only once per tick does the shim forward
+/// to mlua's saved interrupt proc on the VM thread.
 mod interrupt_watchdog {
-    use std::sync::Mutex;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, Once};
     use mlua::ffi;
+
     type Proc = unsafe extern "C-unwind" fn(*mut ffi::lua_State, std::ffi::c_int);
     const WATCHDOG_MS: u64 = 100;
     static VMS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
-    static STARTED: std::sync::Once = std::sync::Once::new();
+    static TICK: AtomicUsize = AtomicUsize::new(0);
+    static STARTED: Once = Once::new();
 
-    /// Takes the installed interrupt off `cb` and arms it periodically.
+    thread_local! {
+        static LAST_TICK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    unsafe extern "C-unwind" fn watchdog_interrupt(
+        state: *mut ffi::lua_State,
+        gc: std::ffi::c_int,
+    ) {
+        if gc >= 0 {
+            return;
+        }
+        let tick = TICK.load(Ordering::Relaxed);
+        let due = LAST_TICK.with(|last| {
+            if last.get() == tick {
+                false
+            } else {
+                last.set(tick);
+                true
+            }
+        });
+        if !due {
+            return;
+        }
+        let cb = unsafe { ffi::lua_callbacks(state) as usize };
+        let proc = {
+            let vms = VMS.lock().unwrap_or_else(|e| e.into_inner());
+            vms.iter().find(|&&(c, _)| c == cb).map(|&(_, p)| p)
+        };
+        if let Some(proc) = proc {
+            // SAFETY: `proc` is the `mlua` interrupt callback registered for
+            // this VM, and the mutex guard is already dropped before invoking
+            // it (it may unwind on script timeout).
+            let proc: Proc = unsafe { std::mem::transmute::<usize, Proc>(proc) };
+            unsafe { proc(state, gc) };
+        }
+    }
+
+    /// Wraps the installed interrupt on `cb` with the race-free atomic tick
+    /// shim and starts the background `lua-watchdog` ticker thread.
+    /// Must be called on the VM thread.
     pub fn register(cb: *mut ffi::lua_Callbacks) {
-        let proc = unsafe { (*cb).interrupt.take() };
+        if cb.is_null() {
+            return;
+        }
+        let proc = unsafe { (*cb).interrupt };
         let Some(proc) = proc else { return };
-        VMS.lock().unwrap().push((cb as usize, proc as usize));
+        VMS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((cb as usize, proc as usize));
+        // SAFETY: called on the VM thread before running scripts; `cb` is
+        // never mutated from any other thread by this module.
+        unsafe {
+            (*cb).interrupt = Some(watchdog_interrupt);
+        }
         STARTED.call_once(|| {
             std::thread::Builder::new()
                 .name("lua-watchdog".into())
                 .spawn(|| loop {
                     std::thread::sleep(std::time::Duration::from_millis(WATCHDOG_MS));
-                    for &(cb, proc) in VMS.lock().unwrap().iter() {
-                        let cb = cb as *mut ffi::lua_Callbacks;
-                        // SAFETY: registered VMs are alive until unregister,
-                        // which takes this lock first.
-                        unsafe {
-                            std::ptr::write_volatile(
-                                &mut (*cb).interrupt,
-                                Some(std::mem::transmute::<usize, Proc>(proc)),
-                            )
-                        };
-                    }
+                    TICK.fetch_add(1, Ordering::Relaxed);
                 })
                 .ok();
         });
     }
 
+    /// Restores the lightweight atomic shim on the VM thread (e.g. if another
+    /// hook temporarily swapped `(*cb).interrupt` to mlua's proc).
     pub fn disarm(cb: usize) {
         if cb != 0 {
             let cb = cb as *mut ffi::lua_Callbacks;
-            unsafe { std::ptr::write_volatile(&mut (*cb).interrupt, None) };
+            // SAFETY: called on the VM thread inside the interrupt callback.
+            unsafe {
+                (*cb).interrupt = Some(watchdog_interrupt);
+            }
         }
     }
 
+    /// Unregisters the VM and clears its interrupt hook on the VM thread.
     pub fn unregister(cb: usize) {
-        VMS.lock().unwrap().retain(|e| e.0 != cb);
+        VMS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|e| e.0 != cb);
+        if cb != 0 {
+            let cb = cb as *mut ffi::lua_Callbacks;
+            // SAFETY: called on the VM thread during `Runtime::drop` before
+            // `Lua` is dropped.
+            unsafe {
+                (*cb).interrupt = None;
+            }
+        }
     }
 }
 

@@ -137,7 +137,14 @@ pub fn write_recovery(key: &RecoveryKey, bytes: &[u8], meta: &RecoveryMeta) -> s
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_rbxl = key.tmp_rbxl_path(seq);
     let dst_rbxl = key.rbxl_path();
-    if let Err(e) = std::fs::write(&tmp_rbxl, bytes) {
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_rbxl)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp_rbxl);
         return Err(e);
     }
@@ -149,7 +156,14 @@ pub fn write_recovery(key: &RecoveryKey, bytes: &[u8], meta: &RecoveryMeta) -> s
     if let Ok(json) = serde_json::to_string_pretty(meta) {
         let tmp_meta = key.tmp_meta_path(seq);
         let dst_meta = key.meta_path();
-        if std::fs::write(&tmp_meta, json).is_ok() {
+        let meta_res = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp_meta)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if meta_res.is_ok() {
             if std::fs::rename(&tmp_meta, &dst_meta).is_err() {
                 let _ = std::fs::remove_file(&tmp_meta);
             }
@@ -214,10 +228,17 @@ pub struct PendingRecovery {
     pub target: RecoveryTarget,
 }
 
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Per-editor auto-save scheduler and crash-recovery prompt state.
 pub struct AutoSaveState {
-    last_saved_doc_id: u64,
-    last_saved_revision: u64,
+    last_saved: Arc<Mutex<(u64, u64)>>,
     last_attempt: Instant,
     in_flight: Arc<AtomicBool>,
     pub pending_recovery: Option<PendingRecovery>,
@@ -232,19 +253,21 @@ impl Default for AutoSaveState {
 impl AutoSaveState {
     pub fn new() -> Self {
         Self {
-            last_saved_doc_id: 0,
-            last_saved_revision: 0,
+            last_saved: Arc::new(Mutex::new((0, 0))),
             last_attempt: Instant::now(),
             in_flight: Arc::new(AtomicBool::new(false)),
             pending_recovery: None,
         }
     }
 
+    fn last_saved_tuple(&self) -> (u64, u64) {
+        *self.last_saved.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Marks the given `(doc_id, revision)` as already snapshotted so the next
     /// tick waits for a new edit before saving again.
     pub fn note_saved(&mut self, doc_id: u64, revision: u64) {
-        self.last_saved_doc_id = doc_id;
-        self.last_saved_revision = revision;
+        *self.last_saved.lock().unwrap_or_else(|e| e.into_inner()) = (doc_id, revision);
         self.last_attempt = Instant::now();
     }
 
@@ -257,7 +280,7 @@ impl AutoSaveState {
         if playing || self.pending_recovery.is_some() || !doc.dirty() {
             return;
         }
-        if (doc.id, doc.revision) == (self.last_saved_doc_id, self.last_saved_revision) {
+        if (doc.id, doc.revision) == self.last_saved_tuple() {
             return;
         }
         let interval = Duration::from_secs(rustudio_core::rustudio_settings::autosave_interval_secs());
@@ -279,18 +302,24 @@ impl AutoSaveState {
 
         let key = RecoveryKey::for_doc(doc);
         let meta = RecoveryMeta::for_doc(doc);
-        self.last_saved_doc_id = doc.id;
-        self.last_saved_revision = doc.revision;
+        let doc_id = doc.id;
+        let doc_rev = doc.revision;
         self.in_flight.store(true, Ordering::Release);
 
         let in_flight = Arc::clone(&self.in_flight);
+        let last_saved = Arc::clone(&self.last_saved);
         let spawned = std::thread::Builder::new()
             .name("autosave".into())
             .spawn(move || {
-                if let Err(e) = write_recovery(&key, &bytes, &meta) {
-                    log::warn!("autosave: write failed ({}): {e}", key.stem());
+                let _clear = ClearOnDrop(in_flight);
+                match write_recovery(&key, &bytes, &meta) {
+                    Ok(()) => {
+                        *last_saved.lock().unwrap_or_else(|e| e.into_inner()) = (doc_id, doc_rev);
+                    }
+                    Err(e) => {
+                        log::warn!("autosave: write failed ({}): {e}", key.stem());
+                    }
                 }
-                in_flight.store(false, Ordering::Release);
             });
         if spawned.is_err() {
             self.in_flight.store(false, Ordering::Release);
@@ -305,15 +334,21 @@ impl AutoSaveState {
         if playing || self.pending_recovery.is_some() || !doc.dirty() {
             return;
         }
-        if (doc.id, doc.revision) == (self.last_saved_doc_id, self.last_saved_revision) {
+        if self.in_flight.load(Ordering::Acquire) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if (doc.id, doc.revision) == self.last_saved_tuple() {
             return;
         }
         if let Ok(bytes) = doc.encode_all(false) {
             let key = RecoveryKey::for_doc(doc);
             let meta = RecoveryMeta::for_doc(doc);
             if write_recovery(&key, &bytes, &meta).is_ok() {
-                self.last_saved_doc_id = doc.id;
-                self.last_saved_revision = doc.revision;
+                *self.last_saved.lock().unwrap_or_else(|e| e.into_inner()) =
+                    (doc.id, doc.revision);
                 self.last_attempt = Instant::now();
             }
         }

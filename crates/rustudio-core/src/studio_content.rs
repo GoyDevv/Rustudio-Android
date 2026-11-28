@@ -25,6 +25,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// (package, folder it unpacks into, relative to the Studio root).
@@ -112,8 +113,21 @@ pub fn builtin_plugins_installed() -> bool {
         .unwrap_or(false)
 }
 
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct InFlightGuard;
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 /// Retry downloading Studio content & official BuiltInPlugins in the background.
 pub fn retry_background_install() {
+    if IN_FLIGHT.load(Ordering::Acquire) {
+        return;
+    }
     set_download_status(DownloadUiStatus::Downloading("Checking Roblox Studio packages…".into()));
     spawn_background_install_if_missing();
 }
@@ -142,6 +156,10 @@ pub fn spawn_background_install_if_missing() {
     if std::env::var_os("RUSTUDIO_NO_STUDIO_FETCH").is_some() {
         return;
     }
+    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let guard = InFlightGuard;
     if let Some(root) = crate::default_scripts::studio_dir() {
         // Upgrade older rustudio downloads without replacing the rest of
         // their content: packages listed since, the View Selector, the
@@ -160,6 +178,7 @@ pub fn spawn_background_install_if_missing() {
                 if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
                     let version = version.to_owned();
                     let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
+                        let _guard = guard;
                         let a = agent();
                         if !packages.is_empty() {
                             let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
@@ -201,7 +220,8 @@ pub fn spawn_background_install_if_missing() {
         }
         return;
     }
-    let _ = std::thread::Builder::new().name("studio-content".into()).spawn(|| {
+    let _ = std::thread::Builder::new().name("studio-content".into()).spawn(move || {
+        let _guard = guard;
         post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' icon font; about 70 MB) from Roblox's CDN…".into());
         // The packages as they come, so a slow connection is seen to get
         // somewhere (the retired textures are a hundred small fetches: one

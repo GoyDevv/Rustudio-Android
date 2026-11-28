@@ -745,9 +745,9 @@ pub fn parse_gltf(path: &Path, bytes: &[u8]) -> Result<Vec<ImportedMesh>, String
                         .ok_or("Invalid data URI in glTF buffer")?;
                     buffers.push(decode_base64(b64)?);
                 } else {
-                    let rel = percent_decode(uri);
-                    let data = std::fs::read(base_dir.join(&rel))
-                        .map_err(|e| format!("Could not read glTF buffer {rel}: {e}"))?;
+                    let buf_path = safe_gltf_uri_path(base_dir, uri)?;
+                    let data = std::fs::read(&buf_path)
+                        .map_err(|e| format!("Could not read glTF buffer {uri}: {e}"))?;
                     buffers.push(data);
                 }
             } else if i == 0 {
@@ -810,18 +810,26 @@ pub fn parse_gltf(path: &Path, bytes: &[u8]) -> Result<Vec<ImportedMesh>, String
         }
     }
 
-    // Compute world transforms for all reachable nodes.
+    // Compute world transforms for all reachable nodes (with cycle guard).
     let mut world_xforms: HashMap<usize, Mat4> = HashMap::new();
+    let mut visited: Vec<bool> = vec![false; nodes.len()];
     let mut stack: Vec<(usize, Mat4)> = roots.into_iter().rev().map(|r| (r, Mat4::IDENTITY)).collect();
     while let Some((idx, parent_xf)) = stack.pop() {
         let Some(node) = nodes.get(idx) else { continue };
+        if visited[idx] {
+            continue;
+        }
+        visited[idx] = true;
         let local = node_local_mat4(node);
         let world = parent_xf * local;
         world_xforms.insert(idx, world);
         if let Some(kids) = node.get("children").and_then(|c| c.as_array()) {
             for k in kids.iter().rev() {
                 if let Some(ki) = k.as_u64() {
-                    stack.push((ki as usize, world));
+                    let ki = ki as usize;
+                    if ki < nodes.len() && !visited[ki] {
+                        stack.push((ki, world));
+                    }
                 }
             }
         }
@@ -1264,11 +1272,39 @@ fn extract_gltf_texture_by_info(
             let b64 = rest.split_once(',').map(|(_, d)| d)?;
             return decode_base64(b64).ok().map(|b| (b, tex_coord));
         } else {
-            let rel = percent_decode(uri);
-            return std::fs::read(base_dir.join(rel)).ok().map(|b| (b, tex_coord));
+            let img_path = safe_gltf_uri_path(base_dir, uri).ok()?;
+            return std::fs::read(img_path).ok().map(|b| (b, tex_coord));
         }
     }
     None
+}
+
+fn safe_gltf_uri_path(base_dir: &Path, uri: &str) -> Result<std::path::PathBuf, String> {
+    let rel = percent_decode(uri);
+    if rel.is_empty() || rel.contains('\0') || rel.contains('\\') {
+        return Err(format!("Unsafe glTF URI: {uri}"));
+    }
+    let rel_path = Path::new(&rel);
+    if rel_path.is_absolute() {
+        return Err(format!("Absolute glTF URI rejected: {uri}"));
+    }
+    for comp in rel_path.components() {
+        match comp {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(format!("Path traversal in glTF URI rejected: {uri}"));
+            }
+        }
+    }
+    let joined = base_dir.join(rel_path);
+    if let (Ok(canon_base), Ok(canon_target)) = (base_dir.canonicalize(), joined.canonicalize()) {
+        if !canon_target.starts_with(&canon_base) {
+            return Err(format!("glTF URI escapes base directory: {uri}"));
+        }
+    }
+    Ok(joined)
 }
 
 fn percent_decode(input: &str) -> String {
@@ -1385,9 +1421,12 @@ fn accessor_slice<'a>(
         .max(elem_bytes);
     let comp = acc.get("componentType").and_then(|v| v.as_u64()).unwrap_or(0);
     let start = bv_offset.checked_add(acc_offset).ok_or("glTF offset overflow")?;
+    if start > buf.len() {
+        return Err("glTF accessor out of buffer bounds".into());
+    }
     if count > 0 {
         let last_end = start
-            .checked_add((count - 1).saturating_mul(stride))
+            .checked_add((count - 1).checked_mul(stride).ok_or("glTF buffer bounds overflow")?)
             .and_then(|v| v.checked_add(elem_bytes))
             .ok_or("glTF buffer bounds overflow")?;
         if last_end > buf.len() {

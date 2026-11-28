@@ -1625,6 +1625,13 @@ impl Slab {
             list.remove(at);
         }
     }
+    fn is_empty(&self) -> bool {
+        let free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        free[0].len() == 1
+            && free[0][0] == (0, SLAB_VERTEX_BYTES)
+            && free[1].len() == 1
+            && free[1][0] == (0, SLAB_INDEX_BYTES)
+    }
 }
 
 /// A mesh's place in a slab, given back when the last copy of the mesh
@@ -1647,6 +1654,7 @@ impl Drop for SlabRange {
 pub(crate) struct MeshPool {
     queue: wgpu::Queue,
     slabs: Vec<std::sync::Arc<Slab>>,
+    next_id: u64,
     /// Uploads not yet written: (slab, 0 vertices / 1 indices, offset,
     /// bytes). Each queue write takes its own staging buffer (one buffer
     /// object each on ANV: thousands of meshes took seconds on the first
@@ -1656,31 +1664,42 @@ pub(crate) struct MeshPool {
 
 impl MeshPool {
     fn new(queue: &wgpu::Queue) -> Self {
-        MeshPool { queue: queue.clone(), slabs: Vec::new(), pending: Vec::new() }
+        MeshPool { queue: queue.clone(), slabs: Vec::new(), next_id: 1, pending: Vec::new() }
+    }
+
+    /// Drops trailing 48 MB slabs once all their ranges and pending uploads are freed.
+    pub(crate) fn evict_empty_trailing(&mut self) {
+        while self
+            .slabs
+            .last()
+            .is_some_and(|s| std::sync::Arc::strong_count(s) == 1 && s.is_empty())
+        {
+            self.slabs.pop();
+        }
     }
 
     /// Writes the pending uploads, adjacent ones merged into one write.
     /// Before anything draws or writes pooled meshes.
     pub(crate) fn flush(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let mut pending = std::mem::take(&mut self.pending);
-        pending.sort_by_key(|p| (p.0.id, p.1, p.2));
-        let mut i = 0;
-        while i < pending.len() {
-            let (slab, which, start) = (pending[i].0.clone(), pending[i].1, pending[i].2);
-            let mut bytes = std::mem::take(&mut pending[i].3);
-            let mut end = start + bytes.len() as u64;
-            i += 1;
-            while i < pending.len() && pending[i].0.id == slab.id && pending[i].1 == which && pending[i].2 == end {
-                end += pending[i].3.len() as u64;
-                bytes.extend_from_slice(&pending[i].3);
+        if !self.pending.is_empty() {
+            let mut pending = std::mem::take(&mut self.pending);
+            pending.sort_by_key(|p| (p.0.id, p.1, p.2));
+            let mut i = 0;
+            while i < pending.len() {
+                let (slab, which, start) = (pending[i].0.clone(), pending[i].1, pending[i].2);
+                let mut bytes = std::mem::take(&mut pending[i].3);
+                let mut end = start + bytes.len() as u64;
                 i += 1;
+                while i < pending.len() && pending[i].0.id == slab.id && pending[i].1 == which && pending[i].2 == end {
+                    end += pending[i].3.len() as u64;
+                    bytes.extend_from_slice(&pending[i].3);
+                    i += 1;
+                }
+                let buf = if which == 0 { &slab.vbuf } else { &slab.ibuf };
+                self.queue.write_buffer(buf, start, &bytes);
             }
-            let buf = if which == 0 { &slab.vbuf } else { &slab.ibuf };
-            self.queue.write_buffer(buf, start, &bytes);
         }
+        self.evict_empty_trailing();
     }
 
     /// Room for `vlen` vertex bytes and `ilen` index bytes in one slab (a
@@ -1700,7 +1719,8 @@ impl MeshPool {
                 slab.give(0, v, vlen);
             }
         }
-        let id = self.slabs.len() as u64 + 1;
+        let id = self.next_id;
+        self.next_id += 1;
         // (mapped at creation: wgpu then counts the whole buffer as zeroed,
         // instead of tracking which ranges were written and clearing the
         // rest when a draw first reads the slab)
@@ -3383,7 +3403,7 @@ pub struct Renderer {
     /// a session that will draw with them (Automatic on a weak GPU, Low):
     /// the first frame takes them instead of compiling them itself (seconds
     /// on Mesa ANV the first time a build's shaders are seen).
-    lower_pending: Option<std::sync::mpsc::Receiver<ViewportPipelines>>,
+    lower_pending: Option<(u32, std::sync::mpsc::Receiver<ViewportPipelines>)>,
     /// Join handle for the `rustudio-pipelines` worker thread so `Drop` waits
     /// for pipeline compilation to finish before `Renderer` / `Device` teardown.
     lower_thread: Option<std::thread::JoinHandle<()>>,
@@ -3538,6 +3558,12 @@ pub struct Renderer {
     /// ViewportFrames' parts (vf_render.rs): never in the world's lists;
     /// each frame's items, and a generation bumped whenever one changes.
     vf: vf::Layers,
+    /// ViewportFrame layer Refs ever rendered into `vf.targets` (including empty
+    /// frames with no parts in `vf.layer_of`) so transient/place cleanup frees all of them.
+    vf_tracked: HashSet<Ref>,
+    /// Egui texture IDs freed during `reset_place_assets()` (where `&RenderState` is unavailable),
+    /// drained via `rs.renderer.write().free_texture(&id)` on the next render or transient release.
+    pending_free_textures: Vec<egui::TextureId>,
     st: StaticLayout,
     occlusion: crate::occlusion::OcclusionBuffer,
     pending: usize,
@@ -4409,6 +4435,8 @@ impl Renderer {
             per_frame: RefSet::default(),
             dyn_occluders: RefSet::default(),
             vf: Default::default(),
+            vf_tracked: HashSet::new(),
+            pending_free_textures: Vec::new(),
             st: StaticLayout::default(),
             occlusion: crate::occlusion::OcclusionBuffer::new(),
             pending: 0,
@@ -4441,7 +4469,7 @@ impl Renderer {
                 let _guard = crate::pipeline_cache::BuildGuard::enter();
                 let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced, &caps));
             }) {
-                r.lower_pending = Some(rx);
+                r.lower_pending = Some((1, rx));
                 r.lower_thread = Some(handle);
             }
         }
@@ -4727,7 +4755,7 @@ impl Renderer {
         self.pending_upload_bytes += uploaded;
         if self.pending_upload_bytes >= 32 * 1024 * 1024 {
             queue.submit(std::iter::empty());
-            if self.caps.is_powervr() {
+            if cfg!(target_os = "android") || self.caps.is_powervr() {
                 let _ = device.poll(wgpu::PollType::Poll);
             } else {
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -5591,62 +5619,68 @@ impl Renderer {
             }
             return self.step_gl_builder(&rs.device);
         }
-        if samples == 1 {
-            if let Some(rx) = self.lower_pending.as_ref() {
-                if cfg!(target_os = "android") {
-                    match rx.try_recv() {
-                        Ok(p) => {
-                            self.lower_pending = None;
-                            if let Some(t) = self.lower_thread.take() {
-                                let _ = t.join();
-                            }
-                            self.pipelines[slot] = Some(p);
+        if let Some((pending_samples, rx)) = self.lower_pending.as_ref() {
+            let pending_samples = *pending_samples;
+            if cfg!(target_os = "android") {
+                match rx.try_recv() {
+                    Ok(p) => {
+                        self.lower_pending = None;
+                        if let Some(t) = self.lower_thread.take() {
+                            let _ = t.join();
+                        }
+                        self.pipelines[sample_slot(pending_samples)] = Some(p);
+                        if pending_samples == samples {
                             return true;
                         }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            return false;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            self.lower_pending = None;
-                            if let Some(t) = self.lower_thread.take() {
-                                let _ = t.join();
-                            }
-                        }
                     }
-                } else {
-                    let rx = self.lower_pending.take().unwrap();
-                    let _p = rustudio_core::bench::scope("r_pipelines_wait");
-                    let got = rx.recv().ok();
-                    if let Some(t) = self.lower_thread.take() {
-                        let _ = t.join();
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return false;
                     }
-                    if let Some(p) = got {
-                        self.pipelines[slot] = Some(p);
-                        return true;
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.lower_pending = None;
+                        if let Some(t) = self.lower_thread.take() {
+                            let _ = t.join();
+                        }
                     }
                 }
-            } else if cfg!(target_os = "android") && !use_incremental_pipelines(&self.caps) {
-                let (device, queue) = (rs.device.clone(), rs.queue.clone());
-                let (g, t, gl, tr, reduced, caps) = (
-                    self.globals_layout.clone(),
-                    self.tex_layout.clone(),
-                    self.glass_layout.clone(),
-                    self.terrain_layout.clone(),
-                    self.reduced,
-                    self.caps.clone(),
-                );
-                let (tx, rx) = std::sync::mpsc::channel();
-                if let Ok(handle) = std::thread::Builder::new()
-                    .name("rustudio-pipelines".into())
-                    .spawn(move || {
-                        let _guard = crate::pipeline_cache::BuildGuard::enter();
-                        let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced, &caps));
-                    })
-                {
-                    self.lower_pending = Some(rx);
-                    self.lower_thread = Some(handle);
-                    return false;
+            } else if pending_samples == samples {
+                let (_, rx) = self.lower_pending.take().unwrap();
+                let _p = rustudio_core::bench::scope("r_pipelines_wait");
+                let got = rx.recv().ok();
+                if let Some(t) = self.lower_thread.take() {
+                    let _ = t.join();
                 }
+                if let Some(p) = got {
+                    self.pipelines[slot] = Some(p);
+                    return true;
+                }
+            }
+        }
+        if self.pipelines[slot].is_none()
+            && self.lower_pending.is_none()
+            && cfg!(target_os = "android")
+            && !use_incremental_pipelines(&self.caps)
+        {
+            let (device, queue) = (rs.device.clone(), rs.queue.clone());
+            let (g, t, gl, tr, reduced, caps) = (
+                self.globals_layout.clone(),
+                self.tex_layout.clone(),
+                self.glass_layout.clone(),
+                self.terrain_layout.clone(),
+                self.reduced,
+                self.caps.clone(),
+            );
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Ok(handle) = std::thread::Builder::new()
+                .name("rustudio-pipelines".into())
+                .spawn(move || {
+                    let _guard = crate::pipeline_cache::BuildGuard::enter();
+                    let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, samples, reduced, &caps));
+                })
+            {
+                self.lower_pending = Some((samples, rx));
+                self.lower_thread = Some(handle);
+                return false;
             }
         }
         if self.pipelines[slot].is_none() {
@@ -5951,6 +5985,7 @@ impl Renderer {
         frame: &Frame,
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
+        self.drain_pending_free_textures(rs);
         self.pool.flush();
         let max_dim = self.caps.limits.max_texture_dimension_2d.min(8192).max(1);
         let size = [size[0].clamp(1, max_dim), size[1].clamp(1, max_dim)];
@@ -8401,7 +8436,9 @@ impl Renderer {
                 c.idle();
             }
         }
-        let vf_layers: Vec<Ref> = self.vf.layer_of.values().copied().collect();
+        self.drain_pending_free_textures(rs);
+        let mut vf_layers: Vec<Ref> = self.vf_tracked.drain().collect();
+        vf_layers.extend(self.vf.layer_of.values().copied());
         let mut freed = HashSet::new();
         for layer in vf_layers {
             if freed.insert(layer) {
@@ -8414,18 +8451,38 @@ impl Renderer {
         self.clear_layered_items();
         self.vf = vf::Layers::default();
         self.world_gui = [None, None, None];
+        self.pool.evict_empty_trailing();
         let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// Records ViewportFrame layer Refs whose targets were rendered so cleanup frees
+    /// all `vf.targets` entries (including frames with no parts in `vf.layer_of`).
+    pub fn track_vf_layers(&mut self, layers: impl IntoIterator<Item = Ref>) {
+        self.vf_tracked.extend(layers);
+    }
+
+    /// Frees egui texture IDs deferred during `reset_place_assets()`.
+    pub fn drain_pending_free_textures(&mut self, rs: &egui_wgpu::RenderState) {
+        if self.pending_free_textures.is_empty() {
+            return;
+        }
+        let mut egui_renderer = rs.renderer.write();
+        for id in self.pending_free_textures.drain(..) {
+            egui_renderer.free_texture(&id);
+        }
     }
 
     /// Releases per-place GPU textures, meshes, slab pools, skinning buffers,
     /// ViewportFrame targets, world_gui mip caches, and CPU render caches on place switch.
     pub fn reset_place_assets(&mut self) {
-        let vf_layers: Vec<Ref> = self.vf.layer_of.values().copied().collect();
+        let mut vf_layers: Vec<Ref> = self.vf_tracked.drain().collect();
+        vf_layers.extend(self.vf.layer_of.values().copied());
         let mut freed = HashSet::new();
         for layer in vf_layers {
             if freed.insert(layer) {
                 if let Some((id, _)) = self.vf_texture(layer) {
                     crate::world_gui::unregister_native(id);
+                    self.pending_free_textures.push(id);
                 }
             }
         }

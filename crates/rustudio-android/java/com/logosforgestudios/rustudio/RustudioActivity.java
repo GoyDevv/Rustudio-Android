@@ -39,6 +39,7 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -72,6 +73,8 @@ public class RustudioActivity extends NativeActivity {
     private boolean imeListenerInstalled = false;
     private boolean storagePromptScheduled = false;
     private final java.util.HashSet<Integer> activeShortcutKeys = new java.util.HashSet<Integer>();
+    private boolean pointerCaptureListenerInstalled = false;
+    private boolean hardwareMouseActive = false;
 
     static {
         // Register librustudio_android.so with this ClassLoader so ART resolves
@@ -85,6 +88,8 @@ public class RustudioActivity extends NativeActivity {
     static native void nativeImeKey(int keyCode, boolean down);
     static native void nativeImeAction(int action);
     static native void nativeHardwareKey(int keyCode, int metaState, boolean down, boolean repeat);
+    static native void nativeMouseCapture(int action, float dx, float dy, int buttonState, int actionButton, float scrollX, float scrollY);
+    static native void nativeHardwareMouseDetected(boolean active);
     static native void nativeImeVisibility(boolean visible, int bottomInsetPx);
     static native void nativeOnLifecycle(int state);
     static native void nativeOnTrimMemory(int level);
@@ -164,6 +169,101 @@ public class RustudioActivity extends NativeActivity {
                                 | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 );
             }
+            installCapturedPointerListenerIfNeeded(decor);
+        }
+    }
+
+    private static boolean isHardwareMouseEvent(MotionEvent event) {
+        if (event == null) {
+            return false;
+        }
+        int src = event.getSource();
+        if ((src & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
+            return true;
+        }
+        if (Build.VERSION.SDK_INT >= 26
+                && (src & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE) {
+            return true;
+        }
+        return event.getPointerCount() > 0
+                && event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE;
+    }
+
+    private static boolean isRealFingerTouchEvent(MotionEvent event) {
+        if (event == null || event.getPointerCount() <= 0) {
+            return false;
+        }
+        return !isHardwareMouseEvent(event)
+                && event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER;
+    }
+
+    private void installCapturedPointerListenerIfNeeded(View decor) {
+        if (Build.VERSION.SDK_INT < 26 || decor == null || pointerCaptureListenerInstalled) {
+            return;
+        }
+        pointerCaptureListenerInstalled = true;
+        decor.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
+            @Override
+            public boolean onCapturedPointerEvent(View view, MotionEvent event) {
+                if (event == null) {
+                    return false;
+                }
+                int action = event.getActionMasked();
+                float dx = event.getX();
+                float dy = event.getY();
+                if (action == MotionEvent.ACTION_MOVE) {
+                    int history = event.getHistorySize();
+                    for (int i = 0; i < history; i++) {
+                        dx += event.getHistoricalX(i);
+                        dy += event.getHistoricalY(i);
+                    }
+                }
+                float scrollX = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                float scrollY = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+                int buttonState = event.getButtonState();
+                int actionButton = event.getActionButton();
+                nativeMouseCapture(action, dx, dy, buttonState, actionButton, scrollX, scrollY);
+                return true;
+            }
+        });
+    }
+
+    private void activateHardwareMouseCapture() {
+        if (!hardwareMouseActive) {
+            hardwareMouseActive = true;
+            nativeHardwareMouseDetected(true);
+        }
+        if (Build.VERSION.SDK_INT < 26) {
+            return;
+        }
+        Window w = getWindow();
+        View decor = w != null ? w.getDecorView() : null;
+        if (decor == null) {
+            return;
+        }
+        installCapturedPointerListenerIfNeeded(decor);
+        if (hasWindowFocus() && !decor.hasPointerCapture()) {
+            try {
+                decor.requestPointerCapture();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void releaseHardwareMouseCapture(boolean deactivateMouse) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            Window w = getWindow();
+            View decor = w != null ? w.getDecorView() : null;
+            if (decor != null && decor.hasPointerCapture()) {
+                try {
+                    decor.releasePointerCapture();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (deactivateMouse && hardwareMouseActive) {
+            hardwareMouseActive = false;
+            nativeHardwareMouseDetected(false);
         }
     }
 
@@ -309,6 +409,7 @@ public class RustudioActivity extends NativeActivity {
     @Override
     protected void onPause() {
         activeShortcutKeys.clear();
+        releaseHardwareMouseCapture(false);
         if (imeView != null) {
             imeView.resetComposing();
         }
@@ -774,9 +875,39 @@ public class RustudioActivity extends NativeActivity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
             applyDarkFullscreenWindow();
-        } else if (imeView != null) {
-            imeView.resetComposing();
+            if (hardwareMouseActive) {
+                activateHardwareMouseCapture();
+            }
+        } else {
+            releaseHardwareMouseCapture(false);
+            if (imeView != null) {
+                imeView.resetComposing();
+            }
         }
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent ev) {
+        if (isHardwareMouseEvent(ev)) {
+            activateHardwareMouseCapture();
+            if (Build.VERSION.SDK_INT >= 26) {
+                return true;
+            }
+        }
+        return super.dispatchGenericMotionEvent(ev);
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (isHardwareMouseEvent(ev)) {
+            activateHardwareMouseCapture();
+            if (Build.VERSION.SDK_INT >= 26) {
+                return true;
+            }
+        } else if (isRealFingerTouchEvent(ev)) {
+            releaseHardwareMouseCapture(true);
+        }
+        return super.dispatchTouchEvent(ev);
     }
 
     @Override

@@ -4767,7 +4767,24 @@ pub mod live {
     pub fn bp_rearm(r: Ref) {
         shared().bp_done.remove(&r);
     }
+
+    /// Removes all shared simulation state associated with `doc_id` so
+    /// repeated Play/Stop cycles do not leak memory.
+    pub fn clear_shared(doc_id: u64) {
+        let mut s = shared();
+        s.stats.remove(&doc_id);
+        s.spins.remove(&doc_id);
+        s.spin_sets.remove(&doc_id);
+        s.reached.remove(&doc_id);
+        s.drags.remove(&doc_id);
+        if s.stats.is_empty() {
+            s.rockets.clear();
+            s.bp_done.clear();
+        }
+    }
 }
+
+pub use live::clear_shared;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HumShape {

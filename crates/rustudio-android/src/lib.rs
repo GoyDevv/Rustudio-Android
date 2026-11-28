@@ -109,6 +109,40 @@ pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeHar
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeMouseCapture(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    action: i32,
+    dx: f32,
+    dy: f32,
+    button_state: i32,
+    action_button: i32,
+    scroll_x: f32,
+    scroll_y: f32,
+) {
+    rustudio::android::ime_bridge::on_mouse_capture(
+        action,
+        dx,
+        dy,
+        button_state,
+        action_button,
+        scroll_x,
+        scroll_y,
+    );
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeHardwareMouseDetected(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    active: u8,
+) {
+    rustudio::android::ime_bridge::on_hardware_mouse_detected(active != 0);
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
 pub extern "C" fn Java_com_logosforgestudios_rustudio_RustudioActivity_nativeImeVisibility(
     _env: *mut c_void,
     _class: *mut c_void,

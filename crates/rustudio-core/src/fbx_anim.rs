@@ -156,10 +156,15 @@ impl Curve {
         let counts = ints("KeyAttrRefCount");
         let mut attrs = Vec::with_capacity(times.len());
         for (j, count) in counts.iter().enumerate() {
+            if attrs.len() >= times.len() {
+                break;
+            }
             let f = flags.get(j).copied().unwrap_or(INTERP_LINEAR);
             let rs = data.get(j * 4).copied().unwrap_or(0.0);
             let nl = data.get(j * 4 + 1).copied().unwrap_or(0.0);
-            for _ in 0..(*count).max(0) {
+            let remaining = times.len() - attrs.len();
+            let take = usize::try_from((*count).max(0)).unwrap_or(remaining).min(remaining);
+            for _ in 0..take {
                 attrs.push((f, rs, nl));
             }
         }
@@ -600,14 +605,20 @@ pub fn read(bytes: &[u8], r15: bool) -> Result<Clip, String> {
     // the start, their Times spread evenly over the range (measured: 7.5
     // fps over 1 s samples 0, 0.1333 .. 0.9333 s as Times 0, 1/7 .. 1;
     // 30 fps over 1.04 s samples k/30 as Times k × 1.04/31).
-    let len = (stop - start).max(0);
-    let n = ((len as f64 / KTIME as f64) / ((1.0 / fps) as f32 as f64)).round().max(0.0) as i64;
+    const MAX_FRAMES: i64 = 36_000;
+    let len = stop.saturating_sub(start).max(0);
+    let raw_n = ((len as f64 / KTIME as f64) / ((1.0 / fps) as f32 as f64)).round();
+    let n = if raw_n.is_finite() && raw_n > 0.0 {
+        (raw_n as i64).min(MAX_FRAMES)
+    } else {
+        0
+    };
     let frames: Vec<(i64, f64)> = (0..=n)
         .map(|k| {
             // (in floats: k × length / n, as Studio's Times read)
             let secs = (len as f64 / KTIME as f64) as f32;
             let label = if n == 0 { 0.0 } else { (k as f32 * secs / n as f32) as f64 };
-            (start + (k as f64 * KTIME as f64 / fps).round() as i64, label)
+            (start.saturating_add((k as f64 * KTIME as f64 / fps).round() as i64), label)
         })
         .collect();
 

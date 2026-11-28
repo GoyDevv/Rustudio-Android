@@ -375,6 +375,10 @@ pub struct PostFx {
     ubo_capacity_slots: usize,
     ubo: wgpu::Buffer,
     ubo_scratch: Vec<u8>,
+    uniform_layout: wgpu::BindGroupLayout,
+    samp_lin: wgpu::Sampler,
+    samp_near: wgpu::Sampler,
+    samp_repeat_near: wgpu::Sampler,
     uniform_bg: wgpu::BindGroup,
     tex_layout: wgpu::BindGroupLayout,
     depth_layout_1x: wgpu::BindGroupLayout,
@@ -483,34 +487,14 @@ impl PostFx {
             ],
         });
 
-        let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("postfx uniform"),
-            layout: &uniform_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &ubo,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(
-                            std::mem::size_of::<PostFxUniform>() as u64,
-                        ),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&samp_lin),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&samp_near),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&samp_repeat_near),
-                },
-            ],
-        });
+        let uniform_bg = Self::create_uniform_bg(
+            device,
+            &uniform_layout,
+            &ubo,
+            &samp_lin,
+            &samp_near,
+            &samp_repeat_near,
+        );
 
         let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
@@ -697,6 +681,10 @@ impl PostFx {
             ubo_capacity_slots: INITIAL_UBO_SLOTS,
             ubo,
             ubo_scratch: Vec::with_capacity((ubo_stride as usize) * INITIAL_UBO_SLOTS),
+            uniform_layout,
+            samp_lin,
+            samp_near,
+            samp_repeat_near,
             uniform_bg,
             tex_layout,
             depth_layout_1x,
@@ -720,6 +708,65 @@ impl PostFx {
             powervr_full_postfx: std::env::var("RUSTUDIO_POWERVR_POSTFX").ok().as_deref() == Some("1"),
             targets: None,
         }
+    }
+
+    fn create_uniform_bg(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        ubo: &wgpu::Buffer,
+        samp_lin: &wgpu::Sampler,
+        samp_near: &wgpu::Sampler,
+        samp_repeat_near: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("postfx uniform"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: ubo,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<PostFxUniform>() as u64,
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(samp_lin),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(samp_near),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(samp_repeat_near),
+                },
+            ],
+        })
+    }
+
+    fn ensure_ubo_capacity(&mut self, device: &wgpu::Device, needed_slots: usize) {
+        if needed_slots <= self.ubo_capacity_slots {
+            return;
+        }
+        self.ubo_capacity_slots = needed_slots.next_power_of_two();
+        self.ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("postfx ubo"),
+            size: (self.ubo_stride as u64) * (self.ubo_capacity_slots as u64),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.uniform_bg = Self::create_uniform_bg(
+            device,
+            &self.uniform_layout,
+            &self.ubo,
+            &self.samp_lin,
+            &self.samp_near,
+            &self.samp_repeat_near,
+        );
     }
 
     fn make_nod_pipe(
@@ -981,7 +1028,7 @@ impl PostFx {
             &self.black_view,
             &self.black_view,
         );
-        let full = if self.is_powervr {
+        let full = if self.is_powervr || cfg!(target_os = "android") {
             None
         } else {
             Some(self.build_full_targets(device, size, samples, hdr_view, depth_view))
@@ -1389,6 +1436,14 @@ impl PostFx {
                 t.blur_only = Some(blur_only);
             }
         }
+        // Ensure UBO capacity and uniform bind group are sized BEFORE any render pass
+        // binds `&self.uniform_bg`, so passes never reference a stale/undersized buffer.
+        let max_frame_slots = 1
+            + usize::from(need_dof) * 32
+            + usize::from(bloom_on) * 10
+            + usize::from(sr_on) * 4
+            + usize::from(need_blur) * 4;
+        self.ensure_ubo_capacity(device, max_frame_slots);
         let Some(ref targets) = self.targets else { return };
 
         let flags = (u32::from(params.terrain_capture_id)) | (u32::from(params.raw_debug) << 1);
@@ -1474,7 +1529,7 @@ impl PostFx {
         let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
         let load = wgpu::LoadOp::Load;
 
-        if self.is_powervr && !need_dof && !bloom_on && !sr_on && !need_blur {
+        if (self.is_powervr || cfg!(target_os = "android")) && !need_dof && !bloom_on && !sr_on && !need_blur {
             // Fast path: no optional PostFX active — run tone-mapping/CC directly without
             // touching optional DoF/Bloom/SunRays/Blur targets.
             let op = push_u(base_u);
@@ -2120,15 +2175,13 @@ impl PostFx {
 
         // Upload all uniform slots for this frame in a single write before submission.
         let needed_slots = self.ubo_scratch.len() / stride;
+        debug_assert!(
+            needed_slots <= self.ubo_capacity_slots,
+            "postfx emitted {needed_slots} UBO slots, exceeding pre-sized capacity {}",
+            self.ubo_capacity_slots
+        );
         if needed_slots > self.ubo_capacity_slots {
-            // Unreachable under current pass counts (< 40 slots), but safe-guard anyway.
-            self.ubo_capacity_slots = needed_slots.next_power_of_two();
-            self.ubo = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("postfx ubo"),
-                size: (self.ubo_stride as u64) * (self.ubo_capacity_slots as u64),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            self.ensure_ubo_capacity(device, needed_slots);
         }
         queue.write_buffer(&self.ubo, 0, &self.ubo_scratch);
     }

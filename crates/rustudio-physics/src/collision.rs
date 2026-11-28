@@ -67,12 +67,12 @@ fn store() -> &'static Store {
                 .spawn(|| loop {
                     let job = {
                         let s = store();
-                        let mut q = s.queue.lock().expect("collision queue");
+                        let mut q = s.queue.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if let Some(j) = q.pop_front() {
                                 break j;
                             }
-                            q = s.wake.wait(q).expect("collision queue");
+                            q = s.wake.wait(q).unwrap_or_else(|e| e.into_inner());
                         }
                     };
                     let result = compute(&job.0, job.1);
@@ -83,7 +83,7 @@ fn store() -> &'static Store {
                     store()
                         .states
                         .lock()
-                        .expect("collision states")
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert(job, st);
                 })
                 .ok();
@@ -117,22 +117,36 @@ fn cache_file(id: &str, fidelity: u32) -> PathBuf {
 }
 
 fn load_cached(id: &str, fidelity: u32) -> Option<Vec<Vec<Vec3>>> {
+    const MAX_HULLS: usize = 10_000;
+    const MAX_POINTS_PER_HULL: usize = 100_000;
     let b = std::fs::read(cache_file(id, fidelity)).ok()?;
     let mut at = 0usize;
-    let mut u32_at = |b: &[u8]| -> Option<u32> {
-        let v = u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?);
-        at += 4;
+    let read_u32 = |at: &mut usize| -> Option<u32> {
+        let end = at.checked_add(4)?;
+        let v = u32::from_le_bytes(b.get(*at..end)?.try_into().ok()?);
+        *at = end;
         Some(v)
     };
-    let n = u32_at(&b)? as usize;
+    let n = read_u32(&mut at)? as usize;
+    let rem = b.len().saturating_sub(at);
+    if n > MAX_HULLS || n.checked_mul(4).map_or(true, |need| need > rem) {
+        return None;
+    }
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let m = u32_at(&b)? as usize;
+        let m = read_u32(&mut at)? as usize;
+        let rem = b.len().saturating_sub(at);
+        if m > MAX_POINTS_PER_HULL || m.checked_mul(12).map_or(true, |need| need > rem) {
+            return None;
+        }
         let mut pts = Vec::with_capacity(m);
         for _ in 0..m {
-            let x = f32::from_bits(u32_at(&b)?);
-            let y = f32::from_bits(u32_at(&b)?);
-            let z = f32::from_bits(u32_at(&b)?);
+            let x = f32::from_bits(read_u32(&mut at)?);
+            let y = f32::from_bits(read_u32(&mut at)?);
+            let z = f32::from_bits(read_u32(&mut at)?);
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return None;
+            }
             pts.push(Vec3::new(x, y, z));
         }
         out.push(pts);
@@ -155,7 +169,12 @@ fn save_cached(id: &str, fidelity: u32, hulls: &[Vec<Vec3>]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, b);
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("bin.{}.{seq}.tmp", std::process::id()));
+    if std::fs::write(&tmp, b).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// The mesh's vertices (welded) and triangles in its unit box.
@@ -292,7 +311,7 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
     let s = store();
     let key = (id.to_string(), fidelity);
     {
-        let mut states = s.states.lock().expect("collision states");
+        let mut states = s.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.get(&key) {
             Some(State::Ready(h)) => return Lookup::Ready(h.clone()),
             Some(State::Pending) => return Lookup::Pending,
@@ -319,7 +338,7 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
         }
         states.insert(key.clone(), State::Pending);
     }
-    s.queue.lock().expect("collision queue").push_back(key);
+    s.queue.lock().unwrap_or_else(|e| e.into_inner()).push_back(key);
     s.wake.notify_one();
     Lookup::Pending
 }
@@ -344,7 +363,7 @@ pub fn wait_ready(id: &str, fidelity: u32, timeout: std::time::Duration) -> Look
                 if rustudio_core::assets::mesh_triangles(id).is_none() {
                     return Lookup::Unavailable;
                 }
-                store().states.lock().expect("collision states").remove(&(id.to_string(), fidelity));
+                store().states.lock().unwrap_or_else(|e| e.into_inner()).remove(&(id.to_string(), fidelity));
             }
             other => return other,
         }

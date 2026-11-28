@@ -211,19 +211,33 @@ fn ray_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<(f32, Vec3)> {
     Some((e2.dot(q) * inv, e1.cross(e2).normalize_or_zero()))
 }
 
+static CACHE: Mutex<Option<HashMap<String, Option<Arc<MeshBvh>>>>> = Mutex::new(None);
+
+/// Clears the process-wide mesh BVH cache to reclaim memory.
+pub fn clear_cache() {
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = g.as_mut() {
+        m.clear();
+        m.shrink_to_fit();
+    }
+}
+
 /// The BVH of a mesh content id (built once, shared).
 pub fn for_mesh(id: &str) -> Option<Arc<MeshBvh>> {
-    static CACHE: Mutex<Option<HashMap<String, Option<Arc<MeshBvh>>>>> = Mutex::new(None);
-    if let Some(hit) = CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(id) {
+    if let Some(hit) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(id)
+    {
         return hit.clone();
     }
     let tris = crate::assets::mesh_triangles(id);
     // A mesh still downloading isn't cached as missing.
     let tris = tris?;
     let bvh = Some(Arc::new(MeshBvh::build(tris)));
-    if let Ok(mut g) = CACHE.lock() {
-        g.get_or_insert_with(HashMap::new).insert(id.to_string(), bvh.clone());
-    }
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashMap::new).insert(id.to_string(), bvh.clone());
     bvh
 }
 

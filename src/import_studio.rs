@@ -133,30 +133,123 @@ fn cframe_from_pos_quat(pos: Vec3, q: Quat) -> CFrame {
     CFrame::new(Vector3::new(pos.x, pos.y, pos.z), rot)
 }
 
+struct GltfBone {
+    name: String,
+    parent: Option<usize>,
+}
+
 struct SimpleKeyframe {
     time: f32,
-    poses: HashMap<String, CFrame>,
+    poses: HashMap<usize, CFrame>,
+}
+
+fn percent_decode_gltf(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_base64_gltf(input: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return Err("Invalid base64 character in glTF buffer".into()),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn safe_gltf_uri_path(base_dir: &Path, uri: &str) -> Result<PathBuf, String> {
+    let rel = percent_decode_gltf(uri);
+    if rel.is_empty() || rel.contains('\0') || rel.contains('\\') {
+        return Err(format!("Unsafe glTF buffer URI: {uri}"));
+    }
+    let rel_path = Path::new(&rel);
+    if rel_path.is_absolute() {
+        return Err(format!("Absolute glTF buffer URI rejected: {uri}"));
+    }
+    for comp in rel_path.components() {
+        match comp {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(format!("Path traversal in glTF buffer URI rejected: {uri}"));
+            }
+        }
+    }
+    let joined = base_dir.join(rel_path);
+    if let (Ok(canon_base), Ok(canon_target)) = (base_dir.canonicalize(), joined.canonicalize()) {
+        if !canon_target.starts_with(&canon_base) {
+            return Err(format!("glTF buffer URI escapes parent directory: {uri}"));
+        }
+    }
+    Ok(joined)
 }
 
 /// Minimal pure-Rust glTF/GLB animation parser extracting translation/rotation tracks.
-fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<SimpleKeyframe>), String> {
+fn parse_gltf_animation(
+    bytes: &[u8],
+    base_dir: Option<&Path>,
+    rig: RigKind,
+) -> Result<(String, Vec<GltfBone>, Vec<SimpleKeyframe>), String> {
     let (json, bin_chunk): (serde_json::Value, Option<&[u8]>) = if bytes.len() >= 20 && &bytes[0..4] == b"glTF" {
         let mut off = 12usize;
         let mut json_slice: Option<&[u8]> = None;
         let mut bin_slice: Option<&[u8]> = None;
-        while off + 8 <= bytes.len() {
+        while let Some(header_end) = off.checked_add(8) {
+            if header_end > bytes.len() {
+                break;
+            }
             let chunk_len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-            let chunk_type = &bytes[off + 4..off + 8];
-            off += 8;
-            if off + chunk_len > bytes.len() {
+            let chunk_type = &bytes[off + 4..header_end];
+            off = header_end;
+            let Some(chunk_end) = off.checked_add(chunk_len) else {
+                break;
+            };
+            if chunk_end > bytes.len() {
                 break;
             }
             if chunk_type == b"JSON" {
-                json_slice = Some(&bytes[off..off + chunk_len]);
+                json_slice = Some(&bytes[off..chunk_end]);
             } else if chunk_type == b"BIN\0" {
-                bin_slice = Some(&bytes[off..off + chunk_len]);
+                bin_slice = Some(&bytes[off..chunk_end]);
             }
-            off += chunk_len;
+            off = chunk_end;
         }
         let js = json_slice.ok_or_else(|| "GLB missing JSON chunk".to_string())?;
         let val: serde_json::Value = serde_json::from_slice(js).map_err(|e| format!("GLB JSON: {e}"))?;
@@ -165,6 +258,34 @@ fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<Simpl
         let val: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("glTF JSON: {e}"))?;
         (val, None)
     };
+
+    // Resolve external/embedded buffers (data: base64 URIs, relative .bin files, or GLB BIN chunk).
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
+    if let Some(arr) = json.get("buffers").and_then(|v| v.as_array()) {
+        for (i, buf) in arr.iter().enumerate() {
+            if let Some(uri) = buf.get("uri").and_then(|u| u.as_str()) {
+                if let Some(rest) = uri.strip_prefix("data:") {
+                    let b64 = rest
+                        .split_once(',')
+                        .map(|(_, d)| d)
+                        .ok_or_else(|| "Invalid data URI in glTF buffer".to_string())?;
+                    buffers.push(decode_base64_gltf(b64)?);
+                } else {
+                    let dir = base_dir.ok_or_else(|| format!("External glTF buffer {uri} requires a parent directory"))?;
+                    let buf_path = safe_gltf_uri_path(dir, uri)?;
+                    let data = std::fs::read(&buf_path)
+                        .map_err(|e| format!("Could not read glTF buffer {uri}: {e}"))?;
+                    buffers.push(data);
+                }
+            } else if i == 0 {
+                buffers.push(bin_chunk.map(|b| b.to_vec()).unwrap_or_default());
+            } else {
+                buffers.push(Vec::new());
+            }
+        }
+    } else if let Some(b) = bin_chunk {
+        buffers.push(b.to_vec());
+    }
 
     let anims = json
         .get("animations")
@@ -197,30 +318,70 @@ fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<Simpl
         };
         let bv_idx = acc.get("bufferView")?.as_u64()? as usize;
         let bv = buffer_views.get(bv_idx)?;
-        let bin = bin_chunk?;
-        let base = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize
-            + acc.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let stride = bv.get("byteStride").and_then(|v| v.as_u64()).unwrap_or((comps * 4) as u64) as usize;
-        let max_items = bin.len().saturating_sub(base) / (comps * 4).max(1);
-    let mut out = Vec::with_capacity(count.min(max_items).saturating_mul(comps));
+        let buf_idx = bv.get("buffer").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let bin = buffers.get(buf_idx)?;
+        let bv_off = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let acc_off = acc.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let base = bv_off.checked_add(acc_off)?;
+        if base > bin.len() {
+            return None;
+        }
+        let elem_bytes = comps.checked_mul(4)?;
+        let stride = bv
+            .get("byteStride")
+            .and_then(|v| v.as_u64())
+            .map(|s| s as usize)
+            .unwrap_or(elem_bytes)
+            .max(elem_bytes);
+        let max_items = bin.len().saturating_sub(base) / elem_bytes.max(1);
+        let mut out = Vec::with_capacity(count.min(max_items).saturating_mul(comps));
         for i in 0..count {
-            let start = base + i * stride;
-            if start + comps * 4 > bin.len() {
+            let start = i.checked_mul(stride).and_then(|o| base.checked_add(o))?;
+            let end = start.checked_add(elem_bytes)?;
+            if end > bin.len() {
                 break;
             }
             for c in 0..comps {
-                let b = start + c * 4;
-                out.push(f32::from_le_bytes(bin[b..b + 4].try_into().ok()?));
+                let b = c.checked_mul(4).and_then(|o| start.checked_add(o))?;
+                let b_end = b.checked_add(4)?;
+                out.push(f32::from_le_bytes(bin.get(b..b_end)?.try_into().ok()?));
             }
         }
         Some(out)
     };
 
+    // Build parent map across glTF nodes to preserve bone hierarchy.
+    let mut node_parent: Vec<Option<usize>> = vec![None; nodes.len()];
+    for (pi, node) in nodes.iter().enumerate() {
+        if let Some(kids) = node.get("children").and_then(|c| c.as_array()) {
+            for k in kids {
+                if let Some(ci) = k.as_u64().map(|v| v as usize) {
+                    if ci < node_parent.len() && ci != pi && node_parent[ci].is_none() {
+                        node_parent[ci] = Some(pi);
+                    }
+                }
+            }
+        }
+    }
+
+    let node_bone_name = |node_idx: usize| -> String {
+        let raw_bone = nodes
+            .get(node_idx)
+            .and_then(|n| n.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        remap_bone_name(raw_bone, rig)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| if raw_bone.is_empty() { format!("Joint{node_idx}") } else { raw_bone.to_string() })
+    };
+
     let samplers = anim.get("samplers").and_then(|v| v.as_array()).ok_or("glTF animation missing samplers")?;
     let channels = anim.get("channels").and_then(|v| v.as_array()).ok_or("glTF animation missing channels")?;
 
-    // Collect per-time-bucket (quantized to 1ms) joint poses
-    let mut buckets: std::collections::BTreeMap<i64, HashMap<String, (Vec3, Quat)>> = std::collections::BTreeMap::new();
+    // Collect per-time-bucket (quantized to 1ms) joint poses and track animated bones.
+    let mut bone_name_to_raw: HashMap<String, usize> = HashMap::new();
+    let mut raw_bones: Vec<(String, usize)> = Vec::new(); // (bone_name, representative glTF node_idx)
+    let mut buckets: std::collections::BTreeMap<i64, HashMap<usize, (Vec3, Quat)>> = std::collections::BTreeMap::new();
 
     for ch in channels {
         let Some(sampler_idx) = ch.get("sampler").and_then(|v| v.as_u64()).map(|v| v as usize) else { continue };
@@ -230,16 +391,15 @@ fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<Simpl
         if path != "translation" && path != "rotation" {
             continue;
         }
-        let raw_bone = nodes
-            .get(node_idx)
-            .and_then(|n| n.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let bone_name = remap_bone_name(raw_bone, rig)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| if raw_bone.is_empty() { format!("Joint{node_idx}") } else { raw_bone.to_string() });
+        let bone_name = node_bone_name(node_idx);
+        let raw_bone_idx = *bone_name_to_raw.entry(bone_name.clone()).or_insert_with(|| {
+            let idx = raw_bones.len();
+            raw_bones.push((bone_name.clone(), node_idx));
+            idx
+        });
 
         let Some(sampler) = samplers.get(sampler_idx) else { continue };
+        let is_cubic = sampler.get("interpolation").and_then(|v| v.as_str()) == Some("CUBICSPLINE");
         let Some(in_idx) = sampler.get("input").and_then(|v| v.as_u64()).map(|v| v as usize) else { continue };
         let Some(out_idx) = sampler.get("output").and_then(|v| v.as_u64()).map(|v| v as usize) else { continue };
         let (Some(times), Some(vals)) = (read_f32s(in_idx), read_f32s(out_idx)) else { continue };
@@ -252,12 +412,32 @@ fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<Simpl
             let entry = buckets
                 .entry(key)
                 .or_default()
-                .entry(bone_name.clone())
+                .entry(raw_bone_idx)
                 .or_insert((Vec3::ZERO, Quat::IDENTITY));
-            if path == "translation" && i * 3 + 2 < vals.len() {
-                entry.0 = Vec3::new(vals[i * 3], vals[i * 3 + 1], vals[i * 3 + 2]);
-            } else if path == "rotation" && i * 4 + 3 < vals.len() {
-                entry.1 = Quat::from_xyzw(vals[i * 4], vals[i * 4 + 1], vals[i * 4 + 2], vals[i * 4 + 3]).normalize();
+            if path == "translation" {
+                let comps = 3usize;
+                let base_idx = if is_cubic {
+                    i.checked_mul(3).and_then(|x| x.checked_add(1)).and_then(|x| x.checked_mul(comps))
+                } else {
+                    i.checked_mul(comps)
+                };
+                if let Some(idx) = base_idx {
+                    if idx.checked_add(2).is_some_and(|last| last < vals.len()) {
+                        entry.0 = Vec3::new(vals[idx], vals[idx + 1], vals[idx + 2]);
+                    }
+                }
+            } else if path == "rotation" {
+                let comps = 4usize;
+                let base_idx = if is_cubic {
+                    i.checked_mul(3).and_then(|x| x.checked_add(1)).and_then(|x| x.checked_mul(comps))
+                } else {
+                    i.checked_mul(comps)
+                };
+                if let Some(idx) = base_idx {
+                    if idx.checked_add(3).is_some_and(|last| last < vals.len()) {
+                        entry.1 = Quat::from_xyzw(vals[idx], vals[idx + 1], vals[idx + 2], vals[idx + 3]).normalize();
+                    }
+                }
             }
         }
     }
@@ -265,17 +445,81 @@ fn parse_gltf_animation(bytes: &[u8], rig: RigKind) -> Result<(String, Vec<Simpl
     if buckets.is_empty() {
         return Err("No keyframe tracks found in glTF animation".to_string());
     }
+
+    // Resolve nearest animated ancestor for each animated bone.
+    let mut raw_parent: Vec<Option<usize>> = vec![None; raw_bones.len()];
+    for (bi, (bname, node_idx)) in raw_bones.iter().enumerate() {
+        let mut cur = node_parent.get(*node_idx).copied().flatten();
+        let mut steps = 0usize;
+        while let Some(p_node) = cur {
+            if steps >= nodes.len() {
+                break;
+            }
+            steps += 1;
+            let p_name = node_bone_name(p_node);
+            if &p_name != bname {
+                if let Some(&p_bi) = bone_name_to_raw.get(&p_name) {
+                    raw_parent[bi] = Some(p_bi);
+                    break;
+                }
+            }
+            cur = node_parent.get(p_node).copied().flatten();
+        }
+    }
+
+    // Topologically order bones (parents before children) with cycle protection.
+    let mut state: Vec<u8> = vec![0; raw_bones.len()]; // 0 = unvisited, 1 = visiting, 2 = done
+    let mut order: Vec<usize> = Vec::with_capacity(raw_bones.len());
+    fn topo_visit(
+        bi: usize,
+        raw_parent: &[Option<usize>],
+        state: &mut [u8],
+        order: &mut Vec<usize>,
+    ) {
+        if state[bi] != 0 {
+            return;
+        }
+        state[bi] = 1;
+        if let Some(pi) = raw_parent[bi] {
+            if state[pi] == 0 {
+                topo_visit(pi, raw_parent, state, order);
+            }
+        }
+        state[bi] = 2;
+        order.push(bi);
+    }
+    for bi in 0..raw_bones.len() {
+        topo_visit(bi, &raw_parent, &mut state, &mut order);
+    }
+
+    let mut old_to_new: Vec<usize> = vec![0; raw_bones.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        old_to_new[old_idx] = new_idx;
+    }
+    let bones: Vec<GltfBone> = order
+        .iter()
+        .map(|&old_idx| {
+            let parent = raw_parent[old_idx]
+                .map(|p| old_to_new[p])
+                .filter(|&p_new| p_new < old_to_new[old_idx]);
+            GltfBone {
+                name: raw_bones[old_idx].0.clone(),
+                parent,
+            }
+        })
+        .collect();
+
     let frames = buckets
         .into_iter()
         .map(|(ms, map)| SimpleKeyframe {
             time: ms as f32 / 1000.0,
             poses: map
                 .into_iter()
-                .map(|(k, (p, q))| (k, cframe_from_pos_quat(p, q)))
+                .map(|(old_bi, (p, q))| (old_to_new[old_bi], cframe_from_pos_quat(p, q)))
                 .collect(),
         })
         .collect();
-    Ok((anim_name, frames))
+    Ok((anim_name, bones, frames))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,8 +718,8 @@ impl Editor {
         }
 
         if matches!(ext.as_str(), "glb" | "gltf") {
-            match parse_gltf_animation(&bytes, rig) {
-                Ok((name, frames)) => {
+            match parse_gltf_animation(&bytes, path.parent(), rig) {
+                Ok((name, bones, frames)) => {
                     let kfs = self.game.doc.insert(
                         parent,
                         InstanceBuilder::new("KeyframeSequence")
@@ -483,6 +727,9 @@ impl Editor {
                             .with_property("Loop", true)
                             .with_property("Priority", Variant::Enum(Enum::from_u32(2))),
                     );
+                    let has_root_bone = bones
+                        .iter()
+                        .any(|b| b.parent.is_none() && b.name == "HumanoidRootPart");
                     for kf in &frames {
                         let kf_ref = self.game.doc.insert(
                             kfs,
@@ -490,20 +737,33 @@ impl Editor {
                                 .with_name("Keyframe")
                                 .with_property("Time", kf.time),
                         );
-                        let root_pose = self.game.doc.insert(
-                            kf_ref,
-                            InstanceBuilder::new("Pose")
-                                .with_name("HumanoidRootPart")
-                                .with_property("Weight", 1.0f32),
-                        );
-                        for (joint, cf) in &kf.poses {
-                            let _ = self.game.doc.insert(
-                                root_pose,
+                        let default_parent = if has_root_bone {
+                            kf_ref
+                        } else {
+                            self.game.doc.insert(
+                                kf_ref,
                                 InstanceBuilder::new("Pose")
-                                    .with_name(joint.clone())
-                                    .with_property("CFrame", *cf)
+                                    .with_name("HumanoidRootPart")
+                                    .with_property("Weight", 1.0f32),
+                            )
+                        };
+                        let mut made_poses: Vec<Ref> = Vec::with_capacity(bones.len());
+                        for (bi, bone) in bones.iter().enumerate() {
+                            let parent_ref = bone
+                                .parent
+                                .and_then(|pi| made_poses.get(pi).copied())
+                                .unwrap_or(default_parent);
+                            let cf = kf.poses.get(&bi).copied().unwrap_or_else(|| {
+                                CFrame::new(Vector3::new(0.0, 0.0, 0.0), Matrix3::identity())
+                            });
+                            let pose_ref = self.game.doc.insert(
+                                parent_ref,
+                                InstanceBuilder::new("Pose")
+                                    .with_name(bone.name.clone())
+                                    .with_property("CFrame", cf)
                                     .with_property("Weight", 1.0f32),
                             );
+                            made_poses.push(pose_ref);
                         }
                     }
                     self.explorer.expanded.insert(parent);

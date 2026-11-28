@@ -751,29 +751,95 @@ impl Game {
         f: impl FnOnce(&Runtime, Option<&Document>, &mut RepMap) -> R,
     ) -> Option<R> {
         let s = self.play.as_mut()?;
+        struct ServerGuard<'a> {
+            runtime: &'a Runtime,
+            world_slot: &'a mut Option<World>,
+            doc_slot: &'a mut Document,
+            output: Vec<(rustudio_core::log::Level, String)>,
+            restored: bool,
+        }
+        impl<'a> ServerGuard<'a> {
+            fn restore(&mut self) {
+                if self.restored {
+                    return;
+                }
+                self.restored = true;
+                let mut w = self.runtime.leave();
+                if let Some(d) = w.doc.take() {
+                    *self.doc_slot = d;
+                }
+                self.output = std::mem::take(&mut w.output);
+                *self.world_slot = Some(w);
+            }
+        }
+        impl<'a> Drop for ServerGuard<'a> {
+            fn drop(&mut self) {
+                self.restore();
+            }
+        }
+
+        struct ClientGuard<'a> {
+            runtime: &'a Runtime,
+            world_slot: &'a mut Option<World>,
+            doc_slot: &'a mut Option<Document>,
+            output: Vec<(rustudio_core::log::Level, String)>,
+            restored: bool,
+        }
+        impl<'a> ClientGuard<'a> {
+            fn restore(&mut self) {
+                if self.restored {
+                    return;
+                }
+                self.restored = true;
+                let mut w = self.runtime.leave();
+                *self.doc_slot = w.doc.take();
+                self.output = std::mem::take(&mut w.output);
+                *self.world_slot = Some(w);
+            }
+        }
+        impl<'a> Drop for ClientGuard<'a> {
+            fn drop(&mut self) {
+                self.restore();
+            }
+        }
+
         let (result, output) = match side {
             Side::Server => {
                 let server = s.server.as_mut()?;
                 let mut w = server.world.take()?;
                 w.doc = Some(std::mem::replace(&mut self.doc, Document::placeholder()));
                 server.runtime.enter(w);
-                let r = f(&server.runtime, s.other_doc.as_ref(), &mut s.map);
-                let mut w = server.runtime.leave();
-                self.doc = w.doc.take().expect("server document returned");
-                let out = std::mem::take(&mut w.output);
-                server.world = Some(w);
+                let mut guard = ServerGuard {
+                    runtime: &server.runtime,
+                    world_slot: &mut server.world,
+                    doc_slot: &mut self.doc,
+                    output: Vec::new(),
+                    restored: false,
+                };
+                let r = f(guard.runtime, s.other_doc.as_ref(), &mut s.map);
+                guard.restore();
+                let out = std::mem::take(&mut guard.output);
                 (r, out)
             }
             Side::Client => {
                 let c = s.client.as_mut()?;
                 let mut w = c.world.take()?;
-                w.doc = Some(s.other_doc.take()?);
+                let Some(other_doc) = s.other_doc.take() else {
+                    c.world = Some(w);
+                    return None;
+                };
+                w.doc = Some(other_doc);
                 c.runtime.enter(w);
-                let r = f(&c.runtime, Some(&self.doc), &mut s.map);
-                let mut w = c.runtime.leave();
-                s.other_doc = w.doc.take();
-                let out = std::mem::take(&mut w.output);
-                c.world = Some(w);
+                let mut guard = ClientGuard {
+                    runtime: &c.runtime,
+                    world_slot: &mut c.world,
+                    doc_slot: &mut s.other_doc,
+                    output: Vec::new(),
+                    restored: false,
+                };
+                let r = f(guard.runtime, Some(&self.doc), &mut s.map);
+                guard.restore();
+                let out = std::mem::take(&mut guard.output);
                 (r, out)
             }
         };
@@ -1342,6 +1408,10 @@ impl Game {
         let Some(mut s) = self.play.take() else {
             return;
         };
+        rustudio_physics::physics::clear_shared(self.doc.id);
+        if let Some(other) = &s.other_doc {
+            rustudio_physics::physics::clear_shared(other.id);
+        }
         if let Some(d) = s.saved_doc.take() {
             self.doc = d;
         }
@@ -4377,13 +4447,25 @@ impl Game {
                           pos: (f64, f64, f64),
                           delta: (f64, f64),
                           gpe: bool| {
-                    let s = |x: &str| Value::String(rt.lua.create_string(x).expect("lua string"));
+                    let (Ok(st), Ok(ui), Ok(ky)) = (
+                        rt.lua.create_string(state),
+                        rt.lua.create_string(uit),
+                        rt.lua.create_string(key),
+                    ) else {
+                        if let Some(mut w) = rt.world_mut() {
+                            w.push_output(
+                                rustudio_core::log::Level::Warn,
+                                "Dropped input event: Luau memory limit reached".into(),
+                            );
+                        }
+                        return;
+                    };
                     rt.spawn_global(
                         "__rs_input_event",
                         vec![
-                            s(state),
-                            s(uit),
-                            s(key),
+                            Value::String(st),
+                            Value::String(ui),
+                            Value::String(ky),
                             Value::Number(pos.0),
                             Value::Number(pos.1),
                             Value::Number(pos.2),
@@ -4424,15 +4506,25 @@ impl Game {
                 // InputBegan / TouchStarted … (src/library.luau
                 // `__rs_touch_event`); then the gestures.
                 for t in &touches {
-                    let s = |x: &str| Value::String(rt.lua.create_string(x).expect("lua string"));
-                    let began_on = rt.lua.create_table().expect("lua table");
+                    let (Ok(st), Ok(began_on)) = (
+                        rt.lua.create_string(t.state.name()),
+                        rt.lua.create_table(),
+                    ) else {
+                        if let Some(mut w) = rt.world_mut() {
+                            w.push_output(
+                                rustudio_core::log::Level::Warn,
+                                "Dropped touch event: Luau memory limit reached".into(),
+                            );
+                        }
+                        continue;
+                    };
                     for r in &t.began_on {
                         let _ = began_on.push(rt.inst(*r));
                     }
                     rt.spawn_global(
                         "__rs_touch_event",
                         vec![
-                            s(t.state.name()),
+                            Value::String(st),
                             Value::Number(t.id as f64),
                             Value::Number(t.x as f64),
                             Value::Number(t.y as f64),
@@ -4445,44 +4537,51 @@ impl Game {
                 }
                 for g in &touch_gestures {
                     use crate::touch_gestures::Gesture;
-                    let s = |x: &str| Value::String(rt.lua.create_string(x).expect("lua string"));
+                    let s = |x: &str| rt.lua.create_string(x).ok().map(Value::String);
                     let points = |pts: &[(f32, f32)]| {
-                        let t = rt.lua.create_table().expect("lua table");
+                        let t = rt.lua.create_table().ok()?;
                         for (x, y) in pts {
                             let _ = t.push(rustudio_engine::ltypes::LVector2(glam::Vec2::new(*x, *y)));
                         }
-                        Value::Table(t)
+                        Some(Value::Table(t))
                     };
                     let n = |v: f32| Value::Number(v as f64);
-                    let args = match g {
-                        Gesture::Tap { positions, gpe } => vec![s("Tap"), points(positions), Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(*gpe)],
+                    let args: Option<Vec<Value>> = (|| match g {
+                        Gesture::Tap { positions, gpe } => Some(vec![s("Tap")?, points(positions)?, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(*gpe)]),
                         Gesture::TapInWorld { pos, processed_by_ui } => {
-                            vec![s("TapInWorld"), points(&[*pos]), Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(*processed_by_ui)]
+                            Some(vec![s("TapInWorld")?, points(&[*pos])?, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(*processed_by_ui)])
                         }
                         Gesture::LongPress { positions, state, gpe } => {
-                            vec![s("LongPress"), points(positions), Value::Nil, Value::Nil, Value::Nil, Value::Nil, s(state.name()), Value::Boolean(*gpe)]
+                            Some(vec![s("LongPress")?, points(positions)?, Value::Nil, Value::Nil, Value::Nil, Value::Nil, s(state.name())?, Value::Boolean(*gpe)])
                         }
-                        Gesture::Pan { positions, translation, velocity, state, gpe } => vec![
-                            s("Pan"),
-                            points(positions),
+                        Gesture::Pan { positions, translation, velocity, state, gpe } => Some(vec![
+                            s("Pan")?,
+                            points(positions)?,
                             n(translation.0),
                             n(translation.1),
                             n(velocity.0),
                             n(velocity.1),
-                            s(state.name()),
+                            s(state.name())?,
                             Value::Boolean(*gpe),
-                        ],
+                        ]),
                         Gesture::Pinch { positions, scale, velocity, state, gpe } => {
-                            vec![s("Pinch"), points(positions), n(*scale), n(*velocity), Value::Nil, Value::Nil, s(state.name()), Value::Boolean(*gpe)]
+                            Some(vec![s("Pinch")?, points(positions)?, n(*scale), n(*velocity), Value::Nil, Value::Nil, s(state.name())?, Value::Boolean(*gpe)])
                         }
                         Gesture::Rotate { positions, rotation, velocity, state, gpe } => {
-                            vec![s("Rotate"), points(positions), n(*rotation), n(*velocity), Value::Nil, Value::Nil, s(state.name()), Value::Boolean(*gpe)]
+                            Some(vec![s("Rotate")?, points(positions)?, n(*rotation), n(*velocity), Value::Nil, Value::Nil, s(state.name())?, Value::Boolean(*gpe)])
                         }
                         Gesture::Swipe { direction, touches, gpe } => {
-                            vec![s("Swipe"), Value::Nil, Value::Number(*touches as f64), Value::Nil, Value::Nil, Value::Nil, s(direction.name()), Value::Boolean(*gpe)]
+                            Some(vec![s("Swipe")?, Value::Nil, Value::Number(*touches as f64), Value::Nil, Value::Nil, Value::Nil, s(direction.name())?, Value::Boolean(*gpe)])
                         }
-                    };
-                    rt.spawn_global("__rs_touch_gesture", args);
+                    })();
+                    if let Some(args) = args {
+                        rt.spawn_global("__rs_touch_gesture", args);
+                    } else if let Some(mut w) = rt.world_mut() {
+                        w.push_output(
+                            rustudio_core::log::Level::Warn,
+                            "Dropped touch gesture: Luau memory limit reached".into(),
+                        );
+                    }
                 }
                 game::step_smooth_scrolls(rt, dt);
                 if let Some(on) = window_focus_change {

@@ -327,6 +327,8 @@ pub struct CloudsGpu {
     active: bool,
     /// True when initial Studio cloud DDS assets were unavailable and fell back to 1x1 dummies.
     missing_content: bool,
+    /// Latched true once a reload with installed Studio content has been attempted.
+    attempted_reload: bool,
 }
 
 impl CloudsGpu {
@@ -413,7 +415,7 @@ impl CloudsGpu {
                 targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let target = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -500,6 +502,7 @@ impl CloudsGpu {
             have_cover: false,
             active: false,
             missing_content,
+            attempted_reload: false,
         }
     }
 
@@ -602,7 +605,8 @@ impl CloudsGpu {
             COVER.store(1.0f32.to_bits(), Ordering::Relaxed);
             return;
         }
-        if self.missing_content && rustudio_core::studio_content::installed().is_some() {
+        if self.missing_content && !self.attempted_reload && rustudio_core::studio_content::installed().is_some() {
+            self.attempted_reload = true;
             let (dist, ok_dist) = content_texture(device, queue, "rbxasset://sky/clouds.dds", true);
             let (adv, ok_adv) = content_texture(device, queue, "rbxasset://sky/cloudAdvection.dds", false);
             let (detail, ok_detail) = content_texture(device, queue, "rbxasset://sky/cloudDetail3D.dds", true);
@@ -720,12 +724,20 @@ impl CloudsGpu {
         self.active = false;
     }
 
-    /// No clouds this frame: forget the cover.
+    /// No clouds this frame: forget the cover, free sized targets, and reset any stuck readback.
     pub fn idle(&mut self) {
         self.active = false;
         self.have_cover = false;
         self.cover = 1.0;
         self.target = 1.0;
+        self.sized = None;
+        if self.readback != 0 {
+            if self.readback == 2 && self.mapped.load(Ordering::Acquire) != 2 {
+                self.cover_buf.unmap();
+            }
+            self.readback = 0;
+            self.mapped = Default::default();
+        }
     }
 }
 
